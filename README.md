@@ -20,7 +20,10 @@ Implemented now:
 - `Tween<T>`
 - `Camera2d`
 - `Projection2d`
+- explicit logical and physical screen-position types
 - `Scene` draw commands
+- per-command pseudo-depth projection
+- structured scene insertion errors
 - `Layer` and stable layered draw order
 - nested screen-space clipping
 - finite-input validation before scene ordering and GPU upload
@@ -29,6 +32,7 @@ Implemented now:
 - `PreparedScene` for reusable GPU-resident geometry
 - validated logical-to-physical display scale for HiDPI targets
 - live `winit` demo in `examples/demo.rs`
+- randomized four-wave matching game in `examples/ui_demo.rs`
 
 Supported first-slice primitives:
 
@@ -81,6 +85,14 @@ scene.with_screen_clip(
         );
     },
 );
+
+scene.with_depth(4.0, |scene| {
+    scene.circle(
+        Vec2::new(28.0, -12.0),
+        6.0,
+        ShapeStyle::filled(Color::WHITE),
+    );
+})?;
 ```
 
 Screen clips use logical pixels with a top-left origin. Commands capture the
@@ -88,12 +100,16 @@ active clip when they are appended, nested clips are intersected, and the
 renderer converts them to physical scissor pixels using its display scale factor.
 
 Camera zoom, stroke widths, shadows, and clips use logical pixels. Surface width
-and height remain physical pixels. `WgpuRenderer::new` assumes scale `1.0`; HiDPI
-hosts should construct `WgpuRendererOptions` with the window scale factor.
+and height remain physical pixels. Camera picking requires a
+`LogicalScreenPosition`; use the renderer's `physical_to_logical_screen` method
+when a host event supplies `PhysicalScreenPosition`. `WgpuRenderer::new` assumes
+scale `1.0`; HiDPI hosts should construct `WgpuRendererOptions` with the window
+scale factor.
 
 Scene primitive methods return `true` when a command is accepted. They return
 `false` without changing command order when geometry, dimensions, colors, or
-styles are non-finite or otherwise non-drawable.
+styles are non-finite or otherwise non-drawable. The corresponding `try_*`
+methods return `SceneError` when the host needs a precise rejection reason.
 
 Window setup is intentionally outside the core scene API. The demo uses `winit`, but Sim;Engine should not force a host app to use a specific app framework.
 
@@ -104,6 +120,24 @@ cargo run --example demo
 ```
 
 The demo opens a window, creates a `WgpuRenderer`, animates the camera, and renders a small visual scene.
+
+The UI interaction example uses only Sim;Engine primitives for its visual layer:
+
+```bash
+cargo run --release --example ui_demo
+```
+
+Use `cargo run --release --example ui_demo -- --solved-preview` to inspect the
+success state without manually matching all eight parameters.
+
+Each pane has a colored frequency slider and a moving gray dashed target. Every
+wave has an independent speed; four selector buttons choose which speed the
+single red bottom slider edits. Pause freezes both target and colored waves at
+their current phase, while the adjacent stop/reset button also returns their
+shared phase to zero. Accuracy is capped at `99%`, and a sufficiently close
+match reveals `YAY`, accept, and dismiss controls. Targets and starting values
+are randomized for every process restart. Hit testing and game state stay in
+the host example; Sim;Engine receives the resulting visual scene.
 
 Static geometry can be prepared once and drawn under changing cameras and
 viewport dimensions without per-frame tessellation or geometry upload:
@@ -116,7 +150,9 @@ renderer.render_prepared(&prepared, &camera)?;
 Prepared geometry is an immutable snapshot tied to the renderer that created
 it. Shape, style, order, background, or logical clip changes require preparing a
 replacement. Viewport-relative clips also need rebuilding when the host wants
-their authored bounds to follow a resize.
+their authored bounds to follow a resize. Each snapshot retains a CPU vertex
+copy so `restore_prepared_scene` can upload it to a replacement renderer after
+device loss without retaining the original high-level `Scene`.
 
 The default `Vsync` mode requests strict FIFO presentation. The demo prints a
 CPU timing breakdown for scene construction, tessellation, upload, surface

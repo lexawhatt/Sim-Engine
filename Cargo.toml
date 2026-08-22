@@ -23,3 +23,7 @@ winit = "0.30.12"
 [[example]]
 name = "demo"
 required-features = ["wgpu"]
+
+[[example]]
+name = "ui_demo"
+required-features = ["wgpu"]

@@ -1,0 +1,1288 @@
+use std::{
+    error::Error,
+    sync::Arc,
+    time::{Instant, SystemTime, UNIX_EPOCH},
+};
+
+use sim_engine::{
+    Camera2d, Color, PhysicalScreenPosition, Rect, Scene, ShapeStyle, Vec2, WgpuRenderer,
+    WgpuRendererOptions,
+};
+use winit::{
+    application::ApplicationHandler,
+    dpi::LogicalSize,
+    event::{ElementState, MouseButton, WindowEvent},
+    event_loop::{ActiveEventLoop, EventLoop},
+    window::{CursorIcon, Window, WindowId},
+};
+
+const WAVE_COUNT: usize = 4;
+const MIN_FREQUENCY: f32 = 0.65;
+const MAX_FREQUENCY: f32 = 5.25;
+const MIN_SPEED: f32 = 0.0;
+const MAX_SPEED: f32 = 2.4;
+const SUCCESS_ACCURACY: f32 = 0.93;
+
+const WAVE_COLORS: [Color; WAVE_COUNT] = [
+    Color::rgb(0.073, 0.651, 0.752),
+    Color::rgb(0.930, 0.552, 0.063),
+    Color::rgb(0.095, 0.604, 0.286),
+    Color::rgb(0.965, 0.141, 0.117),
+];
+
+fn main() -> Result<(), Box<dyn Error>> {
+    env_logger::init();
+
+    let event_loop = EventLoop::new()?;
+    let mut application = UiDemoApplication::new();
+    event_loop.run_app(&mut application)?;
+
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InteractionTarget {
+    PlaybackButton,
+    ResetButton,
+    FrequencySlider(usize),
+    SpeedSelector(usize),
+    SpeedSlider,
+    AcceptButton,
+    DismissButton,
+}
+
+struct UiDemoApplication {
+    window: Option<Arc<Window>>,
+    renderer: Option<WgpuRenderer>,
+    camera: Camera2d,
+    pointer_logical: Vec2,
+    pointer_inside: bool,
+    active_drag: Option<InteractionTarget>,
+    selected_speed_wave: usize,
+    challenge: WaveChallenge,
+    playing: bool,
+    animation_time: f32,
+    success_dismissed: bool,
+    previous_frame: Instant,
+    random: SimpleRandom,
+}
+
+impl UiDemoApplication {
+    fn new() -> Self {
+        let mut random = SimpleRandom::from_system_time();
+        let mut challenge = WaveChallenge::random(&mut random);
+        if solved_preview_requested() {
+            challenge.snap_to_target();
+        }
+        Self {
+            window: None,
+            renderer: None,
+            camera: Camera2d::new(Vec2::ZERO, 1.0).expect("UI demo camera is valid"),
+            pointer_logical: Vec2::ZERO,
+            pointer_inside: false,
+            active_drag: None,
+            selected_speed_wave: 0,
+            challenge,
+            playing: true,
+            animation_time: 0.0,
+            success_dismissed: false,
+            previous_frame: Instant::now(),
+            random,
+        }
+    }
+
+    fn layout(&self) -> Option<UiLayout> {
+        self.renderer.as_ref().map(|renderer| {
+            let (width, height) = renderer.logical_size();
+            UiLayout::new(Vec2::new(width, height))
+        })
+    }
+
+    fn show_success(&self) -> bool {
+        self.challenge.is_solved() && !self.success_dismissed
+    }
+
+    fn hovered_target(&self, layout: UiLayout) -> Option<InteractionTarget> {
+        if !self.pointer_inside {
+            return None;
+        }
+        layout.hit_test(
+            self.pointer_logical,
+            &self.challenge.frequency_amounts,
+            self.challenge.speed_amounts[self.selected_speed_wave],
+            self.show_success(),
+        )
+    }
+
+    fn update_drag(&mut self, layout: UiLayout) {
+        match self.active_drag {
+            Some(InteractionTarget::FrequencySlider(index)) => {
+                self.challenge.frequency_amounts[index] =
+                    layout.frequency_amount_at(index, self.pointer_logical.x);
+                self.success_dismissed = false;
+            }
+            Some(InteractionTarget::SpeedSlider) => {
+                self.challenge.speed_amounts[self.selected_speed_wave] =
+                    layout.speed_amount_at(self.pointer_logical.x);
+                self.success_dismissed = false;
+            }
+            _ => {}
+        }
+    }
+
+    fn start_new_round(&mut self) {
+        self.challenge = WaveChallenge::random(&mut self.random);
+        self.selected_speed_wave = 0;
+        self.animation_time = 0.0;
+        self.success_dismissed = false;
+    }
+
+    fn hard_reset(&mut self) {
+        self.playing = false;
+        self.animation_time = 0.0;
+    }
+
+    fn update_cursor(&self, window: &Window, layout: UiLayout) {
+        let cursor = match self.active_drag {
+            Some(InteractionTarget::FrequencySlider(_) | InteractionTarget::SpeedSlider) => {
+                CursorIcon::Grabbing
+            }
+            Some(_) => CursorIcon::Pointer,
+            None => match self.hovered_target(layout) {
+                Some(InteractionTarget::FrequencySlider(_) | InteractionTarget::SpeedSlider) => {
+                    CursorIcon::Grab
+                }
+                Some(_) => CursorIcon::Pointer,
+                None => CursorIcon::Default,
+            },
+        };
+        window.set_cursor(cursor);
+    }
+
+    fn update_animation(&mut self, now: Instant) {
+        let elapsed = now
+            .saturating_duration_since(self.previous_frame)
+            .as_secs_f32()
+            .min(0.05);
+        self.previous_frame = now;
+        if self.playing {
+            self.animation_time += elapsed;
+        }
+        if !self.challenge.is_solved() {
+            self.success_dismissed = false;
+        }
+    }
+}
+
+impl ApplicationHandler for UiDemoApplication {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        if self.window.is_some() {
+            return;
+        }
+
+        let attributes = Window::default_attributes()
+            .with_title("Sim;Engine wave matching demo")
+            .with_inner_size(LogicalSize::new(1100.0, 760.0))
+            .with_min_inner_size(LogicalSize::new(800.0, 620.0));
+        let window = Arc::new(
+            event_loop
+                .create_window(attributes)
+                .expect("create UI window"),
+        );
+        let size = window.inner_size();
+        let renderer_options = WgpuRendererOptions::new(
+            sim_engine::RendererPresentMode::Vsync,
+            window.scale_factor(),
+        )
+        .expect("window scale factor is valid");
+        let renderer = pollster::block_on(WgpuRenderer::new_with_options(
+            window.clone(),
+            size.width.max(1),
+            size.height.max(1),
+            renderer_options,
+        ))
+        .expect("create UI renderer");
+
+        self.window = Some(window);
+        self.renderer = Some(renderer);
+        self.previous_frame = Instant::now();
+    }
+
+    fn window_event(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        window_id: WindowId,
+        event: WindowEvent,
+    ) {
+        let Some(window) = self.window.clone() else {
+            return;
+        };
+        if window.id() != window_id {
+            return;
+        }
+
+        match event {
+            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::Resized(size) => {
+                if let Some(renderer) = self.renderer.as_mut() {
+                    renderer
+                        .resize_with_scale_factor(size.width, size.height, window.scale_factor())
+                        .expect("window scale factor is valid");
+                }
+            }
+            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                if let Some(renderer) = self.renderer.as_mut() {
+                    renderer
+                        .set_scale_factor(scale_factor)
+                        .expect("window scale factor is valid");
+                }
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                if let Some(renderer) = self.renderer.as_ref() {
+                    self.pointer_logical = renderer
+                        .physical_to_logical_screen(PhysicalScreenPosition::new(
+                            position.x as f32,
+                            position.y as f32,
+                        ))
+                        .to_vec2();
+                    self.pointer_inside = true;
+                }
+                if let Some(layout) = self.layout() {
+                    self.update_drag(layout);
+                    self.update_cursor(&window, layout);
+                }
+                window.request_redraw();
+            }
+            WindowEvent::CursorLeft { .. } => {
+                self.pointer_inside = false;
+                if self.active_drag.is_none() {
+                    window.set_cursor(CursorIcon::Default);
+                }
+            }
+            WindowEvent::MouseInput {
+                state,
+                button: MouseButton::Left,
+                ..
+            } => {
+                let Some(layout) = self.layout() else {
+                    return;
+                };
+                match state {
+                    ElementState::Pressed => {
+                        self.active_drag = self.hovered_target(layout);
+                        match self.active_drag {
+                            Some(InteractionTarget::PlaybackButton) => {
+                                self.playing = !self.playing;
+                            }
+                            Some(InteractionTarget::ResetButton) => {
+                                self.hard_reset();
+                            }
+                            Some(InteractionTarget::SpeedSelector(index)) => {
+                                self.selected_speed_wave = index;
+                            }
+                            Some(
+                                InteractionTarget::FrequencySlider(_)
+                                | InteractionTarget::SpeedSlider,
+                            ) => self.update_drag(layout),
+                            Some(InteractionTarget::AcceptButton) => self.start_new_round(),
+                            Some(InteractionTarget::DismissButton) => {
+                                self.success_dismissed = true;
+                            }
+                            None => {}
+                        }
+                    }
+                    ElementState::Released => self.active_drag = None,
+                }
+                self.update_cursor(&window, layout);
+                window.request_redraw();
+            }
+            WindowEvent::RedrawRequested => {
+                self.update_animation(Instant::now());
+                let Some(layout) = self.layout() else {
+                    return;
+                };
+                let hovered = self.hovered_target(layout);
+                let scene = build_ui_scene(
+                    layout,
+                    &self.challenge,
+                    self.animation_time,
+                    self.playing,
+                    self.selected_speed_wave,
+                    hovered,
+                    self.active_drag,
+                    self.show_success(),
+                );
+                window.pre_present_notify();
+                if let Some(renderer) = self.renderer.as_mut()
+                    && let Err(error) = renderer.render(&scene, &self.camera)
+                {
+                    eprintln!("UI demo renderer error: {error:?}");
+                }
+                window.request_redraw();
+            }
+            _ => {}
+        }
+    }
+
+    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+        if let Some(window) = self.window.as_ref() {
+            window.request_redraw();
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct WaveChallenge {
+    target_frequencies: [f32; WAVE_COUNT],
+    target_speeds: [f32; WAVE_COUNT],
+    frequency_amounts: [f32; WAVE_COUNT],
+    speed_amounts: [f32; WAVE_COUNT],
+    amplitude_amounts: [f32; WAVE_COUNT],
+}
+
+impl WaveChallenge {
+    fn random(random: &mut SimpleRandom) -> Self {
+        let target_frequencies = [
+            random.range(0.75, 1.35),
+            random.range(4.05, 5.0),
+            random.range(1.65, 2.65),
+            random.range(2.75, 3.85),
+        ];
+        let amplitude_amounts = [
+            random.range(0.17, 0.24),
+            random.range(0.27, 0.34),
+            random.range(0.36, 0.44),
+            random.range(0.20, 0.29),
+        ];
+        let target_speeds = [
+            random.range(0.35, 0.72),
+            random.range(1.78, 2.28),
+            random.range(0.82, 1.18),
+            random.range(1.30, 1.68),
+        ];
+        let mut frequency_amounts = target_frequencies.map(frequency_to_amount);
+        for amount in &mut frequency_amounts {
+            let offset =
+                random.range(0.13, 0.31) * if random.next_unit() < 0.5 { -1.0 } else { 1.0 };
+            *amount = (*amount + offset).clamp(0.0, 1.0);
+        }
+        let mut speed_amounts = target_speeds.map(speed_to_amount);
+        for amount in &mut speed_amounts {
+            let offset =
+                random.range(0.14, 0.30) * if random.next_unit() < 0.5 { -1.0 } else { 1.0 };
+            *amount = (*amount + offset).clamp(0.0, 1.0);
+        }
+        Self {
+            target_frequencies,
+            target_speeds,
+            frequency_amounts,
+            speed_amounts,
+            amplitude_amounts,
+        }
+    }
+
+    fn frequency(&self, index: usize) -> f32 {
+        amount_to_frequency(self.frequency_amounts[index])
+    }
+
+    fn speed(&self, index: usize) -> f32 {
+        amount_to_speed(self.speed_amounts[index])
+    }
+
+    fn raw_accuracy(&self) -> f32 {
+        let frequency_error = self
+            .target_frequencies
+            .iter()
+            .enumerate()
+            .map(|(index, target)| {
+                (self.frequency(index) - target).abs() / (MAX_FREQUENCY - MIN_FREQUENCY)
+            })
+            .sum::<f32>()
+            / WAVE_COUNT as f32;
+        let speed_error = self
+            .target_speeds
+            .iter()
+            .enumerate()
+            .map(|(index, target)| (self.speed(index) - target).abs() / (MAX_SPEED - MIN_SPEED))
+            .sum::<f32>()
+            / WAVE_COUNT as f32;
+        (1.0 - (frequency_error * 0.62 + speed_error * 0.38) * 3.2).clamp(0.0, 1.0)
+    }
+
+    fn displayed_accuracy(&self) -> u32 {
+        (self.raw_accuracy() * 99.0).round().clamp(0.0, 99.0) as u32
+    }
+
+    fn is_solved(&self) -> bool {
+        self.raw_accuracy() >= SUCCESS_ACCURACY
+            && self
+                .target_frequencies
+                .iter()
+                .enumerate()
+                .all(|(index, target)| (self.frequency(index) - target).abs() <= 0.16)
+            && self
+                .target_speeds
+                .iter()
+                .enumerate()
+                .all(|(index, target)| (self.speed(index) - target).abs() <= 0.10)
+    }
+
+    fn snap_to_target(&mut self) {
+        self.frequency_amounts = self.target_frequencies.map(frequency_to_amount);
+        self.speed_amounts = self.target_speeds.map(speed_to_amount);
+    }
+
+    #[cfg(test)]
+    fn exact_test_challenge() -> Self {
+        let target_frequencies = [1.0, 4.5, 2.2, 3.2];
+        let target_speeds = [0.5, 2.0, 1.0, 1.5];
+        Self {
+            target_frequencies,
+            target_speeds,
+            frequency_amounts: target_frequencies.map(frequency_to_amount),
+            speed_amounts: target_speeds.map(speed_to_amount),
+            amplitude_amounts: [0.2, 0.3, 0.4, 0.25],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PaneLayout {
+    frame: Rect,
+    plot: Rect,
+    slider_start: Vec2,
+    slider_end: Vec2,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct UiLayout {
+    surface_size: Vec2,
+    panes: [PaneLayout; WAVE_COUNT],
+    playback_button: Rect,
+    reset_button: Rect,
+    speed_selector_buttons: [Rect; WAVE_COUNT],
+    speed_start: Vec2,
+    speed_end: Vec2,
+    status_origin: Vec2,
+    accept_button: Rect,
+    dismiss_button: Rect,
+}
+
+impl UiLayout {
+    fn new(surface_size: Vec2) -> Self {
+        let margin = (surface_size.x.min(surface_size.y) * 0.045).clamp(24.0, 38.0);
+        let gap = 16.0;
+        let bottom_height = 104.0;
+        let grid_bottom = surface_size.y - bottom_height - margin;
+        let pane_width = (surface_size.x - margin * 2.0 - gap) * 0.5;
+        let pane_height = (grid_bottom - margin - gap) * 0.5;
+        let panes = std::array::from_fn(|index| {
+            let column = index % 2;
+            let row = index / 2;
+            let frame_min = Vec2::new(
+                margin + column as f32 * (pane_width + gap),
+                margin + row as f32 * (pane_height + gap),
+            );
+            let frame = Rect::from_min_size(frame_min, Vec2::new(pane_width, pane_height));
+            let plot = Rect::new(
+                frame.min + Vec2::splat(12.0),
+                Vec2::new(frame.max.x - 12.0, frame.max.y - 48.0),
+            );
+            let slider_y = frame.max.y - 23.0;
+            PaneLayout {
+                frame,
+                plot,
+                slider_start: Vec2::new(frame.min.x + 18.0, slider_y),
+                slider_end: Vec2::new(frame.max.x - 18.0, slider_y),
+            }
+        });
+        let controls_y = grid_bottom + (surface_size.y - margin - grid_bottom) * 0.5;
+        let button_size = 54.0;
+        let playback_button = Rect::from_center_size(
+            Vec2::new(margin + button_size * 0.5, controls_y),
+            Vec2::splat(button_size),
+        );
+        let reset_button = Rect::from_center_size(
+            Vec2::new(playback_button.max.x + 12.0 + button_size * 0.5, controls_y),
+            Vec2::splat(button_size),
+        );
+        let selector_size = 32.0;
+        let selector_gap = 7.0;
+        let selector_start_x = reset_button.max.x + 18.0;
+        let speed_selector_buttons = std::array::from_fn(|index| {
+            Rect::from_min_size(
+                Vec2::new(
+                    selector_start_x + index as f32 * (selector_size + selector_gap),
+                    controls_y - selector_size * 0.5,
+                ),
+                Vec2::splat(selector_size),
+            )
+        });
+        let speed_start = Vec2::new(speed_selector_buttons[3].max.x + 18.0, controls_y);
+        let speed_end = Vec2::new(surface_size.x * 0.57, controls_y);
+        let status_origin = Vec2::new(surface_size.x * 0.61, controls_y - 14.0);
+        let dismiss_button = Rect::from_center_size(
+            Vec2::new(surface_size.x - margin - 25.0, controls_y),
+            Vec2::splat(50.0),
+        );
+        let accept_button = Rect::from_center_size(
+            Vec2::new(dismiss_button.min.x - 39.0, controls_y),
+            Vec2::splat(50.0),
+        );
+
+        Self {
+            surface_size,
+            panes,
+            playback_button,
+            reset_button,
+            speed_selector_buttons,
+            speed_start,
+            speed_end,
+            status_origin,
+            accept_button,
+            dismiss_button,
+        }
+    }
+
+    fn frequency_amount_at(self, index: usize, logical_x: f32) -> f32 {
+        let pane = self.panes[index];
+        normalized_track_amount(logical_x, pane.slider_start.x, pane.slider_end.x)
+    }
+
+    fn speed_amount_at(self, logical_x: f32) -> f32 {
+        normalized_track_amount(logical_x, self.speed_start.x, self.speed_end.x)
+    }
+
+    fn frequency_knob(self, index: usize, amount: f32) -> Vec2 {
+        let pane = self.panes[index];
+        pane.slider_start
+            .lerp(pane.slider_end, amount.clamp(0.0, 1.0))
+    }
+
+    fn speed_knob(self, amount: f32) -> Vec2 {
+        self.speed_start
+            .lerp(self.speed_end, amount.clamp(0.0, 1.0))
+    }
+
+    fn hit_test(
+        self,
+        logical_point: Vec2,
+        frequency_amounts: &[f32; WAVE_COUNT],
+        speed_amount: f32,
+        show_success: bool,
+    ) -> Option<InteractionTarget> {
+        if rect_contains(self.playback_button, logical_point) {
+            return Some(InteractionTarget::PlaybackButton);
+        }
+        if rect_contains(self.reset_button, logical_point) {
+            return Some(InteractionTarget::ResetButton);
+        }
+        for (index, selector) in self.speed_selector_buttons.iter().enumerate() {
+            if rect_contains(*selector, logical_point) {
+                return Some(InteractionTarget::SpeedSelector(index));
+            }
+        }
+        for (index, pane) in self.panes.iter().enumerate() {
+            if (logical_point - self.frequency_knob(index, frequency_amounts[index]))
+                .length_squared()
+                <= 17.0 * 17.0
+                || track_contains(pane.slider_start, pane.slider_end, logical_point)
+            {
+                return Some(InteractionTarget::FrequencySlider(index));
+            }
+        }
+        if (logical_point - self.speed_knob(speed_amount)).length_squared() <= 18.0 * 18.0
+            || track_contains(self.speed_start, self.speed_end, logical_point)
+        {
+            return Some(InteractionTarget::SpeedSlider);
+        }
+        if show_success && rect_contains(self.accept_button, logical_point) {
+            return Some(InteractionTarget::AcceptButton);
+        }
+        if show_success && rect_contains(self.dismiss_button, logical_point) {
+            return Some(InteractionTarget::DismissButton);
+        }
+        None
+    }
+
+    fn screen_to_world(self, logical: Vec2) -> Vec2 {
+        Vec2::new(
+            logical.x - self.surface_size.x * 0.5,
+            self.surface_size.y * 0.5 - logical.y,
+        )
+    }
+
+    fn screen_rect_to_world(self, logical: Rect) -> Rect {
+        Rect::new(
+            self.screen_to_world(logical.max),
+            self.screen_to_world(logical.min),
+        )
+        .normalized()
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_ui_scene(
+    layout: UiLayout,
+    challenge: &WaveChallenge,
+    animation_time: f32,
+    playing: bool,
+    selected_speed_wave: usize,
+    hovered: Option<InteractionTarget>,
+    active_drag: Option<InteractionTarget>,
+    show_success: bool,
+) -> Scene {
+    let background = Color::rgb8(16, 18, 22);
+    let surface = Color::rgb8(29, 33, 38);
+    let surface_hover = Color::rgb8(39, 45, 51);
+    let border = Color::rgba8(255, 255, 255, 34);
+    let target_color = Color::rgba8(218, 224, 229, 126);
+    let muted_track = Color::rgba8(255, 255, 255, 42);
+    let speed_color = Color::rgb8(255, 105, 97);
+    let success_color = Color::rgb8(87, 203, 137);
+    let mut scene = Scene::new(background);
+
+    for (index, pane) in layout.panes.iter().copied().enumerate() {
+        scene.rect(
+            layout.screen_rect_to_world(pane.frame),
+            7.0,
+            ShapeStyle::fill_stroke(surface, 1.0, border),
+        );
+        draw_wave_pane(
+            &mut scene,
+            layout,
+            pane,
+            challenge,
+            index,
+            animation_time,
+            target_color,
+        );
+        let slider_active = hovered == Some(InteractionTarget::FrequencySlider(index))
+            || active_drag == Some(InteractionTarget::FrequencySlider(index));
+        draw_slider(
+            &mut scene,
+            layout,
+            pane.slider_start,
+            pane.slider_end,
+            challenge.frequency_amounts[index],
+            WAVE_COLORS[index],
+            slider_active,
+            muted_track,
+        );
+    }
+
+    let button_hovered = hovered == Some(InteractionTarget::PlaybackButton);
+    scene.rect(
+        layout.screen_rect_to_world(layout.playback_button),
+        7.0,
+        ShapeStyle::fill_stroke(
+            if button_hovered {
+                success_color
+            } else {
+                surface_hover
+            },
+            1.5,
+            success_color.with_alpha(0.88),
+        ),
+    );
+    draw_playback_icon(&mut scene, layout, playing, success_color, button_hovered);
+
+    let reset_hovered = hovered == Some(InteractionTarget::ResetButton);
+    scene.rect(
+        layout.screen_rect_to_world(layout.reset_button),
+        7.0,
+        ShapeStyle::fill_stroke(
+            if reset_hovered {
+                speed_color
+            } else {
+                surface_hover
+            },
+            1.5,
+            speed_color.with_alpha(0.88),
+        ),
+    );
+    draw_reset_icon(&mut scene, layout, speed_color, reset_hovered);
+
+    for (index, button) in layout.speed_selector_buttons.iter().copied().enumerate() {
+        draw_speed_selector_button(
+            &mut scene,
+            layout,
+            button,
+            index,
+            index == selected_speed_wave,
+            hovered == Some(InteractionTarget::SpeedSelector(index)),
+        );
+    }
+
+    let speed_active = hovered == Some(InteractionTarget::SpeedSlider)
+        || active_drag == Some(InteractionTarget::SpeedSlider);
+    draw_slider(
+        &mut scene,
+        layout,
+        layout.speed_start,
+        layout.speed_end,
+        challenge.speed_amounts[selected_speed_wave],
+        speed_color,
+        speed_active,
+        muted_track,
+    );
+
+    let status = if show_success {
+        format!("YAY {}%", challenge.displayed_accuracy())
+    } else {
+        format!("ACC {}%", challenge.displayed_accuracy())
+    };
+    draw_pixel_text(
+        &mut scene,
+        layout,
+        &status,
+        layout.status_origin,
+        4.0,
+        if show_success {
+            success_color
+        } else {
+            Color::rgba8(235, 240, 244, 210)
+        },
+    );
+
+    if show_success {
+        draw_confirmation_button(
+            &mut scene,
+            layout,
+            layout.accept_button,
+            true,
+            hovered == Some(InteractionTarget::AcceptButton),
+        );
+        draw_confirmation_button(
+            &mut scene,
+            layout,
+            layout.dismiss_button,
+            false,
+            hovered == Some(InteractionTarget::DismissButton),
+        );
+    }
+
+    scene
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_wave_pane(
+    scene: &mut Scene,
+    layout: UiLayout,
+    pane: PaneLayout,
+    challenge: &WaveChallenge,
+    index: usize,
+    animation_time: f32,
+    target_color: Color,
+) {
+    let center_y = pane.plot.center().y;
+    scene.line(
+        layout.screen_to_world(Vec2::new(pane.plot.min.x, center_y)),
+        layout.screen_to_world(Vec2::new(pane.plot.max.x, center_y)),
+        1.0,
+        Color::rgba8(255, 255, 255, 34),
+    );
+    for division in 1..4 {
+        let x = pane.plot.min.x + pane.plot.width() * division as f32 / 4.0;
+        scene.line(
+            layout.screen_to_world(Vec2::new(x, pane.plot.min.y)),
+            layout.screen_to_world(Vec2::new(x, pane.plot.max.y)),
+            1.0,
+            Color::rgba8(255, 255, 255, 18),
+        );
+    }
+
+    for dash_index in 0..28 {
+        let start_amount = dash_index as f32 / 28.0;
+        let end_amount = (dash_index as f32 + 0.58) / 28.0;
+        let start = wave_screen_point(
+            pane.plot,
+            challenge.target_frequencies[index],
+            challenge.target_speeds[index],
+            challenge.amplitude_amounts[index],
+            animation_time,
+            start_amount,
+        );
+        let end = wave_screen_point(
+            pane.plot,
+            challenge.target_frequencies[index],
+            challenge.target_speeds[index],
+            challenge.amplitude_amounts[index],
+            animation_time,
+            end_amount,
+        );
+        scene.line(
+            layout.screen_to_world(start),
+            layout.screen_to_world(end),
+            1.7,
+            target_color,
+        );
+    }
+
+    let actual = wave_screen_points(
+        pane.plot,
+        challenge.frequency(index),
+        challenge.speed(index),
+        challenge.amplitude_amounts[index],
+        animation_time,
+    )
+    .into_iter()
+    .map(|point| layout.screen_to_world(point))
+    .collect();
+    scene.polyline(actual, 3.0, WAVE_COLORS[index].with_alpha(0.94));
+}
+
+fn wave_screen_points(
+    plot: Rect,
+    frequency: f32,
+    speed: f32,
+    amplitude_amount: f32,
+    animation_time: f32,
+) -> Vec<Vec2> {
+    let mut points = Vec::with_capacity(180);
+    for sample in 0..180 {
+        let amount = sample as f32 / 179.0;
+        points.push(wave_screen_point(
+            plot,
+            frequency,
+            speed,
+            amplitude_amount,
+            animation_time,
+            amount,
+        ));
+    }
+    points
+}
+
+fn wave_screen_point(
+    plot: Rect,
+    frequency: f32,
+    speed: f32,
+    amplitude_amount: f32,
+    animation_time: f32,
+    amount: f32,
+) -> Vec2 {
+    let horizontal_padding = 10.0;
+    let wave_width = plot.width() - horizontal_padding * 2.0;
+    let amplitude = plot.height() * amplitude_amount;
+    let x = plot.min.x + horizontal_padding + wave_width * amount;
+    let envelope = (amount * std::f32::consts::PI).sin().max(0.0).powf(0.18);
+    let y = plot.center().y
+        + (amount * std::f32::consts::TAU * frequency + animation_time * speed).sin()
+            * amplitude
+            * envelope;
+    Vec2::new(x, y)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_slider(
+    scene: &mut Scene,
+    layout: UiLayout,
+    start: Vec2,
+    end: Vec2,
+    amount: f32,
+    color: Color,
+    active: bool,
+    muted_track: Color,
+) {
+    scene.line(
+        layout.screen_to_world(start),
+        layout.screen_to_world(end),
+        5.0,
+        muted_track,
+    );
+    scene.line(
+        layout.screen_to_world(start),
+        layout.screen_to_world(start.lerp(end, amount.clamp(0.0, 1.0))),
+        5.0,
+        color.with_alpha(0.90),
+    );
+    scene.circle(
+        layout.screen_to_world(start.lerp(end, amount.clamp(0.0, 1.0))),
+        if active { 10.5 } else { 8.5 },
+        ShapeStyle::fill_stroke(color, 1.5, Color::WHITE.with_alpha(0.76)),
+    );
+}
+
+fn draw_playback_icon(
+    scene: &mut Scene,
+    layout: UiLayout,
+    playing: bool,
+    color: Color,
+    highlighted: bool,
+) {
+    let center = layout.playback_button.center();
+    let icon_color = if highlighted {
+        Color::rgb8(17, 24, 26)
+    } else {
+        color
+    };
+    if playing {
+        for offset in [-5.0, 5.0] {
+            scene.line(
+                layout.screen_to_world(center + Vec2::new(offset, -8.0)),
+                layout.screen_to_world(center + Vec2::new(offset, 8.0)),
+                4.0,
+                icon_color,
+            );
+        }
+    } else {
+        scene.polyline(
+            vec![
+                layout.screen_to_world(center + Vec2::new(-6.0, -9.0)),
+                layout.screen_to_world(center + Vec2::new(9.0, 0.0)),
+                layout.screen_to_world(center + Vec2::new(-6.0, 9.0)),
+                layout.screen_to_world(center + Vec2::new(-6.0, -9.0)),
+            ],
+            3.0,
+            icon_color,
+        );
+    }
+}
+
+fn draw_reset_icon(scene: &mut Scene, layout: UiLayout, color: Color, highlighted: bool) {
+    let center = layout.reset_button.center();
+    scene.rect(
+        layout.screen_rect_to_world(Rect::from_center_size(center, Vec2::splat(16.0))),
+        2.0,
+        ShapeStyle::filled(if highlighted {
+            Color::rgb8(26, 20, 22)
+        } else {
+            color
+        }),
+    );
+}
+
+fn draw_speed_selector_button(
+    scene: &mut Scene,
+    layout: UiLayout,
+    rect: Rect,
+    index: usize,
+    selected: bool,
+    hovered: bool,
+) {
+    let color = WAVE_COLORS[index];
+    let fill = if selected {
+        color.with_alpha(0.34)
+    } else if hovered {
+        color.with_alpha(0.18)
+    } else {
+        Color::rgb8(39, 45, 51)
+    };
+    scene.rect(
+        layout.screen_rect_to_world(rect),
+        5.0,
+        ShapeStyle::fill_stroke(fill, if selected { 2.0 } else { 1.0 }, color),
+    );
+    let text_origin = rect.center() + Vec2::new(-6.0, -10.0);
+    draw_pixel_text(
+        scene,
+        layout,
+        &(index + 1).to_string(),
+        text_origin,
+        4.0,
+        if selected { Color::WHITE } else { color },
+    );
+}
+
+fn draw_confirmation_button(
+    scene: &mut Scene,
+    layout: UiLayout,
+    rect: Rect,
+    accepted: bool,
+    hovered: bool,
+) {
+    let color = if accepted {
+        Color::rgb8(87, 203, 137)
+    } else {
+        Color::rgb8(255, 105, 97)
+    };
+    scene.rect(
+        layout.screen_rect_to_world(rect),
+        7.0,
+        ShapeStyle::fill_stroke(
+            if hovered {
+                color
+            } else {
+                Color::rgb8(39, 45, 51)
+            },
+            1.5,
+            color,
+        ),
+    );
+    let center = rect.center();
+    let icon = if hovered {
+        Color::rgb8(17, 24, 26)
+    } else {
+        color
+    };
+    if accepted {
+        scene.polyline(
+            vec![
+                layout.screen_to_world(center + Vec2::new(-9.0, 0.0)),
+                layout.screen_to_world(center + Vec2::new(-2.0, 7.0)),
+                layout.screen_to_world(center + Vec2::new(10.0, -8.0)),
+            ],
+            4.0,
+            icon,
+        );
+    } else {
+        for direction in [-1.0, 1.0] {
+            scene.line(
+                layout.screen_to_world(center + Vec2::new(-8.0, 8.0 * direction)),
+                layout.screen_to_world(center + Vec2::new(8.0, -8.0 * direction)),
+                4.0,
+                icon,
+            );
+        }
+    }
+}
+
+fn draw_pixel_text(
+    scene: &mut Scene,
+    layout: UiLayout,
+    text: &str,
+    origin: Vec2,
+    pixel_size: f32,
+    color: Color,
+) {
+    let mut cursor_x = origin.x;
+    for character in text.chars() {
+        let pattern = glyph_pattern(character);
+        for (row, bits) in pattern.into_iter().enumerate() {
+            for column in 0..3 {
+                if bits & (1 << (2 - column)) != 0 {
+                    let min = Vec2::new(
+                        cursor_x + column as f32 * pixel_size,
+                        origin.y + row as f32 * pixel_size,
+                    );
+                    scene.rect(
+                        layout.screen_rect_to_world(Rect::from_min_size(
+                            min,
+                            Vec2::splat(pixel_size - 0.7),
+                        )),
+                        0.8,
+                        ShapeStyle::filled(color),
+                    );
+                }
+            }
+        }
+        cursor_x += pixel_size * 4.0;
+    }
+}
+
+fn glyph_pattern(character: char) -> [u8; 5] {
+    match character {
+        '0' => [0b111, 0b101, 0b101, 0b101, 0b111],
+        '1' => [0b010, 0b110, 0b010, 0b010, 0b111],
+        '2' => [0b111, 0b001, 0b111, 0b100, 0b111],
+        '3' => [0b111, 0b001, 0b111, 0b001, 0b111],
+        '4' => [0b101, 0b101, 0b111, 0b001, 0b001],
+        '5' => [0b111, 0b100, 0b111, 0b001, 0b111],
+        '6' => [0b111, 0b100, 0b111, 0b101, 0b111],
+        '7' => [0b111, 0b001, 0b010, 0b010, 0b010],
+        '8' => [0b111, 0b101, 0b111, 0b101, 0b111],
+        '9' => [0b111, 0b101, 0b111, 0b001, 0b111],
+        'A' => [0b010, 0b101, 0b111, 0b101, 0b101],
+        'C' => [0b111, 0b100, 0b100, 0b100, 0b111],
+        'Y' => [0b101, 0b101, 0b010, 0b010, 0b010],
+        '%' => [0b101, 0b001, 0b010, 0b100, 0b101],
+        _ => [0; 5],
+    }
+}
+
+fn amount_to_frequency(amount: f32) -> f32 {
+    MIN_FREQUENCY + (MAX_FREQUENCY - MIN_FREQUENCY) * amount.clamp(0.0, 1.0)
+}
+
+fn frequency_to_amount(frequency: f32) -> f32 {
+    ((frequency - MIN_FREQUENCY) / (MAX_FREQUENCY - MIN_FREQUENCY)).clamp(0.0, 1.0)
+}
+
+fn amount_to_speed(amount: f32) -> f32 {
+    MIN_SPEED + (MAX_SPEED - MIN_SPEED) * amount.clamp(0.0, 1.0)
+}
+
+fn speed_to_amount(speed: f32) -> f32 {
+    ((speed - MIN_SPEED) / (MAX_SPEED - MIN_SPEED)).clamp(0.0, 1.0)
+}
+
+fn normalized_track_amount(value: f32, start: f32, end: f32) -> f32 {
+    ((value - start) / (end - start)).clamp(0.0, 1.0)
+}
+
+fn track_contains(start: Vec2, end: Vec2, point: Vec2) -> bool {
+    rect_contains(
+        Rect::new(start - Vec2::new(10.0, 14.0), end + Vec2::new(10.0, 14.0)),
+        point,
+    )
+}
+
+fn rect_contains(rect: Rect, point: Vec2) -> bool {
+    let rect = rect.normalized();
+    point.x >= rect.min.x && point.x <= rect.max.x && point.y >= rect.min.y && point.y <= rect.max.y
+}
+
+fn solved_preview_requested() -> bool {
+    std::env::args().any(|argument| argument == "--solved-preview")
+        || std::env::var("SIM_ENGINE_SOLVED_PREVIEW").is_ok_and(|value| {
+            value == "1" || value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("yes")
+        })
+}
+
+struct SimpleRandom {
+    state: u64,
+}
+
+impl SimpleRandom {
+    fn from_system_time() -> Self {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_nanos() as u64);
+        let seed = nanos ^ (std::process::id() as u64).rotate_left(19);
+        Self { state: seed.max(1) }
+    }
+
+    fn next_unit(&mut self) -> f32 {
+        let mut value = self.state;
+        value ^= value << 13;
+        value ^= value >> 7;
+        value ^= value << 17;
+        self.state = value;
+        (value as u32) as f32 / u32::MAX as f32
+    }
+
+    fn range(&mut self, minimum: f32, maximum: f32) -> f32 {
+        minimum + (maximum - minimum) * self.next_unit()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sim_engine::DrawCommand;
+
+    #[test]
+    fn track_amount_clamps_to_interactive_range() {
+        assert_eq!(normalized_track_amount(-20.0, 10.0, 110.0), 0.0);
+        assert_eq!(normalized_track_amount(60.0, 10.0, 110.0), 0.5);
+        assert_eq!(normalized_track_amount(160.0, 10.0, 110.0), 1.0);
+    }
+
+    #[test]
+    fn four_frequency_sliders_have_distinct_hit_targets() {
+        let layout = UiLayout::new(Vec2::new(1100.0, 760.0));
+        let amounts = [0.2, 0.4, 0.6, 0.8];
+
+        for (index, amount) in amounts.into_iter().enumerate() {
+            assert_eq!(
+                layout.hit_test(layout.frequency_knob(index, amount), &amounts, 0.5, false,),
+                Some(InteractionTarget::FrequencySlider(index))
+            );
+        }
+        assert_eq!(
+            layout.hit_test(layout.reset_button.center(), &amounts, 0.5, false),
+            Some(InteractionTarget::ResetButton)
+        );
+        for (index, button) in layout.speed_selector_buttons.iter().enumerate() {
+            assert_eq!(
+                layout.hit_test(button.center(), &amounts, 0.5, false),
+                Some(InteractionTarget::SpeedSelector(index))
+            );
+        }
+    }
+
+    #[test]
+    fn exact_match_is_successful_but_display_is_capped_below_one_hundred() {
+        let challenge = WaveChallenge::exact_test_challenge();
+
+        assert!(challenge.is_solved());
+        assert_eq!(challenge.displayed_accuracy(), 99);
+    }
+
+    #[test]
+    fn randomized_challenge_can_snap_every_speed_and_frequency_to_target() {
+        let mut random = SimpleRandom { state: 17 };
+        let mut challenge = WaveChallenge::random(&mut random);
+        challenge.snap_to_target();
+
+        assert!(challenge.is_solved());
+        assert_eq!(challenge.displayed_accuracy(), 99);
+    }
+
+    #[test]
+    fn changing_frequency_changes_only_the_selected_wave_geometry() {
+        let layout = UiLayout::new(Vec2::new(1100.0, 760.0));
+        let challenge = WaveChallenge::exact_test_challenge();
+        let original = build_ui_scene(layout, &challenge, 0.0, false, 0, None, None, false);
+        let mut changed = challenge.clone();
+        changed.frequency_amounts[2] = 0.9;
+        let changed_scene = build_ui_scene(layout, &changed, 0.0, false, 0, None, None, false);
+        let original_waves = actual_wave_points(&original);
+        let changed_waves = actual_wave_points(&changed_scene);
+
+        assert_eq!(original_waves.len(), WAVE_COUNT);
+        assert_eq!(changed_waves.len(), WAVE_COUNT);
+        assert_eq!(original_waves[0], changed_waves[0]);
+        assert_eq!(original_waves[1], changed_waves[1]);
+        assert_ne!(original_waves[2], changed_waves[2]);
+        assert_eq!(original_waves[3], changed_waves[3]);
+    }
+
+    #[test]
+    fn changing_speed_changes_only_the_selected_wave_geometry() {
+        let layout = UiLayout::new(Vec2::new(1100.0, 760.0));
+        let challenge = WaveChallenge::exact_test_challenge();
+        let original = build_ui_scene(layout, &challenge, 0.8, true, 1, None, None, false);
+        let mut changed = challenge.clone();
+        changed.speed_amounts[1] = 0.05;
+        let changed_scene = build_ui_scene(layout, &changed, 0.8, true, 1, None, None, false);
+        let original_waves = actual_wave_points(&original);
+        let changed_waves = actual_wave_points(&changed_scene);
+
+        assert_eq!(original_waves[0], changed_waves[0]);
+        assert_ne!(original_waves[1], changed_waves[1]);
+        assert_eq!(original_waves[2], changed_waves[2]);
+        assert_eq!(original_waves[3], changed_waves[3]);
+    }
+
+    #[test]
+    fn target_and_actual_share_pause_and_hard_reset_timing() {
+        let plot = Rect::from_min_size(Vec2::ZERO, Vec2::new(400.0, 120.0));
+        let target_at_start = wave_screen_points(plot, 2.0, 1.4, 0.3, 0.0);
+        let target_later = wave_screen_points(plot, 2.0, 1.4, 0.3, 0.7);
+        assert_ne!(target_at_start, target_later);
+
+        let mut application = UiDemoApplication::new();
+        application.animation_time = 3.75;
+        application.playing = false;
+        application.previous_frame = Instant::now();
+        application
+            .update_animation(application.previous_frame + std::time::Duration::from_secs(1));
+        assert_eq!(application.animation_time, 3.75);
+
+        application.hard_reset();
+
+        assert_eq!(application.animation_time, 0.0);
+        assert!(!application.playing);
+        assert_eq!(
+            wave_screen_points(plot, 2.0, 1.4, 0.3, application.animation_time),
+            target_at_start
+        );
+    }
+
+    fn actual_wave_points(scene: &Scene) -> Vec<&[Vec2]> {
+        scene
+            .commands()
+            .iter()
+            .filter_map(|command| {
+                if let DrawCommand::Polyline(polyline) = command.command()
+                    && polyline.points.len() == 180
+                {
+                    return Some(polyline.points.as_slice());
+                }
+                None
+            })
+            .collect()
+    }
+}

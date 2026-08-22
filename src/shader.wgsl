@@ -1,4 +1,5 @@
 struct CameraUniform {
+    camera_center: vec4<f32>,
     world_to_screen_x: vec4<f32>,
     world_to_screen_y: vec4<f32>,
     screen_to_clip: vec4<f32>,
@@ -9,11 +10,12 @@ var<uniform> camera: CameraUniform;
 
 struct VertexIn {
     @location(0) world_position: vec2<f32>,
-    @location(1) screen_offset: vec2<f32>,
-    @location(2) previous_direction: vec2<f32>,
-    @location(3) next_direction: vec2<f32>,
-    @location(4) normal_distance: f32,
-    @location(5) color: vec4<f32>,
+    @location(1) depth: f32,
+    @location(2) screen_offset: vec2<f32>,
+    @location(3) previous_direction: vec2<f32>,
+    @location(4) next_direction: vec2<f32>,
+    @location(5) normal_distance: f32,
+    @location(6) color: vec4<f32>,
 };
 
 struct VertexOut {
@@ -32,9 +34,10 @@ fn safe_normal(direction: vec2<f32>) -> vec2<f32> {
 
 @vertex
 fn vs_main(input: VertexIn) -> VertexOut {
+    let relative_world = input.world_position - camera.camera_center.xy;
     var screen = vec2<f32>(
-        dot(camera.world_to_screen_x.xyz, vec3<f32>(input.world_position, 1.0)),
-        dot(camera.world_to_screen_y.xyz, vec3<f32>(input.world_position, 1.0)),
+        dot(camera.world_to_screen_x.xyz, vec3<f32>(relative_world, input.depth)) + camera.world_to_screen_x.w,
+        dot(camera.world_to_screen_y.xyz, vec3<f32>(relative_world, input.depth)) + camera.world_to_screen_y.w,
     );
 
     if abs(input.normal_distance) > 0.0 {

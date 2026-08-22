@@ -8,22 +8,88 @@ use crate::{
 const MIN_ZOOM: f32 = 0.0001;
 const MIN_PROJECTION_COSINE: f32 = 0.001;
 
+/// Point measured in logical screen pixels with a top-left origin.
+///
+/// Camera picking accepts this type so physical pointer coordinates require an
+/// explicit DPI conversion before they can enter camera math.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct LogicalScreenPosition {
+    value: Vec2,
+}
+
+impl LogicalScreenPosition {
+    /// Builds a position from logical horizontal and vertical pixel coordinates.
+    pub const fn new(x: f32, y: f32) -> Self {
+        Self {
+            value: Vec2::new(x, y),
+        }
+    }
+
+    /// Builds a position from a vector whose units are explicitly logical pixels.
+    pub const fn from_vec2(value: Vec2) -> Self {
+        Self { value }
+    }
+
+    /// Returns the position as a logical-pixel vector.
+    pub const fn to_vec2(self) -> Vec2 {
+        self.value
+    }
+
+    /// Returns true when both coordinates are finite.
+    pub fn is_finite(self) -> bool {
+        self.value.is_finite()
+    }
+}
+
+/// Point measured in physical surface pixels with a top-left origin.
+///
+/// Window systems commonly report pointer positions in this space. A renderer
+/// converts them to [`LogicalScreenPosition`] using its validated DPI scale.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct PhysicalScreenPosition {
+    value: Vec2,
+}
+
+impl PhysicalScreenPosition {
+    /// Builds a position from physical horizontal and vertical pixel coordinates.
+    pub const fn new(x: f32, y: f32) -> Self {
+        Self {
+            value: Vec2::new(x, y),
+        }
+    }
+
+    /// Builds a position from a vector whose units are explicitly physical pixels.
+    pub const fn from_vec2(value: Vec2) -> Self {
+        Self { value }
+    }
+
+    /// Returns the position as a physical-pixel vector.
+    pub const fn to_vec2(self) -> Vec2 {
+        self.value
+    }
+
+    /// Returns true when both coordinates are finite.
+    pub fn is_finite(self) -> bool {
+        self.value.is_finite()
+    }
+}
+
 /// Logical pixel dimensions of the viewport currently being drawn into.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Viewport {
+pub struct LogicalViewport {
     width: f32,
     height: f32,
 }
 
-impl Viewport {
+impl LogicalViewport {
     /// Builds a viewport from logical pixel dimensions.
     ///
     /// Both dimensions must be finite and strictly positive.
-    pub fn new(width: f32, height: f32) -> Result<Self, ViewportError> {
+    pub fn new(width: f32, height: f32) -> Result<Self, LogicalViewportError> {
         if width.is_finite() && height.is_finite() && width > 0.0 && height > 0.0 {
             Ok(Self { width, height })
         } else {
-            Err(ViewportError::InvalidDimensions { width, height })
+            Err(LogicalViewportError::InvalidDimensions { width, height })
         }
     }
 
@@ -38,8 +104,8 @@ impl Viewport {
     }
 
     /// Returns the center point in logical screen pixel coordinates.
-    pub fn center(self) -> Vec2 {
-        Vec2::new(self.width * 0.5, self.height * 0.5)
+    pub fn center(self) -> LogicalScreenPosition {
+        LogicalScreenPosition::new(self.width * 0.5, self.height * 0.5)
     }
 
     /// Returns viewport size in logical screen pixels.
@@ -48,9 +114,9 @@ impl Viewport {
     }
 }
 
-/// Invalid logical dimensions supplied to [`Viewport`].
+/// Invalid logical dimensions supplied to [`LogicalViewport`].
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub enum ViewportError {
+pub enum LogicalViewportError {
     /// Width and height must both be finite and strictly positive.
     InvalidDimensions {
         /// Rejected width in logical screen pixels.
@@ -60,7 +126,7 @@ pub enum ViewportError {
     },
 }
 
-impl fmt::Display for ViewportError {
+impl fmt::Display for LogicalViewportError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidDimensions { width, height } => write!(
@@ -71,7 +137,7 @@ impl fmt::Display for ViewportError {
     }
 }
 
-impl Error for ViewportError {}
+impl Error for LogicalViewportError {}
 
 /// Lightweight pseudo-depth projection for 2D scenes.
 ///
@@ -181,7 +247,7 @@ pub enum Camera2dError {
     /// Screen coordinates and pseudo-depth used for picking must be finite.
     InvalidPickingInput {
         /// Rejected point in logical screen pixels.
-        screen: Vec2,
+        screen: LogicalScreenPosition,
         /// Rejected caller-defined pseudo-depth.
         depth: f32,
     },
@@ -298,15 +364,23 @@ impl Camera2d {
     }
 
     /// Converts a world-space point into logical screen pixel coordinates.
-    pub fn world_to_screen(self, world: Vec2, viewport: Viewport) -> Vec2 {
+    pub fn world_to_screen(self, world: Vec2, viewport: LogicalViewport) -> LogicalScreenPosition {
         self.projected_world_to_screen(world, 0.0, viewport)
     }
 
     /// Converts a world-space point and pseudo-depth into logical screen pixels.
-    pub fn projected_world_to_screen(self, world: Vec2, depth: f32, viewport: Viewport) -> Vec2 {
-        let projected = self.projection.project(world, depth);
-        let projected_center = self.projection.project(self.center, 0.0);
-        let translated = projected - projected_center;
+    pub fn projected_world_to_screen(
+        self,
+        world: Vec2,
+        depth: f32,
+        viewport: LogicalViewport,
+    ) -> LogicalScreenPosition {
+        let relative = world - self.center;
+        let lifted = depth * self.projection.depth_scale;
+        let translated = Vec2::new(
+            relative.x + lifted * self.projection.tilt.sin() * 0.5,
+            relative.y * self.projection.tilt.cos() + lifted * self.projection.tilt.sin(),
+        );
         let cos = self.rotation.cos();
         let sin = self.rotation.sin();
         let rotated = Vec2::new(
@@ -314,7 +388,7 @@ impl Camera2d {
             translated.x * sin + translated.y * cos,
         );
 
-        Vec2::new(
+        LogicalScreenPosition::new(
             viewport.width() * 0.5 + rotated.x * self.zoom,
             viewport.height() * 0.5 - rotated.y * self.zoom,
         )
@@ -324,7 +398,11 @@ impl Camera2d {
     ///
     /// This is equivalent to [`Camera2d::screen_to_world_at_depth`] with
     /// `depth = 0.0`.
-    pub fn screen_to_world(self, screen: Vec2, viewport: Viewport) -> Result<Vec2, Camera2dError> {
+    pub fn screen_to_world(
+        self,
+        screen: LogicalScreenPosition,
+        viewport: LogicalViewport,
+    ) -> Result<Vec2, Camera2dError> {
         self.screen_to_world_at_depth(screen, 0.0, viewport)
     }
 
@@ -336,13 +414,15 @@ impl Camera2d {
     /// [`Camera2dError::SingularProjection`].
     pub fn screen_to_world_at_depth(
         self,
-        screen: Vec2,
+        screen: LogicalScreenPosition,
         depth: f32,
-        viewport: Viewport,
+        viewport: LogicalViewport,
     ) -> Result<Vec2, Camera2dError> {
         if !screen.is_finite() || !depth.is_finite() {
             return Err(Camera2dError::InvalidPickingInput { screen, depth });
         }
+
+        let screen = screen.to_vec2();
 
         let translated = Vec2::new(
             (screen.x - viewport.width() * 0.5) / self.zoom,
@@ -354,7 +434,6 @@ impl Camera2d {
             translated.x * cos + translated.y * sin,
             -translated.x * sin + translated.y * cos,
         );
-        let projected = projected_delta + self.projection.project(self.center, 0.0);
         let projection_cos = self.projection.tilt.cos();
 
         if projection_cos.abs() < MIN_PROJECTION_COSINE {
@@ -364,10 +443,19 @@ impl Camera2d {
         }
 
         let lifted = depth * self.projection.depth_scale;
-        Ok(Vec2::new(
-            projected.x - lifted * self.projection.tilt.sin() * 0.5,
-            (projected.y - lifted * self.projection.tilt.sin()) / projection_cos,
-        ))
+        let relative = Vec2::new(
+            projected_delta.x - lifted * self.projection.tilt.sin() * 0.5,
+            (projected_delta.y - lifted * self.projection.tilt.sin()) / projection_cos,
+        );
+        let world = self.center + relative;
+        if world.is_finite() {
+            Ok(world)
+        } else {
+            Err(Camera2dError::InvalidPickingInput {
+                screen: LogicalScreenPosition::from_vec2(screen),
+                depth,
+            })
+        }
     }
 
     /// Creates a tween initialized with this camera state.
@@ -457,12 +545,12 @@ fn finite_or(value: f32, fallback: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use crate::{
-        Camera2d, Camera2dError, Interpolate, Projection2d, Projection2dError, Vec2, Viewport,
-        ViewportError,
+        Camera2d, Camera2dError, Interpolate, LogicalScreenPosition, LogicalViewport,
+        LogicalViewportError, PhysicalScreenPosition, Projection2d, Projection2dError, Vec2,
     };
 
-    fn test_viewport() -> Viewport {
-        let Ok(viewport) = Viewport::new(1280.0, 720.0) else {
+    fn test_viewport() -> LogicalViewport {
+        let Ok(viewport) = LogicalViewport::new(1280.0, 720.0) else {
             panic!("test viewport should be valid");
         };
         viewport
@@ -541,6 +629,35 @@ mod tests {
     }
 
     #[test]
+    fn picking_requires_a_logical_screen_position_at_hidpi() {
+        let viewport = test_viewport();
+        let camera = Camera2d::default();
+        let physical_pointer = PhysicalScreenPosition::new(1_280.0, 720.0);
+        let logical_pointer = LogicalScreenPosition::from_vec2(physical_pointer.to_vec2() / 2.0);
+
+        let Ok(world) = camera.screen_to_world(logical_pointer, viewport) else {
+            panic!("logical center should be pickable");
+        };
+
+        assert_eq!(world, Vec2::ZERO);
+    }
+
+    #[test]
+    fn large_camera_center_uses_relative_projection_math() {
+        let center = Vec2::new(2.0e38, 0.0);
+        let world = Vec2::new(center.x + 1.0e33, 0.0);
+        let Ok(camera) = Camera2d::new(center, 2.0) else {
+            panic!("large finite camera should be valid");
+        };
+        let viewport = test_viewport();
+
+        let screen = camera.world_to_screen(world, viewport);
+
+        assert!(screen.is_finite());
+        assert!(screen.to_vec2().x > viewport.center().to_vec2().x);
+    }
+
+    #[test]
     fn picking_rejects_non_finite_and_near_singular_inputs() {
         let Ok(mut camera) = Camera2d::new(Vec2::ZERO, 1.0) else {
             panic!("test camera should be valid");
@@ -548,7 +665,7 @@ mod tests {
         let viewport = test_viewport();
 
         assert!(matches!(
-            camera.screen_to_world(Vec2::new(f32::NAN, 0.0), viewport),
+            camera.screen_to_world(LogicalScreenPosition::new(f32::NAN, 0.0), viewport),
             Err(Camera2dError::InvalidPickingInput { .. })
         ));
 
@@ -570,8 +687,8 @@ mod tests {
             Err(Projection2dError::NonFinite { .. })
         ));
         assert!(matches!(
-            Viewport::new(0.0, f32::INFINITY),
-            Err(ViewportError::InvalidDimensions { .. })
+            LogicalViewport::new(0.0, f32::INFINITY),
+            Err(LogicalViewportError::InvalidDimensions { .. })
         ));
     }
 

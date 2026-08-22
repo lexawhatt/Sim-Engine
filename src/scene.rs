@@ -1,6 +1,54 @@
-use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
+use std::{
+    error::Error,
+    fmt,
+    panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
+};
 
 use crate::{Color, Interpolate, Rect, Vec2};
+
+/// Primitive category attached to structured scene validation errors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScenePrimitive {
+    /// Circle geometry or style.
+    Circle,
+    /// Rectangle geometry or style.
+    Rect,
+    /// Single line geometry or stroke.
+    Line,
+    /// Connected polyline geometry or stroke.
+    Polyline,
+}
+
+/// Reason a command or temporary scene state was rejected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SceneError {
+    /// Primitive coordinates contain NaN or infinity.
+    NonFiniteGeometry(ScenePrimitive),
+    /// Radius, size, corner radius, or stroke width is outside its valid range.
+    InvalidDimension(ScenePrimitive),
+    /// Line or polyline has no drawable segment.
+    DegenerateGeometry(ScenePrimitive),
+    /// Shape has no fill, stroke, or shadow.
+    MissingStyle(ScenePrimitive),
+    /// Fill color or gradient configuration is invalid.
+    InvalidFill(ScenePrimitive),
+    /// Stroke width or color is invalid.
+    InvalidStroke(ScenePrimitive),
+    /// Shadow offset, spread, or color is invalid.
+    InvalidShadow(ScenePrimitive),
+    /// Active logical screen clip is non-finite or empty.
+    InvalidScreenClip,
+    /// Pseudo-depth must be finite.
+    NonFiniteDepth,
+}
+
+impl fmt::Display for SceneError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "scene command rejected: {self:?}")
+    }
+}
+
+impl Error for SceneError {}
 
 /// Ordered list of visual draw commands for a single frame.
 ///
@@ -14,6 +62,7 @@ pub struct Scene {
     commands: Vec<SceneCommand>,
     next_order: u64,
     current_screen_clip: Option<ScreenClipRect>,
+    current_depth: f32,
 }
 
 impl Scene {
@@ -24,6 +73,7 @@ impl Scene {
             commands: Vec::new(),
             next_order: 0,
             current_screen_clip: None,
+            current_depth: 0.0,
         }
     }
 
@@ -32,6 +82,7 @@ impl Scene {
         self.commands.clear();
         self.next_order = 0;
         self.current_screen_clip = None;
+        self.current_depth = 0.0;
     }
 
     /// Returns accepted commands in stable layer and insertion order.
@@ -81,12 +132,58 @@ impl Scene {
         }
     }
 
+    /// Replaces the pseudo-depth captured by subsequently appended commands.
+    ///
+    /// Depth is measured in caller-defined units and converted through
+    /// [`crate::Projection2d::depth_scale`]. It affects projection only, not draw
+    /// order. Non-finite values return `false` and leave the current depth unchanged.
+    pub fn set_depth(&mut self, depth: f32) -> bool {
+        self.try_set_depth(depth).is_ok()
+    }
+
+    /// Replaces pseudo-depth and reports why invalid input was rejected.
+    pub fn try_set_depth(&mut self, depth: f32) -> Result<(), SceneError> {
+        if !depth.is_finite() {
+            return Err(SceneError::NonFiniteDepth);
+        }
+        self.current_depth = depth;
+        Ok(())
+    }
+
+    /// Appends commands with a temporary pseudo-depth value.
+    ///
+    /// The previous depth is restored after `draw` returns or unwinds. Non-finite
+    /// depth returns an error without calling `draw`.
+    pub fn with_depth<R>(
+        &mut self,
+        depth: f32,
+        draw: impl FnOnce(&mut Self) -> R,
+    ) -> Result<R, SceneError> {
+        if !depth.is_finite() {
+            return Err(SceneError::NonFiniteDepth);
+        }
+
+        let previous = self.current_depth;
+        self.current_depth = depth;
+        let result = catch_unwind(AssertUnwindSafe(|| draw(self)));
+        self.current_depth = previous;
+        match result {
+            Ok(result) => Ok(result),
+            Err(payload) => resume_unwind(payload),
+        }
+    }
+
     /// Appends a valid command to the default layer.
     ///
     /// Returns `false` and leaves the scene unchanged when the primitive contains
     /// non-finite coordinates, invalid dimensions, or no drawable geometry.
     pub fn push(&mut self, command: DrawCommand) -> bool {
-        self.push_to_layer(Layer::DEFAULT, command)
+        self.try_push(command).is_ok()
+    }
+
+    /// Appends a command to the default layer with structured rejection diagnostics.
+    pub fn try_push(&mut self, command: DrawCommand) -> Result<(), SceneError> {
+        self.try_push_to_layer(Layer::DEFAULT, command)
     }
 
     /// Appends a command to a layer.
@@ -95,12 +192,21 @@ impl Scene {
     /// insertion order.
     /// Returns `false` and leaves ordering unchanged when `command` is invalid.
     pub fn push_to_layer(&mut self, layer: Layer, command: DrawCommand) -> bool {
-        if !command.is_valid()
-            || self
-                .current_screen_clip
-                .is_some_and(|screen_clip| !screen_clip.is_valid())
+        self.try_push_to_layer(layer, command).is_ok()
+    }
+
+    /// Appends a command to a layer with structured rejection diagnostics.
+    pub fn try_push_to_layer(
+        &mut self,
+        layer: Layer,
+        command: DrawCommand,
+    ) -> Result<(), SceneError> {
+        command.validate()?;
+        if self
+            .current_screen_clip
+            .is_some_and(|screen_clip| !screen_clip.is_valid())
         {
-            return false;
+            return Err(SceneError::InvalidScreenClip);
         }
 
         let order = self.next_order;
@@ -108,6 +214,7 @@ impl Scene {
         let scene_command = SceneCommand {
             layer,
             order,
+            depth: self.current_depth,
             screen_clip: self.current_screen_clip,
             command,
         };
@@ -116,7 +223,7 @@ impl Scene {
                 || (existing.layer == scene_command.layer && existing.order <= scene_command.order)
         });
         self.commands.insert(position, scene_command);
-        true
+        Ok(())
     }
 
     /// Appends a circle in world coordinates.
@@ -124,7 +231,17 @@ impl Scene {
     /// `radius` is in world units. Returns `false` for non-positive or non-finite
     /// radius, non-finite center, or invalid style values.
     pub fn circle(&mut self, center: Vec2, radius: f32, style: ShapeStyle) -> bool {
-        self.circle_on_layer(Layer::DEFAULT, center, radius, style)
+        self.try_circle(center, radius, style).is_ok()
+    }
+
+    /// Appends a circle and returns a structured validation error on rejection.
+    pub fn try_circle(
+        &mut self,
+        center: Vec2,
+        radius: f32,
+        style: ShapeStyle,
+    ) -> Result<(), SceneError> {
+        self.try_circle_on_layer(Layer::DEFAULT, center, radius, style)
     }
 
     /// Appends a circle in world coordinates to a layer.
@@ -138,7 +255,19 @@ impl Scene {
         radius: f32,
         style: ShapeStyle,
     ) -> bool {
-        self.push_to_layer(
+        self.try_circle_on_layer(layer, center, radius, style)
+            .is_ok()
+    }
+
+    /// Appends a circle to a layer with structured rejection diagnostics.
+    pub fn try_circle_on_layer(
+        &mut self,
+        layer: Layer,
+        center: Vec2,
+        radius: f32,
+        style: ShapeStyle,
+    ) -> Result<(), SceneError> {
+        self.try_push_to_layer(
             layer,
             DrawCommand::Circle(Circle {
                 center,
@@ -154,7 +283,17 @@ impl Scene {
     /// rectangle size. Invalid bounds, negative radius, and invalid styles return
     /// `false` without adding a command.
     pub fn rect(&mut self, rect: Rect, corner_radius: f32, style: ShapeStyle) -> bool {
-        self.rect_on_layer(Layer::DEFAULT, rect, corner_radius, style)
+        self.try_rect(rect, corner_radius, style).is_ok()
+    }
+
+    /// Appends a rectangle and returns a structured validation error on rejection.
+    pub fn try_rect(
+        &mut self,
+        rect: Rect,
+        corner_radius: f32,
+        style: ShapeStyle,
+    ) -> Result<(), SceneError> {
+        self.try_rect_on_layer(Layer::DEFAULT, rect, corner_radius, style)
     }
 
     /// Appends an axis-aligned rectangle in world coordinates to a layer.
@@ -169,7 +308,19 @@ impl Scene {
         corner_radius: f32,
         style: ShapeStyle,
     ) -> bool {
-        self.push_to_layer(
+        self.try_rect_on_layer(layer, rect, corner_radius, style)
+            .is_ok()
+    }
+
+    /// Appends a rectangle to a layer with structured rejection diagnostics.
+    pub fn try_rect_on_layer(
+        &mut self,
+        layer: Layer,
+        rect: Rect,
+        corner_radius: f32,
+        style: ShapeStyle,
+    ) -> Result<(), SceneError> {
+        self.try_push_to_layer(
             layer,
             DrawCommand::Rect(RectShape {
                 rect,
@@ -185,7 +336,18 @@ impl Scene {
     /// camera zooms. Degenerate geometry and invalid width or color return
     /// `false`.
     pub fn line(&mut self, from: Vec2, to: Vec2, width: f32, color: Color) -> bool {
-        self.line_on_layer(Layer::DEFAULT, from, to, width, color)
+        self.try_line(from, to, width, color).is_ok()
+    }
+
+    /// Appends a line and returns a structured validation error on rejection.
+    pub fn try_line(
+        &mut self,
+        from: Vec2,
+        to: Vec2,
+        width: f32,
+        color: Color,
+    ) -> Result<(), SceneError> {
+        self.try_line_on_layer(Layer::DEFAULT, from, to, width, color)
     }
 
     /// Appends a stroked line between world-space points to a layer.
@@ -201,7 +363,20 @@ impl Scene {
         width: f32,
         color: Color,
     ) -> bool {
-        self.push_to_layer(
+        self.try_line_on_layer(layer, from, to, width, color)
+            .is_ok()
+    }
+
+    /// Appends a line to a layer with structured rejection diagnostics.
+    pub fn try_line_on_layer(
+        &mut self,
+        layer: Layer,
+        from: Vec2,
+        to: Vec2,
+        width: f32,
+        color: Color,
+    ) -> Result<(), SceneError> {
+        self.try_push_to_layer(
             layer,
             DrawCommand::Line(Line {
                 from,
@@ -216,7 +391,17 @@ impl Scene {
     /// `width` is in logical screen pixels. Empty, single-point, fully degenerate, and
     /// non-finite input returns `false` without adding a command.
     pub fn polyline(&mut self, points: Vec<Vec2>, width: f32, color: Color) -> bool {
-        self.polyline_on_layer(Layer::DEFAULT, points, width, color)
+        self.try_polyline(points, width, color).is_ok()
+    }
+
+    /// Appends a polyline and returns a structured validation error on rejection.
+    pub fn try_polyline(
+        &mut self,
+        points: Vec<Vec2>,
+        width: f32,
+        color: Color,
+    ) -> Result<(), SceneError> {
+        self.try_polyline_on_layer(Layer::DEFAULT, points, width, color)
     }
 
     /// Appends connected stroked segments through world-space points to a layer.
@@ -230,7 +415,19 @@ impl Scene {
         width: f32,
         color: Color,
     ) -> bool {
-        self.push_to_layer(
+        self.try_polyline_on_layer(layer, points, width, color)
+            .is_ok()
+    }
+
+    /// Appends a polyline to a layer with structured rejection diagnostics.
+    pub fn try_polyline_on_layer(
+        &mut self,
+        layer: Layer,
+        points: Vec<Vec2>,
+        width: f32,
+        color: Color,
+    ) -> Result<(), SceneError> {
+        self.try_push_to_layer(
             layer,
             DrawCommand::Polyline(Polyline {
                 points,
@@ -338,6 +535,8 @@ pub struct SceneCommand {
     layer: Layer,
     /// Monotonic insertion order within the scene.
     order: u64,
+    /// Caller-defined pseudo-depth used by camera projection.
+    depth: f32,
     /// Optional clipping rectangle in logical screen pixels.
     screen_clip: Option<ScreenClipRect>,
     /// Visual primitive to render.
@@ -353,6 +552,13 @@ impl SceneCommand {
     /// Returns the insertion order assigned by the scene.
     pub fn order(&self) -> u64 {
         self.order
+    }
+
+    /// Returns caller-defined pseudo-depth captured by this command.
+    ///
+    /// Depth affects projection but not layer or insertion ordering.
+    pub fn depth(&self) -> f32 {
+        self.depth
     }
 
     /// Returns the optional clip captured when the command was appended.
@@ -381,38 +587,59 @@ pub enum DrawCommand {
 }
 
 impl DrawCommand {
-    fn is_valid(&self) -> bool {
+    fn validate(&self) -> Result<(), SceneError> {
         match self {
             Self::Circle(circle) => {
-                circle.center.is_finite()
-                    && circle.radius.is_finite()
-                    && circle.radius > 0.0
-                    && circle.style.is_valid()
+                if !circle.center.is_finite() {
+                    return Err(SceneError::NonFiniteGeometry(ScenePrimitive::Circle));
+                }
+                if !circle.radius.is_finite() || circle.radius <= 0.0 {
+                    return Err(SceneError::InvalidDimension(ScenePrimitive::Circle));
+                }
+                circle.style.validate(ScenePrimitive::Circle)
             }
             Self::Rect(rectangle) => {
                 let rect = rectangle.rect.normalized();
-                rect.min.is_finite()
-                    && rect.max.is_finite()
-                    && rect.width() > 0.0
-                    && rect.height() > 0.0
-                    && rectangle.corner_radius.is_finite()
-                    && rectangle.corner_radius >= 0.0
-                    && rectangle.style.is_valid()
+                if !rect.min.is_finite() || !rect.max.is_finite() {
+                    return Err(SceneError::NonFiniteGeometry(ScenePrimitive::Rect));
+                }
+                if rect.width() <= 0.0
+                    || rect.height() <= 0.0
+                    || !rectangle.corner_radius.is_finite()
+                    || rectangle.corner_radius < 0.0
+                {
+                    return Err(SceneError::InvalidDimension(ScenePrimitive::Rect));
+                }
+                rectangle.style.validate(ScenePrimitive::Rect)
             }
             Self::Line(line) => {
-                line.from.is_finite()
-                    && line.to.is_finite()
-                    && (line.to - line.from).length_squared() > f32::EPSILON
-                    && line.stroke.is_valid()
+                if !line.from.is_finite() || !line.to.is_finite() {
+                    return Err(SceneError::NonFiniteGeometry(ScenePrimitive::Line));
+                }
+                if (line.to - line.from).length_squared() <= f32::EPSILON {
+                    return Err(SceneError::DegenerateGeometry(ScenePrimitive::Line));
+                }
+                if !line.stroke.is_valid() {
+                    return Err(SceneError::InvalidStroke(ScenePrimitive::Line));
+                }
+                Ok(())
             }
             Self::Polyline(polyline) => {
-                polyline.points.len() >= 2
-                    && polyline.points.iter().all(|point| point.is_finite())
-                    && polyline
+                if !polyline.points.iter().all(|point| point.is_finite()) {
+                    return Err(SceneError::NonFiniteGeometry(ScenePrimitive::Polyline));
+                }
+                if polyline.points.len() < 2
+                    || !polyline
                         .points
                         .windows(2)
                         .any(|pair| (pair[1] - pair[0]).length_squared() > f32::EPSILON)
-                    && polyline.stroke.is_valid()
+                {
+                    return Err(SceneError::DegenerateGeometry(ScenePrimitive::Polyline));
+                }
+                if !polyline.stroke.is_valid() {
+                    return Err(SceneError::InvalidStroke(ScenePrimitive::Polyline));
+                }
+                Ok(())
             }
         }
     }
@@ -524,11 +751,20 @@ impl ShapeStyle {
         self
     }
 
-    fn is_valid(self) -> bool {
-        (self.fill.is_some() || self.stroke.is_some() || self.shadow.is_some())
-            && self.fill.is_none_or(Fill::is_valid)
-            && self.stroke.is_none_or(Stroke::is_valid)
-            && self.shadow.is_none_or(Shadow::is_valid)
+    fn validate(self, primitive: ScenePrimitive) -> Result<(), SceneError> {
+        if self.fill.is_none() && self.stroke.is_none() && self.shadow.is_none() {
+            return Err(SceneError::MissingStyle(primitive));
+        }
+        if self.fill.is_some_and(|fill| !fill.is_valid()) {
+            return Err(SceneError::InvalidFill(primitive));
+        }
+        if self.stroke.is_some_and(|stroke| !stroke.is_valid()) {
+            return Err(SceneError::InvalidStroke(primitive));
+        }
+        if self.shadow.is_some_and(|shadow| !shadow.is_valid()) {
+            return Err(SceneError::InvalidShadow(primitive));
+        }
+        Ok(())
     }
 }
 
@@ -745,8 +981,8 @@ mod tests {
     use std::panic::{AssertUnwindSafe, catch_unwind};
 
     use crate::{
-        Color, DrawCommand, Fill, Layer, LinearGradient, RadialGradient, Scene, ScreenClipRect,
-        ShapeStyle, Vec2,
+        Color, DrawCommand, Fill, Layer, LinearGradient, RadialGradient, Scene, SceneError,
+        ScenePrimitive, ScreenClipRect, ShapeStyle, Vec2,
     };
 
     #[test]
@@ -817,6 +1053,54 @@ mod tests {
 
         assert!(scene.circle(Vec2::ZERO, 1.0, ShapeStyle::filled(Color::WHITE)));
         assert_eq!(scene.commands()[0].order(), 0);
+    }
+
+    #[test]
+    fn structured_scene_errors_preserve_rejection_reason() {
+        let mut scene = Scene::new(Color::BLACK);
+
+        assert_eq!(
+            scene.try_circle(Vec2::ZERO, -1.0, ShapeStyle::filled(Color::WHITE)),
+            Err(SceneError::InvalidDimension(ScenePrimitive::Circle))
+        );
+        assert_eq!(
+            scene.try_line(Vec2::ZERO, Vec2::ZERO, 1.0, Color::WHITE),
+            Err(SceneError::DegenerateGeometry(ScenePrimitive::Line))
+        );
+        assert_eq!(
+            scene.try_circle(
+                Vec2::ZERO,
+                1.0,
+                ShapeStyle {
+                    fill: None,
+                    stroke: None,
+                    shadow: None,
+                },
+            ),
+            Err(SceneError::MissingStyle(ScenePrimitive::Circle))
+        );
+        assert_eq!(scene.command_count(), 0);
+    }
+
+    #[test]
+    fn commands_capture_depth_and_restore_it_after_unwind() {
+        let mut scene = Scene::new(Color::BLACK);
+        let panic_result = catch_unwind(AssertUnwindSafe(|| {
+            let _ = scene.with_depth(4.5, |scene| {
+                scene.circle(Vec2::ZERO, 1.0, ShapeStyle::filled(Color::WHITE));
+                panic!("intentional depth unwind");
+            });
+        }));
+        assert!(panic_result.is_err());
+
+        scene.circle(Vec2::X, 1.0, ShapeStyle::filled(Color::WHITE));
+
+        assert_eq!(scene.commands()[0].depth(), 4.5);
+        assert_eq!(scene.commands()[1].depth(), 0.0);
+        assert_eq!(
+            scene.with_depth(f32::NAN, |_| {}),
+            Err(SceneError::NonFiniteDepth)
+        );
     }
 
     #[test]

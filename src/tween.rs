@@ -108,13 +108,11 @@ impl<T: Interpolate> Tween<T> {
         }
 
         self.elapsed = self.elapsed.saturating_add(dt);
-        let duration = self.duration.as_secs_f32();
-        let raw_amount = if duration <= f32::EPSILON {
+        let amount = if self.elapsed >= self.duration {
             1.0
         } else {
-            self.elapsed.as_secs_f32() / duration
+            (self.elapsed.as_secs_f64() / self.duration.as_secs_f64()) as f32
         };
-        let amount = raw_amount.clamp(0.0, 1.0);
         self.current = self
             .start
             .interpolate(self.target, self.easing.sample(amount));
@@ -141,5 +139,24 @@ mod tests {
         assert_eq!(tween.update(Duration::from_millis(50)), 5.0);
         assert_eq!(tween.update(Duration::from_millis(50)), 10.0);
         assert!(!tween.is_active());
+    }
+
+    #[test]
+    fn maximum_duration_completes_with_maximum_update() {
+        let mut tween = Tween::new(2.0).to(9.0, Duration::MAX, Easing::Linear);
+
+        assert_eq!(tween.update(Duration::MAX), 9.0);
+        assert!(!tween.is_active());
+    }
+
+    #[test]
+    fn retarget_uses_current_value_as_new_start() {
+        let mut tween = Tween::new(0.0).to(10.0, Duration::from_secs(2), Easing::Linear);
+        assert_eq!(tween.update(Duration::from_secs(1)), 5.0);
+
+        tween.set_target(9.0, Duration::from_secs(1), Easing::Linear);
+
+        assert_eq!(tween.update(Duration::from_millis(500)), 7.0);
+        assert_eq!(tween.update(Duration::from_millis(500)), 9.0);
     }
 }

@@ -8,8 +8,9 @@ use std::{
 };
 
 use crate::{
-    Camera2d, Circle, Color, DrawCommand, Fill, Line, Palette, Polyline, Rect, Scene,
-    ScreenClipRect, Shadow, ShapeStyle, Stroke, Vec2, Viewport,
+    Camera2d, Circle, Color, DrawCommand, Fill, Line, LogicalScreenPosition, LogicalViewport,
+    Palette, PhysicalScreenPosition, Polyline, Rect, Scene, ScreenClipRect, Shadow, ShapeStyle,
+    Stroke, Vec2,
 };
 
 const INITIAL_VERTEX_CAPACITY: usize = 4096;
@@ -21,6 +22,7 @@ const PREFERRED_SAMPLE_COUNT: u32 = 4;
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 struct Vertex {
     world_position: [f32; 2],
+    depth: f32,
     screen_offset: [f32; 2],
     previous_direction: [f32; 2],
     next_direction: [f32; 2],
@@ -31,6 +33,7 @@ struct Vertex {
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 struct CameraUniform {
+    camera_center: [f32; 4],
     world_to_screen_x: [f32; 4],
     world_to_screen_y: [f32; 4],
     screen_to_clip: [f32; 4],
@@ -40,6 +43,8 @@ struct CameraUniform {
 struct GeometryExtents {
     world_min: Vec2,
     world_max: Vec2,
+    depth_min: f32,
+    depth_max: f32,
     direction_min: Vec2,
     direction_max: Vec2,
     screen_offset_max_abs: Vec2,
@@ -62,13 +67,14 @@ struct PreparedDrawBatch {
 }
 
 impl Vertex {
-    const ATTRIBUTES: [wgpu::VertexAttribute; 6] = wgpu::vertex_attr_array![
+    const ATTRIBUTES: [wgpu::VertexAttribute; 7] = wgpu::vertex_attr_array![
         0 => Float32x2,
-        1 => Float32x2,
+        1 => Float32,
         2 => Float32x2,
         3 => Float32x2,
-        4 => Float32,
-        5 => Float32x4
+        4 => Float32x2,
+        5 => Float32,
+        6 => Float32x4
     ];
 
     const LAYOUT: wgpu::VertexBufferLayout<'static> = wgpu::VertexBufferLayout {
@@ -79,6 +85,7 @@ impl Vertex {
 
     fn is_finite(self) -> bool {
         self.world_position.iter().all(|value| value.is_finite())
+            && self.depth.is_finite()
             && self.screen_offset.iter().all(|value| value.is_finite())
             && self
                 .previous_direction
@@ -91,47 +98,64 @@ impl Vertex {
 }
 
 impl CameraUniform {
-    fn new(camera: Camera2d, viewport: Viewport) -> Option<Self> {
+    fn new(camera: Camera2d, viewport: LogicalViewport) -> Option<Self> {
         let projection_cosine = camera.projection().tilt().cos();
         let rotation_cosine = camera.rotation().cos();
         let rotation_sine = camera.rotation().sin();
         let zoom = camera.zoom();
         let center = camera.center();
+        let projection_sine = camera.projection().tilt().sin();
+        let depth_scale = camera.projection().depth_scale();
 
         let horizontal_x = zoom * rotation_cosine;
         let horizontal_y = -zoom * rotation_sine * projection_cosine;
         let vertical_x = -zoom * rotation_sine;
         let vertical_y = -zoom * rotation_cosine * projection_cosine;
-        let horizontal_translation =
-            viewport.width() * 0.5 - horizontal_x * center.x - horizontal_y * center.y;
-        let vertical_translation =
-            viewport.height() * 0.5 - vertical_x * center.x - vertical_y * center.y;
+        let horizontal_depth =
+            zoom * depth_scale * projection_sine * (rotation_cosine * 0.5 - rotation_sine);
+        let vertical_depth =
+            -zoom * depth_scale * projection_sine * (rotation_sine * 0.5 + rotation_cosine);
 
         let uniform = Self {
-            world_to_screen_x: [horizontal_x, horizontal_y, horizontal_translation, 0.0],
-            world_to_screen_y: [vertical_x, vertical_y, vertical_translation, 0.0],
+            camera_center: [center.x, center.y, 0.0, 0.0],
+            world_to_screen_x: [
+                horizontal_x,
+                horizontal_y,
+                horizontal_depth,
+                viewport.width() * 0.5,
+            ],
+            world_to_screen_y: [
+                vertical_x,
+                vertical_y,
+                vertical_depth,
+                viewport.height() * 0.5,
+            ],
             screen_to_clip: [2.0 / viewport.width(), -2.0 / viewport.height(), -1.0, 1.0],
         };
         uniform.is_finite().then_some(uniform)
     }
 
     fn is_finite(self) -> bool {
-        self.world_to_screen_x
+        self.camera_center
             .iter()
+            .chain(self.world_to_screen_x.iter())
             .chain(self.world_to_screen_y.iter())
             .chain(self.screen_to_clip.iter())
             .all(|value| value.is_finite())
     }
 
     #[cfg(test)]
-    fn world_to_screen(self, world: Vec2) -> Vec2 {
+    fn world_to_screen(self, world: Vec2, depth: f32) -> Vec2 {
+        let relative = world - Vec2::new(self.camera_center[0], self.camera_center[1]);
         Vec2::new(
-            self.world_to_screen_x[0] * world.x
-                + self.world_to_screen_x[1] * world.y
-                + self.world_to_screen_x[2],
-            self.world_to_screen_y[0] * world.x
-                + self.world_to_screen_y[1] * world.y
-                + self.world_to_screen_y[2],
+            self.world_to_screen_x[0] * relative.x
+                + self.world_to_screen_x[1] * relative.y
+                + self.world_to_screen_x[2] * depth
+                + self.world_to_screen_x[3],
+            self.world_to_screen_y[0] * relative.x
+                + self.world_to_screen_y[1] * relative.y
+                + self.world_to_screen_y[2] * depth
+                + self.world_to_screen_y[3],
         )
     }
 
@@ -149,6 +173,8 @@ impl GeometryExtents {
         let mut extents = Self {
             world_min: Vec2::splat(f32::INFINITY),
             world_max: Vec2::splat(f32::NEG_INFINITY),
+            depth_min: f32::INFINITY,
+            depth_max: f32::NEG_INFINITY,
             direction_min: Vec2::splat(f32::INFINITY),
             direction_max: Vec2::splat(f32::NEG_INFINITY),
             screen_offset_max_abs: Vec2::ZERO,
@@ -162,6 +188,8 @@ impl GeometryExtents {
             extents.world_min.y = extents.world_min.y.min(world.y);
             extents.world_max.x = extents.world_max.x.max(world.x);
             extents.world_max.y = extents.world_max.y.max(world.y);
+            extents.depth_min = extents.depth_min.min(vertex.depth);
+            extents.depth_max = extents.depth_max.max(vertex.depth);
 
             for direction in [vertex.previous_direction, vertex.next_direction] {
                 extents.direction_min.x = extents.direction_min.x.min(direction[0]);
@@ -191,29 +219,32 @@ impl GeometryExtents {
             return true;
         }
 
-        let world_horizontal = transformed_interval(
+        let center = Vec2::new(uniform.camera_center[0], uniform.camera_center[1]);
+        let world_horizontal = transformed_world_interval(
             uniform.world_to_screen_x,
             self.world_min,
             self.world_max,
-            true,
+            self.depth_min,
+            self.depth_max,
+            center,
         );
-        let world_vertical = transformed_interval(
+        let world_vertical = transformed_world_interval(
             uniform.world_to_screen_y,
             self.world_min,
             self.world_max,
-            true,
+            self.depth_min,
+            self.depth_max,
+            center,
         );
-        let direction_horizontal = transformed_interval(
+        let direction_horizontal = transformed_direction_interval(
             uniform.world_to_screen_x,
             self.direction_min,
             self.direction_max,
-            false,
         );
-        let direction_vertical = transformed_interval(
+        let direction_vertical = transformed_direction_interval(
             uniform.world_to_screen_y,
             self.direction_min,
             self.direction_max,
-            false,
         );
         let maximum_miter = self.normal_distance_max_abs as f64 * 1_000.0;
         let horizontal_limit = interval_max_abs(world_horizontal)
@@ -239,29 +270,35 @@ impl GeometryExtents {
     }
 }
 
-fn transformed_interval(
+fn transformed_world_interval(
     row: [f32; 4],
     minimum: Vec2,
     maximum: Vec2,
-    include_translation: bool,
+    depth_minimum: f32,
+    depth_maximum: f32,
+    center: Vec2,
 ) -> (f64, f64) {
-    let horizontal = [
-        row[0] as f64 * minimum.x as f64,
-        row[0] as f64 * maximum.x as f64,
-    ];
-    let vertical = [
-        row[1] as f64 * minimum.y as f64,
-        row[1] as f64 * maximum.y as f64,
-    ];
-    let translation = if include_translation {
-        row[2] as f64
-    } else {
-        0.0
-    };
+    let relative_minimum = minimum - center;
+    let relative_maximum = maximum - center;
+    let horizontal = interval_products(row[0], relative_minimum.x, relative_maximum.x);
+    let vertical = interval_products(row[1], relative_minimum.y, relative_maximum.y);
+    let depth = interval_products(row[2], depth_minimum, depth_maximum);
     (
-        horizontal[0].min(horizontal[1]) + vertical[0].min(vertical[1]) + translation,
-        horizontal[0].max(horizontal[1]) + vertical[0].max(vertical[1]) + translation,
+        horizontal.0 + vertical.0 + depth.0 + row[3] as f64,
+        horizontal.1 + vertical.1 + depth.1 + row[3] as f64,
     )
+}
+
+fn transformed_direction_interval(row: [f32; 4], minimum: Vec2, maximum: Vec2) -> (f64, f64) {
+    let horizontal = interval_products(row[0], minimum.x, maximum.x);
+    let vertical = interval_products(row[1], minimum.y, maximum.y);
+    (horizontal.0 + vertical.0, horizontal.1 + vertical.1)
+}
+
+fn interval_products(coefficient: f32, minimum: f32, maximum: f32) -> (f64, f64) {
+    let first = coefficient as f64 * minimum as f64;
+    let second = coefficient as f64 * maximum as f64;
+    (first.min(second), first.max(second))
 }
 
 fn interval_max_abs(interval: (f64, f64)) -> f64 {
@@ -468,11 +505,14 @@ impl Error for PreparedSceneRenderError {}
 /// Camera movement, zoom, rotation, projection tilt, viewport resizing, and DPI
 /// changes do not invalidate prepared geometry. Shape, style, gradient, layer,
 /// or clip changes require preparing a replacement. A prepared scene can only be
-/// rendered by the [`WgpuRenderer`] that created it.
+/// rendered by the [`WgpuRenderer`] that created it. Use
+/// [`WgpuRenderer::restore_prepared_scene`] to recreate its GPU buffer for a
+/// replacement renderer after device loss.
 pub struct PreparedScene {
     renderer_identity: Arc<()>,
     background: Color,
     vertex_buffer: Arc<wgpu::Buffer>,
+    vertices: Arc<[Vertex]>,
     command_count: usize,
     vertex_count: usize,
     geometry_extents: GeometryExtents,
@@ -493,6 +533,11 @@ impl PreparedScene {
     /// Returns the number of clip-compatible draw batches.
     pub fn draw_batch_count(&self) -> usize {
         self.draw_batches.len()
+    }
+
+    /// Returns retained CPU vertex bytes available for device-loss recovery.
+    pub fn recovery_memory_bytes(&self) -> usize {
+        self.vertices.len() * std::mem::size_of::<Vertex>()
     }
 }
 
@@ -700,6 +745,28 @@ impl WgpuRenderer {
         )
     }
 
+    /// Returns the current camera viewport in logical screen pixels.
+    pub fn logical_viewport(&self) -> Result<LogicalViewport, crate::LogicalViewportError> {
+        let (width, height) = self.logical_size();
+        LogicalViewport::new(width, height)
+    }
+
+    /// Converts a physical surface position into logical screen pixels.
+    pub fn physical_to_logical_screen(
+        &self,
+        position: PhysicalScreenPosition,
+    ) -> LogicalScreenPosition {
+        physical_to_logical_screen(position, self.scale_factor as f32)
+    }
+
+    /// Converts a logical screen position into physical surface pixels.
+    pub fn logical_to_physical_screen(
+        &self,
+        position: LogicalScreenPosition,
+    ) -> PhysicalScreenPosition {
+        logical_to_physical_screen(position, self.scale_factor as f32)
+    }
+
     /// Returns physical surface pixels per logical screen pixel.
     pub fn scale_factor(&self) -> f64 {
         self.scale_factor
@@ -815,25 +882,25 @@ impl WgpuRenderer {
     /// only the camera or target dimensions change. Any shape, style, gradient,
     /// ordering, or clipping change requires preparing a replacement scene.
     pub fn prepare_scene(&self, scene: &Scene) -> PreparedScene {
-        let mut vertices = Vec::new();
-        let mut draw_batches = Vec::new();
-        tessellate_scene(scene, &mut vertices, &mut draw_batches);
-        let geometry_extents = GeometryExtents::from_vertices(&vertices);
-        let vertex_buffer = Arc::new(create_vertex_buffer(&self.device, vertices.len()));
-        if !vertices.is_empty() {
-            self.queue
-                .write_buffer(&vertex_buffer, 0, bytemuck::cast_slice(&vertices));
-        }
+        prepare_scene_resources(
+            &self.device,
+            &self.queue,
+            Arc::clone(&self.renderer_identity),
+            scene,
+        )
+    }
 
-        PreparedScene {
-            renderer_identity: Arc::clone(&self.renderer_identity),
-            background: scene.background,
-            vertex_buffer,
-            command_count: scene.command_count(),
-            vertex_count: vertices.len(),
-            geometry_extents,
-            draw_batches,
-        }
+    /// Recreates prepared GPU resources on this renderer from a retained CPU snapshot.
+    ///
+    /// This supports renderer recreation after device loss without requiring the
+    /// original high-level [`Scene`]. The returned snapshot belongs to this renderer.
+    pub fn restore_prepared_scene(&self, source: &PreparedScene) -> PreparedScene {
+        restore_prepared_scene_resources(
+            &self.device,
+            &self.queue,
+            Arc::clone(&self.renderer_identity),
+            source,
+        )
     }
 
     /// Draws geometry previously uploaded by [`WgpuRenderer::prepare_scene`].
@@ -859,7 +926,7 @@ impl WgpuRenderer {
         scene: &PreparedScene,
         camera: &Camera2d,
     ) -> Result<RenderReport, PreparedSceneRenderError> {
-        if !Arc::ptr_eq(&self.renderer_identity, &scene.renderer_identity) {
+        if !prepared_scene_belongs_to(&self.renderer_identity, &scene.renderer_identity) {
             return Err(PreparedSceneRenderError::RendererMismatch);
         }
 
@@ -893,7 +960,7 @@ impl WgpuRenderer {
         frame_started_at: Instant,
     ) -> Result<RenderReport, RendererFrameError> {
         let (logical_width, logical_height) = self.logical_size();
-        let viewport = Viewport::new(logical_width, logical_height)
+        let viewport = LogicalViewport::new(logical_width, logical_height)
             .map_err(|_| RendererFrameError::InvalidGeometryTransform)?;
         let camera_uniform_upload_started_at = Instant::now();
         let Some(camera_uniform) = CameraUniform::new(camera, viewport) else {
@@ -1047,6 +1114,66 @@ impl WgpuRenderer {
 
         self.vertex_capacity = vertex_count.next_power_of_two();
         self.vertex_buffer = Arc::new(create_vertex_buffer(&self.device, self.vertex_capacity));
+    }
+}
+
+fn prepared_scene_belongs_to(renderer_identity: &Arc<()>, scene_identity: &Arc<()>) -> bool {
+    Arc::ptr_eq(renderer_identity, scene_identity)
+}
+
+fn prepare_scene_resources(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    renderer_identity: Arc<()>,
+    scene: &Scene,
+) -> PreparedScene {
+    let mut vertices = Vec::new();
+    let mut draw_batches = Vec::new();
+    tessellate_scene(scene, &mut vertices, &mut draw_batches);
+    let geometry_extents = GeometryExtents::from_vertices(&vertices);
+    let vertex_buffer = Arc::new(create_vertex_buffer(device, vertices.len()));
+    if !vertices.is_empty() {
+        queue.write_buffer(&vertex_buffer, 0, bytemuck::cast_slice(&vertices));
+    }
+    let vertex_count = vertices.len();
+    let vertices: Arc<[Vertex]> = vertices.into();
+
+    PreparedScene {
+        renderer_identity,
+        background: scene.background,
+        vertex_buffer,
+        vertices,
+        command_count: scene.command_count(),
+        vertex_count,
+        geometry_extents,
+        draw_batches,
+    }
+}
+
+fn restore_prepared_scene_resources(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    renderer_identity: Arc<()>,
+    source: &PreparedScene,
+) -> PreparedScene {
+    let vertex_buffer = Arc::new(create_vertex_buffer(device, source.vertices.len()));
+    if !source.vertices.is_empty() {
+        queue.write_buffer(
+            &vertex_buffer,
+            0,
+            bytemuck::cast_slice(source.vertices.as_ref()),
+        );
+    }
+
+    PreparedScene {
+        renderer_identity,
+        background: source.background,
+        vertex_buffer,
+        vertices: Arc::clone(&source.vertices),
+        command_count: source.command_count,
+        vertex_count: source.vertex_count,
+        geometry_extents: source.geometry_extents,
+        draw_batches: source.draw_batches.clone(),
     }
 }
 
@@ -1213,6 +1340,20 @@ fn validate_scale_factor(scale_factor: f64) -> Result<(), RendererConfigurationE
     }
 }
 
+fn physical_to_logical_screen(
+    position: PhysicalScreenPosition,
+    scale_factor: f32,
+) -> LogicalScreenPosition {
+    LogicalScreenPosition::from_vec2(position.to_vec2() / scale_factor)
+}
+
+fn logical_to_physical_screen(
+    position: LogicalScreenPosition,
+    scale_factor: f32,
+) -> PhysicalScreenPosition {
+    PhysicalScreenPosition::from_vec2(position.to_vec2() * scale_factor)
+}
+
 fn tessellate_scene(
     scene: &Scene,
     vertices: &mut Vec<Vertex>,
@@ -1234,6 +1375,10 @@ fn tessellate_scene(
             DrawCommand::Polyline(polyline) => {
                 tessellate_polyline(polyline, vertices);
             }
+        }
+
+        for vertex in &mut vertices[vertex_start..] {
+            vertex.depth = scene_command.depth();
         }
 
         let vertex_end = vertices.len();
@@ -1266,7 +1411,7 @@ fn tessellate_scene(
 
 fn screen_clip_to_scissor(
     screen_clip: ScreenClipRect,
-    viewport: Viewport,
+    viewport: LogicalViewport,
     scale_factor: f32,
 ) -> Option<ScissorRect> {
     let rect = screen_clip.rect();
@@ -1615,7 +1760,26 @@ fn push_closed_polyline_world(
         return;
     }
 
-    let unique_points = &points[..points.len() - 1];
+    let mut unique_points = Vec::with_capacity(points.len() - 1);
+    for point in &points[..points.len() - 1] {
+        if unique_points
+            .last()
+            .is_none_or(|previous| (*point - *previous).length_squared() > f32::EPSILON)
+        {
+            unique_points.push(*point);
+        }
+    }
+    if unique_points.len() > 1 {
+        let first = unique_points[0];
+        let last = unique_points[unique_points.len() - 1];
+        if (first - last).length_squared() <= f32::EPSILON {
+            unique_points.pop();
+        }
+    }
+    if unique_points.len() < 3 {
+        return;
+    }
+
     let point_count = unique_points.len();
     let half_width = width * 0.5;
     for index in 0..point_count {
@@ -1749,6 +1913,7 @@ fn push_line_body_world(
 fn world_vertex(world: Vec2, screen_offset: Vec2, color: Color) -> Vertex {
     Vertex {
         world_position: [world.x, world.y],
+        depth: 0.0,
         screen_offset: [screen_offset.x, screen_offset.y],
         previous_direction: [0.0; 2],
         next_direction: [0.0; 2],
@@ -1767,6 +1932,7 @@ fn stroke_vertex(
 ) -> Vertex {
     Vertex {
         world_position: [world.x, world.y],
+        depth: 0.0,
         screen_offset: [screen_offset.x, screen_offset.y],
         previous_direction: [previous_direction.x, previous_direction.y],
         next_direction: [next_direction.x, next_direction.y],
@@ -1812,12 +1978,12 @@ mod tests {
         (vertices, draw_batches)
     }
 
-    fn vertex_screen_position(vertex: Vertex, camera: Camera2d, viewport: Viewport) -> Vec2 {
+    fn vertex_screen_position(vertex: Vertex, camera: Camera2d, viewport: LogicalViewport) -> Vec2 {
         let Some(uniform) = CameraUniform::new(camera, viewport) else {
             panic!("test camera uniform should be finite");
         };
         let world = Vec2::new(vertex.world_position[0], vertex.world_position[1]);
-        let mut screen = uniform.world_to_screen(world)
+        let mut screen = uniform.world_to_screen(world, vertex.depth)
             + Vec2::new(vertex.screen_offset[0], vertex.screen_offset[1]);
         if vertex.normal_distance.abs() > 0.0 {
             let previous = uniform.direction_to_screen(Vec2::new(
@@ -1926,7 +2092,7 @@ mod tests {
             panic!("test projection should be valid");
         };
         camera.set_projection(projection);
-        let Ok(viewport) = Viewport::new(800.0, 600.0) else {
+        let Ok(viewport) = LogicalViewport::new(800.0, 600.0) else {
             panic!("test viewport should be valid");
         };
         let mut scene = Scene::new(Color::BLACK);
@@ -1974,24 +2140,63 @@ mod tests {
         if camera.set_rotation(0.31).is_err() {
             panic!("test rotation should be valid");
         }
-        let Ok(viewport) = Viewport::new(1_137.0, 683.0) else {
+        let Ok(viewport) = LogicalViewport::new(1_137.0, 683.0) else {
             panic!("test viewport should be valid");
         };
         let Some(uniform) = CameraUniform::new(camera, viewport) else {
             panic!("test camera uniform should be finite");
         };
 
-        for world in [
-            Vec2::ZERO,
-            camera.center(),
-            Vec2::new(-81.5, 44.25),
-            Vec2::new(319.0, -127.0),
+        for (world, depth) in [
+            (Vec2::ZERO, 0.0),
+            (camera.center(), 0.0),
+            (Vec2::new(-81.5, 44.25), 7.5),
+            (Vec2::new(319.0, -127.0), -13.25),
         ] {
-            let expected = camera.world_to_screen(world, viewport);
-            let actual = uniform.world_to_screen(world);
+            let expected = camera
+                .projected_world_to_screen(world, depth, viewport)
+                .to_vec2();
+            let actual = uniform.world_to_screen(world, depth);
             assert!((actual.x - expected.x).abs() < 0.001);
             assert!((actual.y - expected.y).abs() < 0.001);
         }
+    }
+
+    #[test]
+    fn scene_depth_reaches_tessellated_vertices() {
+        let mut scene = Scene::new(Color::BLACK);
+        assert!(
+            scene
+                .with_depth(12.5, |scene| {
+                    scene.circle(Vec2::ZERO, 8.0, ShapeStyle::filled(Color::WHITE));
+                })
+                .is_ok()
+        );
+
+        let (vertices, _) = tessellate_for_test(&scene);
+
+        assert!(!vertices.is_empty());
+        assert!(vertices.iter().all(|vertex| vertex.depth == 12.5));
+    }
+
+    #[test]
+    fn maximum_radius_rounded_rect_stroke_has_no_collapsed_directions() {
+        let mut scene = Scene::new(Color::BLACK);
+        scene.rect(
+            Rect::from_center_size(Vec2::ZERO, Vec2::splat(20.0)),
+            100.0,
+            ShapeStyle::stroked(3.0, Color::WHITE),
+        );
+
+        let (vertices, _) = tessellate_for_test(&scene);
+
+        assert!(!vertices.is_empty());
+        assert!(vertices.iter().all(|vertex| {
+            Vec2::new(vertex.previous_direction[0], vertex.previous_direction[1]).length_squared()
+                > f32::EPSILON
+                && Vec2::new(vertex.next_direction[0], vertex.next_direction[1]).length_squared()
+                    > f32::EPSILON
+        }));
     }
 
     #[test]
@@ -2014,7 +2219,7 @@ mod tests {
         if camera.set_rotation(-0.41).is_err() {
             panic!("test rotation should be valid");
         }
-        let Ok(viewport) = Viewport::new(800.0, 600.0) else {
+        let Ok(viewport) = LogicalViewport::new(800.0, 600.0) else {
             panic!("test viewport should be valid");
         };
 
@@ -2035,7 +2240,7 @@ mod tests {
         let Ok(camera) = Camera2d::new(Vec2::ZERO, 2.0) else {
             panic!("test camera should be valid");
         };
-        let Ok(viewport) = Viewport::new(800.0, 600.0) else {
+        let Ok(viewport) = LogicalViewport::new(800.0, 600.0) else {
             panic!("test viewport should be valid");
         };
         let Some(uniform) = CameraUniform::new(camera, viewport) else {
@@ -2043,6 +2248,26 @@ mod tests {
         };
 
         assert!(!extents.is_safe_for(uniform));
+    }
+
+    #[test]
+    fn geometry_extents_accept_valid_geometry_relative_to_large_camera_center() {
+        let center = Vec2::new(2.0e38, 0.0);
+        let world = Vec2::new(center.x + 1.0e33, 0.0);
+        let vertices = [world_vertex(world, Vec2::ZERO, Color::WHITE)];
+        let extents = GeometryExtents::from_vertices(&vertices);
+        let Ok(camera) = Camera2d::new(center, 2.0) else {
+            panic!("large finite camera should be valid");
+        };
+        let Ok(viewport) = LogicalViewport::new(800.0, 600.0) else {
+            panic!("test viewport should be valid");
+        };
+        let Some(uniform) = CameraUniform::new(camera, viewport) else {
+            panic!("relative camera uniform should remain finite");
+        };
+
+        assert!(uniform.world_to_screen(world, 0.0).is_finite());
+        assert!(extents.is_safe_for(uniform));
     }
 
     #[test]
@@ -2092,7 +2317,7 @@ mod tests {
         });
 
         let (vertices, draw_batches) = tessellate_for_test(&scene);
-        let Ok(viewport) = Viewport::new(800.0, 600.0) else {
+        let Ok(viewport) = LogicalViewport::new(800.0, 600.0) else {
             panic!("test viewport should be valid");
         };
 
@@ -2117,7 +2342,7 @@ mod tests {
 
     #[test]
     fn logical_clip_converts_to_hidpi_physical_scissor() {
-        let Ok(viewport) = Viewport::new(800.0, 600.0) else {
+        let Ok(viewport) = LogicalViewport::new(800.0, 600.0) else {
             panic!("test viewport should be valid");
         };
         let clip = ScreenClipRect::from_min_size(Vec2::new(10.25, 20.75), Vec2::new(100.0, 80.0));
@@ -2133,6 +2358,179 @@ mod tests {
                 height: 161,
             })
         );
+    }
+
+    #[test]
+    fn renderer_screen_position_conversion_is_explicit_at_hidpi() {
+        let physical = PhysicalScreenPosition::new(800.0, 600.0);
+
+        let logical = physical_to_logical_screen(physical, 2.0);
+        let roundtrip = logical_to_physical_screen(logical, 2.0);
+
+        assert_eq!(logical, LogicalScreenPosition::new(400.0, 300.0));
+        assert_eq!(roundtrip, physical);
+    }
+
+    #[test]
+    fn prepared_scene_identity_guard_rejects_another_renderer() {
+        let first_renderer = Arc::new(());
+        let same_renderer = Arc::clone(&first_renderer);
+        let second_renderer = Arc::new(());
+
+        assert!(prepared_scene_belongs_to(&first_renderer, &same_renderer));
+        assert!(!prepared_scene_belongs_to(
+            &first_renderer,
+            &second_renderer
+        ));
+    }
+
+    #[test]
+    fn offscreen_gpu_pipeline_accepts_prepared_vertex_contract() {
+        pollster::block_on(async {
+            let instance =
+                wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+            let Ok(adapter) = instance
+                .request_adapter(&wgpu::RequestAdapterOptions {
+                    power_preference: wgpu::PowerPreference::LowPower,
+                    force_fallback_adapter: false,
+                    compatible_surface: None,
+                    apply_limit_buckets: false,
+                })
+                .await
+            else {
+                return;
+            };
+            let Ok((device, queue)) = adapter
+                .request_device(&wgpu::DeviceDescriptor {
+                    label: Some("sim-engine offscreen test device"),
+                    required_features: wgpu::Features::empty(),
+                    required_limits: wgpu::Limits::default(),
+                    experimental_features: wgpu::ExperimentalFeatures::disabled(),
+                    memory_hints: wgpu::MemoryHints::MemoryUsage,
+                    trace: wgpu::Trace::Off,
+                })
+                .await
+            else {
+                panic!("adapter should create a test device");
+            };
+
+            let validation_scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+            let format = wgpu::TextureFormat::Rgba8UnormSrgb;
+            let (pipeline, camera_uniform_buffer, camera_bind_group) =
+                create_pipeline(&device, format, 1);
+            let target = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("sim-engine offscreen test target"),
+                size: wgpu::Extent3d {
+                    width: 64,
+                    height: 64,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                view_formats: &[],
+            });
+            let view = target.create_view(&wgpu::TextureViewDescriptor::default());
+            let mut scene = Scene::new(Color::BLACK);
+            assert!(
+                scene
+                    .with_depth(3.0, |scene| {
+                        scene.rect(
+                            Rect::from_center_size(Vec2::ZERO, Vec2::splat(20.0)),
+                            6.0,
+                            ShapeStyle::filled(Color::WHITE),
+                        );
+                    })
+                    .is_ok()
+            );
+            let source_identity = Arc::new(());
+            let prepared =
+                prepare_scene_resources(&device, &queue, Arc::clone(&source_identity), &scene);
+            let replacement_identity = Arc::new(());
+            let restored = restore_prepared_scene_resources(
+                &device,
+                &queue,
+                Arc::clone(&replacement_identity),
+                &prepared,
+            );
+            assert!(prepared_scene_belongs_to(
+                &source_identity,
+                &prepared.renderer_identity
+            ));
+            assert!(!prepared_scene_belongs_to(
+                &source_identity,
+                &restored.renderer_identity
+            ));
+            assert!(prepared_scene_belongs_to(
+                &replacement_identity,
+                &restored.renderer_identity
+            ));
+            assert_eq!(restored.vertex_count(), prepared.vertex_count());
+            assert_eq!(
+                restored.recovery_memory_bytes(),
+                restored.vertex_count() * std::mem::size_of::<Vertex>()
+            );
+            assert!(Arc::ptr_eq(&restored.vertices, &prepared.vertices));
+            let Ok(mut camera) = Camera2d::new(Vec2::ZERO, 1.0) else {
+                panic!("test camera should be valid");
+            };
+            let Ok(projection) = crate::Projection2d::new(0.5, 2.0) else {
+                panic!("test projection should be valid");
+            };
+            camera.set_projection(projection);
+            let Ok(viewport) = LogicalViewport::new(64.0, 64.0) else {
+                panic!("test viewport should be valid");
+            };
+            let Some(camera_uniform) = CameraUniform::new(camera, viewport) else {
+                panic!("test camera uniform should be finite");
+            };
+            queue.write_buffer(
+                &camera_uniform_buffer,
+                0,
+                bytemuck::bytes_of(&camera_uniform),
+            );
+
+            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("sim-engine offscreen test encoder"),
+            });
+            {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("sim-engine offscreen test pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(Color::BLACK.to_wgpu()),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                pass.set_pipeline(&pipeline);
+                pass.set_bind_group(0, &camera_bind_group, &[]);
+                pass.set_vertex_buffer(0, restored.vertex_buffer.slice(..));
+                for batch in &restored.draw_batches {
+                    pass.draw(batch.vertex_range.clone(), 0..1);
+                }
+            }
+
+            let submission = queue.submit([encoder.finish()]);
+            if let Err(error) = device.poll(wgpu::PollType::Wait {
+                submission_index: Some(submission),
+                timeout: Some(Duration::from_secs(5)),
+            }) {
+                panic!("offscreen GPU submission did not complete: {error:?}");
+            }
+            if let Some(error) = validation_scope.pop().await {
+                panic!("offscreen GPU validation failed: {error}");
+            }
+        });
     }
 
     #[test]

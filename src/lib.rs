@@ -18,14 +18,15 @@ mod tween;
 mod wgpu_renderer;
 
 pub use camera::{
-    Camera2d, Camera2dError, Projection2d, Projection2dError, Viewport, ViewportError,
+    Camera2d, Camera2dError, LogicalScreenPosition, LogicalViewport, LogicalViewportError,
+    PhysicalScreenPosition, Projection2d, Projection2dError,
 };
 pub use color::{Color, Palette};
 pub use easing::Easing;
 pub use math::{Rect, Vec2};
 pub use scene::{
     Circle, DrawCommand, Fill, Layer, Line, LinearGradient, Polyline, RadialGradient, RectShape,
-    Scene, SceneCommand, ScreenClipRect, Shadow, ShapeStyle, Stroke,
+    Scene, SceneCommand, SceneError, ScenePrimitive, ScreenClipRect, Shadow, ShapeStyle, Stroke,
 };
 pub use tween::{Interpolate, Tween};
 
