@@ -1,0 +1,21 @@
+[package]
+name = "sim-engine"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "sim_engine"
+path = "src/lib.rs"
+
+[features]
+default = ["wgpu"]
+wgpu = ["dep:bytemuck", "dep:wgpu"]
+
+[dependencies]
+bytemuck = { version = "1.25.2", features = ["derive"], optional = true }
+wgpu = { version = "30.0.1", optional = true }
+
+[dev-dependencies]
+env_logger = "0.11.11"
+pollster = "1.0.1"
+winit = "0.30.12"
