@@ -208,25 +208,38 @@ pub struct VectorField {
 
 impl VectorField {
     /// Creates a row-major field from finite vectors.
-    pub fn new(width: usize, height: usize, values: Vec<Vec2>) -> Result<Self, ScalarFieldError> {
-        let expected = checked_len(width, height)?;
+    pub fn new(width: usize, height: usize, values: Vec<Vec2>) -> Result<Self, VectorFieldError> {
+        let expected = checked_len(width, height).map_err(VectorFieldError::from)?;
         if values.len() != expected {
-            return Err(ScalarFieldError::InvalidValueCount { expected, actual: values.len() });
+            return Err(VectorFieldError::InvalidValueCount {
+                expected,
+                actual: values.len(),
+            });
         }
         if values.iter().any(|value| !value.is_finite()) {
-            return Err(ScalarFieldError::NonFiniteValue);
+            return Err(VectorFieldError::NonFiniteValue);
         }
-        Ok(Self { width, height, values })
+        Ok(Self {
+            width,
+            height,
+            values,
+        })
     }
 
     /// Returns horizontal vector-cell count.
-    pub fn width(&self) -> usize { self.width }
+    pub fn width(&self) -> usize {
+        self.width
+    }
 
     /// Returns vertical vector-cell count.
-    pub fn height(&self) -> usize { self.height }
+    pub fn height(&self) -> usize {
+        self.height
+    }
 
     /// Returns row-major vectors.
-    pub fn values(&self) -> &[Vec2] { &self.values }
+    pub fn values(&self) -> &[Vec2] {
+        &self.values
+    }
 
     /// Returns a vector, or `None` outside field bounds.
     pub fn value_at(&self, x: usize, y: usize) -> Option<Vec2> {
@@ -234,13 +247,77 @@ impl VectorField {
     }
 
     /// Replaces a finite vector at one cell.
-    pub fn set(&mut self, x: usize, y: usize, value: Vec2) -> Result<(), ScalarFieldError> {
-        if !value.is_finite() { return Err(ScalarFieldError::NonFiniteValue); }
-        if x >= self.width || y >= self.height { return Err(ScalarFieldError::OutOfBounds { x, y }); }
+    pub fn set(&mut self, x: usize, y: usize, value: Vec2) -> Result<(), VectorFieldError> {
+        if !value.is_finite() {
+            return Err(VectorFieldError::NonFiniteValue);
+        }
+        if x >= self.width || y >= self.height {
+            return Err(VectorFieldError::OutOfBounds { x, y });
+        }
         self.values[y * self.width + x] = value;
         Ok(())
     }
 }
+
+/// Rejection reason for vector-field construction or mutation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VectorFieldError {
+    /// Width and height must both be non-zero.
+    ZeroDimension,
+    /// Width multiplied by height overflowed `usize`.
+    DimensionsOverflow,
+    /// Input values did not match the grid dimensions.
+    InvalidValueCount {
+        /// Required row-major cell count.
+        expected: usize,
+        /// Supplied value count.
+        actual: usize,
+    },
+    /// A vector component was NaN or infinite.
+    NonFiniteValue,
+    /// A requested cell lies outside the field dimensions.
+    OutOfBounds {
+        /// Horizontal cell index.
+        x: usize,
+        /// Vertical cell index.
+        y: usize,
+    },
+}
+
+impl From<ScalarFieldError> for VectorFieldError {
+    fn from(error: ScalarFieldError) -> Self {
+        match error {
+            ScalarFieldError::ZeroDimension => Self::ZeroDimension,
+            ScalarFieldError::DimensionsOverflow => Self::DimensionsOverflow,
+            ScalarFieldError::InvalidValueCount { expected, actual } => {
+                Self::InvalidValueCount { expected, actual }
+            }
+            ScalarFieldError::NonFiniteValue => Self::NonFiniteValue,
+            ScalarFieldError::OutOfBounds { x, y } => Self::OutOfBounds { x, y },
+        }
+    }
+}
+
+impl fmt::Display for VectorFieldError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ZeroDimension => write!(formatter, "vector field dimensions must be non-zero"),
+            Self::DimensionsOverflow => write!(formatter, "vector field dimensions overflow"),
+            Self::InvalidValueCount { expected, actual } => {
+                write!(
+                    formatter,
+                    "vector field needs {expected} values, got {actual}"
+                )
+            }
+            Self::NonFiniteValue => write!(formatter, "vector field values must be finite"),
+            Self::OutOfBounds { x, y } => {
+                write!(formatter, "vector field cell ({x}, {y}) is out of bounds")
+            }
+        }
+    }
+}
+
+impl Error for VectorFieldError {}
 
 /// One normalized color-map control point.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -380,6 +457,23 @@ mod tests {
             ScalarField::filled(1, 1, f32::NAN),
             Err(ScalarFieldError::NonFiniteValue)
         );
+        field.replace_region(0, 1, 2, 1, &[7.0, 8.0]).unwrap();
+        assert_eq!(field.values(), &[1.0, 6.0, 7.0, 8.0]);
+        assert_eq!(
+            field.replace_region(1, 1, 2, 1, &[0.0, 1.0]),
+            Err(ScalarFieldError::OutOfBounds { x: 1, y: 1 })
+        );
+        assert_eq!(
+            field.replace_region(0, 0, 1, 2, &[0.0]),
+            Err(ScalarFieldError::InvalidValueCount {
+                expected: 2,
+                actual: 1
+            })
+        );
+        assert_eq!(
+            field.replace_region(0, 0, 1, 1, &[f32::INFINITY]),
+            Err(ScalarFieldError::NonFiniteValue)
+        );
     }
 
     #[test]
@@ -403,7 +497,13 @@ mod tests {
         assert_eq!(field.value_at(1, 0), Some(Vec2::Y));
         field.set(0, 0, Vec2::new(2.0, -3.0)).unwrap();
         assert_eq!(field.value_at(0, 0), Some(Vec2::new(2.0, -3.0)));
-        assert_eq!(field.set(2, 0, Vec2::ZERO), Err(ScalarFieldError::OutOfBounds { x: 2, y: 0 }));
-        assert_eq!(VectorField::new(1, 1, vec![Vec2::new(f32::NAN, 0.0)]), Err(ScalarFieldError::NonFiniteValue));
+        assert_eq!(
+            field.set(2, 0, Vec2::ZERO),
+            Err(VectorFieldError::OutOfBounds { x: 2, y: 0 })
+        );
+        assert_eq!(
+            VectorField::new(1, 1, vec![Vec2::new(f32::NAN, 0.0)]),
+            Err(VectorFieldError::NonFiniteValue)
+        );
     }
 }

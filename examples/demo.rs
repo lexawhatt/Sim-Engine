@@ -5,10 +5,11 @@ use std::{
 };
 
 use sim_engine::{
-    Camera2d, Color, ColorMap, DynamicMesh2d, DynamicVertex2d, Easing, Fill, Layer, LinearGradient,
-    Palette, ParticleField2d, ParticleInstance2d, PreparedScene, Rect, RendererFrameMetrics,
-    RendererPresentMode, ScalarField, ScalarFieldTexture, Scene, ScreenClipRect, Shadow,
-    ShapeStyle, Tween, Vec2, WgpuRenderer, WgpuRendererOptions,
+    BlendMode, Camera2d, Color, ColorMap, DynamicMesh2d, DynamicVertex2d, Easing, Fill,
+    Interpolate, Layer, LinearGradient, Palette, ParticleField2d, ParticleInstance2d,
+    PreparedScene, Rect, RenderTarget2d, RendererFrameMetrics, RendererPresentMode, ScalarField,
+    ScalarFieldTexture, Scene, ScreenClipRect, Shadow, ShapeStyle, TrailBuffer2d, Tween, Vec2,
+    VectorField, WgpuRenderer, WgpuRendererOptions,
 };
 use winit::{
     application::ApplicationHandler,
@@ -35,6 +36,8 @@ struct DemoApplication {
     dynamic_mesh: Option<DynamicMesh2d>,
     particle_field: Option<ParticleField2d>,
     scalar_field_texture: Option<ScalarFieldTexture>,
+    heatmap_target: Option<RenderTarget2d>,
+    heatmap_trails: Option<TrailBuffer2d>,
     heatmap_color_map: Option<ColorMap>,
     present_mode: RendererPresentMode,
     camera: Camera2d,
@@ -60,6 +63,8 @@ impl DemoApplication {
             dynamic_mesh: None,
             particle_field: None,
             scalar_field_texture: None,
+            heatmap_target: None,
+            heatmap_trails: None,
             heatmap_color_map: None,
             present_mode: demo_present_mode(),
             camera,
@@ -122,7 +127,7 @@ impl ApplicationHandler for DemoApplication {
         let renderer_options = WgpuRendererOptions::new(self.present_mode, scale_factor)
             .expect("window scale factor is valid");
 
-        let renderer = pollster::block_on(WgpuRenderer::new_with_options(
+        let mut renderer = pollster::block_on(WgpuRenderer::new_with_options(
             window.clone(),
             size.width.max(1),
             size.height.max(1),
@@ -136,6 +141,18 @@ impl ApplicationHandler for DemoApplication {
                     .create_scalar_field_texture(build_heatmap_field(0.0))
                     .expect("demo scalar field is valid"),
             );
+            self.heatmap_target = Some(
+                renderer
+                    .create_render_target(size.width.max(1), size.height.max(1))
+                    .expect("demo render target dimensions are valid"),
+            );
+            if demo_uses_heatmap_trails() {
+                self.heatmap_trails = Some(
+                    renderer
+                        .create_trail_buffer(size.width.max(1), size.height.max(1))
+                        .expect("demo trail dimensions are valid"),
+                );
+            }
             self.heatmap_color_map = Some(
                 ColorMap::linear(
                     Color::rgba(0.02, 0.05, 0.14, 1.0),
@@ -173,6 +190,8 @@ impl ApplicationHandler for DemoApplication {
                 "demo geometry mode: Instanced particles ({})",
                 self.particle_count
             );
+        } else if demo_uses_vector_field() {
+            println!("demo geometry mode: Vector field");
         } else if demo_uses_prepared_scene() {
             let logical_size = renderer.logical_size();
             let scene = build_scene(0.0, Vec2::new(logical_size.0, logical_size.1));
@@ -206,6 +225,20 @@ impl ApplicationHandler for DemoApplication {
                     renderer
                         .resize_with_scale_factor(size.width, size.height, window.scale_factor())
                         .expect("window scale factor is valid");
+                    if self.heatmap_target.is_some() {
+                        self.heatmap_target = Some(
+                            renderer
+                                .create_render_target(size.width.max(1), size.height.max(1))
+                                .expect("demo render target dimensions are valid"),
+                        );
+                    }
+                    if self.heatmap_trails.is_some() {
+                        self.heatmap_trails = Some(
+                            renderer
+                                .create_trail_buffer(size.width.max(1), size.height.max(1))
+                                .expect("demo trail dimensions are valid"),
+                        );
+                    }
                 }
             }
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
@@ -226,7 +259,14 @@ impl ApplicationHandler for DemoApplication {
                     && self.dynamic_mesh.is_none()
                     && self.particle_field.is_none()
                     && self.scalar_field_texture.is_none())
-                .then(|| build_scene(time_seconds, Vec2::new(logical_size.0, logical_size.1)));
+                .then(|| {
+                    let logical_size = Vec2::new(logical_size.0, logical_size.1);
+                    if demo_uses_vector_field() {
+                        build_vector_field_scene(time_seconds, logical_size)
+                    } else {
+                        build_scene(time_seconds, logical_size)
+                    }
+                });
                 let scene_duration = frame_started_at.elapsed();
                 if self.present_mode == RendererPresentMode::Vsync {
                     window.pre_present_notify();
@@ -248,19 +288,52 @@ impl ApplicationHandler for DemoApplication {
                             let Some(color_map) = self.heatmap_color_map.as_ref() else {
                                 return;
                             };
-                            match renderer.render_scalar_field_texture_with_metrics(
+                            let Some(heatmap_target) = self.heatmap_target.as_ref() else {
+                                return;
+                            };
+                            if let Err(error) = renderer.render_scalar_field_texture_to_target(
+                                heatmap_target,
                                 scalar_field_texture,
                                 color_map,
                                 (0.0, 1.0),
                                 Palette::sim().background(),
                             ) {
+                                eprintln!("demo heatmap target renderer error: {error:?}");
+                                return;
+                            }
+                            let composition = if let Some(trails) = self.heatmap_trails.as_mut() {
+                                renderer
+                                    .accumulate_trail_buffer(
+                                        trails,
+                                        heatmap_target,
+                                        0.90,
+                                        0.12,
+                                        BlendMode::Alpha,
+                                    )
+                                    .and_then(|_| {
+                                        renderer.compose_trail_buffer(
+                                            trails,
+                                            BlendMode::Replace,
+                                            1.0,
+                                            Palette::sim().background(),
+                                        )
+                                    })
+                            } else {
+                                renderer.compose_render_target(
+                                    heatmap_target,
+                                    BlendMode::Replace,
+                                    1.0,
+                                    Palette::sim().background(),
+                                )
+                            };
+                            match composition {
                                 Ok(report) => (
                                     report.metrics(),
                                     scalar_field_texture.field().values().len(),
                                     Duration::ZERO,
                                 ),
                                 Err(error) => {
-                                    eprintln!("demo heatmap renderer error: {error:?}");
+                                    eprintln!("demo heatmap composition error: {error:?}");
                                     return;
                                 }
                             }
@@ -435,6 +508,18 @@ fn demo_uses_particle_field() -> bool {
 
 fn demo_uses_heatmap() -> bool {
     std::env::var("SIM_ENGINE_HEATMAP_DEMO").is_ok_and(|value| {
+        value == "1" || value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("yes")
+    })
+}
+
+fn demo_uses_heatmap_trails() -> bool {
+    std::env::var("SIM_ENGINE_HEATMAP_TRAILS").is_ok_and(|value| {
+        value == "1" || value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("yes")
+    })
+}
+
+fn demo_uses_vector_field() -> bool {
+    std::env::var("SIM_ENGINE_VECTOR_FIELD_DEMO").is_ok_and(|value| {
         value == "1" || value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("yes")
     })
 }
@@ -749,6 +834,63 @@ fn build_heatmap_field(time_seconds: f32) -> ScalarField {
         }
     }
     ScalarField::new(WIDTH, HEIGHT, values).expect("demo heatmap values are finite")
+}
+
+fn build_vector_field(time_seconds: f32) -> VectorField {
+    const WIDTH: usize = 25;
+    const HEIGHT: usize = 15;
+    let mut values = Vec::with_capacity(WIDTH * HEIGHT);
+    for y in 0..HEIGHT {
+        for x in 0..WIDTH {
+            let horizontal = x as f32 / (WIDTH - 1) as f32 * 2.0 - 1.0;
+            let vertical = y as f32 / (HEIGHT - 1) as f32 * 2.0 - 1.0;
+            values.push(Vec2::new(
+                -vertical + (time_seconds + horizontal * 2.0).sin() * 0.3,
+                horizontal + (time_seconds * 0.7 - vertical * 2.0).cos() * 0.3,
+            ));
+        }
+    }
+    VectorField::new(WIDTH, HEIGHT, values).expect("demo vector field is finite")
+}
+
+fn build_vector_field_scene(time_seconds: f32, surface_size: Vec2) -> Scene {
+    let palette = Palette::sim();
+    let mut scene = Scene::new(palette.background()).expect("palette is finite");
+    let field = build_vector_field(time_seconds);
+    let spacing = Vec2::new(24.0, 24.0);
+    let origin = Vec2::new(
+        -(field.width().saturating_sub(1) as f32) * spacing.x * 0.5,
+        -(field.height().saturating_sub(1) as f32) * spacing.y * 0.5,
+    );
+
+    let clip = ScreenClipRect::from_min_size(Vec2::splat(20.0), surface_size - Vec2::splat(40.0))
+        .expect("positive demo viewport clip");
+    scene
+        .with_screen_clip(clip, |scene| {
+            for y in 0..field.height() {
+                for x in 0..field.width() {
+                    let center = origin + Vec2::new(x as f32 * spacing.x, y as f32 * spacing.y);
+                    let direction = field
+                        .value_at(x, y)
+                        .expect("field indices stay in bounds")
+                        .normalized();
+                    let tip = center + direction * 8.5;
+                    let normal = direction.perp() * 3.0;
+                    let color = palette
+                        .primary()
+                        .interpolate(
+                            palette.accent(),
+                            (y as f32 / (field.height() - 1) as f32).clamp(0.0, 1.0),
+                        )
+                        .with_alpha(0.88);
+                    scene.line(center, tip, 1.6, color);
+                    scene.line(tip, tip - direction * 4.8 + normal, 1.4, color);
+                    scene.line(tip, tip - direction * 4.8 - normal, 1.4, color);
+                }
+            }
+        })
+        .expect("vector field clip is valid");
+    scene
 }
 
 fn dynamic_wave_height(x: f32, time_seconds: f32) -> f32 {

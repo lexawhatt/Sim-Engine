@@ -161,3 +161,21 @@ fn heatmap_fs_main(input: HeatmapOut) -> @location(0) vec4<f32> {
     let color_index = min(u32(round(normalized * 255.0)), 255u);
     return textureLoad(color_map, vec2<i32>(i32(color_index), 0), 0);
 }
+
+struct CompositeUniform {
+    opacity: vec4<f32>,
+};
+
+@group(0) @binding(0) var composition_source: texture_2d<f32>;
+@group(0) @binding(1) var<uniform> composition: CompositeUniform;
+
+@fragment
+fn composite_fs_main(input: HeatmapOut) -> @location(0) vec4<f32> {
+    let dimensions = textureDimensions(composition_source);
+    let texel = min(
+        vec2<u32>(input.uv * vec2<f32>(dimensions)),
+        dimensions - vec2<u32>(1u, 1u),
+    );
+    let source = textureLoad(composition_source, vec2<i32>(texel), 0);
+    return vec4<f32>(source.rgb, source.a * composition.opacity.x);
+}

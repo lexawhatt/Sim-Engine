@@ -32,8 +32,11 @@ Implemented now:
 - `PreparedScene` for reusable GPU-resident geometry
 - `ParticleField2d` for instanced circle particles with retained recovery data
 - `ScalarField` and validated piecewise-linear `ColorMap` data contracts
+- `VectorField` with finite rectangular velocity/flow samples
 - `ScalarFieldTexture` for renderer-owned `R32Float` scalar uploads and recovery
 - full-viewport color-mapped scalar heatmap rendering
+- `RenderTarget2d` for offscreen heatmaps and explicit multi-pass composition
+- `BlendMode::{Alpha, Additive, Replace}` for target-to-surface composition
 - validated logical-to-physical display scale for HiDPI targets
 - live `winit` demo in `examples/demo.rs`
 - randomized four-wave matching game in `examples/ui_demo.rs`
@@ -183,6 +186,18 @@ values, updates the retained grid, and uploads only that texture region.
 `Nearest` is exact texel sampling and `Linear` performs deterministic bilinear
 interpolation in WGSL for `R32Float` fields.
 
+`RenderTarget2d` dimensions are physical texture pixels. Create one with
+`create_render_target`, render a heatmap with
+`render_scalar_field_texture_to_target`, then present it with
+`compose_render_target`. Composition validates renderer ownership, opacity,
+and background, and explicitly selects `Alpha`, `Additive`, or `Replace`.
+Targets retain GPU pixels only, so redraw them after recreating a renderer.
+
+Set `SIM_ENGINE_VECTOR_FIELD_DEMO=1` to render an animated finite vector grid
+as clipped arrow glyphs. It is a scene-based consumer intended for velocity and
+flow data; heatmap/vector composition will use the dedicated render-target API
+introduced in the next rendering stage.
+
 ## Run The Demo
 
 ```bash
@@ -252,6 +267,13 @@ SIM_ENGINE_PREPARED_SCENE=1 SIM_ENGINE_PRESENT_MODE=no-vsync cargo run --release
 
 Current implementation status, limitations, and development priorities are
 recorded in `READ_FIRST_SIM_ENGINE_ROADMAP.md`.
+
+## License
+
+Sim;Engine is available under either of the following licenses, at your option:
+
+- [MIT License](LICENSE)
+- [Apache License, Version 2.0](LICENSE-APACHE)
 
 ## Verified Commands
 
