@@ -6,14 +6,10 @@ use crate::tween::Interpolate;
 /// Use [`Color::clamp`] before sending untrusted colors to a renderer.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Color {
-    /// Red channel.
-    pub r: f32,
-    /// Green channel.
-    pub g: f32,
-    /// Blue channel.
-    pub b: f32,
-    /// Alpha channel, where `0.0` is transparent and `1.0` is opaque.
-    pub a: f32,
+    r: f32,
+    g: f32,
+    b: f32,
+    a: f32,
 }
 
 impl Color {
@@ -32,6 +28,26 @@ impl Color {
     /// Builds a color from floating-point RGBA channels.
     pub const fn rgba(r: f32, g: f32, b: f32, a: f32) -> Self {
         Self { r, g, b, a }
+    }
+
+    /// Returns the red linear-light channel.
+    pub const fn red(self) -> f32 {
+        self.r
+    }
+
+    /// Returns the green linear-light channel.
+    pub const fn green(self) -> f32 {
+        self.g
+    }
+
+    /// Returns the blue linear-light channel.
+    pub const fn blue(self) -> f32 {
+        self.b
+    }
+
+    /// Returns alpha coverage, where `0.0` is transparent and `1.0` is opaque.
+    pub const fn alpha(self) -> f32 {
+        self.a
     }
 
     /// Builds an opaque linear color from `0..=255` sRGB channels.
@@ -134,25 +150,64 @@ impl Interpolate for Color {
 /// so examples start from a polished baseline instead of bare grayscale.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Palette {
-    /// Main background color.
-    pub background: Color,
-    /// Elevated surface color for panels or overlays.
-    pub surface: Color,
-    /// Low-contrast grid line color.
-    pub grid: Color,
-    /// Higher-contrast axis line color.
-    pub axis: Color,
-    /// Primary data color.
-    pub primary: Color,
-    /// Secondary data color.
-    pub secondary: Color,
-    /// Accent data color.
-    pub accent: Color,
-    /// Warning or high-energy data color.
-    pub warning: Color,
+    background: Color,
+    surface: Color,
+    grid: Color,
+    axis: Color,
+    primary: Color,
+    secondary: Color,
+    accent: Color,
+    warning: Color,
 }
 
 impl Palette {
+    /// Builds a palette from colors ordered as background, surface, grid, axis,
+    /// primary, secondary, accent, and warning.
+    pub const fn from_colors(colors: [Color; 8]) -> Self {
+        Self {
+            background: colors[0],
+            surface: colors[1],
+            grid: colors[2],
+            axis: colors[3],
+            primary: colors[4],
+            secondary: colors[5],
+            accent: colors[6],
+            warning: colors[7],
+        }
+    }
+
+    /// Returns the main background color.
+    pub const fn background(self) -> Color {
+        self.background
+    }
+    /// Returns the elevated surface color.
+    pub const fn surface(self) -> Color {
+        self.surface
+    }
+    /// Returns the grid-line color.
+    pub const fn grid(self) -> Color {
+        self.grid
+    }
+    /// Returns the axis color.
+    pub const fn axis(self) -> Color {
+        self.axis
+    }
+    /// Returns the primary data color.
+    pub const fn primary(self) -> Color {
+        self.primary
+    }
+    /// Returns the secondary data color.
+    pub const fn secondary(self) -> Color {
+        self.secondary
+    }
+    /// Returns the accent color.
+    pub const fn accent(self) -> Color {
+        self.accent
+    }
+    /// Returns the warning color.
+    pub const fn warning(self) -> Color {
+        self.warning
+    }
     /// Returns the default Sim;Engine color palette.
     pub fn sim() -> Self {
         Self {
@@ -183,8 +238,8 @@ mod tests {
     fn rgb8_converts_srgb_to_linear_light() {
         let middle_gray = Color::rgb8(128, 128, 128);
 
-        assert!((middle_gray.r - 0.21586).abs() < 0.0001);
-        assert_eq!(middle_gray.r, middle_gray.g);
-        assert_eq!(middle_gray.g, middle_gray.b);
+        assert!((middle_gray.red() - 0.21586).abs() < 0.0001);
+        assert_eq!(middle_gray.red(), middle_gray.green());
+        assert_eq!(middle_gray.green(), middle_gray.blue());
     }
 }

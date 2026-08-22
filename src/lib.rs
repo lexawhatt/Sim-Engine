@@ -10,6 +10,7 @@
 mod camera;
 mod color;
 mod easing;
+mod field;
 mod math;
 mod scene;
 mod tween;
@@ -23,6 +24,7 @@ pub use camera::{
 };
 pub use color::{Color, Palette};
 pub use easing::Easing;
+pub use field::{ColorMap, ColorMapError, ColorStop, ScalarField, ScalarFieldError, VectorField};
 pub use math::{Rect, Vec2};
 pub use scene::{
     Circle, DrawCommand, Fill, Layer, Line, LinearGradient, Polyline, RadialGradient, RectShape,
@@ -32,7 +34,12 @@ pub use tween::{Interpolate, Tween};
 
 #[cfg(feature = "wgpu")]
 pub use renderer::{
+    DynamicMesh2d, DynamicMeshError, DynamicMeshRenderError, DynamicMeshUpdateReport,
+    DynamicVertex2d, ParticleField2d, ParticleFieldError, ParticleFieldRenderError,
+    ParticleFieldUpdateReport, ParticleInstance2d, ParticleInstanceError, ParticleStatistics,
     PreparedScene, PreparedSceneRenderError, RenderReport, RenderStatus,
-    RendererConfigurationError, RendererFrameError, RendererFrameMetrics, RendererInitError,
-    RendererPresentMode, RendererSurfaceStatus, WgpuRenderer, WgpuRendererOptions,
+    RendererConfigurationError, RendererCoordinateError, RendererFrameError, RendererFrameMetrics,
+    RendererInitError, RendererPresentMode, RendererSurfaceStatus, ScalarFieldRenderError,
+    ScalarFieldSampling, ScalarFieldTexture, ScalarFieldTextureError, ScalarFieldUploadReport,
+    TessellationStats, WgpuRenderer, WgpuRendererOptions,
 };

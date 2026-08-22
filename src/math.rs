@@ -42,7 +42,7 @@ impl Vec2 {
 
     /// Returns the Euclidean vector length.
     pub fn length(self) -> f32 {
-        self.length_squared().sqrt()
+        self.x.hypot(self.y)
     }
 
     /// Returns the dot product between two vectors.
@@ -54,11 +54,20 @@ impl Vec2 {
     ///
     /// Zero-length and near-zero vectors return [`Vec2::ZERO`] instead of NaN.
     pub fn normalized(self) -> Self {
-        let length = self.length();
-        if length <= f32::EPSILON {
+        if !self.is_finite() {
             Self::ZERO
         } else {
-            self / length
+            let maximum_component = self.x.abs().max(self.y.abs());
+            if maximum_component <= f32::EPSILON {
+                return Self::ZERO;
+            }
+            let scaled = self / maximum_component;
+            let length = scaled.length();
+            if length <= f32::EPSILON {
+                Self::ZERO
+            } else {
+                scaled / length
+            }
         }
     }
 
@@ -77,6 +86,20 @@ impl Vec2 {
     /// Returns true when both components are finite values.
     pub fn is_finite(self) -> bool {
         self.x.is_finite() && self.y.is_finite()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Vec2;
+
+    #[test]
+    fn normalization_preserves_large_finite_direction() {
+        let normalized = Vec2::new(3.0e38, 3.0e38).normalized();
+
+        assert!(normalized.is_finite());
+        assert!((normalized.length() - 1.0).abs() < 0.0001);
+        assert!(normalized.x > 0.0 && normalized.y > 0.0);
     }
 }
 

@@ -30,6 +30,10 @@ Implemented now:
 - `WgpuRenderer`
 - GPU camera uniforms for camera-independent world geometry
 - `PreparedScene` for reusable GPU-resident geometry
+- `ParticleField2d` for instanced circle particles with retained recovery data
+- `ScalarField` and validated piecewise-linear `ColorMap` data contracts
+- `ScalarFieldTexture` for renderer-owned `R32Float` scalar uploads and recovery
+- full-viewport color-mapped scalar heatmap rendering
 - validated logical-to-physical display scale for HiDPI targets
 - live `winit` demo in `examples/demo.rs`
 - randomized four-wave matching game in `examples/ui_demo.rs`
@@ -55,7 +59,7 @@ use sim_engine::{
 };
 
 let camera = Camera2d::new(Vec2::ZERO, 2.0)?;
-let mut scene = Scene::new(Color::rgb8(12, 14, 18));
+let mut scene = Scene::new(Color::rgb8(12, 14, 18))?;
 
 scene.circle(
     Vec2::new(10.0, 20.0),
@@ -75,7 +79,7 @@ scene.rect(
 );
 
 scene.with_screen_clip(
-    ScreenClipRect::from_min_size(Vec2::new(40.0, 40.0), Vec2::new(720.0, 420.0)),
+    ScreenClipRect::from_min_size(Vec2::new(40.0, 40.0), Vec2::new(720.0, 420.0))?,
     |scene| {
         scene.line(
             Vec2::new(-1_000.0, 0.0),
@@ -84,7 +88,7 @@ scene.with_screen_clip(
             Color::WHITE,
         );
     },
-);
+)?;
 
 scene.with_depth(4.0, |scene| {
     scene.circle(
@@ -112,6 +116,72 @@ styles are non-finite or otherwise non-drawable. The corresponding `try_*`
 methods return `SceneError` when the host needs a precise rejection reason.
 
 Window setup is intentionally outside the core scene API. The demo uses `winit`, but Sim;Engine should not force a host app to use a specific app framework.
+
+Set `SIM_ENGINE_DYNAMIC_MESH_DEMO=1` when running `demo` to exercise the
+`DynamicMesh2d` path: the animated wave ribbon is updated as one mutable
+triangle-list mesh rather than rebuilt as scene primitives each frame. Its
+once-per-second diagnostics include dynamic update CPU time and buffer-growth
+events are exposed by `DynamicMeshUpdateReport`.
+
+For a repeatable dynamic-mesh measurement, run a fixed warm-up and measured
+frame count. The fixture exits by itself and prints a final aggregate interval:
+
+```bash
+SIM_ENGINE_DYNAMIC_MESH_BENCHMARK_FRAMES=600 \
+SIM_ENGINE_DYNAMIC_MESH_BENCHMARK_WARMUP_FRAMES=120 \
+SIM_ENGINE_DYNAMIC_MESH_SEGMENTS=10000 \
+SIM_ENGINE_PRESENT_MODE=no-vsync \
+cargo run --release --example demo
+```
+
+The benchmark mode always selects the dynamic-mesh path. Segment count is
+bounded to 1 through 1,000,000 (six triangle-list vertices per segment); use a
+count that fits the target machine's CPU and GPU memory. It measures CPU-side
+dynamic update and renderer stages, not completed GPU time or display scanout.
+
+Set `SIM_ENGINE_PARTICLE_DEMO=1` to render 1,500 animated particles through a
+single instanced circle draw call. `ParticleField2d` validates every instance
+before upload, reuses its instance-buffer capacity across updates, and exposes
+submitted/visible/culled/dropped/rendered counters. It culls circles wholly
+outside the logical viewport before issuing the instance draw. This is a separate visualization
+mode, so it takes precedence over the prepared-scene and dynamic-mesh demo
+switches. `update_particle_field_range` replaces a contiguous subset in place;
+`ParticleFieldUpdateReport` exposes its CPU upload time and whether a full
+replacement grew the GPU buffer.
+
+Particle measurement scenarios use the same deterministic particle distribution
+at 10k, 100k, or 1M instances. For actual renderer/surface measurements, choose
+the count explicitly and retain the once-per-second renderer diagnostics:
+
+```bash
+SIM_ENGINE_PARTICLE_DEMO=1 SIM_ENGINE_PARTICLE_COUNT=10000 \
+SIM_ENGINE_PRESENT_MODE=no-vsync cargo run --release --example demo
+```
+
+Replace `10000` with `100000` or `1000000` only when the target machine has
+sufficient memory. `SIM_ENGINE_PARTICLE_COUNT` is bounded to 1 through 1M.
+For deterministic CPU-only fallback numbers on CI or without a window/GPU:
+
+```bash
+SIM_ENGINE_PARTICLE_CPU_BENCHMARK_COUNT=100000 \
+SIM_ENGINE_PARTICLE_CPU_BENCHMARK_FRAMES=300 \
+cargo run --release --example particle_cpu_benchmark
+```
+
+The CPU example measures only host-side deterministic generation and
+`ParticleInstance2d` validation; it intentionally does not imply GPU upload,
+culling, rasterization, or presentation throughput.
+
+Set `SIM_ENGINE_HEATMAP_DEMO=1` to render an animated 160×96 scalar field as a
+full-viewport color-mapped heatmap. This mode takes precedence over particle,
+dynamic-mesh, prepared, and streaming demo modes.
+
+For subregions that change independently, use
+`update_scalar_field_texture_region`; it validates the rectangular range and
+values, updates the retained grid, and uploads only that texture region.
+`render_scalar_field_texture_with_sampling` makes heatmap sampling explicit:
+`Nearest` is exact texel sampling and `Linear` performs deterministic bilinear
+interpolation in WGSL for `R32Float` fields.
 
 ## Run The Demo
 

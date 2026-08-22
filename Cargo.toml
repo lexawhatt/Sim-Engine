@@ -27,3 +27,7 @@ required-features = ["wgpu"]
 [[example]]
 name = "ui_demo"
 required-features = ["wgpu"]
+
+[[example]]
+name = "particle_cpu_benchmark"
+required-features = ["wgpu"]

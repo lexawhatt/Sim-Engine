@@ -5,9 +5,10 @@ use std::{
 };
 
 use sim_engine::{
-    Camera2d, Color, Easing, Fill, Layer, LinearGradient, Palette, PreparedScene, Rect,
-    RendererFrameMetrics, RendererPresentMode, Scene, ScreenClipRect, Shadow, ShapeStyle, Tween,
-    Vec2, WgpuRenderer, WgpuRendererOptions,
+    Camera2d, Color, ColorMap, DynamicMesh2d, DynamicVertex2d, Easing, Fill, Layer, LinearGradient,
+    Palette, ParticleField2d, ParticleInstance2d, PreparedScene, Rect, RendererFrameMetrics,
+    RendererPresentMode, ScalarField, ScalarFieldTexture, Scene, ScreenClipRect, Shadow,
+    ShapeStyle, Tween, Vec2, WgpuRenderer, WgpuRendererOptions,
 };
 use winit::{
     application::ApplicationHandler,
@@ -31,10 +32,18 @@ struct DemoApplication {
     window: Option<Arc<Window>>,
     renderer: Option<WgpuRenderer>,
     prepared_scene: Option<PreparedScene>,
+    dynamic_mesh: Option<DynamicMesh2d>,
+    particle_field: Option<ParticleField2d>,
+    scalar_field_texture: Option<ScalarFieldTexture>,
+    heatmap_color_map: Option<ColorMap>,
     present_mode: RendererPresentMode,
     camera: Camera2d,
     zoom: Tween<f32>,
     frame_metrics: FrameMetrics,
+    dynamic_mesh_segments: usize,
+    particle_count: usize,
+    benchmark_frames_remaining: Option<usize>,
+    benchmark_warmup_frames_remaining: usize,
     started_at: Instant,
     last_frame: Instant,
 }
@@ -43,10 +52,15 @@ impl DemoApplication {
     fn new() -> Self {
         let now = Instant::now();
         let camera = Camera2d::new(Vec2::ZERO, 2.2).expect("demo camera zoom is valid");
+        let benchmark = dynamic_mesh_benchmark();
         Self {
             window: None,
             renderer: None,
             prepared_scene: None,
+            dynamic_mesh: None,
+            particle_field: None,
+            scalar_field_texture: None,
+            heatmap_color_map: None,
             present_mode: demo_present_mode(),
             camera,
             zoom: Tween::new(camera.zoom()).to(
@@ -55,6 +69,10 @@ impl DemoApplication {
                 Easing::EaseInOutCubic,
             ),
             frame_metrics: FrameMetrics::new(now),
+            dynamic_mesh_segments: benchmark.segments,
+            particle_count: particle_demo_count(),
+            benchmark_frames_remaining: benchmark.frame_count,
+            benchmark_warmup_frames_remaining: benchmark.warmup_frames,
             started_at: now,
             last_frame: now,
         }
@@ -112,7 +130,50 @@ impl ApplicationHandler for DemoApplication {
         ))
         .expect("create renderer");
 
-        if demo_uses_prepared_scene() {
+        if demo_uses_heatmap() {
+            self.scalar_field_texture = Some(
+                renderer
+                    .create_scalar_field_texture(build_heatmap_field(0.0))
+                    .expect("demo scalar field is valid"),
+            );
+            self.heatmap_color_map = Some(
+                ColorMap::linear(
+                    Color::rgba(0.02, 0.05, 0.14, 1.0),
+                    Color::rgba(1.0, 0.66, 0.12, 1.0),
+                )
+                .expect("demo color map is valid"),
+            );
+            println!("demo geometry mode: Scalar heatmap");
+        } else if self.benchmark_frames_remaining.is_some() || demo_uses_dynamic_mesh() {
+            self.dynamic_mesh = Some(
+                renderer
+                    .create_dynamic_mesh(&build_dynamic_mesh_vertices(
+                        0.0,
+                        self.dynamic_mesh_segments,
+                    ))
+                    .expect("demo dynamic mesh vertices are valid"),
+            );
+            if let Some(frame_count) = self.benchmark_frames_remaining {
+                println!(
+                    "dynamic mesh benchmark: {frame_count} measured frames after {} warmup frames, {} segments / {} vertices",
+                    self.benchmark_warmup_frames_remaining,
+                    self.dynamic_mesh_segments,
+                    self.dynamic_mesh_segments * 6,
+                );
+            } else {
+                println!("demo geometry mode: Dynamic mesh");
+            }
+        } else if demo_uses_particle_field() {
+            self.particle_field = Some(
+                renderer
+                    .create_particle_field(&build_particle_instances(0.0, self.particle_count))
+                    .expect("demo particle instances are valid"),
+            );
+            println!(
+                "demo geometry mode: Instanced particles ({})",
+                self.particle_count
+            );
+        } else if demo_uses_prepared_scene() {
             let logical_size = renderer.logical_size();
             let scene = build_scene(0.0, Vec2::new(logical_size.0, logical_size.1));
             self.prepared_scene = Some(renderer.prepare_scene(&scene));
@@ -161,50 +222,176 @@ impl ApplicationHandler for DemoApplication {
                 };
                 let logical_size = renderer.logical_size();
                 let time_seconds = self.update_camera(frame_started_at);
-                let scene = self
-                    .prepared_scene
-                    .is_none()
-                    .then(|| build_scene(time_seconds, Vec2::new(logical_size.0, logical_size.1)));
+                let scene = (self.prepared_scene.is_none()
+                    && self.dynamic_mesh.is_none()
+                    && self.particle_field.is_none()
+                    && self.scalar_field_texture.is_none())
+                .then(|| build_scene(time_seconds, Vec2::new(logical_size.0, logical_size.1)));
                 let scene_duration = frame_started_at.elapsed();
                 if self.present_mode == RendererPresentMode::Vsync {
                     window.pre_present_notify();
                 }
 
-                let (renderer_metrics, command_count) = match self.renderer.as_mut() {
-                    Some(renderer) => match self.prepared_scene.as_ref() {
-                        Some(prepared_scene) => {
-                            match renderer
-                                .render_prepared_with_metrics(prepared_scene, &self.camera)
+                let (renderer_metrics, command_count, dynamic_mesh_update) = match self
+                    .renderer
+                    .as_mut()
+                {
+                    Some(renderer) => {
+                        if let Some(scalar_field_texture) = self.scalar_field_texture.as_mut() {
+                            let field = build_heatmap_field(time_seconds);
+                            if let Err(error) =
+                                renderer.update_scalar_field_texture(scalar_field_texture, field)
                             {
-                                Ok(report) => (report.metrics(), prepared_scene.command_count()),
-                                Err(error) => {
-                                    eprintln!("demo prepared renderer error: {error:?}");
-                                    return;
-                                }
+                                eprintln!("demo heatmap update error: {error:?}");
+                                return;
                             }
-                        }
-                        None => {
-                            let Some(scene) = scene.as_ref() else {
+                            let Some(color_map) = self.heatmap_color_map.as_ref() else {
                                 return;
                             };
-                            match renderer.render_with_metrics(scene, &self.camera) {
-                                Ok(report) => (report.metrics(), scene.command_count()),
+                            match renderer.render_scalar_field_texture_with_metrics(
+                                scalar_field_texture,
+                                color_map,
+                                (0.0, 1.0),
+                                Palette::sim().background(),
+                            ) {
+                                Ok(report) => (
+                                    report.metrics(),
+                                    scalar_field_texture.field().values().len(),
+                                    Duration::ZERO,
+                                ),
                                 Err(error) => {
-                                    eprintln!("demo renderer error: {error:?}");
+                                    eprintln!("demo heatmap renderer error: {error:?}");
                                     return;
                                 }
                             }
+                        } else if let Some(particle_field) = self.particle_field.as_mut() {
+                            let instances =
+                                build_particle_instances(time_seconds, self.particle_count);
+                            if let Err(error) =
+                                renderer.update_particle_field(particle_field, &instances)
+                            {
+                                eprintln!("demo particle field update error: {error:?}");
+                                return;
+                            }
+                            match renderer.render_particle_field_with_metrics(
+                                particle_field,
+                                Palette::sim().background(),
+                                &self.camera,
+                            ) {
+                                Ok(report) => (
+                                    report.metrics(),
+                                    particle_field.statistics().rendered(),
+                                    Duration::ZERO,
+                                ),
+                                Err(error) => {
+                                    eprintln!("demo particle renderer error: {error:?}");
+                                    return;
+                                }
+                            }
+                        } else {
+                            match self.dynamic_mesh.as_mut() {
+                                Some(dynamic_mesh) => {
+                                    let vertices = build_dynamic_mesh_vertices(
+                                        time_seconds,
+                                        self.dynamic_mesh_segments,
+                                    );
+                                    let update = match renderer
+                                        .update_dynamic_mesh_with_metrics(dynamic_mesh, &vertices)
+                                    {
+                                        Ok(update) => update,
+                                        Err(error) => {
+                                            eprintln!("demo dynamic mesh update error: {error:?}");
+                                            return;
+                                        }
+                                    };
+                                    match renderer.render_dynamic_mesh_with_metrics(
+                                        dynamic_mesh,
+                                        Palette::sim().background(),
+                                        &self.camera,
+                                    ) {
+                                        Ok(report) => (
+                                            report.metrics(),
+                                            dynamic_mesh.vertex_count() / 3,
+                                            update.upload(),
+                                        ),
+                                        Err(error) => {
+                                            eprintln!(
+                                                "demo dynamic mesh renderer error: {error:?}"
+                                            );
+                                            return;
+                                        }
+                                    }
+                                }
+                                None => match self.prepared_scene.as_ref() {
+                                    Some(prepared_scene) => {
+                                        match renderer.render_prepared_with_metrics(
+                                            prepared_scene,
+                                            &self.camera,
+                                        ) {
+                                            Ok(report) => (
+                                                report.metrics(),
+                                                prepared_scene.command_count(),
+                                                Duration::ZERO,
+                                            ),
+                                            Err(error) => {
+                                                eprintln!(
+                                                    "demo prepared renderer error: {error:?}"
+                                                );
+                                                return;
+                                            }
+                                        }
+                                    }
+                                    None => {
+                                        let Some(scene) = scene.as_ref() else {
+                                            return;
+                                        };
+                                        match renderer.render_with_metrics(scene, &self.camera) {
+                                            Ok(report) => (
+                                                report.metrics(),
+                                                scene.command_count(),
+                                                Duration::ZERO,
+                                            ),
+                                            Err(error) => {
+                                                eprintln!("demo renderer error: {error:?}");
+                                                return;
+                                            }
+                                        }
+                                    }
+                                },
+                            }
                         }
-                    },
+                    }
                     None => return,
                 };
 
-                self.frame_metrics.record(
-                    frame_started_at,
-                    scene_duration,
-                    renderer_metrics,
-                    command_count,
-                );
+                let measuring_benchmark = self.benchmark_frames_remaining.is_some();
+                let mut finish_benchmark = false;
+                if measuring_benchmark && self.benchmark_warmup_frames_remaining > 0 {
+                    self.benchmark_warmup_frames_remaining -= 1;
+                    if self.benchmark_warmup_frames_remaining == 0 {
+                        self.frame_metrics = FrameMetrics::new(frame_started_at);
+                        println!("dynamic mesh benchmark: warmup complete");
+                    }
+                } else {
+                    if let Some(remaining) = self.benchmark_frames_remaining.as_mut() {
+                        *remaining -= 1;
+                        finish_benchmark = *remaining == 0;
+                    }
+                    self.frame_metrics.record(
+                        frame_started_at,
+                        scene_duration,
+                        renderer_metrics,
+                        command_count,
+                        dynamic_mesh_update,
+                        finish_benchmark,
+                    );
+                }
+
+                if finish_benchmark {
+                    println!("dynamic mesh benchmark: complete");
+                    event_loop.exit();
+                    return;
+                }
 
                 window.request_redraw();
             }
@@ -234,6 +421,61 @@ fn demo_uses_prepared_scene() -> bool {
     })
 }
 
+fn demo_uses_dynamic_mesh() -> bool {
+    std::env::var("SIM_ENGINE_DYNAMIC_MESH_DEMO").is_ok_and(|value| {
+        value == "1" || value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("yes")
+    })
+}
+
+fn demo_uses_particle_field() -> bool {
+    std::env::var("SIM_ENGINE_PARTICLE_DEMO").is_ok_and(|value| {
+        value == "1" || value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("yes")
+    })
+}
+
+fn demo_uses_heatmap() -> bool {
+    std::env::var("SIM_ENGINE_HEATMAP_DEMO").is_ok_and(|value| {
+        value == "1" || value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("yes")
+    })
+}
+
+#[derive(Clone, Copy)]
+struct DynamicMeshBenchmark {
+    frame_count: Option<usize>,
+    warmup_frames: usize,
+    segments: usize,
+}
+
+fn dynamic_mesh_benchmark() -> DynamicMeshBenchmark {
+    const DEFAULT_SEGMENTS: usize = 160;
+    let frame_count = std::env::var("SIM_ENGINE_DYNAMIC_MESH_BENCHMARK_FRAMES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|count| *count > 0);
+    let warmup_frames = std::env::var("SIM_ENGINE_DYNAMIC_MESH_BENCHMARK_WARMUP_FRAMES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(120);
+    let segments = std::env::var("SIM_ENGINE_DYNAMIC_MESH_SEGMENTS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|count| (1..=1_000_000).contains(count))
+        .unwrap_or(DEFAULT_SEGMENTS);
+    DynamicMeshBenchmark {
+        frame_count,
+        warmup_frames,
+        segments,
+    }
+}
+
+fn particle_demo_count() -> usize {
+    std::env::var("SIM_ENGINE_PARTICLE_COUNT")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|count| (1..=1_000_000).contains(count))
+        .unwrap_or(1_500)
+}
+
 struct FrameMetrics {
     report_started_at: Instant,
     previous_frame_started_at: Instant,
@@ -246,6 +488,7 @@ struct FrameMetrics {
     total_camera_uniform_upload_duration: Duration,
     total_surface_acquire_duration: Duration,
     total_encode_submit_present_duration: Duration,
+    total_dynamic_mesh_update_duration: Duration,
 }
 
 impl FrameMetrics {
@@ -262,6 +505,7 @@ impl FrameMetrics {
             total_camera_uniform_upload_duration: Duration::ZERO,
             total_surface_acquire_duration: Duration::ZERO,
             total_encode_submit_present_duration: Duration::ZERO,
+            total_dynamic_mesh_update_duration: Duration::ZERO,
         }
     }
 
@@ -271,9 +515,13 @@ impl FrameMetrics {
         scene_duration: Duration,
         renderer_metrics: RendererFrameMetrics,
         commands: usize,
+        dynamic_mesh_update: Duration,
+        force_report: bool,
     ) {
         let geometry_mode = if renderer_metrics.geometry_reused() {
             "prepared"
+        } else if renderer_metrics.geometry_streamed() {
+            "dynamic mesh"
         } else {
             "streaming"
         };
@@ -291,9 +539,10 @@ impl FrameMetrics {
         self.total_camera_uniform_upload_duration += renderer_metrics.camera_uniform_upload();
         self.total_surface_acquire_duration += renderer_metrics.surface_acquire();
         self.total_encode_submit_present_duration += renderer_metrics.encode_submit_present();
+        self.total_dynamic_mesh_update_duration += dynamic_mesh_update;
 
         let report_duration = frame_started_at.saturating_duration_since(self.report_started_at);
-        if report_duration < Duration::from_secs(1) {
+        if report_duration < Duration::from_secs(1) && !force_report {
             return;
         }
 
@@ -315,11 +564,13 @@ impl FrameMetrics {
             self.total_surface_acquire_duration.as_secs_f64() * 1000.0 / self.frames as f64;
         let average_encode_submit_present_ms =
             self.total_encode_submit_present_duration.as_secs_f64() * 1000.0 / self.frames as f64;
+        let average_dynamic_mesh_update_ms =
+            self.total_dynamic_mesh_update_duration.as_secs_f64() * 1000.0 / self.frames as f64;
         let average_idle_scheduler_ms =
             (average_frame_ms - average_scene_ms - average_renderer_cpu_ms).max(0.0);
 
         println!(
-            "demo fps: {fps:.1}, avg frame: {average_frame_ms:.2} ms, scene: {average_scene_ms:.2} ms, renderer cpu: {average_renderer_cpu_ms:.2} ms, tessellate: {average_tessellation_ms:.2} ms, geometry upload: {average_upload_ms:.2} ms, camera upload: {average_camera_uniform_upload_ms:.3} ms, acquire/wait: {average_surface_acquire_ms:.2} ms, submit/present cpu: {average_encode_submit_present_ms:.2} ms, idle/scheduler: {average_idle_scheduler_ms:.2} ms, geometry: {geometry_mode}, commands: {commands}"
+            "demo fps: {fps:.1}, avg frame: {average_frame_ms:.2} ms, scene: {average_scene_ms:.2} ms, renderer cpu: {average_renderer_cpu_ms:.2} ms, tessellate: {average_tessellation_ms:.2} ms, geometry upload: {average_upload_ms:.2} ms, dynamic update: {average_dynamic_mesh_update_ms:.2} ms, camera upload: {average_camera_uniform_upload_ms:.3} ms, acquire/wait: {average_surface_acquire_ms:.2} ms, submit/present cpu: {average_encode_submit_present_ms:.2} ms, idle/scheduler: {average_idle_scheduler_ms:.2} ms, geometry: {geometry_mode}, commands: {commands}"
         );
 
         *self = Self::new(frame_started_at);
@@ -328,7 +579,7 @@ impl FrameMetrics {
 
 fn build_scene(time_seconds: f32, surface_size: Vec2) -> Scene {
     let palette = Palette::sim();
-    let mut scene = Scene::new(palette.background);
+    let mut scene = Scene::new(palette.background()).expect("palette is finite");
 
     let plot_margin = 48.0;
     let plot_clip = ScreenClipRect::from_min_size(
@@ -338,14 +589,18 @@ fn build_scene(time_seconds: f32, surface_size: Vec2) -> Scene {
             (surface_size.y - plot_margin * 2.0).max(0.0),
         ),
     );
-    scene.with_screen_clip(plot_clip, |scene| draw_grid(scene, palette));
+    scene
+        .with_screen_clip(plot_clip.expect("plot clip is valid"), |scene| {
+            draw_grid(scene, palette)
+        })
+        .expect("plot clip is valid");
 
     let panel = Rect::from_center_size(Vec2::new(0.0, -92.0), Vec2::new(330.0, 58.0));
     scene.rect(
         panel,
         10.0,
         ShapeStyle::fill_stroke(
-            palette.surface.with_alpha(0.74),
+            palette.surface().with_alpha(0.74),
             1.5,
             Color::rgba8(255, 255, 255, 42),
         )
@@ -363,7 +618,7 @@ fn build_scene(time_seconds: f32, surface_size: Vec2) -> Scene {
             (x * 0.045 + time_seconds * 2.0).sin() * 28.0 + (x * 0.018 - time_seconds).cos() * 12.0;
         wave.push(Vec2::new(x, y));
     }
-    scene.polyline(wave, 3.5, palette.primary.with_alpha(0.92));
+    scene.polyline(wave, 3.5, palette.primary().with_alpha(0.92));
 
     for index in 0..18 {
         let phase = index as f32 * 0.72;
@@ -373,11 +628,11 @@ fn build_scene(time_seconds: f32, surface_size: Vec2) -> Scene {
             (time_seconds * 0.58 + phase * 1.13).sin() * orbit * 0.48 + 24.0,
         );
         let color = if index % 3 == 0 {
-            palette.accent
+            palette.accent()
         } else if index % 3 == 1 {
-            palette.secondary
+            palette.secondary()
         } else {
-            palette.primary
+            palette.primary()
         };
 
         scene.circle(
@@ -398,8 +653,8 @@ fn build_scene(time_seconds: f32, surface_size: Vec2) -> Scene {
             Fill::LinearGradient(LinearGradient::new(
                 Vec2::new(-32.0, -8.0),
                 Vec2::new(34.0, 48.0),
-                palette.warning.with_alpha(0.95),
-                palette.accent.with_alpha(0.88),
+                palette.warning().with_alpha(0.95),
+                palette.accent().with_alpha(0.88),
             )),
             2.0,
             Color::WHITE.with_alpha(0.32),
@@ -407,20 +662,106 @@ fn build_scene(time_seconds: f32, surface_size: Vec2) -> Scene {
         .with_shadow(Shadow::new(
             Vec2::new(0.0, 14.0),
             14.0,
-            palette.warning.with_alpha(0.20),
+            palette.warning().with_alpha(0.20),
         )),
     );
 
     scene
 }
 
+fn build_dynamic_mesh_vertices(time_seconds: f32, segments: usize) -> Vec<DynamicVertex2d> {
+    let palette = Palette::sim();
+    let mut vertices = Vec::with_capacity(segments * 6);
+    for index in 0..segments {
+        let amount_start = index as f32 / segments as f32;
+        let amount_end = (index + 1) as f32 / segments as f32;
+        let x_start = -260.0 + amount_start * 520.0;
+        let x_end = -260.0 + amount_end * 520.0;
+        let y_start = dynamic_wave_height(x_start, time_seconds);
+        let y_end = dynamic_wave_height(x_end, time_seconds);
+        let half_width = 3.0
+            + (amount_start * std::f32::consts::TAU + time_seconds)
+                .sin()
+                .abs()
+                * 2.0;
+        let start_color = palette.primary().with_alpha(0.9);
+        let end_color = palette.accent().with_alpha(0.9);
+        let top_start = Vec2::new(x_start, y_start - half_width);
+        let bottom_start = Vec2::new(x_start, y_start + half_width);
+        let top_end = Vec2::new(x_end, y_end - half_width);
+        let bottom_end = Vec2::new(x_end, y_end + half_width);
+        vertices.extend([
+            DynamicVertex2d::new(top_start, 1.5, start_color).expect("finite dynamic mesh vertex"),
+            DynamicVertex2d::new(bottom_start, 1.5, start_color)
+                .expect("finite dynamic mesh vertex"),
+            DynamicVertex2d::new(top_end, 1.5, end_color).expect("finite dynamic mesh vertex"),
+            DynamicVertex2d::new(top_end, 1.5, end_color).expect("finite dynamic mesh vertex"),
+            DynamicVertex2d::new(bottom_start, 1.5, start_color)
+                .expect("finite dynamic mesh vertex"),
+            DynamicVertex2d::new(bottom_end, 1.5, end_color).expect("finite dynamic mesh vertex"),
+        ]);
+    }
+    vertices
+}
+
+fn build_particle_instances(time_seconds: f32, particle_count: usize) -> Vec<ParticleInstance2d> {
+    let palette = Palette::sim();
+    let mut particles = Vec::with_capacity(particle_count);
+    for index in 0..particle_count {
+        let phase = index as f32 * 0.618_034;
+        let ring = 24.0 + (index % 80) as f32 * 2.7;
+        let angle = phase + time_seconds * (0.35 + (index % 7) as f32 * 0.03);
+        let position = Vec2::new(
+            angle.cos() * ring + (time_seconds * 0.7 + phase).sin() * 18.0,
+            angle.sin() * ring * 0.56 + (time_seconds * 0.45 + phase).cos() * 12.0,
+        );
+        let color = match index % 3 {
+            0 => palette.primary(),
+            1 => palette.secondary(),
+            _ => palette.accent(),
+        }
+        .with_alpha(0.48 + (phase + time_seconds).sin().abs() * 0.36);
+        particles.push(
+            ParticleInstance2d::new(
+                position,
+                1.5 + (index % 5) as f32 * 0.35,
+                color,
+                (index % 9) as f32 * 0.15,
+            )
+            .expect("demo particle is finite"),
+        );
+    }
+    particles
+}
+
+fn build_heatmap_field(time_seconds: f32) -> ScalarField {
+    const WIDTH: usize = 160;
+    const HEIGHT: usize = 96;
+    let mut values = Vec::with_capacity(WIDTH * HEIGHT);
+    for y in 0..HEIGHT {
+        for x in 0..WIDTH {
+            let horizontal = x as f32 / (WIDTH - 1) as f32;
+            let vertical = y as f32 / (HEIGHT - 1) as f32;
+            let wave = ((horizontal * 9.0 + time_seconds * 1.2).sin()
+                + (vertical * 7.0 - time_seconds * 0.8).cos())
+                * 0.25;
+            values.push((horizontal * 0.45 + vertical * 0.35 + wave + 0.25).clamp(0.0, 1.0));
+        }
+    }
+    ScalarField::new(WIDTH, HEIGHT, values).expect("demo heatmap values are finite")
+}
+
+fn dynamic_wave_height(x: f32, time_seconds: f32) -> f32 {
+    (x * 0.045 + time_seconds * 2.0).sin() * 42.0 + (x * 0.018 - time_seconds * 0.8).cos() * 16.0
+}
+
 fn draw_grid(scene: &mut Scene, palette: Palette) {
     for line in -10..=10 {
         let coordinate = line as f32 * 32.0;
         let color = if line == 0 {
-            palette.axis
+            palette.axis()
         } else {
-            palette.grid
+            palette.grid()
         };
         let width = if line == 0 { 2.0 } else { 1.0 };
 

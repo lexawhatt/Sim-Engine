@@ -244,6 +244,7 @@ impl ApplicationHandler for UiDemoApplication {
                             position.x as f32,
                             position.y as f32,
                         ))
+                        .expect("window pointer coordinates must convert")
                         .to_vec2();
                     self.pointer_inside = true;
                 }
@@ -640,7 +641,7 @@ fn build_ui_scene(
     let muted_track = Color::rgba8(255, 255, 255, 42);
     let speed_color = Color::rgb8(255, 105, 97);
     let success_color = Color::rgb8(87, 203, 137);
-    let mut scene = Scene::new(background);
+    let mut scene = Scene::new(background).expect("background is finite");
 
     for (index, pane) in layout.panes.iter().copied().enumerate() {
         scene.rect(

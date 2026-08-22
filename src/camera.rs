@@ -179,13 +179,25 @@ impl Projection2d {
         self.depth_scale
     }
 
-    /// Projects a world-space point with caller-provided pseudo-depth.
-    pub fn project(self, point: Vec2, depth: f32) -> Vec2 {
+    /// Projects a camera-relative world-space point with caller-provided pseudo-depth.
+    ///
+    /// This is the same relative-coordinate operation used by [`Camera2d`].
+    /// It is not an absolute-world transform and must not be applied before
+    /// [`Camera2d::world_to_screen`], which performs it itself.
+    pub fn project_relative(self, point: Vec2, depth: f32) -> Result<Vec2, Projection2dError> {
+        if !point.is_finite() || !depth.is_finite() {
+            return Err(Projection2dError::InvalidInput { point, depth });
+        }
         let lifted = depth * self.depth_scale;
-        Vec2::new(
+        let projected = Vec2::new(
             point.x + lifted * self.tilt.sin() * 0.5,
             point.y * self.tilt.cos() + lifted * self.tilt.sin(),
-        )
+        );
+        if projected.is_finite() {
+            Ok(projected)
+        } else {
+            Err(Projection2dError::Overflow { point, depth })
+        }
     }
 }
 
@@ -199,6 +211,20 @@ pub enum Projection2dError {
         /// Rejected world units per depth unit.
         depth_scale: f32,
     },
+    /// Relative world coordinates or depth are non-finite.
+    InvalidInput {
+        /// Rejected camera-relative world point.
+        point: Vec2,
+        /// Rejected caller-defined depth.
+        depth: f32,
+    },
+    /// Finite inputs overflowed while applying projection.
+    Overflow {
+        /// Camera-relative world point.
+        point: Vec2,
+        /// Caller-defined depth.
+        depth: f32,
+    },
 }
 
 impl fmt::Display for Projection2dError {
@@ -207,6 +233,14 @@ impl fmt::Display for Projection2dError {
             Self::NonFinite { tilt, depth_scale } => write!(
                 formatter,
                 "projection tilt and depth scale must be finite, got tilt {tilt} and scale {depth_scale}"
+            ),
+            Self::InvalidInput { point, depth } => write!(
+                formatter,
+                "projection point and depth must be finite, got {point:?} at depth {depth}"
+            ),
+            Self::Overflow { point, depth } => write!(
+                formatter,
+                "projection overflowed for {point:?} at depth {depth}"
             ),
         }
     }
@@ -256,6 +290,20 @@ pub enum Camera2dError {
         /// Projection tilt in radians.
         tilt: f32,
     },
+    /// World coordinates or depth supplied for forward projection are non-finite.
+    InvalidProjectionInput {
+        /// Rejected world-space point.
+        world: Vec2,
+        /// Rejected caller-defined pseudo-depth.
+        depth: f32,
+    },
+    /// Finite forward-projection inputs overflowed logical screen coordinates.
+    ProjectionOverflow {
+        /// World-space point that could not be represented on screen.
+        world: Vec2,
+        /// Caller-defined pseudo-depth.
+        depth: f32,
+    },
 }
 
 impl fmt::Display for Camera2dError {
@@ -283,6 +331,14 @@ impl fmt::Display for Camera2dError {
                     "projection tilt is singular for screen picking: {tilt}"
                 )
             }
+            Self::InvalidProjectionInput { world, depth } => write!(
+                formatter,
+                "world coordinates and projection depth must be finite, got {world:?} at depth {depth}"
+            ),
+            Self::ProjectionOverflow { world, depth } => write!(
+                formatter,
+                "world-to-screen projection overflowed for {world:?} at depth {depth}"
+            ),
         }
     }
 }
@@ -353,18 +409,24 @@ impl Camera2d {
         Ok(())
     }
 
-    /// Returns the pseudo-depth projection applied before camera transform.
+    /// Returns the pseudo-depth projection applied to camera-relative coordinates.
     pub fn projection(self) -> Projection2d {
         self.projection
     }
 
-    /// Replaces the pseudo-depth projection applied before camera transform.
+    /// Replaces the pseudo-depth projection applied to camera-relative coordinates.
     pub fn set_projection(&mut self, projection: Projection2d) {
         self.projection = projection;
     }
 
     /// Converts a world-space point into logical screen pixel coordinates.
-    pub fn world_to_screen(self, world: Vec2, viewport: LogicalViewport) -> LogicalScreenPosition {
+    ///
+    /// Returns an error if finite values overflow during the transform.
+    pub fn world_to_screen(
+        self,
+        world: Vec2,
+        viewport: LogicalViewport,
+    ) -> Result<LogicalScreenPosition, Camera2dError> {
         self.projected_world_to_screen(world, 0.0, viewport)
     }
 
@@ -374,13 +436,15 @@ impl Camera2d {
         world: Vec2,
         depth: f32,
         viewport: LogicalViewport,
-    ) -> LogicalScreenPosition {
+    ) -> Result<LogicalScreenPosition, Camera2dError> {
+        if !world.is_finite() || !depth.is_finite() {
+            return Err(Camera2dError::InvalidProjectionInput { world, depth });
+        }
         let relative = world - self.center;
-        let lifted = depth * self.projection.depth_scale;
-        let translated = Vec2::new(
-            relative.x + lifted * self.projection.tilt.sin() * 0.5,
-            relative.y * self.projection.tilt.cos() + lifted * self.projection.tilt.sin(),
-        );
+        let translated = self
+            .projection
+            .project_relative(relative, depth)
+            .map_err(|_| Camera2dError::ProjectionOverflow { world, depth })?;
         let cos = self.rotation.cos();
         let sin = self.rotation.sin();
         let rotated = Vec2::new(
@@ -388,10 +452,15 @@ impl Camera2d {
             translated.x * sin + translated.y * cos,
         );
 
-        LogicalScreenPosition::new(
+        let screen = LogicalScreenPosition::new(
             viewport.width() * 0.5 + rotated.x * self.zoom,
             viewport.height() * 0.5 - rotated.y * self.zoom,
-        )
+        );
+        if screen.is_finite() {
+            Ok(screen)
+        } else {
+            Err(Camera2dError::ProjectionOverflow { world, depth })
+        }
     }
 
     /// Converts logical screen pixel coordinates back into world coordinates.
@@ -573,7 +642,7 @@ mod tests {
         let viewport = test_viewport();
         let world = Vec2::new(44.0, 12.0);
 
-        let screen = camera.world_to_screen(world, viewport);
+        let screen = camera.world_to_screen(world, viewport).unwrap();
         let Ok(roundtrip) = camera.screen_to_world(screen, viewport) else {
             panic!("flat projection should be invertible");
         };
@@ -594,7 +663,9 @@ mod tests {
         let world = Vec2::new(44.0, 12.0);
         let depth = 9.0;
 
-        let screen = camera.projected_world_to_screen(world, depth, viewport);
+        let screen = camera
+            .projected_world_to_screen(world, depth, viewport)
+            .unwrap();
         let Ok(roundtrip) = camera.screen_to_world_at_depth(screen, depth, viewport) else {
             panic!("projection should be invertible at this tilt");
         };
@@ -623,7 +694,7 @@ mod tests {
         assert!(camera.set_rotation(0.4).is_ok());
         let viewport = test_viewport();
 
-        let screen = camera.world_to_screen(center, viewport);
+        let screen = camera.world_to_screen(center, viewport).unwrap();
 
         assert_eq!(screen, viewport.center());
     }
@@ -651,10 +722,41 @@ mod tests {
         };
         let viewport = test_viewport();
 
-        let screen = camera.world_to_screen(world, viewport);
+        let screen = camera.world_to_screen(world, viewport).unwrap();
 
         assert!(screen.is_finite());
         assert!(screen.to_vec2().x > viewport.center().to_vec2().x);
+    }
+
+    #[test]
+    fn forward_projection_reports_finite_overflow() {
+        let camera = Camera2d::new(Vec2::ZERO, f32::MAX).unwrap();
+        let viewport = test_viewport();
+
+        assert!(matches!(
+            camera.world_to_screen(Vec2::new(f32::MAX, 0.0), viewport),
+            Err(Camera2dError::ProjectionOverflow { .. })
+        ));
+    }
+
+    #[test]
+    fn relative_projection_matches_camera_centered_pipeline() {
+        let center = Vec2::new(10.0, 100.0);
+        let mut camera = Camera2d::new(center, 2.0).unwrap();
+        let projection = test_projection(0.6, 1.25);
+        camera.set_projection(projection);
+        let viewport = test_viewport();
+
+        assert_eq!(
+            projection.project_relative(Vec2::ZERO, 0.0).unwrap(),
+            Vec2::ZERO
+        );
+        assert_eq!(
+            camera
+                .projected_world_to_screen(center, 0.0, viewport)
+                .unwrap(),
+            viewport.center()
+        );
     }
 
     #[test]

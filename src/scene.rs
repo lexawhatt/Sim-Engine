@@ -22,6 +22,8 @@ pub enum ScenePrimitive {
 /// Reason a command or temporary scene state was rejected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SceneError {
+    /// Clear color contains NaN or infinity.
+    InvalidBackground,
     /// Primitive coordinates contain NaN or infinity.
     NonFiniteGeometry(ScenePrimitive),
     /// Radius, size, corner radius, or stroke width is outside its valid range.
@@ -56,8 +58,7 @@ impl Error for SceneError {}
 /// entities, domain rules, or time stepping.
 #[derive(Debug, Clone)]
 pub struct Scene {
-    /// Clear color used before drawing commands.
-    pub background: Color,
+    background: Color,
     /// Commands stored in draw order.
     commands: Vec<SceneCommand>,
     next_order: u64,
@@ -66,15 +67,32 @@ pub struct Scene {
 }
 
 impl Scene {
-    /// Creates an empty scene with a background color.
-    pub fn new(background: Color) -> Self {
-        Self {
+    /// Creates an empty scene with a finite background color.
+    pub fn new(background: Color) -> Result<Self, SceneError> {
+        if !background.is_finite() {
+            return Err(SceneError::InvalidBackground);
+        }
+        Ok(Self {
             background,
             commands: Vec::new(),
             next_order: 0,
             current_screen_clip: None,
             current_depth: 0.0,
+        })
+    }
+
+    /// Returns the finite clear color used before drawing commands.
+    pub fn background(&self) -> Color {
+        self.background
+    }
+
+    /// Replaces the clear color used before drawing commands.
+    pub fn set_background(&mut self, background: Color) -> Result<(), SceneError> {
+        if !background.is_finite() {
+            return Err(SceneError::InvalidBackground);
         }
+        self.background = background;
+        Ok(())
     }
 
     /// Removes all draw commands and active clipping without changing the background color.
@@ -101,12 +119,19 @@ impl Scene {
     /// of the render surface. Existing commands keep the clip they captured when
     /// they were appended. `None` disables clipping for subsequent commands.
     /// The previous clip is returned so callers can restore explicit drawing
-    /// state without tracking it separately.
+    /// state without tracking it separately. Invalid clips are rejected here,
+    /// before they can affect a later command insertion.
     pub fn set_screen_clip(
         &mut self,
         screen_clip: Option<ScreenClipRect>,
-    ) -> Option<ScreenClipRect> {
-        std::mem::replace(&mut self.current_screen_clip, screen_clip)
+    ) -> Result<Option<ScreenClipRect>, SceneError> {
+        if screen_clip.is_some_and(|clip| !clip.is_valid()) {
+            return Err(SceneError::InvalidScreenClip);
+        }
+        Ok(std::mem::replace(
+            &mut self.current_screen_clip,
+            screen_clip,
+        ))
     }
 
     /// Appends commands from `draw` using a temporary screen-space clip.
@@ -118,16 +143,23 @@ impl Scene {
         &mut self,
         screen_clip: ScreenClipRect,
         draw: impl FnOnce(&mut Self) -> R,
-    ) -> R {
+    ) -> Result<R, SceneError> {
+        if !screen_clip.is_valid() {
+            return Err(SceneError::InvalidScreenClip);
+        }
         let previous = self.current_screen_clip;
-        self.current_screen_clip = Some(match previous {
-            Some(outer) => outer.intersection(screen_clip),
+        let combined = match previous {
+            Some(outer) => outer.intersection(screen_clip)?,
             None => screen_clip,
-        });
+        };
+        if !combined.is_valid() {
+            return Err(SceneError::InvalidScreenClip);
+        }
+        self.current_screen_clip = Some(combined);
         let result = catch_unwind(AssertUnwindSafe(|| draw(self)));
         self.current_screen_clip = previous;
         match result {
-            Ok(result) => result,
+            Ok(result) => Ok(result),
             Err(payload) => resume_unwind(payload),
         }
     }
@@ -220,7 +252,10 @@ impl Scene {
         };
         let position = self.commands.partition_point(|existing| {
             existing.layer < scene_command.layer
-                || (existing.layer == scene_command.layer && existing.order <= scene_command.order)
+                || (existing.layer == scene_command.layer
+                    && (existing.depth < scene_command.depth
+                        || (existing.depth == scene_command.depth
+                            && existing.order <= scene_command.order)))
         });
         self.commands.insert(position, scene_command);
         Ok(())
@@ -467,29 +502,31 @@ impl Layer {
 /// Axis-aligned clipping rectangle in logical screen pixels.
 ///
 /// The coordinate origin is the top-left of the render surface and positive y
-/// points downward. Scenes normalize inverted bounds conceptually and reject
-/// commands captured under empty or non-finite clips. Renderers clamp valid
-/// clips to the target viewport.
+/// points downward. Constructors reject empty and non-finite bounds.
+/// Renderers clamp valid clips to the target viewport.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ScreenClipRect {
     rect: Rect,
 }
 
 impl ScreenClipRect {
-    /// Builds a clip from two corners in logical screen pixels.
-    pub fn new(min: Vec2, max: Vec2) -> Self {
-        Self {
-            rect: Rect::new(min, max),
-        }
+    /// Builds a non-empty clip from two corners in logical screen pixels.
+    pub fn new(min: Vec2, max: Vec2) -> Result<Self, SceneError> {
+        Self::from_rect(Rect::new(min, max))
     }
 
     /// Builds a clip from its top-left corner and size in logical screen pixels.
     ///
-    /// Negative size components are accepted and normalized by renderers.
-    pub fn from_min_size(min: Vec2, size: Vec2) -> Self {
-        Self {
-            rect: Rect::from_min_size(min, size),
-        }
+    /// Negative size components are accepted and normalized before validation.
+    pub fn from_min_size(min: Vec2, size: Vec2) -> Result<Self, SceneError> {
+        Self::from_rect(Rect::from_min_size(min, size))
+    }
+
+    fn from_rect(rect: Rect) -> Result<Self, SceneError> {
+        let clip = Self { rect };
+        clip.is_valid()
+            .then_some(clip)
+            .ok_or(SceneError::InvalidScreenClip)
     }
 
     /// Returns the underlying bounds in logical screen pixels.
@@ -499,17 +536,8 @@ impl ScreenClipRect {
 
     /// Returns the overlap between two screen-space clips.
     ///
-    /// Disjoint inputs produce a zero-area rectangle. Non-finite coordinates
-    /// remain non-finite and are skipped by renderers.
-    pub fn intersection(self, other: Self) -> Self {
-        if !self.rect.min.is_finite()
-            || !self.rect.max.is_finite()
-            || !other.rect.min.is_finite()
-            || !other.rect.max.is_finite()
-        {
-            return Self::new(Vec2::splat(f32::NAN), Vec2::splat(f32::NAN));
-        }
-
+    /// Disjoint inputs return [`SceneError::InvalidScreenClip`].
+    pub fn intersection(self, other: Self) -> Result<Self, SceneError> {
         let first = self.rect.normalized();
         let second = other.rect.normalized();
         let min = Vec2::new(first.min.x.max(second.min.x), first.min.y.max(second.min.y));
@@ -556,7 +584,8 @@ impl SceneCommand {
 
     /// Returns caller-defined pseudo-depth captured by this command.
     ///
-    /// Depth affects projection but not layer or insertion ordering.
+    /// Within one layer, higher depth is drawn later so pseudo-depth motion
+    /// changes both position and overlap. Insertion order breaks equal-depth ties.
     pub fn depth(&self) -> f32 {
         self.depth
     }
@@ -616,7 +645,7 @@ impl DrawCommand {
                 if !line.from.is_finite() || !line.to.is_finite() {
                     return Err(SceneError::NonFiniteGeometry(ScenePrimitive::Line));
                 }
-                if (line.to - line.from).length_squared() <= f32::EPSILON {
+                if !drawable_segment(line.from, line.to) {
                     return Err(SceneError::DegenerateGeometry(ScenePrimitive::Line));
                 }
                 if !line.stroke.is_valid() {
@@ -632,7 +661,7 @@ impl DrawCommand {
                     || !polyline
                         .points
                         .windows(2)
-                        .any(|pair| (pair[1] - pair[0]).length_squared() > f32::EPSILON)
+                        .any(|pair| drawable_segment(pair[0], pair[1]))
                 {
                     return Err(SceneError::DegenerateGeometry(ScenePrimitive::Polyline));
                 }
@@ -645,60 +674,128 @@ impl DrawCommand {
     }
 }
 
+fn drawable_segment(from: Vec2, to: Vec2) -> bool {
+    let delta = to - from;
+    delta.is_finite() && (delta.x != 0.0 || delta.y != 0.0)
+}
+
 /// Circle primitive in world coordinates.
 #[derive(Debug, Clone)]
 pub struct Circle {
-    /// Center in world coordinates.
-    pub center: Vec2,
-    /// Radius in world units.
-    pub radius: f32,
-    /// Fill, stroke, and shadow styling.
-    pub style: ShapeStyle,
+    center: Vec2,
+    radius: f32,
+    style: ShapeStyle,
+}
+
+impl Circle {
+    /// Returns the center in world coordinates.
+    pub const fn center(&self) -> Vec2 {
+        self.center
+    }
+    /// Returns the radius in world units.
+    pub const fn radius(&self) -> f32 {
+        self.radius
+    }
+    /// Returns fill, stroke, and shadow styling.
+    pub const fn style(&self) -> ShapeStyle {
+        self.style
+    }
 }
 
 /// Axis-aligned rectangle primitive in world coordinates.
 #[derive(Debug, Clone)]
 pub struct RectShape {
-    /// Rectangle bounds in world coordinates.
-    pub rect: Rect,
-    /// Corner radius in world units.
-    pub corner_radius: f32,
-    /// Fill, stroke, and shadow styling.
-    pub style: ShapeStyle,
+    rect: Rect,
+    corner_radius: f32,
+    style: ShapeStyle,
+}
+
+impl RectShape {
+    /// Returns rectangle bounds in world coordinates.
+    pub const fn rect(&self) -> Rect {
+        self.rect
+    }
+    /// Returns corner radius in world units.
+    pub const fn corner_radius(&self) -> f32 {
+        self.corner_radius
+    }
+    /// Returns fill, stroke, and shadow styling.
+    pub const fn style(&self) -> ShapeStyle {
+        self.style
+    }
 }
 
 /// Stroked line primitive in world coordinates.
 #[derive(Debug, Clone)]
 pub struct Line {
-    /// Start point in world coordinates.
-    pub from: Vec2,
-    /// End point in world coordinates.
-    pub to: Vec2,
-    /// Stroke style. Width is in logical screen pixels.
-    pub stroke: Stroke,
+    from: Vec2,
+    to: Vec2,
+    stroke: Stroke,
+}
+
+impl Line {
+    /// Returns the start point in world coordinates.
+    pub const fn from(&self) -> Vec2 {
+        self.from
+    }
+    /// Returns the end point in world coordinates.
+    pub const fn to(&self) -> Vec2 {
+        self.to
+    }
+    /// Returns the logical-pixel stroke.
+    pub const fn stroke(&self) -> Stroke {
+        self.stroke
+    }
 }
 
 /// Connected line-strip primitive in world coordinates.
 #[derive(Debug, Clone)]
 pub struct Polyline {
-    /// Points in world coordinates.
-    pub points: Vec<Vec2>,
-    /// Stroke style. Width is in logical screen pixels.
-    pub stroke: Stroke,
+    points: Vec<Vec2>,
+    stroke: Stroke,
+}
+
+impl Polyline {
+    /// Returns connected points in world coordinates.
+    pub fn points(&self) -> &[Vec2] {
+        &self.points
+    }
+    /// Returns the logical-pixel stroke.
+    pub const fn stroke(&self) -> Stroke {
+        self.stroke
+    }
 }
 
 /// Fill, stroke, and shadow styling for solid primitives.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ShapeStyle {
-    /// Fill paint, or `None` for no fill.
-    pub fill: Option<Fill>,
-    /// Stroke style, or `None` for no stroke.
-    pub stroke: Option<Stroke>,
-    /// Shadow style, or `None` for no shadow.
-    pub shadow: Option<Shadow>,
+    fill: Option<Fill>,
+    stroke: Option<Stroke>,
+    shadow: Option<Shadow>,
 }
 
 impl ShapeStyle {
+    /// Builds explicit fill, stroke, and shadow choices.
+    pub const fn new(fill: Option<Fill>, stroke: Option<Stroke>, shadow: Option<Shadow>) -> Self {
+        Self {
+            fill,
+            stroke,
+            shadow,
+        }
+    }
+
+    /// Returns fill paint, if any.
+    pub const fn fill(self) -> Option<Fill> {
+        self.fill
+    }
+    /// Returns outline stroke, if any.
+    pub const fn stroke(self) -> Option<Stroke> {
+        self.stroke
+    }
+    /// Returns shadow styling, if any.
+    pub const fn shadow(self) -> Option<Shadow> {
+        self.shadow
+    }
     /// Creates a style with fill color only.
     pub fn filled(color: Color) -> Self {
         Self::filled_with(Fill::Solid(color))
@@ -813,14 +910,10 @@ impl From<Color> for Fill {
 /// Linear color gradient in world coordinates.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LinearGradient {
-    /// Start point in world coordinates.
-    pub start: Vec2,
-    /// End point in world coordinates.
-    pub end: Vec2,
-    /// Color at `start`.
-    pub start_color: Color,
-    /// Color at `end`.
-    pub end_color: Color,
+    start: Vec2,
+    end: Vec2,
+    start_color: Color,
+    end_color: Color,
 }
 
 impl LinearGradient {
@@ -832,6 +925,23 @@ impl LinearGradient {
             start_color,
             end_color,
         }
+    }
+
+    /// Returns the world-space gradient start.
+    pub const fn start(self) -> Vec2 {
+        self.start
+    }
+    /// Returns the world-space gradient end.
+    pub const fn end(self) -> Vec2 {
+        self.end
+    }
+    /// Returns the color at the start.
+    pub const fn start_color(self) -> Color {
+        self.start_color
+    }
+    /// Returns the color at the end.
+    pub const fn end_color(self) -> Color {
+        self.end_color
     }
 
     /// Samples the gradient at a world-space point.
@@ -935,13 +1045,23 @@ impl RadialGradient {
 /// Stroke color and width for lines and shape outlines.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Stroke {
-    /// Width in logical screen pixels.
-    pub width: f32,
-    /// Stroke color.
-    pub color: Color,
+    width: f32,
+    color: Color,
 }
 
 impl Stroke {
+    /// Builds a logical-pixel stroke.
+    pub const fn new(width: f32, color: Color) -> Self {
+        Self { width, color }
+    }
+    /// Returns width in logical screen pixels.
+    pub const fn width(self) -> f32 {
+        self.width
+    }
+    /// Returns the stroke color.
+    pub const fn color(self) -> Color {
+        self.color
+    }
     fn is_valid(self) -> bool {
         self.width.is_finite() && self.width > 0.0 && self.color.is_finite()
     }
@@ -950,12 +1070,9 @@ impl Stroke {
 /// Simple screen-space shadow used by the first renderer slice.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Shadow {
-    /// Offset in logical screen pixels.
-    pub offset: Vec2,
-    /// Extra spread in logical screen pixels.
-    pub spread: f32,
-    /// Shadow color.
-    pub color: Color,
+    offset: Vec2,
+    spread: f32,
+    color: Color,
 }
 
 impl Shadow {
@@ -966,6 +1083,19 @@ impl Shadow {
             spread,
             color,
         }
+    }
+
+    /// Returns the logical-pixel shadow offset.
+    pub const fn offset(self) -> Vec2 {
+        self.offset
+    }
+    /// Returns extra logical-pixel spread.
+    pub const fn spread(self) -> f32 {
+        self.spread
+    }
+    /// Returns the shadow color.
+    pub const fn color(self) -> Color {
+        self.color
     }
 
     fn is_valid(self) -> bool {
@@ -987,7 +1117,7 @@ mod tests {
 
     #[test]
     fn scene_collects_visual_commands_only() {
-        let mut scene = Scene::new(Color::BLACK);
+        let mut scene = Scene::new(Color::BLACK).unwrap();
         scene.circle(Vec2::ZERO, 10.0, ShapeStyle::filled(Color::WHITE));
 
         assert_eq!(scene.commands.len(), 1);
@@ -995,7 +1125,7 @@ mod tests {
 
     #[test]
     fn scene_keeps_commands_sorted_by_layer() {
-        let mut scene = Scene::new(Color::BLACK);
+        let mut scene = Scene::new(Color::BLACK).unwrap();
         scene.circle_on_layer(
             Layer::FOREGROUND,
             Vec2::ZERO,
@@ -1014,37 +1144,40 @@ mod tests {
 
         let sampled = Fill::LinearGradient(gradient).color_at(Vec2::new(0.5, 4.0));
 
-        assert!((sampled.r - 0.5).abs() < 0.001);
-        assert!((sampled.g - 0.5).abs() < 0.001);
-        assert!((sampled.b - 0.5).abs() < 0.001);
+        assert!((sampled.red() - 0.5).abs() < 0.001);
+        assert!((sampled.green() - 0.5).abs() < 0.001);
+        assert!((sampled.blue() - 0.5).abs() < 0.001);
     }
 
     #[test]
     fn commands_capture_temporary_screen_clip() {
-        let mut scene = Scene::new(Color::BLACK);
-        let outer = ScreenClipRect::from_min_size(Vec2::new(10.0, 20.0), Vec2::new(100.0, 80.0));
-        let inner = ScreenClipRect::from_min_size(Vec2::new(50.0, 0.0), Vec2::new(100.0, 50.0));
+        let mut scene = Scene::new(Color::BLACK).unwrap();
+        let outer =
+            ScreenClipRect::from_min_size(Vec2::new(10.0, 20.0), Vec2::new(100.0, 80.0)).unwrap();
+        let inner =
+            ScreenClipRect::from_min_size(Vec2::new(50.0, 0.0), Vec2::new(100.0, 50.0)).unwrap();
 
-        scene.with_screen_clip(outer, |scene| {
-            scene.with_screen_clip(inner, |scene| {
-                scene.circle(Vec2::ZERO, 10.0, ShapeStyle::filled(Color::WHITE));
-            });
-        });
+        scene
+            .with_screen_clip(outer, |scene| {
+                scene
+                    .with_screen_clip(inner, |scene| {
+                        scene.circle(Vec2::ZERO, 10.0, ShapeStyle::filled(Color::WHITE));
+                    })
+                    .unwrap();
+            })
+            .unwrap();
         scene.circle(Vec2::ZERO, 10.0, ShapeStyle::filled(Color::WHITE));
 
         assert_eq!(
             scene.commands[0].screen_clip,
-            Some(ScreenClipRect::new(
-                Vec2::new(50.0, 20.0),
-                Vec2::new(110.0, 50.0)
-            ))
+            Some(ScreenClipRect::new(Vec2::new(50.0, 20.0), Vec2::new(110.0, 50.0)).unwrap())
         );
         assert_eq!(scene.commands[1].screen_clip, None);
     }
 
     #[test]
     fn scene_rejects_invalid_primitives_before_ordering() {
-        let mut scene = Scene::new(Color::BLACK);
+        let mut scene = Scene::new(Color::BLACK).unwrap();
 
         assert!(!scene.circle(Vec2::ZERO, -1.0, ShapeStyle::filled(Color::WHITE)));
         assert!(!scene.line(Vec2::ZERO, Vec2::X, f32::NAN, Color::WHITE));
@@ -1056,8 +1189,38 @@ mod tests {
     }
 
     #[test]
+    fn background_and_clip_are_validated_when_created() {
+        assert!(matches!(
+            Scene::new(Color::rgba(f32::NAN, 0.0, 0.0, 1.0)),
+            Err(SceneError::InvalidBackground)
+        ));
+        assert_eq!(
+            ScreenClipRect::new(Vec2::ZERO, Vec2::new(0.0, 10.0)),
+            Err(SceneError::InvalidScreenClip)
+        );
+        assert_eq!(
+            ScreenClipRect::new(Vec2::new(f32::NAN, 0.0), Vec2::new(10.0, 10.0)),
+            Err(SceneError::InvalidScreenClip)
+        );
+    }
+
+    #[test]
+    fn higher_depth_is_drawn_later_within_a_layer() {
+        let mut scene = Scene::new(Color::BLACK).unwrap();
+        scene.circle(Vec2::ZERO, 1.0, ShapeStyle::filled(Color::WHITE));
+        scene
+            .with_depth(4.0, |scene| {
+                scene.circle(Vec2::X, 1.0, ShapeStyle::filled(Color::WHITE));
+            })
+            .unwrap();
+
+        assert_eq!(scene.commands()[0].depth(), 0.0);
+        assert_eq!(scene.commands()[1].depth(), 4.0);
+    }
+
+    #[test]
     fn structured_scene_errors_preserve_rejection_reason() {
-        let mut scene = Scene::new(Color::BLACK);
+        let mut scene = Scene::new(Color::BLACK).unwrap();
 
         assert_eq!(
             scene.try_circle(Vec2::ZERO, -1.0, ShapeStyle::filled(Color::WHITE)),
@@ -1084,7 +1247,7 @@ mod tests {
 
     #[test]
     fn commands_capture_depth_and_restore_it_after_unwind() {
-        let mut scene = Scene::new(Color::BLACK);
+        let mut scene = Scene::new(Color::BLACK).unwrap();
         let panic_result = catch_unwind(AssertUnwindSafe(|| {
             let _ = scene.with_depth(4.5, |scene| {
                 scene.circle(Vec2::ZERO, 1.0, ShapeStyle::filled(Color::WHITE));
@@ -1095,8 +1258,8 @@ mod tests {
 
         scene.circle(Vec2::X, 1.0, ShapeStyle::filled(Color::WHITE));
 
-        assert_eq!(scene.commands()[0].depth(), 4.5);
-        assert_eq!(scene.commands()[1].depth(), 0.0);
+        assert_eq!(scene.commands()[0].depth(), 0.0);
+        assert_eq!(scene.commands()[1].depth(), 4.5);
         assert_eq!(
             scene.with_depth(f32::NAN, |_| {}),
             Err(SceneError::NonFiniteDepth)
@@ -1121,11 +1284,11 @@ mod tests {
 
     #[test]
     fn temporary_screen_clip_restores_state_after_unwind() {
-        let mut scene = Scene::new(Color::BLACK);
-        let clip = ScreenClipRect::from_min_size(Vec2::ZERO, Vec2::splat(100.0));
+        let mut scene = Scene::new(Color::BLACK).unwrap();
+        let clip = ScreenClipRect::from_min_size(Vec2::ZERO, Vec2::splat(100.0)).unwrap();
 
         let panic_result = catch_unwind(AssertUnwindSafe(|| {
-            scene.with_screen_clip(clip, |_| panic!("intentional test panic"));
+            let _ = scene.with_screen_clip(clip, |_| panic!("intentional test panic"));
         }));
         assert!(panic_result.is_err());
 
