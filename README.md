@@ -19,6 +19,7 @@ Implemented now:
 - `Easing`
 - `Tween<T>`
 - `Camera2d`
+- world-space pan, cursor-centered logical-pixel zoom, and fit-to-bounds helpers
 - `Projection2d`
 - explicit logical and physical screen-position types
 - `Scene` draw commands
@@ -192,6 +193,10 @@ interpolation in WGSL for `R32Float` fields.
 `compose_render_target`. Composition validates renderer ownership, opacity,
 and background, and explicitly selects `Alpha`, `Additive`, or `Replace`.
 Targets retain GPU pixels only, so redraw them after recreating a renderer.
+`allocation_bytes` exposes format-aware target memory use; `TrailBuffer2d`
+reports the sum for its two textures. `restore_render_target` and
+`restore_trail_buffer` intentionally restore empty, cleared resources, making
+the missing visual redraw step explicit after device recovery.
 
 For bounded temporal history, `TrailBuffer2d` owns two ping-pong targets.
 `accumulate_trail_buffer` takes retained-history and fresh-source opacities in

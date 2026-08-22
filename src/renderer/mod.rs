@@ -1134,6 +1134,7 @@ pub struct RenderTarget2d {
     view: wgpu::TextureView,
     width: u32,
     height: u32,
+    allocation_bytes: usize,
 }
 
 /// A pair of offscreen targets used for bounded temporal accumulation.
@@ -1163,6 +1164,13 @@ impl TrailBuffer2d {
     pub fn size(&self) -> (u32, u32) {
         self.front.size()
     }
+
+    /// Returns total allocated bytes for both ping-pong textures.
+    pub fn allocation_bytes(&self) -> usize {
+        self.front
+            .allocation_bytes()
+            .saturating_add(self.back.allocation_bytes())
+    }
 }
 
 impl RenderTarget2d {
@@ -1180,6 +1188,11 @@ impl RenderTarget2d {
     pub fn size(&self) -> (u32, u32) {
         (self.width, self.height)
     }
+
+    /// Returns the exact single-level GPU texture allocation implied by its format.
+    pub fn allocation_bytes(&self) -> usize {
+        self.allocation_bytes
+    }
 }
 
 /// Failure while creating or composing a [`RenderTarget2d`].
@@ -1187,6 +1200,8 @@ impl RenderTarget2d {
 pub enum RenderTargetError {
     /// Target dimensions must both be non-zero.
     ZeroDimension,
+    /// Dimensions exceed the current device's supported target size or allocation range.
+    DimensionsTooLarge,
     /// The target belongs to another renderer and GPU device.
     RendererMismatch,
     /// Opacity must be finite and within `0.0..=1.0`.
@@ -1203,6 +1218,9 @@ impl fmt::Display for RenderTargetError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ZeroDimension => write!(formatter, "render target dimensions must be non-zero"),
+            Self::DimensionsTooLarge => {
+                write!(formatter, "render target dimensions exceed device limits")
+            }
             Self::RendererMismatch => {
                 write!(formatter, "render target belongs to a different renderer")
             }
@@ -2082,6 +2100,13 @@ impl WgpuRenderer {
         if width == 0 || height == 0 {
             return Err(RenderTargetError::ZeroDimension);
         }
+        if width > self.device.limits().max_texture_dimension_2d
+            || height > self.device.limits().max_texture_dimension_2d
+        {
+            return Err(RenderTargetError::DimensionsTooLarge);
+        }
+        let allocation_bytes = render_target_allocation_bytes(self.config.format, width, height)
+            .ok_or(RenderTargetError::DimensionsTooLarge)?;
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("sim-engine render target"),
             size: wgpu::Extent3d {
@@ -2106,6 +2131,7 @@ impl WgpuRenderer {
             view,
             width,
             height,
+            allocation_bytes,
         })
     }
 
@@ -2124,6 +2150,25 @@ impl WgpuRenderer {
         };
         self.draw_clear_trail_buffer(&trails, Color::rgba(0.0, 0.0, 0.0, 0.0), Instant::now());
         Ok(trails)
+    }
+
+    /// Recreates an empty target with the source dimensions after device recovery.
+    ///
+    /// GPU pixels are deliberately not retained; callers redraw their source
+    /// state into the restored target.
+    pub fn restore_render_target(
+        &self,
+        source: &RenderTarget2d,
+    ) -> Result<RenderTarget2d, RenderTargetError> {
+        self.create_render_target(source.width(), source.height())
+    }
+
+    /// Recreates an empty, deterministically cleared trail buffer after recovery.
+    pub fn restore_trail_buffer(
+        &mut self,
+        source: &TrailBuffer2d,
+    ) -> Result<TrailBuffer2d, RenderTargetError> {
+        self.create_trail_buffer(source.width(), source.height())
     }
 
     /// Retains one bounded frame of history and composites a fresh source target.
@@ -3400,6 +3445,18 @@ impl WgpuRenderer {
 
 fn prepared_scene_belongs_to(renderer_identity: &Arc<()>, scene_identity: &Arc<()>) -> bool {
     Arc::ptr_eq(renderer_identity, scene_identity)
+}
+
+fn render_target_allocation_bytes(
+    format: wgpu::TextureFormat,
+    width: u32,
+    height: u32,
+) -> Option<usize> {
+    let bytes_per_texel = u64::from(format.block_copy_size(None)?);
+    let byte_count = u64::from(width)
+        .checked_mul(u64::from(height))?
+        .checked_mul(bytes_per_texel)?;
+    usize::try_from(byte_count).ok()
 }
 
 fn dynamic_vertices_to_gpu(vertices: &[DynamicVertex2d]) -> Result<Vec<Vertex>, DynamicMeshError> {
@@ -6374,6 +6431,18 @@ mod tests {
             WgpuRendererOptions::new(RendererPresentMode::Vsync, f32::MIN_POSITIVE as f64),
             Err(RendererConfigurationError::InvalidScaleFactor { .. })
         ));
+    }
+
+    #[test]
+    fn render_target_memory_accounting_is_checked_and_format_aware() {
+        assert_eq!(
+            render_target_allocation_bytes(wgpu::TextureFormat::Rgba8UnormSrgb, 3, 5),
+            Some(60)
+        );
+        assert_eq!(
+            render_target_allocation_bytes(wgpu::TextureFormat::Rgba16Float, 3, 5),
+            Some(120)
+        );
     }
 
     #[test]
