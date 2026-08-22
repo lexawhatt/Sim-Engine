@@ -19,3 +19,7 @@ wgpu = { version = "30.0.1", optional = true }
 env_logger = "0.11.11"
 pollster = "1.0.1"
 winit = "0.30.12"
+
+[[example]]
+name = "demo"
+required-features = ["wgpu"]

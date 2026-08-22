@@ -27,7 +27,7 @@ impl Interpolate for Vec2 {
 /// Time-based interpolation from one value to another.
 ///
 /// The tween stores its current value and can be retargeted while active. Time is
-/// supplied by the caller, which lets Sim;X drive rendering from its own loop.
+/// supplied by the caller, which lets each host drive rendering from its own loop.
 #[derive(Debug, Clone)]
 pub struct Tween<T: Interpolate> {
     start: T,

@@ -27,7 +27,11 @@ impl Easing {
     /// Input is clamped to `0.0..=1.0`. Output is usually in that same range,
     /// except for overshooting curves such as [`Easing::EaseOutBack`].
     pub fn sample(self, amount: f32) -> f32 {
-        let t = amount.clamp(0.0, 1.0);
+        let t = if amount.is_finite() {
+            amount.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
         match self {
             Self::Linear => t,
             Self::SmoothStep => t * t * (3.0 - 2.0 * t),
@@ -54,5 +58,6 @@ mod tests {
     fn easing_clamps_input() {
         assert_eq!(Easing::Linear.sample(-1.0), 0.0);
         assert_eq!(Easing::Linear.sample(2.0), 1.0);
+        assert_eq!(Easing::Linear.sample(f32::NAN), 0.0);
     }
 }

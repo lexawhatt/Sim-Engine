@@ -3,7 +3,8 @@ use std::ops::{Add, AddAssign, Div, DivAssign, Mul, MulAssign, Neg, Sub, SubAssi
 /// A 2D vector used for world-space and screen-space coordinates.
 ///
 /// The type is intentionally unitless. Callers should document whether a value
-/// is in simulation world units, screen pixels, or another coordinate space.
+/// is in simulation world units, logical screen pixels, physical surface pixels,
+/// or another coordinate space.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct Vec2 {
     /// Horizontal component.

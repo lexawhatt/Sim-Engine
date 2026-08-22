@@ -1,8 +1,9 @@
 //! Sim;Engine is a rendering layer for simulation products.
 //!
 //! It intentionally does not model physics, biology, chemistry, math domains,
-//! constants, entities, or plugins. Those belong to Sim;X. This crate accepts
-//! already-computed visual state and turns it into a smooth, styled 2D scene.
+//! constants, entities, or plugins. Those belong to the host application's
+//! domain layer. This crate accepts already-computed visual state and turns it
+//! into a smooth, styled 2D scene.
 
 #![warn(missing_docs)]
 
@@ -16,14 +17,21 @@ mod tween;
 #[cfg(feature = "wgpu")]
 mod wgpu_renderer;
 
-pub use camera::{Camera2d, Projection2d, Viewport};
+pub use camera::{
+    Camera2d, Camera2dError, Projection2d, Projection2dError, Viewport, ViewportError,
+};
 pub use color::{Color, Palette};
 pub use easing::Easing;
 pub use math::{Rect, Vec2};
 pub use scene::{
-    Circle, DrawCommand, Line, Polyline, RectShape, Scene, Shadow, ShapeStyle, Stroke,
+    Circle, DrawCommand, Fill, Layer, Line, LinearGradient, Polyline, RadialGradient, RectShape,
+    Scene, SceneCommand, ScreenClipRect, Shadow, ShapeStyle, Stroke,
 };
 pub use tween::{Interpolate, Tween};
 
 #[cfg(feature = "wgpu")]
-pub use wgpu_renderer::{RenderStatus, RendererInitError, RendererSurfaceStatus, WgpuRenderer};
+pub use wgpu_renderer::{
+    PreparedScene, PreparedSceneRenderError, RenderReport, RenderStatus,
+    RendererConfigurationError, RendererFrameError, RendererFrameMetrics, RendererInitError,
+    RendererPresentMode, RendererSurfaceStatus, WgpuRenderer, WgpuRendererOptions,
+};

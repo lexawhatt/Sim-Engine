@@ -34,17 +34,20 @@ impl Color {
         Self { r, g, b, a }
     }
 
-    /// Builds an opaque color from `0..=255` RGB channels.
+    /// Builds an opaque linear color from `0..=255` sRGB channels.
     pub fn rgb8(r: u8, g: u8, b: u8) -> Self {
         Self::rgba8(r, g, b, 255)
     }
 
-    /// Builds a color from `0..=255` RGBA channels.
+    /// Builds a linear color from `0..=255` sRGB and alpha channels.
+    ///
+    /// RGB channels are converted from sRGB to linear light. Alpha is linear
+    /// coverage and is only normalized to `0.0..=1.0`.
     pub fn rgba8(r: u8, g: u8, b: u8, a: u8) -> Self {
         Self::rgba(
-            r as f32 / 255.0,
-            g as f32 / 255.0,
-            b as f32 / 255.0,
+            srgb_channel_to_linear(r as f32 / 255.0),
+            srgb_channel_to_linear(g as f32 / 255.0),
+            srgb_channel_to_linear(b as f32 / 255.0),
             a as f32 / 255.0,
         )
     }
@@ -62,13 +65,20 @@ impl Color {
         }
     }
 
-    /// Clamps every channel to `0.0..=1.0`.
+    /// Returns true when every channel is finite.
+    pub fn is_finite(self) -> bool {
+        self.r.is_finite() && self.g.is_finite() && self.b.is_finite() && self.a.is_finite()
+    }
+
+    /// Sanitizes every channel to `0.0..=1.0`.
+    ///
+    /// NaN channels become `0.0`. Infinite values clamp to the nearest bound.
     pub fn clamp(self) -> Self {
         Self::rgba(
-            self.r.clamp(0.0, 1.0),
-            self.g.clamp(0.0, 1.0),
-            self.b.clamp(0.0, 1.0),
-            self.a.clamp(0.0, 1.0),
+            sanitize_channel(self.r),
+            sanitize_channel(self.g),
+            sanitize_channel(self.b),
+            sanitize_channel(self.a),
         )
     }
 
@@ -88,6 +98,22 @@ impl Color {
             b: color.b as f64,
             a: color.a as f64,
         }
+    }
+}
+
+fn sanitize_channel(channel: f32) -> f32 {
+    if channel.is_nan() {
+        0.0
+    } else {
+        channel.clamp(0.0, 1.0)
+    }
+}
+
+fn srgb_channel_to_linear(channel: f32) -> f32 {
+    if channel <= 0.04045 {
+        channel / 12.92
+    } else {
+        ((channel + 0.055) / 1.055).powf(2.4)
     }
 }
 
@@ -139,5 +165,26 @@ impl Palette {
             accent: Color::rgb8(255, 190, 94),
             warning: Color::rgb8(255, 105, 120),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Color;
+
+    #[test]
+    fn clamp_sanitizes_non_finite_channels() {
+        let color = Color::rgba(f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 1.5).clamp();
+
+        assert_eq!(color, Color::rgba(0.0, 1.0, 0.0, 1.0));
+    }
+
+    #[test]
+    fn rgb8_converts_srgb_to_linear_light() {
+        let middle_gray = Color::rgb8(128, 128, 128);
+
+        assert!((middle_gray.r - 0.21586).abs() < 0.0001);
+        assert_eq!(middle_gray.r, middle_gray.g);
+        assert_eq!(middle_gray.g, middle_gray.b);
     }
 }
