@@ -357,10 +357,16 @@ impl fmt::Display for Camera2dError {
                 "world-to-screen projection overflowed for {world:?} at depth {depth}"
             ),
             Self::InvalidPan { delta } => {
-                write!(formatter, "camera pan delta must be finite and keep the center finite, got {delta:?}")
+                write!(
+                    formatter,
+                    "camera pan delta must be finite and keep the center finite, got {delta:?}"
+                )
             }
             Self::InvalidZoomFactor { factor } => {
-                write!(formatter, "camera zoom factor must be finite and positive, got {factor}")
+                write!(
+                    formatter,
+                    "camera zoom factor must be finite and positive, got {factor}"
+                )
             }
             Self::InvalidFitBounds { bounds, padding } => write!(
                 formatter,
@@ -890,7 +896,11 @@ mod tests {
         ));
         assert_eq!(camera, before);
         assert!(matches!(
-            camera.fit_to_bounds(crate::Rect::from_center_size(Vec2::ZERO, Vec2::new(0.0, 1.0)), 0.0, viewport),
+            camera.fit_to_bounds(
+                crate::Rect::from_center_size(Vec2::ZERO, Vec2::new(0.0, 1.0)),
+                0.0,
+                viewport
+            ),
             Err(Camera2dError::InvalidFitBounds { .. })
         ));
         assert_eq!(camera, before);
