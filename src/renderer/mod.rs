@@ -1209,7 +1209,7 @@ fn create_pipeline(
 ) -> (wgpu::RenderPipeline, wgpu::Buffer, wgpu::BindGroup) {
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("sim-engine flat color shader"),
-        source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("shader.wgsl"))),
+        source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("primitive.wgsl"))),
     });
     let camera_uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("sim-engine camera uniform buffer"),

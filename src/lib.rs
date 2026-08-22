@@ -15,7 +15,7 @@ mod scene;
 mod tween;
 
 #[cfg(feature = "wgpu")]
-mod wgpu_renderer;
+mod renderer;
 
 pub use camera::{
     Camera2d, Camera2dError, LogicalScreenPosition, LogicalViewport, LogicalViewportError,
@@ -31,7 +31,7 @@ pub use scene::{
 pub use tween::{Interpolate, Tween};
 
 #[cfg(feature = "wgpu")]
-pub use wgpu_renderer::{
+pub use renderer::{
     PreparedScene, PreparedSceneRenderError, RenderReport, RenderStatus,
     RendererConfigurationError, RendererFrameError, RendererFrameMetrics, RendererInitError,
     RendererPresentMode, RendererSurfaceStatus, WgpuRenderer, WgpuRendererOptions,

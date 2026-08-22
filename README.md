@@ -180,8 +180,8 @@ To exercise the retained GPU geometry path:
 SIM_ENGINE_PREPARED_SCENE=1 SIM_ENGINE_PRESENT_MODE=no-vsync cargo run --release --example demo
 ```
 
-Detailed implementation contracts, limitations, and adversarial review targets
-are recorded in `RED_TEAM_GPU_CAMERA_AND_PREPARED_SCENE.md`.
+Current implementation status, limitations, and development priorities are
+recorded in `READ_FIRST_SIM_ENGINE_ROADMAP.md`.
 
 ## Verified Commands
 
