@@ -5536,8 +5536,8 @@ mod tests {
                 particle_pipeline,
                 heatmap_pipeline,
                 target_heatmap_pipeline,
-                composition_pipelines,
-                _target_composition_pipelines,
+                _composition_pipelines,
+                target_composition_pipelines,
                 camera_uniform_buffer,
                 camera_bind_group,
                 heatmap_uniform_buffer,
@@ -6000,7 +6000,7 @@ mod tests {
             );
             let composition_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("sim-engine offscreen composition bind group"),
-                layout: &composition_pipelines.bind_group_layout,
+                layout: &target_composition_pipelines.bind_group_layout,
                 entries: &[
                     wgpu::BindGroupEntry {
                         binding: 0,
@@ -6039,7 +6039,7 @@ mod tests {
                     occlusion_query_set: None,
                     multiview_mask: None,
                 });
-                pass.set_pipeline(&composition_pipelines.alpha);
+                pass.set_pipeline(&target_composition_pipelines.alpha);
                 pass.set_bind_group(0, &composition_bind_group, &[]);
                 pass.draw(0..6, 0..1);
             }
@@ -6088,6 +6088,145 @@ mod tests {
                 "render-target composition should preserve source heatmap color"
             );
             drop(composition_bytes);
+            composition_readback.unmap();
+
+            queue.write_buffer(
+                &target_composition_pipelines.secondary_uniform_buffer,
+                0,
+                bytemuck::bytes_of(&CompositeUniform {
+                    opacity: [0.5, 0.0, 0.0, 0.0],
+                }),
+            );
+            queue.write_buffer(
+                &target_composition_pipelines.uniform_buffer,
+                0,
+                bytemuck::bytes_of(&CompositeUniform {
+                    opacity: [0.5, 0.0, 0.0, 0.0],
+                }),
+            );
+            let trail_history_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("sim-engine offscreen trail history bind group"),
+                layout: &target_composition_pipelines.bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&heatmap_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: target_composition_pipelines
+                            .secondary_uniform_buffer
+                            .as_entire_binding(),
+                    },
+                ],
+            });
+            let trail_source_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("sim-engine offscreen trail source bind group"),
+                layout: &target_composition_pipelines.bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&heatmap_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: target_composition_pipelines
+                            .uniform_buffer
+                            .as_entire_binding(),
+                    },
+                ],
+            });
+            let mut trail_encoder =
+                device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("sim-engine offscreen trail encoder"),
+                });
+            {
+                let mut pass = trail_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("sim-engine offscreen trail history pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &composition_target_view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(Color::rgba(0.0, 0.0, 0.0, 0.0).to_wgpu()),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                pass.set_pipeline(&target_composition_pipelines.alpha);
+                pass.set_bind_group(0, &trail_history_bind_group, &[]);
+                pass.draw(0..6, 0..1);
+            }
+            {
+                let mut pass = trail_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("sim-engine offscreen trail source pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &composition_target_view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                pass.set_pipeline(&target_composition_pipelines.alpha);
+                pass.set_bind_group(0, &trail_source_bind_group, &[]);
+                pass.draw(0..6, 0..1);
+            }
+            trail_encoder.copy_texture_to_buffer(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &composition_target,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &composition_readback,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(256),
+                        rows_per_image: Some(2),
+                    },
+                },
+                wgpu::Extent3d {
+                    width: 2,
+                    height: 2,
+                    depth_or_array_layers: 1,
+                },
+            );
+            queue.submit([trail_encoder.finish()]);
+            let trail_slice = composition_readback.slice(..);
+            let (trail_sender, trail_receiver) = mpsc::channel();
+            trail_slice.map_async(wgpu::MapMode::Read, move |result| {
+                trail_sender.send(result).unwrap()
+            });
+            device
+                .poll(wgpu::PollType::Wait {
+                    submission_index: None,
+                    timeout: Some(Duration::from_secs(5)),
+                })
+                .expect("offscreen trail readback should complete");
+            trail_receiver
+                .recv_timeout(Duration::from_secs(5))
+                .expect("offscreen trail callback")
+                .expect("offscreen trail should map");
+            let trail_bytes = trail_slice
+                .get_mapped_range()
+                .expect("offscreen trail bytes");
+            assert!(
+                trail_bytes[4] > 112 && trail_bytes[4] < 128,
+                "half-retained history plus half-opacity source should accumulate predictably"
+            );
+            drop(trail_bytes);
             composition_readback.unmap();
 
             let linear_uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {

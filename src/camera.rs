@@ -1,7 +1,7 @@
 use std::{error::Error, fmt};
 
 use crate::{
-    math::Vec2,
+    math::{Rect, Vec2},
     tween::{Interpolate, Tween},
 };
 
@@ -304,6 +304,23 @@ pub enum Camera2dError {
         /// Caller-defined pseudo-depth.
         depth: f32,
     },
+    /// World-space panning delta was non-finite or overflowed the center.
+    InvalidPan {
+        /// Rejected world-space delta.
+        delta: Vec2,
+    },
+    /// Cursor-centered zoom needs a finite, strictly positive multiplier.
+    InvalidZoomFactor {
+        /// Rejected multiplier.
+        factor: f32,
+    },
+    /// Bounds fitting requires finite, non-empty bounds and usable padding.
+    InvalidFitBounds {
+        /// Rejected world-space bounds.
+        bounds: Rect,
+        /// Rejected logical-pixel padding.
+        padding: f32,
+    },
 }
 
 impl fmt::Display for Camera2dError {
@@ -338,6 +355,16 @@ impl fmt::Display for Camera2dError {
             Self::ProjectionOverflow { world, depth } => write!(
                 formatter,
                 "world-to-screen projection overflowed for {world:?} at depth {depth}"
+            ),
+            Self::InvalidPan { delta } => {
+                write!(formatter, "camera pan delta must be finite and keep the center finite, got {delta:?}")
+            }
+            Self::InvalidZoomFactor { factor } => {
+                write!(formatter, "camera zoom factor must be finite and positive, got {factor}")
+            }
+            Self::InvalidFitBounds { bounds, padding } => write!(
+                formatter,
+                "camera fit bounds must be finite and non-empty with usable padding, got {bounds:?} and padding {padding}"
             ),
         }
     }
@@ -417,6 +444,88 @@ impl Camera2d {
     /// Replaces the pseudo-depth projection applied to camera-relative coordinates.
     pub fn set_projection(&mut self, projection: Projection2d) {
         self.projection = projection;
+    }
+
+    /// Pans the displayed world center by a finite world-space delta.
+    pub fn pan_by(&mut self, delta: Vec2) -> Result<(), Camera2dError> {
+        let center = self.center + delta;
+        if !delta.is_finite() || !center.is_finite() {
+            return Err(Camera2dError::InvalidPan { delta });
+        }
+        self.center = center;
+        Ok(())
+    }
+
+    /// Changes zoom while keeping the depth-zero world point under `anchor` fixed.
+    ///
+    /// `anchor` is measured in logical pixels. The operation is atomic: invalid
+    /// factors, singular projections, or overflows leave this camera unchanged.
+    pub fn zoom_about_screen(
+        &mut self,
+        factor: f32,
+        anchor: LogicalScreenPosition,
+        viewport: LogicalViewport,
+    ) -> Result<(), Camera2dError> {
+        if !factor.is_finite() || factor <= 0.0 {
+            return Err(Camera2dError::InvalidZoomFactor { factor });
+        }
+        let world_before = self.screen_to_world(anchor, viewport)?;
+        let zoom = self.zoom * factor;
+        validate_zoom(zoom)?;
+        let mut candidate = *self;
+        candidate.zoom = zoom;
+        let world_after = candidate.screen_to_world(anchor, viewport)?;
+        let center = candidate.center + (world_before - world_after);
+        validate_center(center)?;
+        candidate.center = center;
+        *self = candidate;
+        Ok(())
+    }
+
+    /// Centers and zooms the camera so finite non-empty world bounds fit a viewport.
+    ///
+    /// `padding` is measured in logical pixels on every edge. The extent
+    /// calculation accounts for this camera's rotation and depth-zero tilt.
+    pub fn fit_to_bounds(
+        &mut self,
+        bounds: Rect,
+        padding: f32,
+        viewport: LogicalViewport,
+    ) -> Result<(), Camera2dError> {
+        let bounds = bounds.normalized();
+        if !bounds.min.is_finite()
+            || !bounds.max.is_finite()
+            || !padding.is_finite()
+            || padding < 0.0
+        {
+            return Err(Camera2dError::InvalidFitBounds { bounds, padding });
+        }
+        let available = viewport.size() - Vec2::splat(padding * 2.0);
+        let size = bounds.size();
+        let projection_y = self.projection.tilt.cos().abs();
+        let cos = self.rotation.cos().abs();
+        let sin = self.rotation.sin().abs();
+        let screen_extent = Vec2::new(
+            cos * size.x + sin * size.y * projection_y,
+            sin * size.x + cos * size.y * projection_y,
+        );
+        if size.x <= 0.0
+            || size.y <= 0.0
+            || available.x <= 0.0
+            || available.y <= 0.0
+            || screen_extent.x <= 0.0
+            || screen_extent.y <= 0.0
+            || !screen_extent.is_finite()
+        {
+            return Err(Camera2dError::InvalidFitBounds { bounds, padding });
+        }
+        let zoom = (available.x / screen_extent.x).min(available.y / screen_extent.y);
+        validate_zoom(zoom)?;
+        let center = bounds.center();
+        validate_center(center)?;
+        self.center = center;
+        self.zoom = zoom;
+        Ok(())
     }
 
     /// Converts a world-space point into logical screen pixel coordinates.
@@ -737,6 +846,54 @@ mod tests {
             camera.world_to_screen(Vec2::new(f32::MAX, 0.0), viewport),
             Err(Camera2dError::ProjectionOverflow { .. })
         ));
+    }
+
+    #[test]
+    fn pan_cursor_zoom_and_fit_preserve_coordinate_contracts() {
+        let viewport = test_viewport();
+        let mut camera = Camera2d::new(Vec2::new(5.0, -3.0), 2.0).unwrap();
+        camera.pan_by(Vec2::new(4.0, 7.0)).unwrap();
+        assert_eq!(camera.center(), Vec2::new(9.0, 4.0));
+
+        let anchor = LogicalScreenPosition::new(192.0, 531.0);
+        let world_before = camera.screen_to_world(anchor, viewport).unwrap();
+        camera.zoom_about_screen(1.75, anchor, viewport).unwrap();
+        let world_after = camera.screen_to_world(anchor, viewport).unwrap();
+        assert!((world_before.x - world_after.x).abs() < 0.0001);
+        assert!((world_before.y - world_after.y).abs() < 0.0001);
+
+        camera.set_rotation(0.35).unwrap();
+        camera.set_projection(test_projection(0.4, 1.0));
+        let bounds = crate::Rect::from_center_size(Vec2::new(30.0, -20.0), Vec2::new(80.0, 40.0));
+        camera.fit_to_bounds(bounds, 24.0, viewport).unwrap();
+        assert_eq!(camera.center(), bounds.center());
+        for corner in [bounds.min, bounds.max] {
+            let screen = camera.world_to_screen(corner, viewport).unwrap().to_vec2();
+            assert!(screen.x >= 24.0 && screen.x <= viewport.width() - 24.0);
+            assert!(screen.y >= 24.0 && screen.y <= viewport.height() - 24.0);
+        }
+    }
+
+    #[test]
+    fn camera_helpers_reject_invalid_inputs_without_mutation() {
+        let viewport = test_viewport();
+        let mut camera = Camera2d::default();
+        let before = camera;
+        assert!(matches!(
+            camera.pan_by(Vec2::new(f32::NAN, 0.0)),
+            Err(Camera2dError::InvalidPan { .. })
+        ));
+        assert_eq!(camera, before);
+        assert!(matches!(
+            camera.zoom_about_screen(0.0, viewport.center(), viewport),
+            Err(Camera2dError::InvalidZoomFactor { .. })
+        ));
+        assert_eq!(camera, before);
+        assert!(matches!(
+            camera.fit_to_bounds(crate::Rect::from_center_size(Vec2::ZERO, Vec2::new(0.0, 1.0)), 0.0, viewport),
+            Err(Camera2dError::InvalidFitBounds { .. })
+        ));
+        assert_eq!(camera, before);
     }
 
     #[test]

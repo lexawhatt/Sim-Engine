@@ -193,6 +193,13 @@ interpolation in WGSL for `R32Float` fields.
 and background, and explicitly selects `Alpha`, `Additive`, or `Replace`.
 Targets retain GPU pixels only, so redraw them after recreating a renderer.
 
+For bounded temporal history, `TrailBuffer2d` owns two ping-pong targets.
+`accumulate_trail_buffer` takes retained-history and fresh-source opacities in
+`0.0..=1.0`, rejects feedback aliases, and swaps only after GPU submission.
+`clear_trail_buffer` clears both targets deterministically. Set both
+`SIM_ENGINE_HEATMAP_DEMO=1` and `SIM_ENGINE_HEATMAP_TRAILS=1` to view the
+animated heatmap through this temporal path.
+
 Set `SIM_ENGINE_VECTOR_FIELD_DEMO=1` to render an animated finite vector grid
 as clipped arrow glyphs. It is a scene-based consumer intended for velocity and
 flow data; heatmap/vector composition will use the dedicated render-target API
