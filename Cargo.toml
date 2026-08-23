@@ -21,6 +21,9 @@ env_logger = "0.11.11"
 pollster = "1.0.1"
 winit = "0.30.12"
 
+[profile.dev]
+opt-level = 1
+
 [[example]]
 name = "demo"
 required-features = ["wgpu"]
@@ -31,4 +34,8 @@ required-features = ["wgpu"]
 
 [[example]]
 name = "particle_cpu_benchmark"
+required-features = ["wgpu"]
+
+[[example]]
+name = "star_remnant_stress"
 required-features = ["wgpu"]

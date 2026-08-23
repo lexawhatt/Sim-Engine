@@ -1,27 +1,36 @@
 use std::{
     error::Error,
     sync::Arc,
-    time::{Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use sim_engine::{
-    Camera2d, Color, PhysicalScreenPosition, Rect, Scene, ShapeStyle, Vec2, WgpuRenderer,
-    WgpuRendererOptions,
+    Camera2d, Color, Fill, LinearGradient, LogicalScreenPosition, LogicalScreenVector,
+    PhysicalScreenPosition, Projection2d, Rect, RendererFrameMetrics, Scene, ScreenClipRect,
+    ShapeStyle, Vec2, WgpuRenderer, WgpuRendererOptions,
 };
 use winit::{
     application::ApplicationHandler,
     dpi::LogicalSize,
     event::{ElementState, MouseButton, WindowEvent},
-    event_loop::{ActiveEventLoop, EventLoop},
+    event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
+    keyboard::{KeyCode, PhysicalKey},
     window::{CursorIcon, Window, WindowId},
 };
 
 const WAVE_COUNT: usize = 4;
+const WAVE_SAMPLE_COUNT: usize = 48;
+const TARGET_DASH_COUNT: usize = 8;
 const MIN_FREQUENCY: f32 = 0.65;
 const MAX_FREQUENCY: f32 = 5.25;
 const MIN_SPEED: f32 = 0.0;
 const MAX_SPEED: f32 = 2.4;
 const SUCCESS_ACCURACY: f32 = 0.93;
+const EDGE_CASE_ZOOM: f32 = 10_000.0;
+// Schedule at 120 Hz and let FIFO presentation provide the final display pacing.
+// A 60 Hz timer accumulates event-loop/compositor latency and otherwise settles
+// around 53-59 FPS even when the renderer itself needs only a few milliseconds.
+const TARGET_FRAME_INTERVAL: Duration = Duration::from_nanos(8_333_333);
 
 const WAVE_COLORS: [Color; WAVE_COUNT] = [
     Color::rgb(0.073, 0.651, 0.752),
@@ -42,6 +51,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InteractionTarget {
+    MenuSimulation(DemoScreen),
     PlaybackButton,
     ResetButton,
     FrequencySlider(usize),
@@ -51,10 +61,122 @@ enum InteractionTarget {
     DismissButton,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DemoScreen {
+    Menu,
+    FluidSimulation,
+    GasSimulation,
+    WaveSimulation,
+    EdgeCaseLab,
+}
+
+impl DemoScreen {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Menu => "Menu",
+            Self::FluidSimulation => "Fluid",
+            Self::GasSimulation => "Gas",
+            Self::WaveSimulation => "Wave",
+            Self::EdgeCaseLab => "Edge",
+        }
+    }
+}
+
+struct ShowcaseFrameMetrics {
+    screen: DemoScreen,
+    started_at: Instant,
+    previous_frame_at: Instant,
+    frames: usize,
+    frame_intervals: Duration,
+    frame_samples: Vec<Duration>,
+    scene_time: Duration,
+    renderer_time: Duration,
+    tessellation_time: Duration,
+    upload_time: Duration,
+    surface_acquire_time: Duration,
+}
+
+impl ShowcaseFrameMetrics {
+    fn new(screen: DemoScreen, now: Instant) -> Self {
+        Self {
+            screen,
+            started_at: now,
+            previous_frame_at: now,
+            frames: 0,
+            frame_intervals: Duration::ZERO,
+            frame_samples: Vec::with_capacity(240),
+            scene_time: Duration::ZERO,
+            renderer_time: Duration::ZERO,
+            tessellation_time: Duration::ZERO,
+            upload_time: Duration::ZERO,
+            surface_acquire_time: Duration::ZERO,
+        }
+    }
+
+    fn record(
+        &mut self,
+        frame_started_at: Instant,
+        scene_time: Duration,
+        renderer: RendererFrameMetrics,
+        command_count: usize,
+    ) -> Option<String> {
+        if self.frames > 0 {
+            let interval = frame_started_at.saturating_duration_since(self.previous_frame_at);
+            self.frame_intervals += interval;
+            self.frame_samples.push(interval);
+        }
+        self.previous_frame_at = frame_started_at;
+        self.frames += 1;
+        self.scene_time += scene_time;
+        self.renderer_time += renderer.total_cpu();
+        self.tessellation_time += renderer.tessellation();
+        self.upload_time += renderer.upload();
+        self.surface_acquire_time += renderer.surface_acquire();
+
+        let elapsed = frame_started_at.saturating_duration_since(self.started_at);
+        if elapsed < Duration::from_secs(1) {
+            return None;
+        }
+
+        let frames = self.frames.max(1) as f64;
+        let interval_count = self.frames.saturating_sub(1).max(1) as f64;
+        let fps = self.frames as f64 / elapsed.as_secs_f64();
+        let frame_ms = self.frame_intervals.as_secs_f64() * 1000.0 / interval_count;
+        self.frame_samples.sort_unstable();
+        let p99_frame_ms = self
+            .frame_samples
+            .get(
+                (self.frame_samples.len() * 99 / 100)
+                    .min(self.frame_samples.len().saturating_sub(1)),
+            )
+            .copied()
+            .unwrap_or_default()
+            .as_secs_f64()
+            * 1000.0;
+        let scene_ms = self.scene_time.as_secs_f64() * 1000.0 / frames;
+        let renderer_ms = self.renderer_time.as_secs_f64() * 1000.0 / frames;
+        let tessellation_ms = self.tessellation_time.as_secs_f64() * 1000.0 / frames;
+        let upload_ms = self.upload_time.as_secs_f64() * 1000.0 / frames;
+        let acquire_ms = self.surface_acquire_time.as_secs_f64() * 1000.0 / frames;
+        let idle_ms = (frame_ms - scene_ms - renderer_ms).max(0.0);
+        let label = self.screen.label();
+        println!(
+            "ui_demo {label}: {fps:.1} fps, frame {frame_ms:.2} ms, p99 frame {p99_frame_ms:.2} ms, scene {scene_ms:.2} ms, renderer {renderer_ms:.2} ms, tessellate {tessellation_ms:.2} ms, upload {upload_ms:.2} ms, acquire/wait {acquire_ms:.2} ms, idle/scheduler {idle_ms:.2} ms, commands {command_count}"
+        );
+        let title = format!(
+            "Sim;Engine {label} | {fps:.1} FPS | scene {scene_ms:.2} ms | tess {tessellation_ms:.2} ms"
+        );
+        *self = Self::new(self.screen, frame_started_at);
+        Some(title)
+    }
+}
+
 struct UiDemoApplication {
     window: Option<Arc<Window>>,
     renderer: Option<WgpuRenderer>,
     camera: Camera2d,
+    screen: DemoScreen,
+    uncapped: bool,
     pointer_logical: Vec2,
     pointer_inside: bool,
     active_drag: Option<InteractionTarget>,
@@ -64,6 +186,8 @@ struct UiDemoApplication {
     animation_time: f32,
     success_dismissed: bool,
     previous_frame: Instant,
+    next_frame_at: Instant,
+    frame_metrics: ShowcaseFrameMetrics,
     random: SimpleRandom,
 }
 
@@ -74,10 +198,15 @@ impl UiDemoApplication {
         if solved_preview_requested() {
             challenge.snap_to_target();
         }
+        let now = Instant::now();
+        let screen = requested_initial_screen().unwrap_or(DemoScreen::Menu);
+        let uncapped = uncapped_requested();
         Self {
             window: None,
             renderer: None,
             camera: Camera2d::new(Vec2::ZERO, 1.0).expect("UI demo camera is valid"),
+            screen,
+            uncapped,
             pointer_logical: Vec2::ZERO,
             pointer_inside: false,
             active_drag: None,
@@ -86,7 +215,9 @@ impl UiDemoApplication {
             playing: true,
             animation_time: 0.0,
             success_dismissed: false,
-            previous_frame: Instant::now(),
+            previous_frame: now,
+            next_frame_at: now,
+            frame_metrics: ShowcaseFrameMetrics::new(screen, now),
             random,
         }
     }
@@ -106,24 +237,33 @@ impl UiDemoApplication {
         if !self.pointer_inside {
             return None;
         }
-        layout.hit_test(
-            self.pointer_logical,
-            &self.challenge.frequency_amounts,
-            self.challenge.speed_amounts[self.selected_speed_wave],
-            self.show_success(),
-        )
+        match self.screen {
+            DemoScreen::Menu => layout.menu_hit_test(self.pointer_logical),
+            DemoScreen::WaveSimulation => layout.hit_test(
+                self.pointer_logical,
+                &self.challenge.frequency_amounts,
+                self.challenge.speed_amounts[self.selected_speed_wave],
+                self.show_success(),
+            ),
+            DemoScreen::FluidSimulation | DemoScreen::GasSimulation | DemoScreen::EdgeCaseLab => {
+                None
+            }
+        }
     }
 
     fn update_drag(&mut self, layout: UiLayout) {
+        if self.screen != DemoScreen::WaveSimulation {
+            return;
+        }
         match self.active_drag {
             Some(InteractionTarget::FrequencySlider(index)) => {
                 self.challenge.frequency_amounts[index] =
-                    layout.frequency_amount_at(index, self.pointer_logical.x);
+                    layout.frequency_amount_at(index, self.pointer_logical.x());
                 self.success_dismissed = false;
             }
             Some(InteractionTarget::SpeedSlider) => {
                 self.challenge.speed_amounts[self.selected_speed_wave] =
-                    layout.speed_amount_at(self.pointer_logical.x);
+                    layout.speed_amount_at(self.pointer_logical.x());
                 self.success_dismissed = false;
             }
             _ => {}
@@ -140,6 +280,62 @@ impl UiDemoApplication {
     fn hard_reset(&mut self) {
         self.playing = false;
         self.animation_time = 0.0;
+    }
+
+    fn show_simulation(&mut self, screen: DemoScreen) {
+        if screen == DemoScreen::Menu {
+            return;
+        }
+        self.screen = screen;
+        self.active_drag = None;
+        let now = Instant::now();
+        self.previous_frame = now;
+        self.next_frame_at = now;
+        self.frame_metrics = ShowcaseFrameMetrics::new(screen, now);
+    }
+
+    fn show_menu(&mut self) {
+        self.screen = DemoScreen::Menu;
+        self.active_drag = None;
+        let now = Instant::now();
+        self.next_frame_at = now;
+        self.frame_metrics = ShowcaseFrameMetrics::new(DemoScreen::Menu, now);
+    }
+
+    fn handle_key(&mut self, key_code: KeyCode) {
+        match (self.screen, key_code) {
+            (DemoScreen::Menu, KeyCode::Digit1 | KeyCode::Enter | KeyCode::Space) => {
+                self.show_simulation(DemoScreen::FluidSimulation);
+            }
+            (DemoScreen::Menu, KeyCode::Digit2) => {
+                self.show_simulation(DemoScreen::GasSimulation);
+            }
+            (DemoScreen::Menu, KeyCode::Digit3) => {
+                self.show_simulation(DemoScreen::WaveSimulation);
+            }
+            (DemoScreen::Menu, KeyCode::Digit4) => {
+                self.show_simulation(DemoScreen::EdgeCaseLab);
+            }
+            (screen, KeyCode::Escape) if screen != DemoScreen::Menu => self.show_menu(),
+            (screen, KeyCode::Space) if screen != DemoScreen::Menu => {
+                self.playing = !self.playing;
+            }
+            (screen, KeyCode::KeyR) if screen != DemoScreen::Menu => self.hard_reset(),
+            _ => {}
+        }
+    }
+
+    fn active_camera(&self) -> Camera2d {
+        if self.screen == DemoScreen::EdgeCaseLab {
+            let mut camera =
+                Camera2d::new(Vec2::ZERO, EDGE_CASE_ZOOM).expect("edge-case camera is valid");
+            camera.set_projection(
+                Projection2d::new(0.42, 0.002).expect("edge-case projection is valid"),
+            );
+            camera
+        } else {
+            self.camera
+        }
     }
 
     fn update_cursor(&self, window: &Window, layout: UiLayout) {
@@ -165,7 +361,7 @@ impl UiDemoApplication {
             .as_secs_f32()
             .min(0.05);
         self.previous_frame = now;
-        if self.playing {
+        if self.screen != DemoScreen::Menu && self.playing {
             self.animation_time += elapsed;
         }
         if !self.challenge.is_solved() {
@@ -181,7 +377,7 @@ impl ApplicationHandler for UiDemoApplication {
         }
 
         let attributes = Window::default_attributes()
-            .with_title("Sim;Engine wave matching demo")
+            .with_title("Sim;Engine simulation showcase")
             .with_inner_size(LogicalSize::new(1100.0, 760.0))
             .with_min_inner_size(LogicalSize::new(800.0, 620.0));
         let window = Arc::new(
@@ -190,11 +386,13 @@ impl ApplicationHandler for UiDemoApplication {
                 .expect("create UI window"),
         );
         let size = window.inner_size();
-        let renderer_options = WgpuRendererOptions::new(
-            sim_engine::RendererPresentMode::Vsync,
-            window.scale_factor(),
-        )
-        .expect("window scale factor is valid");
+        let present_mode = if self.uncapped {
+            sim_engine::RendererPresentMode::NoVsync
+        } else {
+            sim_engine::RendererPresentMode::Vsync
+        };
+        let renderer_options = WgpuRendererOptions::new(present_mode, window.scale_factor())
+            .expect("window scale factor is valid");
         let renderer = pollster::block_on(WgpuRenderer::new_with_options(
             window.clone(),
             size.width.max(1),
@@ -203,9 +401,12 @@ impl ApplicationHandler for UiDemoApplication {
         ))
         .expect("create UI renderer");
 
+        window.request_redraw();
         self.window = Some(window);
         self.renderer = Some(renderer);
-        self.previous_frame = Instant::now();
+        let now = Instant::now();
+        self.previous_frame = now;
+        self.next_frame_at = now;
     }
 
     fn window_event(
@@ -235,6 +436,17 @@ impl ApplicationHandler for UiDemoApplication {
                     renderer
                         .set_scale_factor(scale_factor)
                         .expect("window scale factor is valid");
+                }
+            }
+            WindowEvent::KeyboardInput { event, .. }
+                if event.state == ElementState::Pressed && !event.repeat =>
+            {
+                if let PhysicalKey::Code(key_code) = event.physical_key {
+                    self.handle_key(key_code);
+                    if let Some(layout) = self.layout() {
+                        self.update_cursor(&window, layout);
+                    }
+                    window.request_redraw();
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
@@ -272,6 +484,9 @@ impl ApplicationHandler for UiDemoApplication {
                     ElementState::Pressed => {
                         self.active_drag = self.hovered_target(layout);
                         match self.active_drag {
+                            Some(InteractionTarget::MenuSimulation(screen)) => {
+                                self.show_simulation(screen);
+                            }
                             Some(InteractionTarget::PlaybackButton) => {
                                 self.playing = !self.playing;
                             }
@@ -298,36 +513,82 @@ impl ApplicationHandler for UiDemoApplication {
                 window.request_redraw();
             }
             WindowEvent::RedrawRequested => {
-                self.update_animation(Instant::now());
+                let frame_started_at = Instant::now();
+                self.update_animation(frame_started_at);
                 let Some(layout) = self.layout() else {
                     return;
                 };
                 let hovered = self.hovered_target(layout);
-                let scene = build_ui_scene(
-                    layout,
-                    &self.challenge,
-                    self.animation_time,
-                    self.playing,
-                    self.selected_speed_wave,
-                    hovered,
-                    self.active_drag,
-                    self.show_success(),
-                );
+                let scene = match self.screen {
+                    DemoScreen::Menu => build_menu_scene(layout, hovered),
+                    DemoScreen::FluidSimulation => {
+                        build_fluid_scene(layout, self.animation_time, self.playing)
+                    }
+                    DemoScreen::GasSimulation => {
+                        build_gas_scene(layout, self.animation_time, self.playing)
+                    }
+                    DemoScreen::WaveSimulation => build_ui_scene(
+                        layout,
+                        &self.challenge,
+                        self.animation_time,
+                        self.playing,
+                        self.selected_speed_wave,
+                        hovered,
+                        self.active_drag,
+                        self.show_success(),
+                    ),
+                    DemoScreen::EdgeCaseLab => build_edge_case_scene(layout, self.animation_time),
+                };
+                let scene_time = frame_started_at.elapsed();
+                let command_count = scene.command_count();
+                let camera = self.active_camera();
                 window.pre_present_notify();
-                if let Some(renderer) = self.renderer.as_mut()
-                    && let Err(error) = renderer.render(&scene, &self.camera)
-                {
-                    eprintln!("UI demo renderer error: {error:?}");
+                if let Some(renderer) = self.renderer.as_mut() {
+                    match renderer.render_with_metrics(&scene, &camera) {
+                        Ok(report) => {
+                            if let Some(title) = self.frame_metrics.record(
+                                frame_started_at,
+                                scene_time,
+                                report.metrics(),
+                                command_count,
+                            ) {
+                                window.set_title(&title);
+                            }
+                        }
+                        Err(error) => eprintln!("UI demo renderer error: {error:?}"),
+                    }
                 }
-                window.request_redraw();
+                if self.uncapped {
+                    window.request_redraw();
+                    event_loop.set_control_flow(ControlFlow::Poll);
+                } else {
+                    self.next_frame_at = frame_started_at + TARGET_FRAME_INTERVAL;
+                    event_loop.set_control_flow(ControlFlow::WaitUntil(self.next_frame_at));
+                }
             }
             _ => {}
         }
     }
 
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        if let Some(window) = self.window.as_ref() {
-            window.request_redraw();
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if self.uncapped {
+            if let Some(window) = self.window.as_ref() {
+                window.request_redraw();
+                event_loop.set_control_flow(ControlFlow::Poll);
+            }
+            return;
+        }
+        let now = Instant::now();
+        if now >= self.next_frame_at {
+            self.next_frame_at = now + TARGET_FRAME_INTERVAL;
+            if let Some(window) = self.window.as_ref() {
+                window.request_redraw();
+            }
+        } else {
+            event_loop.set_control_flow(ControlFlow::WaitUntil(self.next_frame_at));
+        }
+        if self.window.is_none() {
+            event_loop.set_control_flow(ControlFlow::Wait);
         }
     }
 }
@@ -471,11 +732,11 @@ struct UiLayout {
 
 impl UiLayout {
     fn new(surface_size: Vec2) -> Self {
-        let margin = (surface_size.x.min(surface_size.y) * 0.045).clamp(24.0, 38.0);
+        let margin = (surface_size.x().min(surface_size.y()) * 0.045).clamp(24.0, 38.0);
         let gap = 16.0;
         let bottom_height = 104.0;
-        let grid_bottom = surface_size.y - bottom_height - margin;
-        let pane_width = (surface_size.x - margin * 2.0 - gap) * 0.5;
+        let grid_bottom = surface_size.y() - bottom_height - margin;
+        let pane_width = (surface_size.x() - margin * 2.0 - gap) * 0.5;
         let pane_height = (grid_bottom - margin - gap) * 0.5;
         let panes = std::array::from_fn(|index| {
             let column = index % 2;
@@ -486,30 +747,33 @@ impl UiLayout {
             );
             let frame = Rect::from_min_size(frame_min, Vec2::new(pane_width, pane_height));
             let plot = Rect::new(
-                frame.min + Vec2::splat(12.0),
-                Vec2::new(frame.max.x - 12.0, frame.max.y - 48.0),
+                frame.min() + Vec2::splat(12.0),
+                Vec2::new(frame.max().x() - 12.0, frame.max().y() - 48.0),
             );
-            let slider_y = frame.max.y - 23.0;
+            let slider_y = frame.max().y() - 23.0;
             PaneLayout {
                 frame,
                 plot,
-                slider_start: Vec2::new(frame.min.x + 18.0, slider_y),
-                slider_end: Vec2::new(frame.max.x - 18.0, slider_y),
+                slider_start: Vec2::new(frame.min().x() + 18.0, slider_y),
+                slider_end: Vec2::new(frame.max().x() - 18.0, slider_y),
             }
         });
-        let controls_y = grid_bottom + (surface_size.y - margin - grid_bottom) * 0.5;
+        let controls_y = grid_bottom + (surface_size.y() - margin - grid_bottom) * 0.5;
         let button_size = 54.0;
         let playback_button = Rect::from_center_size(
             Vec2::new(margin + button_size * 0.5, controls_y),
             Vec2::splat(button_size),
         );
         let reset_button = Rect::from_center_size(
-            Vec2::new(playback_button.max.x + 12.0 + button_size * 0.5, controls_y),
+            Vec2::new(
+                playback_button.max().x() + 12.0 + button_size * 0.5,
+                controls_y,
+            ),
             Vec2::splat(button_size),
         );
         let selector_size = 32.0;
         let selector_gap = 7.0;
-        let selector_start_x = reset_button.max.x + 18.0;
+        let selector_start_x = reset_button.max().x() + 18.0;
         let speed_selector_buttons = std::array::from_fn(|index| {
             Rect::from_min_size(
                 Vec2::new(
@@ -519,15 +783,15 @@ impl UiLayout {
                 Vec2::splat(selector_size),
             )
         });
-        let speed_start = Vec2::new(speed_selector_buttons[3].max.x + 18.0, controls_y);
-        let speed_end = Vec2::new(surface_size.x * 0.57, controls_y);
-        let status_origin = Vec2::new(surface_size.x * 0.61, controls_y - 14.0);
+        let speed_start = Vec2::new(speed_selector_buttons[3].max().x() + 18.0, controls_y);
+        let speed_end = Vec2::new(surface_size.x() * 0.57, controls_y);
+        let status_origin = Vec2::new(surface_size.x() * 0.61, controls_y - 14.0);
         let dismiss_button = Rect::from_center_size(
-            Vec2::new(surface_size.x - margin - 25.0, controls_y),
+            Vec2::new(surface_size.x() - margin - 25.0, controls_y),
             Vec2::splat(50.0),
         );
         let accept_button = Rect::from_center_size(
-            Vec2::new(dismiss_button.min.x - 39.0, controls_y),
+            Vec2::new(dismiss_button.min().x() - 39.0, controls_y),
             Vec2::splat(50.0),
         );
 
@@ -547,11 +811,11 @@ impl UiLayout {
 
     fn frequency_amount_at(self, index: usize, logical_x: f32) -> f32 {
         let pane = self.panes[index];
-        normalized_track_amount(logical_x, pane.slider_start.x, pane.slider_end.x)
+        normalized_track_amount(logical_x, pane.slider_start.x(), pane.slider_end.x())
     }
 
     fn speed_amount_at(self, logical_x: f32) -> f32 {
-        normalized_track_amount(logical_x, self.speed_start.x, self.speed_end.x)
+        normalized_track_amount(logical_x, self.speed_start.x(), self.speed_end.x())
     }
 
     fn frequency_knob(self, index: usize, amount: f32) -> Vec2 {
@@ -563,6 +827,57 @@ impl UiLayout {
     fn speed_knob(self, amount: f32) -> Vec2 {
         self.speed_start
             .lerp(self.speed_end, amount.clamp(0.0, 1.0))
+    }
+
+    fn menu_panel(self) -> Rect {
+        Rect::from_center_size(
+            self.surface_size * 0.5,
+            Vec2::new(
+                (self.surface_size.x() - 64.0).min(720.0),
+                (self.surface_size.y() - 64.0).min(600.0),
+            ),
+        )
+    }
+
+    fn menu_buttons(self) -> [(DemoScreen, Rect); 4] {
+        let panel = self.menu_panel();
+        let gap = 16.0;
+        let button_width = (panel.width() - 96.0 - gap) * 0.5;
+        let button_height = 72.0;
+        let first_center = Vec2::new(
+            panel.center().x() - (button_width + gap) * 0.5,
+            panel.max().y() - 188.0,
+        );
+        let screens = [
+            DemoScreen::FluidSimulation,
+            DemoScreen::GasSimulation,
+            DemoScreen::WaveSimulation,
+            DemoScreen::EdgeCaseLab,
+        ];
+        std::array::from_fn(|index| {
+            let column = index % 2;
+            let row = index / 2;
+            (
+                screens[index],
+                Rect::from_center_size(
+                    first_center
+                        + Vec2::new(
+                            column as f32 * (button_width + gap),
+                            row as f32 * (button_height + gap),
+                        ),
+                    Vec2::new(button_width, button_height),
+                ),
+            )
+        })
+    }
+
+    fn menu_hit_test(self, logical_point: Vec2) -> Option<InteractionTarget> {
+        for (screen, button) in self.menu_buttons() {
+            if rect_contains(button, logical_point) {
+                return Some(InteractionTarget::MenuSimulation(screen));
+            }
+        }
+        None
     }
 
     fn hit_test(
@@ -608,18 +923,462 @@ impl UiLayout {
 
     fn screen_to_world(self, logical: Vec2) -> Vec2 {
         Vec2::new(
-            logical.x - self.surface_size.x * 0.5,
-            self.surface_size.y * 0.5 - logical.y,
+            logical.x() - self.surface_size.x() * 0.5,
+            self.surface_size.y() * 0.5 - logical.y(),
         )
     }
 
     fn screen_rect_to_world(self, logical: Rect) -> Rect {
         Rect::new(
-            self.screen_to_world(logical.max),
-            self.screen_to_world(logical.min),
+            self.screen_to_world(logical.max()),
+            self.screen_to_world(logical.min()),
         )
         .normalized()
     }
+}
+
+fn build_menu_scene(layout: UiLayout, hovered: Option<InteractionTarget>) -> Scene {
+    let background = Color::rgb8(12, 15, 19);
+    let panel_color = Color::rgb8(25, 30, 36);
+    let panel_border = Color::rgba8(255, 255, 255, 38);
+    let muted = Color::rgba8(224, 232, 238, 150);
+    let mut scene = Scene::new(background).expect("menu background is finite");
+    let panel = layout.menu_panel();
+
+    scene.rect(
+        layout.screen_rect_to_world(panel),
+        18.0,
+        ShapeStyle::fill_stroke(panel_color, 1.5, panel_border),
+    );
+
+    draw_centered_pixel_text(
+        &mut scene,
+        layout,
+        "SIM ENGINE",
+        Vec2::new(panel.center().x(), panel.min().y() + 54.0),
+        4.0,
+        muted,
+    );
+    draw_centered_pixel_text(
+        &mut scene,
+        layout,
+        "USE CASE LABS",
+        Vec2::new(panel.center().x(), panel.min().y() + 96.0),
+        7.0,
+        Color::WHITE,
+    );
+
+    let wave_plot = Rect::new(
+        Vec2::new(panel.min().x() + 42.0, panel.min().y() + 148.0),
+        Vec2::new(panel.max().x() - 42.0, panel.max().y() - 246.0),
+    );
+    for (index, color) in WAVE_COLORS.into_iter().enumerate() {
+        let center_y = wave_plot.min().y() + wave_plot.height() * (index as f32 + 0.5) / 4.0;
+        let line_plot = Rect::from_center_size(
+            Vec2::new(wave_plot.center().x(), center_y),
+            Vec2::new(wave_plot.width(), wave_plot.height() * 0.22),
+        );
+        let points = wave_screen_points(
+            line_plot,
+            1.25 + index as f32 * 0.72,
+            0.0,
+            0.38,
+            index as f32 * 0.7,
+        )
+        .into_iter()
+        .map(|point| layout.screen_to_world(point))
+        .collect();
+        scene.polyline(points, 2.5, color.with_alpha(0.88));
+    }
+
+    let labels = [
+        ("FLUID SIMULATION", WAVE_COLORS[0]),
+        ("GAS SIMULATION", WAVE_COLORS[1]),
+        ("WAVE LAB", WAVE_COLORS[2]),
+        ("EDGE CASE LAB", WAVE_COLORS[3]),
+    ];
+    for (index, (screen, button)) in layout.menu_buttons().into_iter().enumerate() {
+        let (label, button_color) = labels[index];
+        let button_hovered = hovered == Some(InteractionTarget::MenuSimulation(screen));
+        scene.rect(
+            layout.screen_rect_to_world(button),
+            12.0,
+            ShapeStyle::fill_stroke(
+                if button_hovered {
+                    button_color
+                } else {
+                    button_color.with_alpha(0.15)
+                },
+                2.0,
+                button_color,
+            ),
+        );
+        draw_pixel_text(
+            &mut scene,
+            layout,
+            &(index + 1).to_string(),
+            button.min() + Vec2::new(12.0, 10.0),
+            2.5,
+            if button_hovered {
+                background
+            } else {
+                button_color
+            },
+        );
+        draw_centered_pixel_text(
+            &mut scene,
+            layout,
+            label,
+            button.center(),
+            2.0,
+            if button_hovered {
+                background
+            } else {
+                button_color
+            },
+        );
+    }
+
+    draw_centered_pixel_text(
+        &mut scene,
+        layout,
+        "1 2 3 4 OR CLICK",
+        Vec2::new(panel.center().x(), panel.max().y() - 12.0),
+        2.0,
+        Color::rgba8(224, 232, 238, 105),
+    );
+
+    scene
+}
+
+fn build_fluid_scene(layout: UiLayout, animation_time: f32, playing: bool) -> Scene {
+    let background = Color::rgb8(8, 18, 26);
+    let water = Color::rgb8(28, 166, 201);
+    let foam = Color::rgb8(154, 238, 244);
+    let mut scene = Scene::new(background).expect("fluid background is finite");
+    draw_lab_header(&mut scene, layout, "FLUID SIMULATION", water, playing);
+
+    let tank = Rect::new(
+        Vec2::new(42.0, 78.0),
+        Vec2::new(
+            layout.surface_size.x() - 42.0,
+            layout.surface_size.y() - 42.0,
+        ),
+    );
+    let tank_world = layout.screen_rect_to_world(tank);
+    scene.rect(
+        tank_world,
+        18.0,
+        ShapeStyle::filled_with(Fill::LinearGradient(LinearGradient::new(
+            Vec2::new(tank_world.min().x(), tank_world.max().y()),
+            Vec2::new(tank_world.max().x(), tank_world.min().y()),
+            Color::rgb8(9, 37, 53),
+            Color::rgb8(7, 24, 38),
+        ))),
+    );
+    scene.rect(
+        tank_world,
+        18.0,
+        ShapeStyle::stroked(2.0, water.with_alpha(0.55)),
+    );
+
+    let obstacle_center = Vec2::new(tank.center().x(), tank.center().y() + 12.0);
+    let obstacle_radius = tank.height().min(tank.width()) * 0.115;
+    scene.circle(
+        layout.screen_to_world(obstacle_center),
+        obstacle_radius,
+        ShapeStyle::fill_stroke(Color::rgb8(18, 45, 58), 2.0, foam.with_alpha(0.7)),
+    );
+
+    for row in 0..5 {
+        let row_amount = (row as f32 + 0.5) / 5.0;
+        let base_y = tank.min().y() + tank.height() * row_amount;
+        let mut points = Vec::with_capacity(36);
+        for sample in 0..36 {
+            let amount = sample as f32 / 35.0;
+            let x = tank.min().x() + tank.width() * amount;
+            let obstacle_dx = (x - obstacle_center.x()) / obstacle_radius;
+            let obstacle_dy = (base_y - obstacle_center.y()) / obstacle_radius;
+            let influence = (1.0 - obstacle_dx.abs()).max(0.0) * (1.0 - obstacle_dy.abs()).max(0.0);
+            let deflection = obstacle_dy.signum() * influence * obstacle_radius * 0.72;
+            let ripple = (amount * 14.0 + row as f32 * 0.61 - animation_time * 1.8).sin()
+                * (3.0 + row_amount * 4.0);
+            points.push(layout.screen_to_world(Vec2::new(x, base_y + deflection + ripple)));
+        }
+        scene.polyline(
+            points,
+            if row % 3 == 0 { 2.4 } else { 1.4 },
+            water.with_alpha(0.32 + row_amount * 0.46),
+        );
+    }
+
+    for index in 0..36 {
+        let seed = index as f32 * 0.618_034;
+        let x_amount = (seed + animation_time * (0.035 + (index % 7) as f32 * 0.004)).fract();
+        let y_amount = (index as f32 * 0.371).fract();
+        let point = Vec2::new(
+            tank.min().x() + 18.0 + x_amount * (tank.width() - 36.0),
+            tank.min().y()
+                + 18.0
+                + y_amount * (tank.height() - 36.0)
+                + (animation_time + seed * 9.0).sin() * 5.0,
+        );
+        let size = 3.6 + (index % 4) as f32 * 1.1;
+        scene.rect(
+            layout.screen_rect_to_world(Rect::from_center_size(point, Vec2::splat(size))),
+            0.0,
+            ShapeStyle::filled(foam.with_alpha(0.35 + (index % 5) as f32 * 0.1)),
+        );
+    }
+
+    scene
+}
+
+fn build_gas_scene(layout: UiLayout, animation_time: f32, playing: bool) -> Scene {
+    let background = Color::rgb8(22, 12, 18);
+    let hot = Color::rgb8(255, 101, 66);
+    let cold = Color::rgb8(86, 195, 255);
+    let mut scene = Scene::new(background).expect("gas background is finite");
+    draw_lab_header(&mut scene, layout, "GAS SIMULATION", hot, playing);
+
+    let chamber = Rect::new(
+        Vec2::new(42.0, 78.0),
+        Vec2::new(
+            layout.surface_size.x() - 42.0,
+            layout.surface_size.y() - 42.0,
+        ),
+    );
+    scene.rect(
+        layout.screen_rect_to_world(chamber),
+        16.0,
+        ShapeStyle::fill_stroke(
+            Color::rgb8(34, 22, 29),
+            2.0,
+            Color::rgba8(255, 180, 150, 95),
+        ),
+    );
+    let clip = ScreenClipRect::from_min_size(
+        LogicalScreenPosition::new(chamber.min().x(), chamber.min().y()),
+        LogicalScreenVector::new(chamber.width(), chamber.height()),
+    )
+    .expect("gas chamber clip is valid");
+    scene
+        .with_screen_clip(clip, |scene| {
+            for index in 0..180 {
+                let seed = index as f32 + 1.0;
+                let speed = 0.18 + (index % 17) as f32 * 0.013;
+                let x_amount = ping_pong(seed * 0.754_877_7 + animation_time * speed);
+                let y_amount = ping_pong(seed * 0.569_840_3 + animation_time * speed * 0.73);
+                let position = Vec2::new(
+                    chamber.min().x() + 8.0 + x_amount * (chamber.width() - 16.0),
+                    chamber.min().y() + 8.0 + y_amount * (chamber.height() - 16.0),
+                );
+                let heat = (index % 29) as f32 / 28.0;
+                let color = Color::rgba(
+                    cold.red() + (hot.red() - cold.red()) * heat,
+                    cold.green() + (hot.green() - cold.green()) * heat,
+                    cold.blue() + (hot.blue() - cold.blue()) * heat,
+                    0.48 + heat * 0.42,
+                );
+                let size = 3.6 + (index % 5) as f32 * 0.9;
+                scene.rect(
+                    layout
+                        .screen_rect_to_world(Rect::from_center_size(position, Vec2::splat(size))),
+                    0.0,
+                    ShapeStyle::filled(color),
+                );
+            }
+        })
+        .expect("gas particles use a valid clip");
+
+    scene
+}
+
+fn build_edge_case_scene(layout: UiLayout, animation_time: f32) -> Scene {
+    let background = Color::rgb8(13, 13, 18);
+    let accent = Color::rgb8(255, 105, 97);
+    let mut scene = Scene::new(background).expect("edge-case background is finite");
+    let panel = Rect::new(
+        Vec2::new(34.0, 34.0),
+        Vec2::new(
+            layout.surface_size.x() - 34.0,
+            layout.surface_size.y() - 34.0,
+        ),
+    );
+    scene.rect(
+        edge_screen_rect_to_world(layout, panel),
+        16.0 / EDGE_CASE_ZOOM,
+        ShapeStyle::fill_stroke(
+            Color::rgb8(24, 25, 32),
+            2.0,
+            Color::rgba8(255, 255, 255, 40),
+        ),
+    );
+    draw_edge_centered_text(
+        &mut scene,
+        layout,
+        "EDGE CASE LAB X10000",
+        Vec2::new(panel.center().x(), panel.min().y() + 34.0),
+        3.0,
+        Color::WHITE,
+    );
+    draw_edge_pixel_text(
+        &mut scene,
+        layout,
+        "ESC MENU   SPACE PAUSE   R RESET",
+        panel.min() + Vec2::new(18.0, 62.0),
+        1.8,
+        Color::rgba8(235, 240, 244, 145),
+    );
+
+    let short_line_center = edge_screen_to_world(
+        layout,
+        Vec2::new(panel.center().x(), panel.min().y() + 126.0),
+    );
+    scene.line(
+        short_line_center - Vec2::new(0.0025, 0.0),
+        short_line_center + Vec2::new(0.0025, 0.0),
+        5.0,
+        Color::rgb8(87, 203, 137),
+    );
+    draw_edge_centered_text(
+        &mut scene,
+        layout,
+        "0.005 WORLD LINE",
+        Vec2::new(panel.center().x(), panel.min().y() + 154.0),
+        2.0,
+        Color::rgb8(87, 203, 137),
+    );
+
+    let gradient_rect = Rect::from_min_size(
+        Vec2::new(panel.min().x() + 48.0, panel.min().y() + 200.0),
+        Vec2::new(panel.width() * 0.42, 104.0),
+    );
+    scene.rect(
+        edge_screen_rect_to_world(layout, gradient_rect),
+        14.0 / EDGE_CASE_ZOOM,
+        ShapeStyle::filled_with(Fill::LinearGradient(LinearGradient::new(
+            Vec2::new(-f32::MAX, 0.0),
+            Vec2::new(f32::MAX, 0.0),
+            cold_edge_color(),
+            hot_edge_color(),
+        ))),
+    );
+    draw_edge_centered_text(
+        &mut scene,
+        layout,
+        "EXTREME FINITE GRADIENT",
+        Vec2::new(gradient_rect.center().x(), gradient_rect.max().y() + 24.0),
+        1.7,
+        Color::rgba8(235, 240, 244, 170),
+    );
+
+    let clip_rect = Rect::from_min_size(
+        Vec2::new(panel.center().x() + 40.0, panel.min().y() + 200.0),
+        Vec2::new(panel.width() * 0.32, 104.0),
+    );
+    let clip = ScreenClipRect::from_min_size(
+        LogicalScreenPosition::new(clip_rect.min().x(), clip_rect.min().y()),
+        LogicalScreenVector::new(clip_rect.width(), clip_rect.height()),
+    )
+    .expect("edge-case clip is valid");
+    scene
+        .with_screen_clip(clip, |scene| {
+            let pulse = 58.0 + animation_time.sin() * 12.0;
+            scene.circle(
+                edge_screen_to_world(layout, clip_rect.min() + Vec2::new(14.0, 52.0)),
+                pulse / EDGE_CASE_ZOOM,
+                ShapeStyle::filled(accent.with_alpha(0.72)),
+            );
+        })
+        .expect("edge-case clipping is valid");
+    scene.rect(
+        edge_screen_rect_to_world(layout, clip_rect),
+        10.0 / EDGE_CASE_ZOOM,
+        ShapeStyle::stroked(2.0, accent),
+    );
+    draw_edge_centered_text(
+        &mut scene,
+        layout,
+        "LOGICAL CLIP",
+        Vec2::new(clip_rect.center().x(), clip_rect.max().y() + 24.0),
+        1.7,
+        accent,
+    );
+
+    let depth_center = edge_screen_to_world(
+        layout,
+        Vec2::new(panel.center().x(), panel.max().y() - 105.0),
+    );
+    scene.circle(
+        depth_center,
+        34.0 / EDGE_CASE_ZOOM,
+        ShapeStyle::filled(Color::rgb8(86, 195, 255).with_alpha(0.8)),
+    );
+    scene
+        .with_depth(5.0, |scene| {
+            scene.circle(
+                depth_center,
+                24.0 / EDGE_CASE_ZOOM,
+                ShapeStyle::filled(Color::rgb8(255, 190, 94).with_alpha(0.9)),
+            );
+        })
+        .expect("edge-case depth is finite");
+    draw_edge_centered_text(
+        &mut scene,
+        layout,
+        "DEPTH PROJECTION",
+        Vec2::new(panel.center().x(), panel.max().y() - 36.0),
+        2.0,
+        Color::rgba8(235, 240, 244, 170),
+    );
+
+    scene
+}
+
+fn draw_lab_header(scene: &mut Scene, layout: UiLayout, title: &str, color: Color, playing: bool) {
+    draw_pixel_text(scene, layout, title, Vec2::new(42.0, 28.0), 3.0, color);
+    draw_pixel_text(
+        scene,
+        layout,
+        if playing {
+            "ESC MENU   SPACE PAUSE   R RESET"
+        } else {
+            "PAUSED   SPACE PLAY   ESC MENU"
+        },
+        Vec2::new(42.0, 52.0),
+        1.7,
+        Color::rgba8(235, 240, 244, 145),
+    );
+}
+
+fn ping_pong(value: f32) -> f32 {
+    let wrapped = value.rem_euclid(2.0);
+    if wrapped <= 1.0 {
+        wrapped
+    } else {
+        2.0 - wrapped
+    }
+}
+
+fn edge_screen_to_world(layout: UiLayout, logical: Vec2) -> Vec2 {
+    layout.screen_to_world(logical) / EDGE_CASE_ZOOM
+}
+
+fn edge_screen_rect_to_world(layout: UiLayout, logical: Rect) -> Rect {
+    Rect::new(
+        edge_screen_to_world(layout, logical.max()),
+        edge_screen_to_world(layout, logical.min()),
+    )
+    .normalized()
+}
+
+fn cold_edge_color() -> Color {
+    Color::rgb8(86, 195, 255)
+}
+
+fn hot_edge_color() -> Color {
+    Color::rgb8(255, 105, 97)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -642,6 +1401,15 @@ fn build_ui_scene(
     let speed_color = Color::rgb8(255, 105, 97);
     let success_color = Color::rgb8(87, 203, 137);
     let mut scene = Scene::new(background).expect("background is finite");
+
+    draw_pixel_text(
+        &mut scene,
+        layout,
+        "ESC MENU",
+        Vec2::new(12.0, 8.0),
+        2.0,
+        Color::rgba8(235, 240, 244, 150),
+    );
 
     for (index, pane) in layout.panes.iter().copied().enumerate() {
         scene.rect(
@@ -776,26 +1544,26 @@ fn draw_wave_pane(
     animation_time: f32,
     target_color: Color,
 ) {
-    let center_y = pane.plot.center().y;
+    let center_y = pane.plot.center().y();
     scene.line(
-        layout.screen_to_world(Vec2::new(pane.plot.min.x, center_y)),
-        layout.screen_to_world(Vec2::new(pane.plot.max.x, center_y)),
+        layout.screen_to_world(Vec2::new(pane.plot.min().x(), center_y)),
+        layout.screen_to_world(Vec2::new(pane.plot.max().x(), center_y)),
         1.0,
         Color::rgba8(255, 255, 255, 34),
     );
     for division in 1..4 {
-        let x = pane.plot.min.x + pane.plot.width() * division as f32 / 4.0;
+        let x = pane.plot.min().x() + pane.plot.width() * division as f32 / 4.0;
         scene.line(
-            layout.screen_to_world(Vec2::new(x, pane.plot.min.y)),
-            layout.screen_to_world(Vec2::new(x, pane.plot.max.y)),
+            layout.screen_to_world(Vec2::new(x, pane.plot.min().y())),
+            layout.screen_to_world(Vec2::new(x, pane.plot.max().y())),
             1.0,
             Color::rgba8(255, 255, 255, 18),
         );
     }
 
-    for dash_index in 0..28 {
-        let start_amount = dash_index as f32 / 28.0;
-        let end_amount = (dash_index as f32 + 0.58) / 28.0;
+    for dash_index in 0..TARGET_DASH_COUNT {
+        let start_amount = dash_index as f32 / TARGET_DASH_COUNT as f32;
+        let end_amount = (dash_index as f32 + 0.58) / TARGET_DASH_COUNT as f32;
         let start = wave_screen_point(
             pane.plot,
             challenge.target_frequencies[index],
@@ -840,9 +1608,9 @@ fn wave_screen_points(
     amplitude_amount: f32,
     animation_time: f32,
 ) -> Vec<Vec2> {
-    let mut points = Vec::with_capacity(180);
-    for sample in 0..180 {
-        let amount = sample as f32 / 179.0;
+    let mut points = Vec::with_capacity(WAVE_SAMPLE_COUNT);
+    for sample in 0..WAVE_SAMPLE_COUNT {
+        let amount = sample as f32 / (WAVE_SAMPLE_COUNT - 1) as f32;
         points.push(wave_screen_point(
             plot,
             frequency,
@@ -866,9 +1634,9 @@ fn wave_screen_point(
     let horizontal_padding = 10.0;
     let wave_width = plot.width() - horizontal_padding * 2.0;
     let amplitude = plot.height() * amplitude_amount;
-    let x = plot.min.x + horizontal_padding + wave_width * amount;
+    let x = plot.min().x() + horizontal_padding + wave_width * amount;
     let envelope = (amount * std::f32::consts::PI).sin().max(0.0).powf(0.18);
-    let y = plot.center().y
+    let y = plot.center().y()
         + (amount * std::f32::consts::TAU * frequency + animation_time * speed).sin()
             * amplitude
             * envelope;
@@ -1047,7 +1815,7 @@ fn draw_pixel_text(
     pixel_size: f32,
     color: Color,
 ) {
-    let mut cursor_x = origin.x;
+    let mut cursor_x = origin.x();
     for character in text.chars() {
         let pattern = glyph_pattern(character);
         for (row, bits) in pattern.into_iter().enumerate() {
@@ -1055,14 +1823,14 @@ fn draw_pixel_text(
                 if bits & (1 << (2 - column)) != 0 {
                     let min = Vec2::new(
                         cursor_x + column as f32 * pixel_size,
-                        origin.y + row as f32 * pixel_size,
+                        origin.y() + row as f32 * pixel_size,
                     );
                     scene.rect(
                         layout.screen_rect_to_world(Rect::from_min_size(
                             min,
                             Vec2::splat(pixel_size - 0.7),
                         )),
-                        0.8,
+                        0.0,
                         ShapeStyle::filled(color),
                     );
                 }
@@ -1070,6 +1838,87 @@ fn draw_pixel_text(
         }
         cursor_x += pixel_size * 4.0;
     }
+}
+
+fn draw_centered_pixel_text(
+    scene: &mut Scene,
+    layout: UiLayout,
+    text: &str,
+    center: Vec2,
+    pixel_size: f32,
+    color: Color,
+) {
+    let glyph_count = text.chars().count();
+    let width_in_pixels = glyph_count
+        .checked_sub(1)
+        .map_or(0, |spacing_count| spacing_count * 4)
+        + 3;
+    let text_size = Vec2::new(width_in_pixels as f32 * pixel_size, 5.0 * pixel_size);
+    draw_pixel_text(
+        scene,
+        layout,
+        text,
+        center - text_size * 0.5,
+        pixel_size,
+        color,
+    );
+}
+
+fn draw_edge_pixel_text(
+    scene: &mut Scene,
+    layout: UiLayout,
+    text: &str,
+    origin: Vec2,
+    pixel_size: f32,
+    color: Color,
+) {
+    let mut cursor_x = origin.x();
+    for character in text.chars() {
+        let pattern = glyph_pattern(character);
+        for (row, bits) in pattern.into_iter().enumerate() {
+            for column in 0..3 {
+                if bits & (1 << (2 - column)) != 0 {
+                    let min = Vec2::new(
+                        cursor_x + column as f32 * pixel_size,
+                        origin.y() + row as f32 * pixel_size,
+                    );
+                    scene.rect(
+                        edge_screen_rect_to_world(
+                            layout,
+                            Rect::from_min_size(min, Vec2::splat(pixel_size - 0.35)),
+                        ),
+                        0.0,
+                        ShapeStyle::filled(color),
+                    );
+                }
+            }
+        }
+        cursor_x += pixel_size * 4.0;
+    }
+}
+
+fn draw_edge_centered_text(
+    scene: &mut Scene,
+    layout: UiLayout,
+    text: &str,
+    center: Vec2,
+    pixel_size: f32,
+    color: Color,
+) {
+    let glyph_count = text.chars().count();
+    let width_in_pixels = glyph_count
+        .checked_sub(1)
+        .map_or(0, |spacing_count| spacing_count * 4)
+        + 3;
+    let text_size = Vec2::new(width_in_pixels as f32 * pixel_size, 5.0 * pixel_size);
+    draw_edge_pixel_text(
+        scene,
+        layout,
+        text,
+        center - text_size * 0.5,
+        pixel_size,
+        color,
+    );
 }
 
 fn glyph_pattern(character: char) -> [u8; 5] {
@@ -1085,8 +1934,31 @@ fn glyph_pattern(character: char) -> [u8; 5] {
         '8' => [0b111, 0b101, 0b111, 0b101, 0b111],
         '9' => [0b111, 0b101, 0b111, 0b001, 0b111],
         'A' => [0b010, 0b101, 0b111, 0b101, 0b101],
+        'B' => [0b110, 0b101, 0b110, 0b101, 0b110],
         'C' => [0b111, 0b100, 0b100, 0b100, 0b111],
+        'D' => [0b110, 0b101, 0b101, 0b101, 0b110],
+        'E' => [0b111, 0b100, 0b110, 0b100, 0b111],
+        'F' => [0b111, 0b100, 0b110, 0b100, 0b100],
+        'G' => [0b111, 0b100, 0b101, 0b101, 0b111],
+        'H' => [0b101, 0b101, 0b111, 0b101, 0b101],
+        'I' => [0b111, 0b010, 0b010, 0b010, 0b111],
+        'J' => [0b001, 0b001, 0b001, 0b101, 0b111],
+        'K' => [0b101, 0b101, 0b110, 0b101, 0b101],
+        'L' => [0b100, 0b100, 0b100, 0b100, 0b111],
+        'M' => [0b101, 0b111, 0b111, 0b101, 0b101],
+        'N' => [0b101, 0b111, 0b111, 0b111, 0b101],
+        'O' => [0b111, 0b101, 0b101, 0b101, 0b111],
+        'P' => [0b110, 0b101, 0b110, 0b100, 0b100],
+        'Q' => [0b111, 0b101, 0b101, 0b111, 0b001],
+        'R' => [0b110, 0b101, 0b110, 0b101, 0b101],
+        'S' => [0b111, 0b100, 0b111, 0b001, 0b111],
+        'T' => [0b111, 0b010, 0b010, 0b010, 0b010],
+        'U' => [0b101, 0b101, 0b101, 0b101, 0b111],
+        'V' => [0b101, 0b101, 0b101, 0b101, 0b010],
+        'W' => [0b101, 0b101, 0b111, 0b111, 0b101],
+        'X' => [0b101, 0b101, 0b010, 0b101, 0b101],
         'Y' => [0b101, 0b101, 0b010, 0b010, 0b010],
+        'Z' => [0b111, 0b001, 0b010, 0b100, 0b111],
         '%' => [0b101, 0b001, 0b010, 0b100, 0b101],
         _ => [0; 5],
     }
@@ -1121,7 +1993,10 @@ fn track_contains(start: Vec2, end: Vec2, point: Vec2) -> bool {
 
 fn rect_contains(rect: Rect, point: Vec2) -> bool {
     let rect = rect.normalized();
-    point.x >= rect.min.x && point.x <= rect.max.x && point.y >= rect.min.y && point.y <= rect.max.y
+    point.x() >= rect.min().x()
+        && point.x() <= rect.max().x()
+        && point.y() >= rect.min().y()
+        && point.y() <= rect.max().y()
 }
 
 fn solved_preview_requested() -> bool {
@@ -1129,6 +2004,20 @@ fn solved_preview_requested() -> bool {
         || std::env::var("SIM_ENGINE_SOLVED_PREVIEW").is_ok_and(|value| {
             value == "1" || value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("yes")
         })
+}
+
+fn requested_initial_screen() -> Option<DemoScreen> {
+    std::env::args().find_map(|argument| match argument.as_str() {
+        "--screen=fluid" => Some(DemoScreen::FluidSimulation),
+        "--screen=gas" => Some(DemoScreen::GasSimulation),
+        "--screen=wave" => Some(DemoScreen::WaveSimulation),
+        "--screen=edge" => Some(DemoScreen::EdgeCaseLab),
+        _ => None,
+    })
+}
+
+fn uncapped_requested() -> bool {
+    std::env::args().any(|argument| argument == "--uncapped" || argument == "--benchmark")
 }
 
 struct SimpleRandom {
@@ -1168,6 +2057,78 @@ mod tests {
         assert_eq!(normalized_track_amount(-20.0, 10.0, 110.0), 0.0);
         assert_eq!(normalized_track_amount(60.0, 10.0, 110.0), 0.5);
         assert_eq!(normalized_track_amount(160.0, 10.0, 110.0), 1.0);
+    }
+
+    #[test]
+    fn menu_buttons_have_distinct_navigation_targets() {
+        let layout = UiLayout::new(Vec2::new(1100.0, 760.0));
+        let expected = [
+            DemoScreen::FluidSimulation,
+            DemoScreen::GasSimulation,
+            DemoScreen::WaveSimulation,
+            DemoScreen::EdgeCaseLab,
+        ];
+
+        for ((screen, button), expected_screen) in layout.menu_buttons().into_iter().zip(expected) {
+            assert_eq!(screen, expected_screen);
+            assert_eq!(
+                layout.menu_hit_test(button.center()),
+                Some(InteractionTarget::MenuSimulation(expected_screen))
+            );
+        }
+        assert!(build_menu_scene(layout, None).command_count() > 20);
+    }
+
+    #[test]
+    fn keyboard_navigation_enters_simulation_and_escape_returns_to_menu() {
+        let mut application = UiDemoApplication::new();
+        assert_eq!(application.screen, DemoScreen::Menu);
+
+        application.handle_key(KeyCode::Escape);
+        assert_eq!(application.screen, DemoScreen::Menu);
+
+        application.handle_key(KeyCode::Enter);
+        assert_eq!(application.screen, DemoScreen::FluidSimulation);
+
+        application.animation_time = 3.5;
+        application.handle_key(KeyCode::Space);
+        assert!(!application.playing);
+        application.handle_key(KeyCode::KeyR);
+        assert_eq!(application.animation_time, 0.0);
+
+        application.handle_key(KeyCode::Escape);
+        assert_eq!(application.screen, DemoScreen::Menu);
+
+        application.handle_key(KeyCode::Digit4);
+        assert_eq!(application.screen, DemoScreen::EdgeCaseLab);
+        application.handle_key(KeyCode::Escape);
+        application.handle_key(KeyCode::Digit3);
+        assert_eq!(application.screen, DemoScreen::WaveSimulation);
+    }
+
+    #[test]
+    fn showcase_scenes_exercise_dense_clip_and_extreme_geometry_paths() {
+        let layout = UiLayout::new(Vec2::new(1100.0, 760.0));
+        let fluid = build_fluid_scene(layout, 1.25, true);
+        let gas = build_gas_scene(layout, 1.25, true);
+        let edge = build_edge_case_scene(layout, 1.25);
+
+        assert!(fluid.command_count() > 80);
+        assert!(gas.command_count() > 180);
+        assert!(
+            gas.commands()
+                .iter()
+                .filter_map(|command| command.screen_clip())
+                .count()
+                >= 180
+        );
+        assert!(edge.commands().iter().any(|command| {
+            if let DrawCommand::Line(line) = command.command() {
+                ((line.to() - line.from()).length() - 0.005).abs() < 0.000_001
+            } else {
+                false
+            }
+        }));
     }
 
     #[test]
@@ -1278,9 +2239,9 @@ mod tests {
             .iter()
             .filter_map(|command| {
                 if let DrawCommand::Polyline(polyline) = command.command()
-                    && polyline.points.len() == 180
+                    && polyline.points().len() == WAVE_SAMPLE_COUNT
                 {
-                    return Some(polyline.points.as_slice());
+                    return Some(polyline.points());
                 }
                 None
             })

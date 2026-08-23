@@ -4,7 +4,7 @@ use std::{
     panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
 };
 
-use crate::{Color, Interpolate, Rect, Vec2};
+use crate::{Color, Interpolate, LogicalScreenPosition, LogicalScreenVector, Rect, Vec2};
 
 /// Primitive category attached to structured scene validation errors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -252,10 +252,7 @@ impl Scene {
         };
         let position = self.commands.partition_point(|existing| {
             existing.layer < scene_command.layer
-                || (existing.layer == scene_command.layer
-                    && (existing.depth < scene_command.depth
-                        || (existing.depth == scene_command.depth
-                            && existing.order <= scene_command.order)))
+                || (existing.layer == scene_command.layer && existing.order <= scene_command.order)
         });
         self.commands.insert(position, scene_command);
         Ok(())
@@ -511,15 +508,18 @@ pub struct ScreenClipRect {
 
 impl ScreenClipRect {
     /// Builds a non-empty clip from two corners in logical screen pixels.
-    pub fn new(min: Vec2, max: Vec2) -> Result<Self, SceneError> {
-        Self::from_rect(Rect::new(min, max))
+    pub fn new(min: LogicalScreenPosition, max: LogicalScreenPosition) -> Result<Self, SceneError> {
+        Self::from_rect(Rect::new(min.to_vec2(), max.to_vec2()))
     }
 
     /// Builds a clip from its top-left corner and size in logical screen pixels.
     ///
     /// Negative size components are accepted and normalized before validation.
-    pub fn from_min_size(min: Vec2, size: Vec2) -> Result<Self, SceneError> {
-        Self::from_rect(Rect::from_min_size(min, size))
+    pub fn from_min_size(
+        min: LogicalScreenPosition,
+        size: LogicalScreenVector,
+    ) -> Result<Self, SceneError> {
+        Self::from_rect(Rect::from_min_size(min.to_vec2(), size.to_vec2()))
     }
 
     fn from_rect(rect: Rect) -> Result<Self, SceneError> {
@@ -529,9 +529,19 @@ impl ScreenClipRect {
             .ok_or(SceneError::InvalidScreenClip)
     }
 
-    /// Returns the underlying bounds in logical screen pixels.
-    pub fn rect(self) -> Rect {
+    #[cfg(feature = "wgpu")]
+    pub(crate) fn rect(self) -> Rect {
         self.rect
+    }
+
+    /// Returns the normalized top-left corner in logical screen pixels.
+    pub fn min(self) -> LogicalScreenPosition {
+        LogicalScreenPosition::from_vec2(self.rect.normalized().min)
+    }
+
+    /// Returns the normalized bottom-right corner in logical screen pixels.
+    pub fn max(self) -> LogicalScreenPosition {
+        LogicalScreenPosition::from_vec2(self.rect.normalized().max)
     }
 
     /// Returns the overlap between two screen-space clips.
@@ -543,7 +553,10 @@ impl ScreenClipRect {
         let min = Vec2::new(first.min.x.max(second.min.x), first.min.y.max(second.min.y));
         let max = Vec2::new(first.max.x.min(second.max.x), first.max.y.min(second.max.y));
 
-        Self::new(min, Vec2::new(max.x.max(min.x), max.y.max(min.y)))
+        Self::new(
+            LogicalScreenPosition::from_vec2(min),
+            LogicalScreenPosition::from_vec2(Vec2::new(max.x.max(min.x), max.y.max(min.y))),
+        )
     }
 
     fn is_valid(self) -> bool {
@@ -584,8 +597,8 @@ impl SceneCommand {
 
     /// Returns caller-defined pseudo-depth captured by this command.
     ///
-    /// Within one layer, higher depth is drawn later so pseudo-depth motion
-    /// changes both position and overlap. Insertion order breaks equal-depth ties.
+    /// Depth affects camera projection only. Commands on one layer retain their
+    /// insertion order regardless of depth.
     pub fn depth(&self) -> f32 {
         self.depth
     }
@@ -625,6 +638,11 @@ impl DrawCommand {
                 if !circle.radius.is_finite() || circle.radius <= 0.0 {
                     return Err(SceneError::InvalidDimension(ScenePrimitive::Circle));
                 }
+                if !(circle.center + Vec2::splat(circle.radius)).is_finite()
+                    || !(circle.center - Vec2::splat(circle.radius)).is_finite()
+                {
+                    return Err(SceneError::NonFiniteGeometry(ScenePrimitive::Circle));
+                }
                 circle.style.validate(ScenePrimitive::Circle)
             }
             Self::Rect(rectangle) => {
@@ -632,8 +650,13 @@ impl DrawCommand {
                 if !rect.min.is_finite() || !rect.max.is_finite() {
                     return Err(SceneError::NonFiniteGeometry(ScenePrimitive::Rect));
                 }
-                if rect.width() <= 0.0
-                    || rect.height() <= 0.0
+                let width = rect.width();
+                let height = rect.height();
+                if !width.is_finite() || !height.is_finite() {
+                    return Err(SceneError::NonFiniteGeometry(ScenePrimitive::Rect));
+                }
+                if width <= 0.0
+                    || height <= 0.0
                     || !rectangle.corner_radius.is_finite()
                     || rectangle.corner_radius < 0.0
                 {
@@ -643,6 +666,9 @@ impl DrawCommand {
             }
             Self::Line(line) => {
                 if !line.from.is_finite() || !line.to.is_finite() {
+                    return Err(SceneError::NonFiniteGeometry(ScenePrimitive::Line));
+                }
+                if !(line.to - line.from).is_finite() {
                     return Err(SceneError::NonFiniteGeometry(ScenePrimitive::Line));
                 }
                 if !drawable_segment(line.from, line.to) {
@@ -655,6 +681,13 @@ impl DrawCommand {
             }
             Self::Polyline(polyline) => {
                 if !polyline.points.iter().all(|point| point.is_finite()) {
+                    return Err(SceneError::NonFiniteGeometry(ScenePrimitive::Polyline));
+                }
+                if polyline
+                    .points
+                    .windows(2)
+                    .any(|pair| !(pair[1] - pair[0]).is_finite())
+                {
                     return Err(SceneError::NonFiniteGeometry(ScenePrimitive::Polyline));
                 }
                 if polyline.points.len() < 2
@@ -950,15 +983,14 @@ impl LinearGradient {
             return self.end_color.clamp();
         }
 
-        let axis = self.end - self.start;
-        let length_squared = axis.length_squared();
-        if length_squared <= f32::EPSILON {
-            return self.end_color;
-        }
-
-        let amount = (world - self.start).dot(axis) / length_squared;
-        self.start_color
-            .interpolate(self.end_color, amount.clamp(0.0, 1.0))
+        let axis_x = f64::from(self.end.x) - f64::from(self.start.x);
+        let axis_y = f64::from(self.end.y) - f64::from(self.start.y);
+        let relative_x = f64::from(world.x) - f64::from(self.start.x);
+        let relative_y = f64::from(world.y) - f64::from(self.start.y);
+        let axis_length_squared = axis_x * axis_x + axis_y * axis_y;
+        let amount = ((relative_x * axis_x + relative_y * axis_y) / axis_length_squared)
+            .clamp(0.0, 1.0) as f32;
+        self.start_color.interpolate(self.end_color, amount)
     }
 
     fn is_valid(self) -> bool {
@@ -966,6 +998,7 @@ impl LinearGradient {
             && self.end.is_finite()
             && self.start_color.is_finite()
             && self.end_color.is_finite()
+            && self.start != self.end
     }
 }
 
@@ -973,15 +1006,15 @@ impl LinearGradient {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RadialGradient {
     /// Center point in world coordinates.
-    pub center: Vec2,
+    center: Vec2,
     /// Radius where `inner_color` is reached, in world units.
-    pub inner_radius: f32,
+    inner_radius: f32,
     /// Radius where `outer_color` is reached, in world units.
-    pub outer_radius: f32,
+    outer_radius: f32,
     /// Color at or inside `inner_radius`.
-    pub inner_color: Color,
+    inner_color: Color,
     /// Color at or outside `outer_radius`.
-    pub outer_color: Color,
+    outer_color: Color,
 }
 
 impl RadialGradient {
@@ -1015,6 +1048,31 @@ impl RadialGradient {
         }
     }
 
+    /// Returns the world-space gradient center.
+    pub const fn center(self) -> Vec2 {
+        self.center
+    }
+
+    /// Returns the inner radius in world units.
+    pub const fn inner_radius(self) -> f32 {
+        self.inner_radius
+    }
+
+    /// Returns the outer radius in world units.
+    pub const fn outer_radius(self) -> f32 {
+        self.outer_radius
+    }
+
+    /// Returns the inner linear color.
+    pub const fn inner_color(self) -> Color {
+        self.inner_color
+    }
+
+    /// Returns the outer linear color.
+    pub const fn outer_color(self) -> Color {
+        self.outer_color
+    }
+
     /// Samples the gradient at a world-space point.
     pub fn color_at(self, world: Vec2) -> Color {
         if !self.is_valid() || !world.is_finite() {
@@ -1026,9 +1084,12 @@ impl RadialGradient {
             return self.outer_color;
         }
 
-        let amount = ((world - self.center).length() - self.inner_radius) / radius_range;
-        self.inner_color
-            .interpolate(self.outer_color, amount.clamp(0.0, 1.0))
+        let horizontal = f64::from(world.x) - f64::from(self.center.x);
+        let vertical = f64::from(world.y) - f64::from(self.center.y);
+        let distance = horizontal.hypot(vertical);
+        let amount = ((distance - f64::from(self.inner_radius)) / f64::from(radius_range))
+            .clamp(0.0, 1.0) as f32;
+        self.inner_color.interpolate(self.outer_color, amount)
     }
 
     fn is_valid(self) -> bool {
@@ -1070,14 +1131,14 @@ impl Stroke {
 /// Simple screen-space shadow used by the first renderer slice.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Shadow {
-    offset: Vec2,
+    offset: LogicalScreenVector,
     spread: f32,
     color: Color,
 }
 
 impl Shadow {
     /// Builds a shadow from logical screen-space offset, spread, and color.
-    pub fn new(offset: Vec2, spread: f32, color: Color) -> Self {
+    pub fn new(offset: LogicalScreenVector, spread: f32, color: Color) -> Self {
         Self {
             offset,
             spread,
@@ -1086,7 +1147,7 @@ impl Shadow {
     }
 
     /// Returns the logical-pixel shadow offset.
-    pub const fn offset(self) -> Vec2 {
+    pub const fn offset(self) -> LogicalScreenVector {
         self.offset
     }
     /// Returns extra logical-pixel spread.
@@ -1102,6 +1163,7 @@ impl Shadow {
         self.offset.is_finite()
             && self.spread.is_finite()
             && self.spread >= 0.0
+            && (self.spread * 2.0).is_finite()
             && self.color.is_finite()
     }
 }
@@ -1111,8 +1173,9 @@ mod tests {
     use std::panic::{AssertUnwindSafe, catch_unwind};
 
     use crate::{
-        Color, DrawCommand, Fill, Layer, LinearGradient, RadialGradient, Scene, SceneError,
-        ScenePrimitive, ScreenClipRect, ShapeStyle, Vec2,
+        Color, DrawCommand, Fill, Layer, LinearGradient, LogicalScreenPosition,
+        LogicalScreenVector, RadialGradient, Rect, Scene, SceneError, ScenePrimitive,
+        ScreenClipRect, ShapeStyle, Vec2,
     };
 
     #[test]
@@ -1150,12 +1213,94 @@ mod tests {
     }
 
     #[test]
+    fn extreme_gradients_sample_without_f32_overflow() {
+        let gradient = LinearGradient::new(
+            Vec2::new(-f32::MAX, 0.0),
+            Vec2::new(f32::MAX, 0.0),
+            Color::BLACK,
+            Color::WHITE,
+        );
+        let mut scene = Scene::new(Color::BLACK).unwrap();
+
+        assert!(
+            scene
+                .try_circle(
+                    Vec2::ZERO,
+                    1.0,
+                    ShapeStyle::filled_with(Fill::LinearGradient(gradient)),
+                )
+                .is_ok()
+        );
+        assert_eq!(
+            gradient.color_at(Vec2::ZERO),
+            Color::rgba(0.5, 0.5, 0.5, 1.0)
+        );
+
+        let radial = RadialGradient::new(
+            Vec2::splat(f32::MAX),
+            0.0,
+            f32::MAX,
+            Color::BLACK,
+            Color::WHITE,
+        );
+        assert_eq!(radial.color_at(Vec2::splat(-f32::MAX)), Color::WHITE);
+    }
+
+    #[test]
+    fn overflowing_circle_and_shadow_are_rejected_at_scene_boundary() {
+        let mut scene = Scene::new(Color::BLACK).unwrap();
+        assert_eq!(
+            scene.try_circle(
+                Vec2::splat(f32::MAX),
+                f32::MAX,
+                ShapeStyle::filled(Color::WHITE),
+            ),
+            Err(SceneError::NonFiniteGeometry(ScenePrimitive::Circle))
+        );
+        assert_eq!(
+            scene.try_circle(
+                Vec2::ZERO,
+                1.0,
+                ShapeStyle::filled(Color::WHITE).with_shadow(super::Shadow::new(
+                    LogicalScreenVector::new(0.0, 0.0),
+                    f32::MAX,
+                    Color::WHITE,
+                )),
+            ),
+            Err(SceneError::InvalidShadow(ScenePrimitive::Circle))
+        );
+        assert_eq!(
+            scene.try_line(
+                Vec2::new(-f32::MAX, 0.0),
+                Vec2::new(f32::MAX, 0.0),
+                1.0,
+                Color::WHITE,
+            ),
+            Err(SceneError::NonFiniteGeometry(ScenePrimitive::Line))
+        );
+        assert_eq!(
+            scene.try_rect(
+                Rect::new(Vec2::new(-f32::MAX, 0.0), Vec2::new(f32::MAX, 1.0),),
+                0.0,
+                ShapeStyle::filled(Color::WHITE),
+            ),
+            Err(SceneError::NonFiniteGeometry(ScenePrimitive::Rect))
+        );
+    }
+
+    #[test]
     fn commands_capture_temporary_screen_clip() {
         let mut scene = Scene::new(Color::BLACK).unwrap();
-        let outer =
-            ScreenClipRect::from_min_size(Vec2::new(10.0, 20.0), Vec2::new(100.0, 80.0)).unwrap();
-        let inner =
-            ScreenClipRect::from_min_size(Vec2::new(50.0, 0.0), Vec2::new(100.0, 50.0)).unwrap();
+        let outer = ScreenClipRect::from_min_size(
+            LogicalScreenPosition::new(10.0, 20.0),
+            LogicalScreenVector::new(100.0, 80.0),
+        )
+        .unwrap();
+        let inner = ScreenClipRect::from_min_size(
+            LogicalScreenPosition::new(50.0, 0.0),
+            LogicalScreenVector::new(100.0, 50.0),
+        )
+        .unwrap();
 
         scene
             .with_screen_clip(outer, |scene| {
@@ -1170,7 +1315,13 @@ mod tests {
 
         assert_eq!(
             scene.commands[0].screen_clip,
-            Some(ScreenClipRect::new(Vec2::new(50.0, 20.0), Vec2::new(110.0, 50.0)).unwrap())
+            Some(
+                ScreenClipRect::new(
+                    LogicalScreenPosition::new(50.0, 20.0),
+                    LogicalScreenPosition::new(110.0, 50.0),
+                )
+                .unwrap(),
+            )
         );
         assert_eq!(scene.commands[1].screen_clip, None);
     }
@@ -1195,27 +1346,33 @@ mod tests {
             Err(SceneError::InvalidBackground)
         ));
         assert_eq!(
-            ScreenClipRect::new(Vec2::ZERO, Vec2::new(0.0, 10.0)),
+            ScreenClipRect::new(
+                LogicalScreenPosition::new(0.0, 0.0),
+                LogicalScreenPosition::new(0.0, 10.0),
+            ),
             Err(SceneError::InvalidScreenClip)
         );
         assert_eq!(
-            ScreenClipRect::new(Vec2::new(f32::NAN, 0.0), Vec2::new(10.0, 10.0)),
+            ScreenClipRect::new(
+                LogicalScreenPosition::new(f32::NAN, 0.0),
+                LogicalScreenPosition::new(10.0, 10.0),
+            ),
             Err(SceneError::InvalidScreenClip)
         );
     }
 
     #[test]
-    fn higher_depth_is_drawn_later_within_a_layer() {
+    fn depth_does_not_reorder_commands_within_a_layer() {
         let mut scene = Scene::new(Color::BLACK).unwrap();
-        scene.circle(Vec2::ZERO, 1.0, ShapeStyle::filled(Color::WHITE));
         scene
             .with_depth(4.0, |scene| {
                 scene.circle(Vec2::X, 1.0, ShapeStyle::filled(Color::WHITE));
             })
             .unwrap();
+        scene.circle(Vec2::ZERO, 1.0, ShapeStyle::filled(Color::WHITE));
 
-        assert_eq!(scene.commands()[0].depth(), 0.0);
-        assert_eq!(scene.commands()[1].depth(), 4.0);
+        assert_eq!(scene.commands()[0].depth(), 4.0);
+        assert_eq!(scene.commands()[1].depth(), 0.0);
     }
 
     #[test]
@@ -1258,8 +1415,8 @@ mod tests {
 
         scene.circle(Vec2::X, 1.0, ShapeStyle::filled(Color::WHITE));
 
-        assert_eq!(scene.commands()[0].depth(), 0.0);
-        assert_eq!(scene.commands()[1].depth(), 4.5);
+        assert_eq!(scene.commands()[0].depth(), 4.5);
+        assert_eq!(scene.commands()[1].depth(), 0.0);
         assert_eq!(
             scene.with_depth(f32::NAN, |_| {}),
             Err(SceneError::NonFiniteDepth)
@@ -1277,15 +1434,19 @@ mod tests {
         assert_eq!(invalid_linear.color_at(Vec2::ZERO), Color::WHITE);
 
         let reversed = RadialGradient::new(Vec2::ZERO, 10.0, 5.0, Color::WHITE, Color::BLACK);
-        assert_eq!(reversed.inner_radius, 5.0);
-        assert_eq!(reversed.outer_radius, 10.0);
+        assert_eq!(reversed.inner_radius(), 5.0);
+        assert_eq!(reversed.outer_radius(), 10.0);
         assert_eq!(reversed.color_at(Vec2::ZERO), Color::BLACK);
     }
 
     #[test]
     fn temporary_screen_clip_restores_state_after_unwind() {
         let mut scene = Scene::new(Color::BLACK).unwrap();
-        let clip = ScreenClipRect::from_min_size(Vec2::ZERO, Vec2::splat(100.0)).unwrap();
+        let clip = ScreenClipRect::from_min_size(
+            LogicalScreenPosition::new(0.0, 0.0),
+            LogicalScreenVector::new(100.0, 100.0),
+        )
+        .unwrap();
 
         let panic_result = catch_unwind(AssertUnwindSafe(|| {
             let _ = scene.with_screen_clip(clip, |_| panic!("intentional test panic"));

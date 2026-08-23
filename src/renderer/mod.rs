@@ -15,6 +15,7 @@ use crate::{
 
 const INITIAL_VERTEX_CAPACITY: usize = 4096;
 const CIRCLE_SEGMENTS: usize = 64;
+const ROUND_CAP_SEGMENTS: usize = 16;
 const CORNER_SEGMENTS: usize = 12;
 const PREFERRED_SAMPLE_COUNT: u32 = 4;
 
@@ -27,6 +28,14 @@ struct Vertex {
     previous_direction: [f32; 2],
     next_direction: [f32; 2],
     normal_distance: f32,
+    color: [f32; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct DynamicGpu {
+    world_position: [f32; 2],
+    depth: f32,
     color: [f32; 4],
 }
 
@@ -83,23 +92,13 @@ pub enum BlendMode {
     Replace,
 }
 
-struct CompositionPipelines {
-    alpha: wgpu::RenderPipeline,
-    additive: wgpu::RenderPipeline,
-    replace: wgpu::RenderPipeline,
-    uniform_buffer: wgpu::Buffer,
-    secondary_uniform_buffer: wgpu::Buffer,
-    bind_group_layout: wgpu::BindGroupLayout,
-}
-
-impl CompositionPipelines {
-    fn pipeline(&self, blend_mode: BlendMode) -> &wgpu::RenderPipeline {
-        match blend_mode {
-            BlendMode::Alpha => &self.alpha,
-            BlendMode::Additive => &self.additive,
-            BlendMode::Replace => &self.replace,
-        }
-    }
+/// How a target-rendering pass initializes its destination pixels.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RenderTargetLoad {
+    /// Preserve existing target pixels and blend new geometry over them.
+    Load,
+    /// Clear the target to a finite straight-alpha color before drawing.
+    Clear(Color),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -121,6 +120,13 @@ struct ScissorRect {
     y: u32,
     width: u32,
     height: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ParticleDrawPreparation {
+    visible_count: usize,
+    upload: Duration,
+    camera_uniform_upload: Duration,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -187,6 +193,17 @@ impl Vertex {
             && self.normal_distance.is_finite()
             && self.color.iter().all(|value| value.is_finite())
     }
+}
+
+impl DynamicGpu {
+    const ATTRIBUTES: [wgpu::VertexAttribute; 3] =
+        wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32, 2 => Float32x4];
+
+    const LAYOUT: wgpu::VertexBufferLayout<'static> = wgpu::VertexBufferLayout {
+        array_stride: std::mem::size_of::<Self>() as wgpu::BufferAddress,
+        step_mode: wgpu::VertexStepMode::Vertex,
+        attributes: &Self::ATTRIBUTES,
+    };
 }
 
 #[repr(C)]
@@ -344,8 +361,8 @@ impl CameraUniform {
 }
 
 impl GeometryExtents {
-    fn from_vertices(vertices: &[Vertex]) -> Self {
-        let mut extents = Self {
+    fn empty(is_empty: bool) -> Self {
+        Self {
             world_min: Vec2::splat(f32::INFINITY),
             world_max: Vec2::splat(f32::NEG_INFINITY),
             depth_min: f32::INFINITY,
@@ -354,36 +371,63 @@ impl GeometryExtents {
             direction_max: Vec2::splat(f32::NEG_INFINITY),
             screen_offset_max_abs: Vec2::ZERO,
             normal_distance_max_abs: 0.0,
-            empty: vertices.is_empty(),
-        };
+            empty: is_empty,
+        }
+    }
 
+    fn include(&mut self, vertex: Vertex) {
+        let world = Vec2::new(vertex.world_position[0], vertex.world_position[1]);
+        self.world_min.x = self.world_min.x.min(world.x);
+        self.world_min.y = self.world_min.y.min(world.y);
+        self.world_max.x = self.world_max.x.max(world.x);
+        self.world_max.y = self.world_max.y.max(world.y);
+        self.depth_min = self.depth_min.min(vertex.depth);
+        self.depth_max = self.depth_max.max(vertex.depth);
+
+        for direction in [vertex.previous_direction, vertex.next_direction] {
+            self.direction_min.x = self.direction_min.x.min(direction[0]);
+            self.direction_min.y = self.direction_min.y.min(direction[1]);
+            self.direction_max.x = self.direction_max.x.max(direction[0]);
+            self.direction_max.y = self.direction_max.y.max(direction[1]);
+        }
+
+        self.screen_offset_max_abs.x = self
+            .screen_offset_max_abs
+            .x
+            .max(vertex.screen_offset[0].abs());
+        self.screen_offset_max_abs.y = self
+            .screen_offset_max_abs
+            .y
+            .max(vertex.screen_offset[1].abs());
+        self.normal_distance_max_abs = self
+            .normal_distance_max_abs
+            .max(vertex.normal_distance.abs());
+    }
+
+    fn include_dynamic(&mut self, vertex: DynamicGpu) {
+        let world = Vec2::new(vertex.world_position[0], vertex.world_position[1]);
+        self.world_min.x = self.world_min.x.min(world.x);
+        self.world_min.y = self.world_min.y.min(world.y);
+        self.world_max.x = self.world_max.x.max(world.x);
+        self.world_max.y = self.world_max.y.max(world.y);
+        self.depth_min = self.depth_min.min(vertex.depth);
+        self.depth_max = self.depth_max.max(vertex.depth);
+        self.direction_min = Vec2::ZERO;
+        self.direction_max = Vec2::ZERO;
+    }
+
+    fn from_dynamic_vertices(vertices: &[DynamicGpu]) -> Self {
+        let mut extents = Self::empty(vertices.is_empty());
         for vertex in vertices {
-            let world = Vec2::new(vertex.world_position[0], vertex.world_position[1]);
-            extents.world_min.x = extents.world_min.x.min(world.x);
-            extents.world_min.y = extents.world_min.y.min(world.y);
-            extents.world_max.x = extents.world_max.x.max(world.x);
-            extents.world_max.y = extents.world_max.y.max(world.y);
-            extents.depth_min = extents.depth_min.min(vertex.depth);
-            extents.depth_max = extents.depth_max.max(vertex.depth);
+            extents.include_dynamic(*vertex);
+        }
+        extents
+    }
 
-            for direction in [vertex.previous_direction, vertex.next_direction] {
-                extents.direction_min.x = extents.direction_min.x.min(direction[0]);
-                extents.direction_min.y = extents.direction_min.y.min(direction[1]);
-                extents.direction_max.x = extents.direction_max.x.max(direction[0]);
-                extents.direction_max.y = extents.direction_max.y.max(direction[1]);
-            }
-
-            extents.screen_offset_max_abs.x = extents
-                .screen_offset_max_abs
-                .x
-                .max(vertex.screen_offset[0].abs());
-            extents.screen_offset_max_abs.y = extents
-                .screen_offset_max_abs
-                .y
-                .max(vertex.screen_offset[1].abs());
-            extents.normal_distance_max_abs = extents
-                .normal_distance_max_abs
-                .max(vertex.normal_distance.abs());
+    fn from_vertices(vertices: &[Vertex]) -> Self {
+        let mut extents = Self::empty(vertices.is_empty());
+        for vertex in vertices {
+            extents.include(*vertex);
         }
 
         extents
@@ -601,6 +645,8 @@ pub enum RendererFrameError {
     Surface(RendererSurfaceStatus),
     /// Camera and geometry are finite separately but overflow when transformed together.
     InvalidGeometryTransform,
+    /// Tessellated geometry exceeds the active device's vertex-buffer limit.
+    GeometryCapacityTooLarge,
 }
 
 impl fmt::Display for RendererFrameError {
@@ -609,6 +655,9 @@ impl fmt::Display for RendererFrameError {
             Self::Surface(status) => write!(formatter, "renderer surface failed: {status:?}"),
             Self::InvalidGeometryTransform => {
                 write!(formatter, "camera and geometry overflow the GPU transform")
+            }
+            Self::GeometryCapacityTooLarge => {
+                write!(formatter, "geometry exceeds the GPU vertex-buffer limit")
             }
         }
     }
@@ -682,6 +731,28 @@ impl fmt::Display for RendererCoordinateError {
 }
 
 impl Error for RendererCoordinateError {}
+
+/// Failure while uploading or restoring immutable prepared-scene geometry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreparedSceneError {
+    /// Tessellated geometry exceeds the active device's vertex-buffer limit.
+    CapacityTooLarge,
+}
+
+impl fmt::Display for PreparedSceneError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CapacityTooLarge => {
+                write!(
+                    formatter,
+                    "prepared scene exceeds the GPU vertex-buffer limit"
+                )
+            }
+        }
+    }
+}
+
+impl Error for PreparedSceneError {}
 
 /// Failure to draw geometry prepared by [`WgpuRenderer::prepare_scene`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -776,6 +847,8 @@ pub enum DynamicMeshError {
     UpdateRangeOutOfBounds,
     /// The mesh belongs to a different renderer and GPU device.
     RendererMismatch,
+    /// The mesh capacity exceeds the current device's vertex-buffer limit.
+    CapacityTooLarge,
 }
 
 impl fmt::Display for DynamicMeshError {
@@ -793,6 +866,12 @@ impl fmt::Display for DynamicMeshError {
             Self::RendererMismatch => {
                 write!(formatter, "dynamic mesh belongs to a different renderer")
             }
+            Self::CapacityTooLarge => {
+                write!(
+                    formatter,
+                    "dynamic mesh exceeds the GPU vertex-buffer limit"
+                )
+            }
         }
     }
 }
@@ -807,7 +886,7 @@ impl Error for DynamicMeshError {}
 pub struct DynamicMesh2d {
     renderer_identity: Arc<()>,
     vertex_buffer: Arc<wgpu::Buffer>,
-    vertices: Vec<Vertex>,
+    vertices: Vec<DynamicGpu>,
     vertex_capacity: usize,
     geometry_extents: GeometryExtents,
 }
@@ -825,7 +904,7 @@ impl DynamicMesh2d {
 
     /// Returns retained CPU memory used for validation and future updates.
     pub fn recovery_memory_bytes(&self) -> usize {
-        self.vertices.len() * std::mem::size_of::<Vertex>()
+        self.vertices.len() * std::mem::size_of::<DynamicGpu>()
     }
 }
 
@@ -938,8 +1017,10 @@ impl Error for ParticleInstanceError {}
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ParticleStatistics {
     submitted: usize,
+    visibility_checked: usize,
     visible: usize,
     culled: usize,
+    budget_limited: usize,
     dropped: usize,
     rendered: usize,
 }
@@ -950,7 +1031,12 @@ impl ParticleStatistics {
         self.submitted
     }
 
-    /// Returns instances remaining after future culling passes.
+    /// Returns instances tested against the camera viewport this frame.
+    pub fn visibility_checked(self) -> usize {
+        self.visibility_checked
+    }
+
+    /// Returns checked instances that intersect the camera viewport.
     pub fn visible(self) -> usize {
         self.visible
     }
@@ -958,6 +1044,11 @@ impl ParticleStatistics {
     /// Returns instances outside the current camera viewport.
     pub fn culled(self) -> usize {
         self.culled
+    }
+
+    /// Returns unchecked or camera-visible instances omitted by the render budget.
+    pub fn budget_limited(self) -> usize {
+        self.budget_limited
     }
 
     /// Returns instances rejected before GPU submission.
@@ -971,6 +1062,109 @@ impl ParticleStatistics {
     }
 }
 
+/// Hard per-field limits that keep particle visualization from starving a host simulation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParticleRenderBudget {
+    max_visible_instances: usize,
+    max_gpu_bytes: usize,
+    max_upload_bytes_per_frame: usize,
+    max_visibility_checks_per_frame: usize,
+}
+
+impl ParticleRenderBudget {
+    /// No application-level cap beyond active-device allocation limits.
+    pub const UNBOUNDED: Self = Self {
+        max_visible_instances: usize::MAX,
+        max_gpu_bytes: usize::MAX,
+        max_upload_bytes_per_frame: usize::MAX,
+        max_visibility_checks_per_frame: usize::MAX,
+    };
+
+    /// Creates explicit visible-instance, GPU-memory, and per-frame upload caps.
+    pub fn new(
+        max_visible_instances: usize,
+        max_gpu_bytes: usize,
+        max_upload_bytes_per_frame: usize,
+    ) -> Result<Self, ParticleBudgetError> {
+        let minimum_bytes = std::mem::size_of::<ParticleGpu>();
+        if max_visible_instances == 0
+            || max_gpu_bytes < minimum_bytes
+            || max_upload_bytes_per_frame < minimum_bytes
+        {
+            return Err(ParticleBudgetError::InvalidLimit);
+        }
+        Ok(Self {
+            max_visible_instances,
+            max_gpu_bytes,
+            max_upload_bytes_per_frame,
+            max_visibility_checks_per_frame: usize::MAX,
+        })
+    }
+
+    /// Caps camera visibility checks while sampling candidates uniformly across
+    /// the retained field. The cap must fit the effective visible-instance cap.
+    pub fn with_max_visibility_checks(
+        mut self,
+        max_visibility_checks_per_frame: usize,
+    ) -> Result<Self, ParticleBudgetError> {
+        if max_visibility_checks_per_frame < self.instance_limit() {
+            return Err(ParticleBudgetError::InvalidLimit);
+        }
+        self.max_visibility_checks_per_frame = max_visibility_checks_per_frame;
+        Ok(self)
+    }
+
+    /// Returns the maximum camera-visible instances considered for drawing.
+    pub const fn max_visible_instances(self) -> usize {
+        self.max_visible_instances
+    }
+
+    /// Returns the maximum particle instance-buffer allocation in bytes.
+    pub const fn max_gpu_bytes(self) -> usize {
+        self.max_gpu_bytes
+    }
+
+    /// Returns the maximum particle bytes uploaded by one render call.
+    pub const fn max_upload_bytes_per_frame(self) -> usize {
+        self.max_upload_bytes_per_frame
+    }
+
+    /// Returns the maximum retained instances checked against the viewport.
+    pub const fn max_visibility_checks_per_frame(self) -> usize {
+        self.max_visibility_checks_per_frame
+    }
+
+    fn instance_limit(self) -> usize {
+        self.max_visible_instances
+            .min(self.max_gpu_bytes / std::mem::size_of::<ParticleGpu>())
+            .min(self.max_upload_bytes_per_frame / std::mem::size_of::<ParticleGpu>())
+    }
+}
+
+impl Default for ParticleRenderBudget {
+    fn default() -> Self {
+        Self::UNBOUNDED
+    }
+}
+
+/// Invalid particle visualization resource budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParticleBudgetError {
+    /// Every enabled budget must fit at least one particle instance.
+    InvalidLimit,
+}
+
+impl fmt::Display for ParticleBudgetError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "particle budget must fit at least one visible instance"
+        )
+    }
+}
+
+impl Error for ParticleBudgetError {}
+
 /// Renderer-owned instanced particles for high-volume simulation visuals.
 ///
 /// The field retains its validated CPU instances so it can be recreated after
@@ -980,7 +1174,9 @@ pub struct ParticleField2d {
     renderer_identity: Arc<()>,
     instance_buffer: Arc<wgpu::Buffer>,
     instances: Vec<ParticleGpu>,
+    visible_instances: Vec<ParticleGpu>,
     instance_capacity: usize,
+    budget: ParticleRenderBudget,
     statistics: ParticleStatistics,
 }
 
@@ -1000,9 +1196,28 @@ impl ParticleField2d {
         self.statistics
     }
 
+    /// Returns the hard visualization budget applied by rendering.
+    pub fn budget(&self) -> ParticleRenderBudget {
+        self.budget
+    }
+
     /// Returns retained CPU memory used for recovery and validation.
     pub fn recovery_memory_bytes(&self) -> usize {
         self.instances.len() * std::mem::size_of::<ParticleGpu>()
+    }
+
+    /// Returns currently reserved CPU bytes for retained and culled instance lists.
+    pub fn cpu_allocation_bytes(&self) -> usize {
+        self.instances
+            .capacity()
+            .saturating_add(self.visible_instances.capacity())
+            .saturating_mul(std::mem::size_of::<ParticleGpu>())
+    }
+
+    /// Returns allocated GPU instance-buffer bytes.
+    pub fn gpu_allocation_bytes(&self) -> usize {
+        self.instance_capacity
+            .saturating_mul(std::mem::size_of::<ParticleGpu>())
     }
 }
 
@@ -1015,6 +1230,8 @@ pub enum ParticleFieldError {
     UpdateRangeOutOfBounds,
     /// The field belongs to another renderer and GPU device.
     RendererMismatch,
+    /// The instance capacity exceeds the current device's buffer limit.
+    CapacityTooLarge,
 }
 
 impl fmt::Display for ParticleFieldError {
@@ -1030,6 +1247,12 @@ impl fmt::Display for ParticleFieldError {
             Self::RendererMismatch => {
                 write!(formatter, "particle field belongs to a different renderer")
             }
+            Self::CapacityTooLarge => {
+                write!(
+                    formatter,
+                    "particle field exceeds the GPU instance-buffer limit"
+                )
+            }
         }
     }
 }
@@ -1040,7 +1263,7 @@ impl Error for ParticleFieldError {}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ParticleFieldUpdateReport {
     statistics: ParticleStatistics,
-    upload: Duration,
+    preparation: Duration,
     reallocated: bool,
 }
 
@@ -1050,9 +1273,18 @@ impl ParticleFieldUpdateReport {
         self.statistics
     }
 
-    /// Returns CPU time spent validating, allocating when needed, and uploading.
+    /// Returns CPU time spent validating and retaining the new visual state.
+    ///
+    /// GPU upload is deferred until rendering, after camera culling has selected
+    /// the compact visible set.
+    pub fn preparation(self) -> Duration {
+        self.preparation
+    }
+
+    /// Backward-compatible alias for [`ParticleFieldUpdateReport::preparation`].
+    #[deprecated(note = "particle GPU upload is deferred to render; use preparation()")]
     pub fn upload(self) -> Duration {
-        self.upload
+        self.preparation
     }
 
     /// Returns whether this update grew and replaced the GPU instance buffer.
@@ -1119,6 +1351,11 @@ impl ScalarFieldTexture {
     /// Returns retained CPU scalar bytes used for device-loss recovery.
     pub fn recovery_memory_bytes(&self) -> usize {
         std::mem::size_of_val(self.field.values())
+    }
+
+    /// Returns allocated `R32Float` texel bytes on the GPU.
+    pub fn gpu_allocation_bytes(&self) -> usize {
+        self.recovery_memory_bytes()
     }
 }
 
@@ -1393,77 +1630,6 @@ impl PreparedScene {
     }
 }
 
-/// Presentation behavior for the window surface.
-///
-/// `Vsync` requests strict FIFO presentation for stable frame pacing and no
-/// tearing. `NoVsync` requests the fastest available non-VSync mode, but may
-/// fall back to FIFO when the platform exposes no Immediate or Mailbox mode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RendererPresentMode {
-    /// Use strict FIFO presentation synchronized to display refresh.
-    Vsync,
-    /// Prefer Immediate, then Mailbox, and fall back to FIFO when necessary.
-    NoVsync,
-}
-
-impl RendererPresentMode {
-    fn to_wgpu(self) -> wgpu::PresentMode {
-        match self {
-            Self::Vsync => wgpu::PresentMode::Fifo,
-            Self::NoVsync => wgpu::PresentMode::AutoNoVsync,
-        }
-    }
-}
-
-/// Options used when creating a [`WgpuRenderer`].
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct WgpuRendererOptions {
-    present_mode: RendererPresentMode,
-    scale_factor: f64,
-}
-
-impl WgpuRendererOptions {
-    /// Builds options from presentation behavior and display scale.
-    ///
-    /// `scale_factor` is physical surface pixels per logical screen pixel. It
-    /// must be finite, positive, representable as `f32`, and large enough that
-    /// every supported physical surface has finite logical dimensions.
-    pub fn new(
-        present_mode: RendererPresentMode,
-        scale_factor: f64,
-    ) -> Result<Self, RendererConfigurationError> {
-        validate_scale_factor(scale_factor)?;
-        Ok(Self {
-            present_mode,
-            scale_factor,
-        })
-    }
-
-    /// Returns presentation behavior for the surface.
-    pub fn present_mode(self) -> RendererPresentMode {
-        self.present_mode
-    }
-
-    /// Returns physical surface pixels per logical screen pixel.
-    pub fn scale_factor(self) -> f64 {
-        self.scale_factor
-    }
-}
-
-impl Default for WgpuRendererOptions {
-    fn default() -> Self {
-        Self {
-            present_mode: RendererPresentMode::Vsync,
-            scale_factor: 1.0,
-        }
-    }
-}
-
-struct MultisampleTarget {
-    _texture: wgpu::Texture,
-    view: wgpu::TextureView,
-}
-
 /// `wgpu` backend that renders [`Scene`] commands into a presentation surface.
 ///
 /// The renderer owns the GPU device, queue, surface, pipeline, and transient
@@ -1479,7 +1645,9 @@ pub struct WgpuRenderer {
     config: wgpu::SurfaceConfiguration,
     scale_factor: f64,
     pipeline: wgpu::RenderPipeline,
+    dynamic_pipeline: wgpu::RenderPipeline,
     particle_pipeline: wgpu::RenderPipeline,
+    target_particle_pipeline: wgpu::RenderPipeline,
     heatmap_pipeline: wgpu::RenderPipeline,
     target_heatmap_pipeline: wgpu::RenderPipeline,
     composition_pipelines: CompositionPipelines,
@@ -1488,6 +1656,7 @@ pub struct WgpuRenderer {
     camera_bind_group: wgpu::BindGroup,
     heatmap_uniform_buffer: wgpu::Buffer,
     heatmap_bind_group_layout: wgpu::BindGroupLayout,
+    color_map_cache: Option<CachedColorMap>,
     vertex_buffer: Arc<wgpu::Buffer>,
     particle_unit_buffer: wgpu::Buffer,
     vertex_capacity: usize,
@@ -1495,6 +1664,13 @@ pub struct WgpuRenderer {
     sample_count: u32,
     vertices: Vec<Vertex>,
     draw_batches: Vec<PreparedDrawBatch>,
+    retired_devices: Vec<RetiredDevice>,
+}
+
+struct RetiredDevice {
+    _adapter: wgpu::Adapter,
+    _device: wgpu::Device,
+    _queue: wgpu::Queue,
 }
 
 impl WgpuRenderer {
@@ -1565,7 +1741,9 @@ impl WgpuRenderer {
         let sample_count = preferred_sample_count(&adapter, config.format);
         let (
             pipeline,
+            dynamic_pipeline,
             particle_pipeline,
+            target_particle_pipeline,
             heatmap_pipeline,
             target_heatmap_pipeline,
             composition_pipelines,
@@ -1589,7 +1767,9 @@ impl WgpuRenderer {
             config,
             scale_factor: options.scale_factor(),
             pipeline,
+            dynamic_pipeline,
             particle_pipeline,
+            target_particle_pipeline,
             heatmap_pipeline,
             target_heatmap_pipeline,
             composition_pipelines,
@@ -1598,6 +1778,7 @@ impl WgpuRenderer {
             camera_bind_group,
             heatmap_uniform_buffer,
             heatmap_bind_group_layout,
+            color_map_cache: None,
             vertex_buffer,
             particle_unit_buffer,
             vertex_capacity: INITIAL_VERTEX_CAPACITY,
@@ -1605,6 +1786,7 @@ impl WgpuRenderer {
             sample_count,
             vertices: Vec::with_capacity(INITIAL_VERTEX_CAPACITY),
             draw_batches: Vec::new(),
+            retired_devices: Vec::new(),
         })
     }
 
@@ -1730,7 +1912,7 @@ impl WgpuRenderer {
         self.draw_batches.clear();
         let tessellation_stats =
             tessellate_scene(scene, &mut self.vertices, &mut self.draw_batches);
-        self.ensure_vertex_capacity(self.vertices.len());
+        self.ensure_vertex_capacity(self.vertices.len())?;
         let tessellation = tessellation_started_at.elapsed();
 
         let upload_started_at = Instant::now();
@@ -1741,9 +1923,9 @@ impl WgpuRenderer {
         let upload = upload_started_at.elapsed();
 
         let vertex_buffer = Arc::clone(&self.vertex_buffer);
-        let draw_batches = self.draw_batches.clone();
+        let draw_batches = std::mem::take(&mut self.draw_batches);
         let geometry_extents = GeometryExtents::from_vertices(&self.vertices);
-        self.draw_geometry(
+        let result = self.draw_geometry(
             scene.background(),
             &vertex_buffer,
             self.vertices.len(),
@@ -1756,7 +1938,9 @@ impl WgpuRenderer {
             false,
             tessellation_stats,
             frame_started_at,
-        )
+        );
+        self.draw_batches = draw_batches;
+        result
     }
 
     /// Tessellates a scene once and uploads immutable geometry to a dedicated GPU buffer.
@@ -1764,7 +1948,7 @@ impl WgpuRenderer {
     /// Preparing is appropriate for geometry that will be drawn repeatedly while
     /// only the camera or target dimensions change. Any shape, style, gradient,
     /// ordering, or clipping change requires preparing a replacement scene.
-    pub fn prepare_scene(&self, scene: &Scene) -> PreparedScene {
+    pub fn prepare_scene(&self, scene: &Scene) -> Result<PreparedScene, PreparedSceneError> {
         prepare_scene_resources(
             &self.device,
             &self.queue,
@@ -1777,7 +1961,10 @@ impl WgpuRenderer {
     ///
     /// This supports renderer recreation after device loss without requiring the
     /// original high-level [`Scene`]. The returned snapshot belongs to this renderer.
-    pub fn restore_prepared_scene(&self, source: &PreparedScene) -> PreparedScene {
+    pub fn restore_prepared_scene(
+        &self,
+        source: &PreparedScene,
+    ) -> Result<PreparedScene, PreparedSceneError> {
         restore_prepared_scene_resources(
             &self.device,
             &self.queue,
@@ -1791,7 +1978,10 @@ impl WgpuRenderer {
     /// Use this after recreating a renderer following device loss. The returned
     /// mesh belongs to this renderer and preserves the source mesh's capacity so
     /// subsequent updates retain the same allocation behavior.
-    pub fn restore_dynamic_mesh(&self, source: &DynamicMesh2d) -> DynamicMesh2d {
+    pub fn restore_dynamic_mesh(
+        &self,
+        source: &DynamicMesh2d,
+    ) -> Result<DynamicMesh2d, DynamicMeshError> {
         restore_dynamic_mesh_resources(
             &self.device,
             &self.queue,
@@ -1809,15 +1999,17 @@ impl WgpuRenderer {
         vertices: &[DynamicVertex2d],
     ) -> Result<DynamicMesh2d, DynamicMeshError> {
         let vertices = dynamic_vertices_to_gpu(vertices)?;
-        let vertex_capacity = dynamic_vertex_capacity(vertices.len());
-        let vertex_buffer = Arc::new(create_vertex_buffer(&self.device, vertex_capacity));
+        let vertex_capacity = dynamic_vertex_capacity(vertices.len())
+            .filter(|capacity| buffer_capacity_fits::<DynamicGpu>(&self.device, *capacity))
+            .ok_or(DynamicMeshError::CapacityTooLarge)?;
+        let vertex_buffer = Arc::new(create_dynamic_vertex_buffer(&self.device, vertex_capacity));
         if !vertices.is_empty() {
             self.queue
                 .write_buffer(&vertex_buffer, 0, bytemuck::cast_slice(&vertices));
         }
         Ok(DynamicMesh2d {
             renderer_identity: Arc::clone(&self.renderer_identity),
-            geometry_extents: GeometryExtents::from_vertices(&vertices),
+            geometry_extents: GeometryExtents::from_dynamic_vertices(&vertices),
             vertex_buffer,
             vertices,
             vertex_capacity,
@@ -1842,18 +2034,30 @@ impl WgpuRenderer {
     ) -> Result<DynamicMeshUpdateReport, DynamicMeshError> {
         let update_started_at = Instant::now();
         self.validate_dynamic_mesh(mesh)?;
-        let vertices = dynamic_vertices_to_gpu(vertices)?;
+        validate_dynamic_vertices(vertices)?;
         let reallocated = vertices.len() > mesh.vertex_capacity;
-        if vertices.len() > mesh.vertex_capacity {
-            mesh.vertex_capacity = dynamic_vertex_capacity(vertices.len());
-            mesh.vertex_buffer = Arc::new(create_vertex_buffer(&self.device, mesh.vertex_capacity));
+        if reallocated {
+            mesh.vertex_capacity = dynamic_vertex_capacity(vertices.len())
+                .filter(|capacity| buffer_capacity_fits::<DynamicGpu>(&self.device, *capacity))
+                .ok_or(DynamicMeshError::CapacityTooLarge)?;
+            mesh.vertex_buffer = Arc::new(create_dynamic_vertex_buffer(
+                &self.device,
+                mesh.vertex_capacity,
+            ));
         }
-        if !vertices.is_empty() {
+        mesh.vertices.clear();
+        mesh.vertices.reserve(vertices.len());
+        let mut geometry_extents = GeometryExtents::empty(vertices.is_empty());
+        for vertex in vertices.iter().copied() {
+            let vertex = dynamic_vertex_to_gpu(vertex);
+            geometry_extents.include_dynamic(vertex);
+            mesh.vertices.push(vertex);
+        }
+        if !mesh.vertices.is_empty() {
             self.queue
-                .write_buffer(&mesh.vertex_buffer, 0, bytemuck::cast_slice(&vertices));
+                .write_buffer(&mesh.vertex_buffer, 0, bytemuck::cast_slice(&mesh.vertices));
         }
-        mesh.geometry_extents = GeometryExtents::from_vertices(&vertices);
-        mesh.vertices = vertices;
+        mesh.geometry_extents = geometry_extents;
         Ok(DynamicMeshUpdateReport {
             vertex_count: mesh.vertices.len(),
             upload: update_started_at.elapsed(),
@@ -1895,11 +2099,11 @@ impl WgpuRenderer {
         }
         let vertices = dynamic_vertices_to_gpu(vertices)?;
         if !vertices.is_empty() {
-            let offset = (first_vertex * std::mem::size_of::<Vertex>()) as wgpu::BufferAddress;
+            let offset = (first_vertex * std::mem::size_of::<DynamicGpu>()) as wgpu::BufferAddress;
             self.queue
                 .write_buffer(&mesh.vertex_buffer, offset, bytemuck::cast_slice(&vertices));
             mesh.vertices[first_vertex..end].copy_from_slice(&vertices);
-            mesh.geometry_extents = GeometryExtents::from_vertices(&mesh.vertices);
+            mesh.geometry_extents = GeometryExtents::from_dynamic_vertices(&mesh.vertices);
         }
         Ok(DynamicMeshUpdateReport {
             vertex_count: mesh.vertices.len(),
@@ -1961,23 +2165,55 @@ impl WgpuRenderer {
         &self,
         instances: &[ParticleInstance2d],
     ) -> Result<ParticleField2d, ParticleFieldError> {
+        self.create_particle_field_with_budget(instances, ParticleRenderBudget::UNBOUNDED)
+    }
+
+    /// Creates an instanced particle field with hard GPU-memory and upload limits.
+    pub fn create_particle_field_with_budget(
+        &self,
+        instances: &[ParticleInstance2d],
+        budget: ParticleRenderBudget,
+    ) -> Result<ParticleField2d, ParticleFieldError> {
         let instances = particle_instances_to_gpu(instances)?;
-        let instance_capacity = particle_instance_capacity(instances.len());
+        let instance_capacity = particle_budgeted_capacity(instances.len(), budget)
+            .filter(|capacity| buffer_capacity_fits::<ParticleGpu>(&self.device, *capacity))
+            .ok_or(ParticleFieldError::CapacityTooLarge)?;
         let instance_buffer = Arc::new(create_particle_instance_buffer(
             &self.device,
             instance_capacity,
         ));
-        if !instances.is_empty() {
-            self.queue
-                .write_buffer(&instance_buffer, 0, bytemuck::cast_slice(&instances));
-        }
         Ok(ParticleField2d {
             renderer_identity: Arc::clone(&self.renderer_identity),
             instance_buffer,
             statistics: particle_statistics(instances.len(), instances.len(), 0),
             instances,
+            visible_instances: Vec::new(),
             instance_capacity,
+            budget,
         })
+    }
+
+    /// Replaces a particle field's hard resource budget, shrinking memory when required.
+    pub fn set_particle_field_budget(
+        &self,
+        field: &mut ParticleField2d,
+        budget: ParticleRenderBudget,
+    ) -> Result<(), ParticleFieldError> {
+        self.validate_particle_field(field)?;
+        let desired_capacity = particle_budgeted_capacity(field.instances.len(), budget)
+            .filter(|capacity| buffer_capacity_fits::<ParticleGpu>(&self.device, *capacity))
+            .ok_or(ParticleFieldError::CapacityTooLarge)?;
+        if desired_capacity != field.instance_capacity {
+            field.instance_buffer = Arc::new(create_particle_instance_buffer(
+                &self.device,
+                desired_capacity,
+            ));
+            field.instance_capacity = desired_capacity;
+        }
+        field.budget = budget;
+        field.visible_instances.clear();
+        field.statistics = particle_statistics(field.instances.len(), field.instances.len(), 0);
+        Ok(())
     }
 
     /// Replaces all particle instances, reusing GPU capacity whenever possible.
@@ -1990,7 +2226,7 @@ impl WgpuRenderer {
             .map(|report| report.statistics())
     }
 
-    /// Replaces all particle instances and returns CPU-side upload metrics.
+    /// Replaces all particle instances and returns CPU-side preparation metrics.
     pub fn update_particle_field_with_metrics(
         &self,
         field: &mut ParticleField2d,
@@ -1999,23 +2235,22 @@ impl WgpuRenderer {
         let update_started_at = Instant::now();
         self.validate_particle_field(field)?;
         let instances = particle_instances_to_gpu(instances)?;
-        let reallocated = instances.len() > field.instance_capacity;
+        let desired_capacity = particle_budgeted_capacity(instances.len(), field.budget)
+            .filter(|capacity| buffer_capacity_fits::<ParticleGpu>(&self.device, *capacity))
+            .ok_or(ParticleFieldError::CapacityTooLarge)?;
+        let reallocated = desired_capacity > field.instance_capacity;
         if reallocated {
-            field.instance_capacity = particle_instance_capacity(instances.len());
+            field.instance_capacity = desired_capacity;
             field.instance_buffer = Arc::new(create_particle_instance_buffer(
                 &self.device,
                 field.instance_capacity,
             ));
         }
-        if !instances.is_empty() {
-            self.queue
-                .write_buffer(&field.instance_buffer, 0, bytemuck::cast_slice(&instances));
-        }
         field.statistics = particle_statistics(instances.len(), instances.len(), 0);
         field.instances = instances;
         Ok(ParticleFieldUpdateReport {
             statistics: field.statistics,
-            upload: update_started_at.elapsed(),
+            preparation: update_started_at.elapsed(),
             reallocated,
         })
     }
@@ -2031,7 +2266,7 @@ impl WgpuRenderer {
             .map(|report| report.statistics())
     }
 
-    /// Replaces a particle range and returns CPU-side upload metrics.
+    /// Replaces a particle range and returns CPU-side preparation metrics.
     pub fn update_particle_field_range_with_metrics(
         &self,
         field: &mut ParticleField2d,
@@ -2043,39 +2278,27 @@ impl WgpuRenderer {
         let range = particle_update_range(first_instance, instances.len(), field.instances.len())?;
         let instances = particle_instances_to_gpu(instances)?;
         if !instances.is_empty() {
-            let offset = (range.start * std::mem::size_of::<ParticleGpu>()) as wgpu::BufferAddress;
-            self.queue.write_buffer(
-                &field.instance_buffer,
-                offset,
-                bytemuck::cast_slice(&instances),
-            );
             field.instances[range].copy_from_slice(&instances);
         }
         field.statistics = particle_statistics(field.instances.len(), field.instances.len(), 0);
         Ok(ParticleFieldUpdateReport {
             statistics: field.statistics,
-            upload: update_started_at.elapsed(),
+            preparation: update_started_at.elapsed(),
             reallocated: false,
         })
     }
 
     /// Recreates a particle field on this renderer from retained CPU instances.
-    pub fn restore_particle_field(&self, source: &ParticleField2d) -> ParticleField2d {
-        let instance_buffer = Arc::new(create_particle_instance_buffer(
+    pub fn restore_particle_field(
+        &self,
+        source: &ParticleField2d,
+    ) -> Result<ParticleField2d, ParticleFieldError> {
+        restore_particle_field_resources(
             &self.device,
-            source.instance_capacity,
-        ));
-        if !source.instances.is_empty() {
-            self.queue
-                .write_buffer(&instance_buffer, 0, bytemuck::cast_slice(&source.instances));
-        }
-        ParticleField2d {
-            renderer_identity: Arc::clone(&self.renderer_identity),
-            instance_buffer,
-            instances: source.instances.clone(),
-            instance_capacity: source.instance_capacity,
-            statistics: source.statistics,
-        }
+            &self.queue,
+            Arc::clone(&self.renderer_identity),
+            source,
+        )
     }
 
     /// Creates a single-channel floating-point texture from a validated scalar grid.
@@ -2325,9 +2548,8 @@ impl WgpuRenderer {
     ) -> Result<RenderReport, ScalarFieldRenderError> {
         self.validate_scalar_field_texture(texture)
             .map_err(|_| ScalarFieldRenderError::RendererMismatch)?;
-        if !minimum.is_finite() || !maximum.is_finite() || maximum <= minimum {
-            return Err(ScalarFieldRenderError::InvalidValueRange { minimum, maximum });
-        }
+        let value_extent = scalar_value_range_extent(minimum, maximum)
+            .ok_or(ScalarFieldRenderError::InvalidValueRange { minimum, maximum })?;
         if !background.is_finite() {
             return Err(ScalarFieldRenderError::InvalidBackground);
         }
@@ -2335,7 +2557,7 @@ impl WgpuRenderer {
             texture,
             color_map,
             minimum,
-            maximum,
+            value_extent,
             ScalarFieldSampling::Nearest,
             background,
             Instant::now(),
@@ -2354,9 +2576,8 @@ impl WgpuRenderer {
     ) -> Result<RenderStatus, ScalarFieldRenderError> {
         self.validate_scalar_field_texture(texture)
             .map_err(|_| ScalarFieldRenderError::RendererMismatch)?;
-        if !minimum.is_finite() || !maximum.is_finite() || maximum <= minimum {
-            return Err(ScalarFieldRenderError::InvalidValueRange { minimum, maximum });
-        }
+        let value_extent = scalar_value_range_extent(minimum, maximum)
+            .ok_or(ScalarFieldRenderError::InvalidValueRange { minimum, maximum })?;
         if !background.is_finite() {
             return Err(ScalarFieldRenderError::InvalidBackground);
         }
@@ -2364,7 +2585,7 @@ impl WgpuRenderer {
             texture,
             color_map,
             minimum,
-            maximum,
+            value_extent,
             sampling,
             background,
             Instant::now(),
@@ -2406,9 +2627,8 @@ impl WgpuRenderer {
             .map_err(|_| ScalarFieldRenderError::RendererMismatch)?;
         self.validate_scalar_field_texture(texture)
             .map_err(|_| ScalarFieldRenderError::RendererMismatch)?;
-        if !minimum.is_finite() || !maximum.is_finite() || maximum <= minimum {
-            return Err(ScalarFieldRenderError::InvalidValueRange { minimum, maximum });
-        }
+        let value_extent = scalar_value_range_extent(minimum, maximum)
+            .ok_or(ScalarFieldRenderError::InvalidValueRange { minimum, maximum })?;
         if !background.is_finite() {
             return Err(ScalarFieldRenderError::InvalidBackground);
         }
@@ -2417,7 +2637,7 @@ impl WgpuRenderer {
             texture,
             color_map,
             minimum,
-            maximum,
+            value_extent,
             sampling,
             background,
             Instant::now(),
@@ -2466,19 +2686,42 @@ impl WgpuRenderer {
         if !background.is_finite() {
             return Err(ParticleFieldRenderError::InvalidBackground);
         }
-        let report = self
-            .draw_particle_field(background, field, *camera, Instant::now())
+        self.draw_particle_field(background, field, *camera, Instant::now())
             .map_err(|error| match error {
                 RendererFrameError::InvalidGeometryTransform => {
                     ParticleFieldRenderError::InvalidGeometryTransform
                 }
                 other => ParticleFieldRenderError::Frame(other),
-            })?;
-        field.statistics.rendered = match report.status() {
-            RenderStatus::Drawn => field.statistics.visible,
-            RenderStatus::Skipped(_) => 0,
-        };
-        Ok(report)
+            })
+    }
+
+    /// Draws a particle field into an offscreen target.
+    ///
+    /// Target dimensions may be lower than the presentation surface to bound
+    /// raster cost. Camera coordinates and particle radii remain expressed in
+    /// logical presentation pixels, so composing the target back to the surface
+    /// preserves layout while trading only raster resolution.
+    pub fn render_particle_field_to_target(
+        &mut self,
+        target: &RenderTarget2d,
+        field: &mut ParticleField2d,
+        camera: &Camera2d,
+        load: RenderTargetLoad,
+    ) -> Result<RenderReport, ParticleFieldRenderError> {
+        self.validate_render_target(target)
+            .map_err(|_| ParticleFieldRenderError::RendererMismatch)?;
+        self.validate_particle_field(field)
+            .map_err(|_| ParticleFieldRenderError::RendererMismatch)?;
+        if matches!(load, RenderTargetLoad::Clear(color) if !color.is_finite()) {
+            return Err(ParticleFieldRenderError::InvalidBackground);
+        }
+        self.draw_particle_field_to_target(target, field, *camera, load, Instant::now())
+            .map_err(|error| match error {
+                RendererFrameError::InvalidGeometryTransform => {
+                    ParticleFieldRenderError::InvalidGeometryTransform
+                }
+                other => ParticleFieldRenderError::Frame(other),
+            })
     }
 
     /// Draws geometry previously uploaded by [`WgpuRenderer::prepare_scene`].
@@ -2651,7 +2894,12 @@ impl WgpuRenderer {
             });
 
             if vertex_count > 0 {
-                pass.set_pipeline(&self.pipeline);
+                let pipeline = if geometry_streamed {
+                    &self.dynamic_pipeline
+                } else {
+                    &self.pipeline
+                };
+                pass.set_pipeline(pipeline);
                 pass.set_bind_group(0, &self.camera_bind_group, &[]);
                 pass.set_vertex_buffer(0, vertex_buffer.slice(..));
                 for batch in draw_batches {
@@ -2703,19 +2951,23 @@ impl WgpuRenderer {
         texture: &ScalarFieldTexture,
         color_map: &ColorMap,
         minimum: f32,
-        maximum: f32,
+        value_extent: f32,
         sampling: ScalarFieldSampling,
         background: Color,
         frame_started_at: Instant,
     ) -> Result<RenderReport, RendererFrameError> {
         let upload_started_at = Instant::now();
-        let color_map_texture = create_color_map_texture(&self.device, &self.queue, color_map);
+        self.cache_color_map(color_map);
         let scalar_view = texture
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
-        let color_map_view = color_map_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let color_map_view = &self
+            .color_map_cache
+            .as_ref()
+            .expect("the color-map cache was populated")
+            .view;
         let uniform = HeatmapUniform {
-            value_range: [minimum, maximum - minimum, 0.0, 0.0],
+            value_range: [minimum, value_extent, 0.0, 0.0],
             dimensions: [
                 texture.width() as u32,
                 texture.height() as u32,
@@ -2738,7 +2990,7 @@ impl WgpuRenderer {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&color_map_view),
+                    resource: wgpu::BindingResource::TextureView(color_map_view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
@@ -2861,22 +3113,26 @@ impl WgpuRenderer {
         texture: &ScalarFieldTexture,
         color_map: &ColorMap,
         minimum: f32,
-        maximum: f32,
+        value_extent: f32,
         sampling: ScalarFieldSampling,
         background: Color,
         frame_started_at: Instant,
     ) -> RenderReport {
         let upload_started_at = Instant::now();
-        let color_map_texture = create_color_map_texture(&self.device, &self.queue, color_map);
+        self.cache_color_map(color_map);
         let scalar_view = texture
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
-        let color_map_view = color_map_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let color_map_view = &self
+            .color_map_cache
+            .as_ref()
+            .expect("the color-map cache was populated")
+            .view;
         self.queue.write_buffer(
             &self.heatmap_uniform_buffer,
             0,
             bytemuck::bytes_of(&HeatmapUniform {
-                value_range: [minimum, maximum - minimum, 0.0, 0.0],
+                value_range: [minimum, value_extent, 0.0, 0.0],
                 dimensions: [
                     texture.width() as u32,
                     texture.height() as u32,
@@ -2895,7 +3151,7 @@ impl WgpuRenderer {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&color_map_view),
+                    resource: wgpu::BindingResource::TextureView(color_map_view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
@@ -2918,7 +3174,7 @@ impl WgpuRenderer {
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(background.to_wgpu()),
+                        load: wgpu::LoadOp::Clear(premultiplied_wgpu_color(background)),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -3231,7 +3487,7 @@ impl WgpuRenderer {
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(color.to_wgpu()),
+                        load: wgpu::LoadOp::Clear(premultiplied_wgpu_color(color)),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -3256,6 +3512,126 @@ impl WgpuRenderer {
         )
     }
 
+    fn prepare_particle_draw(
+        &self,
+        field: &mut ParticleField2d,
+        camera: Camera2d,
+    ) -> Result<ParticleDrawPreparation, RendererFrameError> {
+        let (logical_width, logical_height) = self.logical_size();
+        let viewport = LogicalViewport::new(logical_width, logical_height)
+            .map_err(|_| RendererFrameError::InvalidGeometryTransform)?;
+        let Some(camera_uniform) = CameraUniform::new(camera, viewport) else {
+            return Err(RendererFrameError::InvalidGeometryTransform);
+        };
+        let instance_count = field.instances.len();
+        let visibility_checked = instance_count.min(field.budget.max_visibility_checks_per_frame);
+        if visibility_checked < instance_count {
+            field.visible_instances.clear();
+            for candidate_index in 0..visibility_checked {
+                let source_index =
+                    uniformly_sampled_index(candidate_index, instance_count, visibility_checked);
+                let instance = field.instances[source_index];
+                if !instance.is_safe_for(camera_uniform) {
+                    return Err(RendererFrameError::InvalidGeometryTransform);
+                }
+                if instance.intersects_viewport(camera_uniform, viewport) {
+                    field.visible_instances.push(instance);
+                }
+            }
+            let visible_count = field.visible_instances.len();
+            let selected_count = visible_count.min(field.budget.instance_limit());
+            if selected_count < visible_count {
+                let mut visible_index = 0;
+                field.visible_instances.retain(|_| {
+                    let selected = particle_visible_index_is_selected(
+                        visible_index,
+                        visible_count,
+                        selected_count,
+                    );
+                    visible_index += 1;
+                    selected
+                });
+            }
+            field.statistics = particle_statistics_with_budget(
+                instance_count,
+                visibility_checked,
+                visible_count,
+                selected_count,
+                0,
+            );
+            return self.upload_particle_draw(field, camera_uniform, selected_count);
+        }
+
+        let visible_count = visible_particle_count(&field.instances, camera_uniform, viewport)?;
+        let selected_count = visible_count.min(field.budget.instance_limit());
+        field.statistics = particle_statistics_with_budget(
+            instance_count,
+            instance_count,
+            visible_count,
+            selected_count,
+            0,
+        );
+        if selected_count == field.instances.len() {
+            field.visible_instances.clear();
+        } else {
+            field.visible_instances.clear();
+            let mut visible_index = 0;
+            for instance in field.instances.iter().copied() {
+                if !instance.intersects_viewport(camera_uniform, viewport) {
+                    continue;
+                }
+                let selected_index = field.visible_instances.len();
+                if selected_index < selected_count
+                    && particle_visible_index_is_selected(
+                        visible_index,
+                        visible_count,
+                        selected_count,
+                    )
+                {
+                    field.visible_instances.push(instance);
+                }
+                visible_index += 1;
+            }
+        }
+        self.upload_particle_draw(field, camera_uniform, selected_count)
+    }
+
+    fn upload_particle_draw(
+        &self,
+        field: &ParticleField2d,
+        camera_uniform: CameraUniform,
+        visible_count: usize,
+    ) -> Result<ParticleDrawPreparation, RendererFrameError> {
+        let visible_instances =
+            if field.visible_instances.is_empty() && visible_count == field.instances.len() {
+                field.instances.as_slice()
+            } else {
+                field.visible_instances.as_slice()
+            };
+        let upload_started_at = Instant::now();
+        if !visible_instances.is_empty() {
+            self.queue.write_buffer(
+                &field.instance_buffer,
+                0,
+                bytemuck::cast_slice(visible_instances),
+            );
+        }
+        let upload = upload_started_at.elapsed();
+        let camera_uniform_upload_started_at = Instant::now();
+        self.queue.write_buffer(
+            &self.camera_uniform_buffer,
+            0,
+            bytemuck::bytes_of(&camera_uniform),
+        );
+        let camera_uniform_upload = camera_uniform_upload_started_at.elapsed();
+
+        Ok(ParticleDrawPreparation {
+            visible_count,
+            upload,
+            camera_uniform_upload,
+        })
+    }
+
     fn draw_particle_field(
         &mut self,
         background: Color,
@@ -3263,31 +3639,7 @@ impl WgpuRenderer {
         camera: Camera2d,
         frame_started_at: Instant,
     ) -> Result<RenderReport, RendererFrameError> {
-        let (logical_width, logical_height) = self.logical_size();
-        let viewport = LogicalViewport::new(logical_width, logical_height)
-            .map_err(|_| RendererFrameError::InvalidGeometryTransform)?;
-        let camera_uniform_upload_started_at = Instant::now();
-        let Some(camera_uniform) = CameraUniform::new(camera, viewport) else {
-            return Err(RendererFrameError::InvalidGeometryTransform);
-        };
-        let visible_instances =
-            visible_particle_instances(&field.instances, camera_uniform, viewport)?;
-        field.statistics = particle_statistics(field.instances.len(), visible_instances.len(), 0);
-        let upload_started_at = Instant::now();
-        if !visible_instances.is_empty() {
-            self.queue.write_buffer(
-                &field.instance_buffer,
-                0,
-                bytemuck::cast_slice(&visible_instances),
-            );
-        }
-        let upload = upload_started_at.elapsed();
-        self.queue.write_buffer(
-            &self.camera_uniform_buffer,
-            0,
-            bytemuck::bytes_of(&camera_uniform),
-        );
-        let camera_uniform_upload = camera_uniform_upload_started_at.elapsed();
+        let preparation = self.prepare_particle_draw(field, camera)?;
 
         let surface_acquire_started_at = Instant::now();
         let surface_texture = match self.surface.get_current_texture() {
@@ -3296,11 +3648,11 @@ impl WgpuRenderer {
             wgpu::CurrentSurfaceTexture::Timeout => {
                 return Ok(render_report(
                     RenderStatus::Skipped(RendererSurfaceStatus::Timeout),
-                    upload,
-                    upload,
-                    camera_uniform_upload,
+                    Duration::ZERO,
+                    preparation.upload,
+                    preparation.camera_uniform_upload,
                     surface_acquire_started_at.elapsed(),
-                    upload,
+                    Duration::ZERO,
                     frame_started_at.elapsed(),
                     false,
                     true,
@@ -3311,8 +3663,8 @@ impl WgpuRenderer {
                 return Ok(render_report(
                     RenderStatus::Skipped(RendererSurfaceStatus::Occluded),
                     Duration::ZERO,
-                    Duration::ZERO,
-                    camera_uniform_upload,
+                    preparation.upload,
+                    preparation.camera_uniform_upload,
                     surface_acquire_started_at.elapsed(),
                     Duration::ZERO,
                     frame_started_at.elapsed(),
@@ -3326,8 +3678,8 @@ impl WgpuRenderer {
                 return Ok(render_report(
                     RenderStatus::Skipped(RendererSurfaceStatus::Outdated),
                     Duration::ZERO,
-                    Duration::ZERO,
-                    camera_uniform_upload,
+                    preparation.upload,
+                    preparation.camera_uniform_upload,
                     surface_acquire_started_at.elapsed(),
                     Duration::ZERO,
                     frame_started_at.elapsed(),
@@ -3376,21 +3728,22 @@ impl WgpuRenderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            if !visible_instances.is_empty() {
+            if preparation.visible_count > 0 {
                 pass.set_pipeline(&self.particle_pipeline);
                 pass.set_bind_group(0, &self.camera_bind_group, &[]);
                 pass.set_vertex_buffer(0, self.particle_unit_buffer.slice(..));
                 pass.set_vertex_buffer(1, field.instance_buffer.slice(..));
-                pass.draw(0..6, 0..visible_instances.len() as u32);
+                pass.draw(0..6, 0..preparation.visible_count as u32);
             }
         }
         self.queue.submit([encoder.finish()]);
         self.queue.present(surface_texture);
+        field.statistics.rendered = preparation.visible_count;
         Ok(render_report(
             RenderStatus::Drawn,
-            upload,
             Duration::ZERO,
-            camera_uniform_upload,
+            preparation.upload,
+            preparation.camera_uniform_upload,
             surface_acquire,
             encode_submit_present_started_at.elapsed(),
             frame_started_at.elapsed(),
@@ -3400,13 +3753,78 @@ impl WgpuRenderer {
         ))
     }
 
-    fn ensure_vertex_capacity(&mut self, vertex_count: usize) {
+    fn draw_particle_field_to_target(
+        &self,
+        target: &RenderTarget2d,
+        field: &mut ParticleField2d,
+        camera: Camera2d,
+        load: RenderTargetLoad,
+        frame_started_at: Instant,
+    ) -> Result<RenderReport, RendererFrameError> {
+        let preparation = self.prepare_particle_draw(field, camera)?;
+        let encode_started_at = Instant::now();
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("sim-engine target particle encoder"),
+            });
+        {
+            let load = match load {
+                RenderTargetLoad::Load => wgpu::LoadOp::Load,
+                RenderTargetLoad::Clear(color) => {
+                    wgpu::LoadOp::Clear(premultiplied_wgpu_color(color))
+                }
+            };
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("sim-engine target particle pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &target.view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            if preparation.visible_count > 0 {
+                pass.set_pipeline(&self.target_particle_pipeline);
+                pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                pass.set_vertex_buffer(0, self.particle_unit_buffer.slice(..));
+                pass.set_vertex_buffer(1, field.instance_buffer.slice(..));
+                pass.draw(0..6, 0..preparation.visible_count as u32);
+            }
+        }
+        self.queue.submit([encoder.finish()]);
+        field.statistics.rendered = preparation.visible_count;
+        Ok(render_report(
+            RenderStatus::Drawn,
+            Duration::ZERO,
+            preparation.upload,
+            preparation.camera_uniform_upload,
+            Duration::ZERO,
+            encode_started_at.elapsed(),
+            frame_started_at.elapsed(),
+            false,
+            true,
+            TessellationStats::default(),
+        ))
+    }
+
+    fn ensure_vertex_capacity(&mut self, vertex_count: usize) -> Result<(), RendererFrameError> {
         if vertex_count <= self.vertex_capacity {
-            return;
+            return Ok(());
         }
 
-        self.vertex_capacity = vertex_count.next_power_of_two();
+        self.vertex_capacity = dynamic_vertex_capacity(vertex_count)
+            .filter(|capacity| buffer_capacity_fits::<Vertex>(&self.device, *capacity))
+            .ok_or(RendererFrameError::GeometryCapacityTooLarge)?;
         self.vertex_buffer = Arc::new(create_vertex_buffer(&self.device, self.vertex_capacity));
+        Ok(())
     }
 
     fn validate_dynamic_mesh(&self, mesh: &DynamicMesh2d) -> Result<(), DynamicMeshError> {
@@ -3428,6 +3846,21 @@ impl WgpuRenderer {
         prepared_scene_belongs_to(&self.renderer_identity, &texture.renderer_identity)
             .then_some(())
             .ok_or(ScalarFieldTextureError::RendererMismatch)
+    }
+
+    fn cache_color_map(&mut self, color_map: &ColorMap) {
+        if self
+            .color_map_cache
+            .as_ref()
+            .is_some_and(|cached| cached.source == *color_map)
+        {
+            return;
+        }
+        self.color_map_cache = Some(create_cached_color_map(
+            &self.device,
+            &self.queue,
+            color_map,
+        ));
     }
 
     fn validate_render_target(&self, target: &RenderTarget2d) -> Result<(), RenderTargetError> {
@@ -3459,35 +3892,40 @@ fn render_target_allocation_bytes(
     usize::try_from(byte_count).ok()
 }
 
-fn dynamic_vertices_to_gpu(vertices: &[DynamicVertex2d]) -> Result<Vec<Vertex>, DynamicMeshError> {
+fn dynamic_vertices_to_gpu(
+    vertices: &[DynamicVertex2d],
+) -> Result<Vec<DynamicGpu>, DynamicMeshError> {
+    validate_dynamic_vertices(vertices)?;
+    Ok(vertices
+        .iter()
+        .copied()
+        .map(dynamic_vertex_to_gpu)
+        .collect())
+}
+
+fn validate_dynamic_vertices(vertices: &[DynamicVertex2d]) -> Result<(), DynamicMeshError> {
     if !vertices.len().is_multiple_of(3) {
         return Err(DynamicMeshError::InvalidVertexCount);
     }
-    vertices
-        .iter()
-        .copied()
-        .map(|vertex| {
-            if !vertex.world_position.is_finite()
-                || !vertex.depth.is_finite()
-                || !vertex.color.is_finite()
-            {
-                return Err(DynamicMeshError::InvalidVertex);
-            }
-            Ok(Vertex {
-                world_position: [vertex.world_position.x, vertex.world_position.y],
-                depth: vertex.depth,
-                screen_offset: [0.0; 2],
-                previous_direction: [0.0; 2],
-                next_direction: [0.0; 2],
-                normal_distance: 0.0,
-                color: vertex.color.to_array(),
-            })
-        })
-        .collect()
+    // Private fields and the only public constructor make finiteness an
+    // invariant of DynamicVertex2d. Keep the assertion in development without
+    // rescanning an already-validated high-volume stream in release builds.
+    debug_assert!(vertices.iter().all(|vertex| {
+        vertex.world_position.is_finite() && vertex.depth.is_finite() && vertex.color.is_finite()
+    }));
+    Ok(())
 }
 
-fn dynamic_vertex_capacity(vertex_count: usize) -> usize {
-    vertex_count.max(1).next_power_of_two()
+fn dynamic_vertex_to_gpu(vertex: DynamicVertex2d) -> DynamicGpu {
+    DynamicGpu {
+        world_position: [vertex.world_position.x, vertex.world_position.y],
+        depth: vertex.depth,
+        color: vertex.color.to_array(),
+    }
+}
+
+fn dynamic_vertex_capacity(vertex_count: usize) -> Option<usize> {
+    vertex_count.max(1).checked_next_power_of_two()
 }
 
 fn particle_instances_to_gpu(
@@ -3515,8 +3953,28 @@ fn particle_instances_to_gpu(
         .collect()
 }
 
-fn particle_instance_capacity(instance_count: usize) -> usize {
-    instance_count.max(1).next_power_of_two()
+fn particle_instance_capacity(instance_count: usize) -> Option<usize> {
+    instance_count.max(1).checked_next_power_of_two()
+}
+
+fn particle_budgeted_capacity(
+    instance_count: usize,
+    budget: ParticleRenderBudget,
+) -> Option<usize> {
+    let limit = budget.instance_limit();
+    let required = instance_count.min(limit).max(1);
+    particle_instance_capacity(required).map(|capacity| capacity.min(limit))
+}
+
+fn buffer_allocation_bytes<T>(capacity: usize) -> Option<u64> {
+    u64::try_from(capacity)
+        .ok()?
+        .checked_mul(std::mem::size_of::<T>() as u64)
+}
+
+fn buffer_capacity_fits<T>(device: &wgpu::Device, capacity: usize) -> bool {
+    buffer_allocation_bytes::<T>(capacity)
+        .is_some_and(|bytes| bytes <= device.limits().max_buffer_size)
 }
 
 fn particle_update_range(
@@ -3532,18 +3990,13 @@ fn particle_update_range(
         .ok_or(ParticleFieldError::UpdateRangeOutOfBounds)
 }
 
+#[cfg(test)]
 fn visible_particle_instances(
     instances: &[ParticleGpu],
     camera: CameraUniform,
     viewport: LogicalViewport,
 ) -> Result<Vec<ParticleGpu>, RendererFrameError> {
-    if !instances
-        .iter()
-        .copied()
-        .all(|instance| instance.is_safe_for(camera))
-    {
-        return Err(RendererFrameError::InvalidGeometryTransform);
-    }
+    visible_particle_count(instances, camera, viewport)?;
     Ok(instances
         .iter()
         .copied()
@@ -3551,15 +4004,63 @@ fn visible_particle_instances(
         .collect())
 }
 
+fn visible_particle_count(
+    instances: &[ParticleGpu],
+    camera: CameraUniform,
+    viewport: LogicalViewport,
+) -> Result<usize, RendererFrameError> {
+    let mut visible = 0;
+    for instance in instances.iter().copied() {
+        if !instance.is_safe_for(camera) {
+            return Err(RendererFrameError::InvalidGeometryTransform);
+        }
+        visible += usize::from(instance.intersects_viewport(camera, viewport));
+    }
+    Ok(visible)
+}
+
+fn particle_visible_index_is_selected(
+    visible_index: usize,
+    visible_count: usize,
+    selected_count: usize,
+) -> bool {
+    if visible_count == 0 || selected_count == 0 {
+        return false;
+    }
+    let before = visible_index as u128 * selected_count as u128 / visible_count as u128;
+    let after = (visible_index as u128 + 1) * selected_count as u128 / visible_count as u128;
+    before < after
+}
+
+fn uniformly_sampled_index(sample_index: usize, source_count: usize, sample_count: usize) -> usize {
+    debug_assert!(sample_index < sample_count);
+    debug_assert!(sample_count <= source_count);
+    (((sample_index as u128 + 1) * source_count as u128 - 1) / sample_count as u128) as usize
+}
+
 fn particle_statistics(
     instance_count: usize,
     visible: usize,
     rendered: usize,
 ) -> ParticleStatistics {
+    particle_statistics_with_budget(instance_count, instance_count, visible, visible, rendered)
+}
+
+fn particle_statistics_with_budget(
+    instance_count: usize,
+    visibility_checked: usize,
+    visible: usize,
+    selected: usize,
+    rendered: usize,
+) -> ParticleStatistics {
     ParticleStatistics {
         submitted: instance_count,
+        visibility_checked,
         visible,
-        culled: instance_count.saturating_sub(visible),
+        culled: visibility_checked.saturating_sub(visible),
+        budget_limited: instance_count
+            .saturating_sub(visibility_checked)
+            .saturating_add(visible.saturating_sub(selected)),
         dropped: 0,
         rendered,
     }
@@ -3570,11 +4071,14 @@ fn prepare_scene_resources(
     queue: &wgpu::Queue,
     renderer_identity: Arc<()>,
     scene: &Scene,
-) -> PreparedScene {
+) -> Result<PreparedScene, PreparedSceneError> {
     let mut vertices = Vec::new();
     let mut draw_batches = Vec::new();
     let tessellation = tessellate_scene(scene, &mut vertices, &mut draw_batches);
     let geometry_extents = GeometryExtents::from_vertices(&vertices);
+    if !buffer_capacity_fits::<Vertex>(device, vertices.len().max(1)) {
+        return Err(PreparedSceneError::CapacityTooLarge);
+    }
     let vertex_buffer = Arc::new(create_vertex_buffer(device, vertices.len()));
     if !vertices.is_empty() {
         queue.write_buffer(&vertex_buffer, 0, bytemuck::cast_slice(&vertices));
@@ -3582,7 +4086,7 @@ fn prepare_scene_resources(
     let vertex_count = vertices.len();
     let vertices: Arc<[Vertex]> = vertices.into();
 
-    PreparedScene {
+    Ok(PreparedScene {
         renderer_identity,
         background: scene.background(),
         vertex_buffer,
@@ -3592,7 +4096,7 @@ fn prepare_scene_resources(
         geometry_extents,
         draw_batches,
         tessellation,
-    }
+    })
 }
 
 fn restore_prepared_scene_resources(
@@ -3600,7 +4104,10 @@ fn restore_prepared_scene_resources(
     queue: &wgpu::Queue,
     renderer_identity: Arc<()>,
     source: &PreparedScene,
-) -> PreparedScene {
+) -> Result<PreparedScene, PreparedSceneError> {
+    if !buffer_capacity_fits::<Vertex>(device, source.vertices.len().max(1)) {
+        return Err(PreparedSceneError::CapacityTooLarge);
+    }
     let vertex_buffer = Arc::new(create_vertex_buffer(device, source.vertices.len()));
     if !source.vertices.is_empty() {
         queue.write_buffer(
@@ -3610,7 +4117,7 @@ fn restore_prepared_scene_resources(
         );
     }
 
-    PreparedScene {
+    Ok(PreparedScene {
         renderer_identity,
         background: source.background,
         vertex_buffer,
@@ -3620,7 +4127,7 @@ fn restore_prepared_scene_resources(
         geometry_extents: source.geometry_extents,
         draw_batches: source.draw_batches.clone(),
         tessellation: source.tessellation,
-    }
+    })
 }
 
 fn restore_dynamic_mesh_resources(
@@ -3628,8 +4135,11 @@ fn restore_dynamic_mesh_resources(
     queue: &wgpu::Queue,
     renderer_identity: Arc<()>,
     source: &DynamicMesh2d,
-) -> DynamicMesh2d {
-    let vertex_buffer = Arc::new(create_vertex_buffer(device, source.vertex_capacity));
+) -> Result<DynamicMesh2d, DynamicMeshError> {
+    if !buffer_capacity_fits::<DynamicGpu>(device, source.vertex_capacity) {
+        return Err(DynamicMeshError::CapacityTooLarge);
+    }
+    let vertex_buffer = Arc::new(create_dynamic_vertex_buffer(device, source.vertex_capacity));
     if !source.vertices.is_empty() {
         queue.write_buffer(
             &vertex_buffer,
@@ -3637,13 +4147,37 @@ fn restore_dynamic_mesh_resources(
             bytemuck::cast_slice(source.vertices.as_slice()),
         );
     }
-    DynamicMesh2d {
+    Ok(DynamicMesh2d {
         renderer_identity,
         vertex_buffer,
         vertices: source.vertices.clone(),
         vertex_capacity: source.vertex_capacity,
         geometry_extents: source.geometry_extents,
+    })
+}
+
+fn restore_particle_field_resources(
+    device: &wgpu::Device,
+    _queue: &wgpu::Queue,
+    renderer_identity: Arc<()>,
+    source: &ParticleField2d,
+) -> Result<ParticleField2d, ParticleFieldError> {
+    if !buffer_capacity_fits::<ParticleGpu>(device, source.instance_capacity) {
+        return Err(ParticleFieldError::CapacityTooLarge);
     }
+    let instance_buffer = Arc::new(create_particle_instance_buffer(
+        device,
+        source.instance_capacity,
+    ));
+    Ok(ParticleField2d {
+        renderer_identity,
+        instance_buffer,
+        instances: source.instances.clone(),
+        visible_instances: Vec::new(),
+        instance_capacity: source.instance_capacity,
+        budget: source.budget,
+        statistics: particle_statistics(source.instances.len(), source.instances.len(), 0),
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3680,6 +4214,8 @@ fn create_pipeline(
     format: wgpu::TextureFormat,
     sample_count: u32,
 ) -> (
+    wgpu::RenderPipeline,
+    wgpu::RenderPipeline,
     wgpu::RenderPipeline,
     wgpu::RenderPipeline,
     wgpu::RenderPipeline,
@@ -3760,6 +4296,38 @@ fn create_pipeline(
         cache: None,
     });
 
+    let dynamic_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("sim-engine dynamic mesh pipeline"),
+        layout: Some(&pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("dynamic_vs_main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            buffers: &[Some(DynamicGpu::LAYOUT)],
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            ..Default::default()
+        },
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState {
+            count: sample_count,
+            ..Default::default()
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format,
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        multiview_mask: None,
+        cache: None,
+    });
+
     let particle_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("sim-engine particle pipeline"),
         layout: Some(&pipeline_layout),
@@ -3776,6 +4344,38 @@ fn create_pipeline(
         depth_stencil: None,
         multisample: wgpu::MultisampleState {
             count: sample_count,
+            ..Default::default()
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format,
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        multiview_mask: None,
+        cache: None,
+    });
+
+    let target_particle_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("sim-engine target particle pipeline"),
+        layout: Some(&pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("particle_vs_main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            buffers: &[Some(ParticleUnitVertex::LAYOUT), Some(ParticleGpu::LAYOUT)],
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            ..Default::default()
+        },
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState {
+            count: 1,
             ..Default::default()
         },
         fragment: Some(wgpu::FragmentState {
@@ -4050,7 +4650,9 @@ fn create_pipeline(
 
     (
         pipeline,
+        dynamic_pipeline,
         particle_pipeline,
+        target_particle_pipeline,
         heatmap_pipeline,
         target_heatmap_pipeline,
         composition_pipelines,
@@ -4074,68 +4676,24 @@ fn preferred_sample_count(adapter: &wgpu::Adapter, format: wgpu::TextureFormat) 
     }
 }
 
-fn create_composition_pipeline(
-    device: &wgpu::Device,
-    shader: &wgpu::ShaderModule,
-    layout: &wgpu::PipelineLayout,
-    format: wgpu::TextureFormat,
-    sample_count: u32,
-    blend_mode: BlendMode,
-) -> wgpu::RenderPipeline {
-    let blend = match blend_mode {
-        BlendMode::Alpha => Some(wgpu::BlendState::ALPHA_BLENDING),
-        BlendMode::Additive => Some(wgpu::BlendState {
-            color: wgpu::BlendComponent {
-                src_factor: wgpu::BlendFactor::SrcAlpha,
-                dst_factor: wgpu::BlendFactor::One,
-                operation: wgpu::BlendOperation::Add,
-            },
-            alpha: wgpu::BlendComponent {
-                src_factor: wgpu::BlendFactor::One,
-                dst_factor: wgpu::BlendFactor::One,
-                operation: wgpu::BlendOperation::Add,
-            },
-        }),
-        BlendMode::Replace => None,
-    };
-    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some("sim-engine composition pipeline"),
-        layout: Some(layout),
-        vertex: wgpu::VertexState {
-            module: shader,
-            entry_point: Some("heatmap_vs_main"),
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
-            buffers: &[],
-        },
-        primitive: wgpu::PrimitiveState {
-            topology: wgpu::PrimitiveTopology::TriangleList,
-            ..Default::default()
-        },
-        depth_stencil: None,
-        multisample: wgpu::MultisampleState {
-            count: sample_count,
-            ..Default::default()
-        },
-        fragment: Some(wgpu::FragmentState {
-            module: shader,
-            entry_point: Some("composite_fs_main"),
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
-            targets: &[Some(wgpu::ColorTargetState {
-                format,
-                blend,
-                write_mask: wgpu::ColorWrites::ALL,
-            })],
-        }),
-        multiview_mask: None,
-        cache: None,
-    })
-}
-
 fn create_vertex_buffer(device: &wgpu::Device, capacity: usize) -> wgpu::Buffer {
     device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("sim-engine vertex buffer"),
         size: (capacity.max(1) * std::mem::size_of::<Vertex>()) as wgpu::BufferAddress,
-        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+        usage: wgpu::BufferUsages::VERTEX
+            | wgpu::BufferUsages::COPY_DST
+            | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    })
+}
+
+fn create_dynamic_vertex_buffer(device: &wgpu::Device, capacity: usize) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("sim-engine dynamic vertex buffer"),
+        size: (capacity.max(1) * std::mem::size_of::<DynamicGpu>()) as wgpu::BufferAddress,
+        usage: wgpu::BufferUsages::VERTEX
+            | wgpu::BufferUsages::COPY_DST
+            | wgpu::BufferUsages::COPY_SRC,
         mapped_at_creation: false,
     })
 }
@@ -4155,11 +4713,35 @@ fn scalar_field_extent(field: &ScalarField) -> Result<wgpu::Extent3d, ScalarFiel
     })
 }
 
+fn scalar_value_range_extent(minimum: f32, maximum: f32) -> Option<f32> {
+    if !minimum.is_finite() || !maximum.is_finite() || maximum <= minimum {
+        return None;
+    }
+    let extent = maximum - minimum;
+    (extent.is_finite() && extent > 0.0).then_some(extent)
+}
+
+fn premultiplied_wgpu_color(color: Color) -> wgpu::Color {
+    let [red, green, blue, alpha] = color.to_array();
+    wgpu::Color {
+        r: f64::from(red * alpha),
+        g: f64::from(green * alpha),
+        b: f64::from(blue * alpha),
+        a: f64::from(alpha),
+    }
+}
+
 fn create_scalar_field_texture(
     device: &wgpu::Device,
     field: &ScalarField,
 ) -> Result<wgpu::Texture, ScalarFieldTextureError> {
     let extent = scalar_field_extent(field)?;
+    let limits = device.limits();
+    if extent.width > limits.max_texture_dimension_2d
+        || extent.height > limits.max_texture_dimension_2d
+    {
+        return Err(ScalarFieldTextureError::DimensionsTooLarge);
+    }
     Ok(device.create_texture(&wgpu::TextureDescriptor {
         label: Some("sim-engine scalar field texture"),
         size: extent,
@@ -4251,15 +4833,16 @@ fn create_scalar_field_texture_resources(
     })
 }
 
-fn create_color_map_texture(
+fn create_cached_color_map(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     color_map: &ColorMap,
-) -> wgpu::Texture {
+) -> CachedColorMap {
+    const COLOR_MAP_LUT_SIZE: u32 = 256;
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("sim-engine color map texture"),
         size: wgpu::Extent3d {
-            width: 256,
+            width: COLOR_MAP_LUT_SIZE,
             height: 1,
             depth_or_array_layers: 1,
         },
@@ -4270,11 +4853,9 @@ fn create_color_map_texture(
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     });
-    let mut bytes = Vec::with_capacity(256 * 4);
-    for index in 0..256 {
-        let color = color_map
-            .sample(index as f32 / 255.0)
-            .expect("finite color map sample");
+    let mut bytes = Vec::with_capacity(COLOR_MAP_LUT_SIZE as usize * 4);
+    for index in 0..COLOR_MAP_LUT_SIZE {
+        let color = color_map.sample_normalized(index as f32 / (COLOR_MAP_LUT_SIZE - 1) as f32);
         bytes.extend(
             color
                 .to_array()
@@ -4295,12 +4876,17 @@ fn create_color_map_texture(
             rows_per_image: Some(1),
         },
         wgpu::Extent3d {
-            width: 256,
+            width: COLOR_MAP_LUT_SIZE,
             height: 1,
             depth_or_array_layers: 1,
         },
     );
-    texture
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    CachedColorMap {
+        source: color_map.clone(),
+        _texture: texture,
+        view,
+    }
 }
 
 fn create_particle_unit_buffer(device: &wgpu::Device, queue: &wgpu::Queue) -> wgpu::Buffer {
@@ -4343,2117 +4929,20 @@ fn create_particle_instance_buffer(device: &wgpu::Device, capacity: usize) -> wg
     })
 }
 
-fn create_multisample_target(
-    device: &wgpu::Device,
-    config: &wgpu::SurfaceConfiguration,
-    sample_count: u32,
-) -> Option<MultisampleTarget> {
-    if sample_count <= 1 {
-        return None;
-    }
-
-    let texture = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("sim-engine multisample target"),
-        size: wgpu::Extent3d {
-            width: config.width,
-            height: config.height,
-            depth_or_array_layers: 1,
-        },
-        mip_level_count: 1,
-        sample_count,
-        dimension: wgpu::TextureDimension::D2,
-        format: config.format,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-        view_formats: &[],
-    });
-    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-
-    Some(MultisampleTarget {
-        _texture: texture,
-        view,
-    })
-}
-
-fn validate_scale_factor(scale_factor: f64) -> Result<(), RendererConfigurationError> {
-    let scale_factor_f32 = scale_factor as f32;
-    let minimum_scale_factor = u32::MAX as f64 / f32::MAX as f64;
-    if scale_factor.is_finite()
-        && scale_factor_f32.is_finite()
-        && scale_factor >= minimum_scale_factor
-    {
-        Ok(())
-    } else {
-        Err(RendererConfigurationError::InvalidScaleFactor { scale_factor })
-    }
-}
-
-fn physical_to_logical_screen(
-    position: PhysicalScreenPosition,
-    scale_factor: f32,
-) -> Result<LogicalScreenPosition, RendererCoordinateError> {
-    let logical = position.to_vec2() / scale_factor;
-    (position.is_finite() && logical.is_finite())
-        .then_some(LogicalScreenPosition::from_vec2(logical))
-        .ok_or(RendererCoordinateError::NonFiniteConversion)
-}
-
-fn logical_to_physical_screen(
-    position: LogicalScreenPosition,
-    scale_factor: f32,
-) -> Result<PhysicalScreenPosition, RendererCoordinateError> {
-    let physical = position.to_vec2() * scale_factor;
-    (position.is_finite() && physical.is_finite())
-        .then_some(PhysicalScreenPosition::from_vec2(physical))
-        .ok_or(RendererCoordinateError::NonFiniteConversion)
-}
-
-fn tessellate_scene(
-    scene: &Scene,
-    vertices: &mut Vec<Vertex>,
-    draw_batches: &mut Vec<PreparedDrawBatch>,
-) -> TessellationStats {
-    let mut stats = TessellationStats {
-        command_count: scene.command_count(),
-        ..TessellationStats::default()
-    };
-    for scene_command in scene.commands() {
-        let screen_clip = scene_command.screen_clip();
-        let vertex_start = vertices.len();
-
-        match scene_command.command() {
-            DrawCommand::Circle(circle) => tessellate_circle(circle, vertices),
-            DrawCommand::Rect(rectangle) => tessellate_rect(
-                rectangle.rect(),
-                rectangle.corner_radius(),
-                rectangle.style(),
-                vertices,
-            ),
-            DrawCommand::Line(line) => tessellate_line(line, vertices),
-            DrawCommand::Polyline(polyline) => {
-                tessellate_polyline(polyline, vertices);
-            }
-        }
-
-        for vertex in &mut vertices[vertex_start..] {
-            vertex.depth = scene_command.depth();
-        }
-
-        let vertex_end = vertices.len();
-        if vertices[vertex_start..]
-            .iter()
-            .any(|vertex| !vertex.is_finite())
-        {
-            vertices.truncate(vertex_start);
-            stats.dropped_command_count += 1;
-            continue;
-        }
-        if vertex_end == vertex_start {
-            stats.dropped_command_count += 1;
-            continue;
-        }
-
-        stats.rendered_command_count += 1;
-
-        let vertex_start = vertex_start as u32;
-        let vertex_end = vertex_end as u32;
-        match draw_batches.last_mut() {
-            Some(batch)
-                if batch.screen_clip == screen_clip && batch.vertex_range.end == vertex_start =>
-            {
-                batch.vertex_range.end = vertex_end;
-            }
-            _ => draw_batches.push(PreparedDrawBatch {
-                vertex_range: vertex_start..vertex_end,
-                screen_clip,
-            }),
-        }
-    }
-    stats
-}
-
-fn screen_clip_to_scissor(
-    screen_clip: ScreenClipRect,
-    viewport: LogicalViewport,
-    scale_factor: f32,
-) -> Option<ScissorRect> {
-    let rect = screen_clip.rect();
-    if !rect.min.is_finite()
-        || !rect.max.is_finite()
-        || !scale_factor.is_finite()
-        || scale_factor <= 0.0
-    {
-        return None;
-    }
-    let rect = rect.normalized();
-    let physical_width = (viewport.width() * scale_factor).round();
-    let physical_height = (viewport.height() * scale_factor).round();
-
-    let min_x = (rect.min.x * scale_factor)
-        .floor()
-        .clamp(0.0, physical_width);
-    let min_y = (rect.min.y * scale_factor)
-        .floor()
-        .clamp(0.0, physical_height);
-    let max_x = (rect.max.x * scale_factor)
-        .ceil()
-        .clamp(0.0, physical_width);
-    let max_y = (rect.max.y * scale_factor)
-        .ceil()
-        .clamp(0.0, physical_height);
-    if max_x <= min_x || max_y <= min_y {
-        return None;
-    }
-
-    Some(ScissorRect {
-        x: min_x as u32,
-        y: min_y as u32,
-        width: (max_x - min_x) as u32,
-        height: (max_y - min_y) as u32,
-    })
-}
-
-fn tessellate_circle(circle: &Circle, vertices: &mut Vec<Vertex>) {
-    if circle.radius() <= 0.0 {
-        return;
-    }
-
-    if let Some(shadow) = circle.style().shadow() {
-        push_circle_shadow_world(circle.center(), circle.radius(), shadow, vertices);
-    }
-
-    if let Some(fill) = circle.style().fill() {
-        push_circle_fill_world(circle.center(), circle.radius(), fill, Vec2::ZERO, vertices);
-    }
-
-    if let Some(stroke) = circle.style().stroke() {
-        push_circle_stroke_world(circle.center(), circle.radius(), stroke, vertices);
-    }
-}
-
-fn push_circle_shadow_world(
-    center_world: Vec2,
-    radius_world: f32,
-    shadow: Shadow,
-    vertices: &mut Vec<Vertex>,
-) {
-    push_circle_fill_world(
-        center_world,
-        radius_world,
-        Fill::Solid(shadow.color()),
-        shadow.offset(),
-        vertices,
-    );
-
-    if shadow.spread() > 0.0 {
-        let points = circle_world_points(center_world, radius_world);
-        push_closed_polyline_world(
-            &points,
-            shadow.spread() * 2.0,
-            shadow.color(),
-            shadow.offset(),
-            vertices,
-        );
-    }
-}
-
-fn push_circle_stroke_world(
-    center_world: Vec2,
-    radius_world: f32,
-    stroke: Stroke,
-    vertices: &mut Vec<Vertex>,
-) {
-    let points = circle_world_points(center_world, radius_world);
-    push_closed_polyline_world(
-        &points,
-        stroke.width(),
-        stroke.color(),
-        Vec2::ZERO,
-        vertices,
-    );
-}
-
-fn tessellate_rect(rect: Rect, corner_radius: f32, style: ShapeStyle, vertices: &mut Vec<Vertex>) {
-    let rect = rect.normalized();
-    if rect.width() <= 0.0 || rect.height() <= 0.0 {
-        return;
-    }
-
-    if let Some(shadow) = style.shadow() {
-        push_rect_world(
-            rect,
-            corner_radius,
-            Fill::Solid(shadow.color()),
-            shadow.offset(),
-            vertices,
-        );
-        if shadow.spread() > 0.0 {
-            let points = rounded_rect_points(rect, corner_radius);
-            push_closed_polyline_world(
-                &points,
-                shadow.spread() * 2.0,
-                shadow.color(),
-                shadow.offset(),
-                vertices,
-            );
-        }
-    }
-
-    if let Some(fill) = style.fill() {
-        push_rect_world(rect, corner_radius, fill, Vec2::ZERO, vertices);
-    }
-
-    if let Some(stroke) = style.stroke() {
-        let points = rounded_rect_points(rect, corner_radius);
-        push_closed_polyline_world(
-            &points,
-            stroke.width(),
-            stroke.color(),
-            Vec2::ZERO,
-            vertices,
-        );
-    }
-}
-
-fn tessellate_line(line: &Line, vertices: &mut Vec<Vertex>) {
-    push_round_line_world(
-        line.from(),
-        line.to(),
-        line.stroke().width(),
-        line.stroke().color(),
-        Vec2::ZERO,
-        vertices,
-    );
-}
-
-fn tessellate_polyline(polyline: &Polyline, vertices: &mut Vec<Vertex>) {
-    let mut emitted_segment = false;
-    for pair in polyline.points().windows(2) {
-        emitted_segment |= push_line_body_world(
-            pair[0],
-            pair[1],
-            polyline.stroke().width(),
-            polyline.stroke().color(),
-            Vec2::ZERO,
-            vertices,
-        );
-    }
-
-    if emitted_segment {
-        let radius = polyline.stroke().width() * 0.5;
-        for point in polyline.points() {
-            push_circle_screen_at_world(
-                *point,
-                radius,
-                polyline.stroke().color(),
-                Vec2::ZERO,
-                vertices,
-            );
-        }
-    }
-}
-
-fn push_circle_screen_at_world(
-    center_world: Vec2,
-    radius: f32,
-    color: Color,
-    screen_offset: Vec2,
-    vertices: &mut Vec<Vertex>,
-) {
-    if radius <= 0.0 {
-        return;
-    }
-
-    let center_vertex = world_vertex(center_world, screen_offset, color);
-    for index in 0..CIRCLE_SEGMENTS {
-        let angle_start = index as f32 / CIRCLE_SEGMENTS as f32 * std::f32::consts::TAU;
-        let angle_end = (index + 1) as f32 / CIRCLE_SEGMENTS as f32 * std::f32::consts::TAU;
-        vertices.push(center_vertex);
-        vertices.push(world_vertex(
-            center_world,
-            screen_offset + Vec2::new(angle_start.cos(), -angle_start.sin()) * radius,
-            color,
-        ));
-        vertices.push(world_vertex(
-            center_world,
-            screen_offset + Vec2::new(angle_end.cos(), -angle_end.sin()) * radius,
-            color,
-        ));
-    }
-}
-
-fn push_circle_fill_world(
-    center_world: Vec2,
-    radius_world: f32,
-    fill: Fill,
-    screen_offset: Vec2,
-    vertices: &mut Vec<Vertex>,
-) {
-    if radius_world <= 0.0 {
-        return;
-    }
-
-    let center_vertex = world_vertex(center_world, screen_offset, fill.color_at(center_world));
-
-    for index in 0..CIRCLE_SEGMENTS {
-        let angle_start = index as f32 / CIRCLE_SEGMENTS as f32 * std::f32::consts::TAU;
-        let angle_end = (index + 1) as f32 / CIRCLE_SEGMENTS as f32 * std::f32::consts::TAU;
-        let world_start =
-            center_world + Vec2::new(angle_start.cos(), angle_start.sin()) * radius_world;
-        let world_end = center_world + Vec2::new(angle_end.cos(), angle_end.sin()) * radius_world;
-
-        vertices.push(center_vertex);
-        vertices.push(world_vertex(
-            world_start,
-            screen_offset,
-            fill.color_at(world_start),
-        ));
-        vertices.push(world_vertex(
-            world_end,
-            screen_offset,
-            fill.color_at(world_end),
-        ));
-    }
-}
-
-fn circle_world_points(center_world: Vec2, radius_world: f32) -> Vec<Vec2> {
-    let mut points = Vec::with_capacity(CIRCLE_SEGMENTS + 1);
-    for index in 0..=CIRCLE_SEGMENTS {
-        let angle = index as f32 / CIRCLE_SEGMENTS as f32 * std::f32::consts::TAU;
-        points.push(center_world + Vec2::new(angle.cos(), angle.sin()) * radius_world);
-    }
-    points
-}
-
-fn push_rect_world(
-    rect: Rect,
-    corner_radius: f32,
-    fill: Fill,
-    screen_offset: Vec2,
-    vertices: &mut Vec<Vertex>,
-) {
-    let points = rounded_rect_points(rect, corner_radius);
-    if points.len() < 3 {
-        return;
-    }
-
-    let center = rect.center();
-    for index in 0..points.len() - 1 {
-        vertices.push(world_vertex(
-            center,
-            screen_offset,
-            fill.color_at(rect.center()),
-        ));
-        vertices.push(world_vertex(
-            points[index],
-            screen_offset,
-            fill.color_at(points[index]),
-        ));
-        vertices.push(world_vertex(
-            points[index + 1],
-            screen_offset,
-            fill.color_at(points[index + 1]),
-        ));
-    }
-}
-
-fn rounded_rect_points(rect: Rect, corner_radius: f32) -> Vec<Vec2> {
-    let radius = corner_radius
-        .max(0.0)
-        .min(rect.width().abs() * 0.5)
-        .min(rect.height().abs() * 0.5);
-
-    if radius <= f32::EPSILON {
-        return vec![
-            Vec2::new(rect.max.x, rect.min.y),
-            Vec2::new(rect.max.x, rect.max.y),
-            Vec2::new(rect.min.x, rect.max.y),
-            Vec2::new(rect.min.x, rect.min.y),
-            Vec2::new(rect.max.x, rect.min.y),
-        ];
-    }
-
-    let corners = [
-        (
-            Vec2::new(rect.max.x - radius, rect.max.y - radius),
-            0.0,
-            std::f32::consts::FRAC_PI_2,
-        ),
-        (
-            Vec2::new(rect.min.x + radius, rect.max.y - radius),
-            std::f32::consts::FRAC_PI_2,
-            std::f32::consts::PI,
-        ),
-        (
-            Vec2::new(rect.min.x + radius, rect.min.y + radius),
-            std::f32::consts::PI,
-            std::f32::consts::PI * 1.5,
-        ),
-        (
-            Vec2::new(rect.max.x - radius, rect.min.y + radius),
-            std::f32::consts::PI * 1.5,
-            std::f32::consts::TAU,
-        ),
-    ];
-
-    let mut points = Vec::with_capacity(CORNER_SEGMENTS * 4 + 1);
-    for (center, start_angle, end_angle) in corners {
-        for step in 0..=CORNER_SEGMENTS {
-            let amount = step as f32 / CORNER_SEGMENTS as f32;
-            let angle = start_angle + (end_angle - start_angle) * amount;
-            points.push(center + Vec2::new(angle.cos(), angle.sin()) * radius);
-        }
-    }
-    points.push(points[0]);
-
-    points
-}
-
-fn push_round_line_world(
-    from: Vec2,
-    to: Vec2,
-    width: f32,
-    color: Color,
-    screen_offset: Vec2,
-    vertices: &mut Vec<Vertex>,
-) {
-    if push_line_body_world(from, to, width, color, screen_offset, vertices) {
-        let radius = width * 0.5;
-        push_circle_screen_at_world(from, radius, color, screen_offset, vertices);
-        push_circle_screen_at_world(to, radius, color, screen_offset, vertices);
-    }
-}
-
-fn push_closed_polyline_world(
-    points: &[Vec2],
-    width: f32,
-    color: Color,
-    screen_offset: Vec2,
-    vertices: &mut Vec<Vertex>,
-) {
-    if points.len() < 4 || width <= 0.0 || !width.is_finite() {
-        return;
-    }
-
-    let mut unique_points = Vec::with_capacity(points.len() - 1);
-    for point in &points[..points.len() - 1] {
-        if unique_points
-            .last()
-            .is_none_or(|previous| (*point - *previous).length_squared() > f32::EPSILON)
-        {
-            unique_points.push(*point);
-        }
-    }
-    if unique_points.len() > 1 {
-        let first = unique_points[0];
-        let last = unique_points[unique_points.len() - 1];
-        if (first - last).length_squared() <= f32::EPSILON {
-            unique_points.pop();
-        }
-    }
-    if unique_points.len() < 3 {
-        return;
-    }
-
-    let point_count = unique_points.len();
-    let half_width = width * 0.5;
-    for index in 0..point_count {
-        let next = (index + 1) % point_count;
-        let previous = (index + point_count - 1) % point_count;
-        let after_next = (next + 1) % point_count;
-        let current_previous_direction = unique_points[index] - unique_points[previous];
-        let current_next_direction = unique_points[next] - unique_points[index];
-        let next_next_direction = unique_points[after_next] - unique_points[next];
-
-        vertices.push(stroke_vertex(
-            unique_points[index],
-            screen_offset,
-            current_previous_direction,
-            current_next_direction,
-            half_width,
-            color,
-        ));
-        vertices.push(stroke_vertex(
-            unique_points[next],
-            screen_offset,
-            current_next_direction,
-            next_next_direction,
-            half_width,
-            color,
-        ));
-        vertices.push(stroke_vertex(
-            unique_points[next],
-            screen_offset,
-            current_next_direction,
-            next_next_direction,
-            -half_width,
-            color,
-        ));
-        vertices.push(stroke_vertex(
-            unique_points[index],
-            screen_offset,
-            current_previous_direction,
-            current_next_direction,
-            half_width,
-            color,
-        ));
-        vertices.push(stroke_vertex(
-            unique_points[next],
-            screen_offset,
-            current_next_direction,
-            next_next_direction,
-            -half_width,
-            color,
-        ));
-        vertices.push(stroke_vertex(
-            unique_points[index],
-            screen_offset,
-            current_previous_direction,
-            current_next_direction,
-            -half_width,
-            color,
-        ));
-    }
-}
-
-fn push_line_body_world(
-    from: Vec2,
-    to: Vec2,
-    width: f32,
-    color: Color,
-    screen_offset: Vec2,
-    vertices: &mut Vec<Vertex>,
-) -> bool {
-    if width <= 0.0 {
-        return false;
-    }
-
-    let delta = to - from;
-    if !delta.is_finite() || (delta.x == 0.0 && delta.y == 0.0) {
-        return false;
-    }
-
-    let half_width = width * 0.5;
-    vertices.push(stroke_vertex(
-        from,
-        screen_offset,
-        delta,
-        delta,
-        half_width,
-        color,
-    ));
-    vertices.push(stroke_vertex(
-        to,
-        screen_offset,
-        delta,
-        delta,
-        half_width,
-        color,
-    ));
-    vertices.push(stroke_vertex(
-        to,
-        screen_offset,
-        delta,
-        delta,
-        -half_width,
-        color,
-    ));
-    vertices.push(stroke_vertex(
-        from,
-        screen_offset,
-        delta,
-        delta,
-        half_width,
-        color,
-    ));
-    vertices.push(stroke_vertex(
-        to,
-        screen_offset,
-        delta,
-        delta,
-        -half_width,
-        color,
-    ));
-    vertices.push(stroke_vertex(
-        from,
-        screen_offset,
-        delta,
-        delta,
-        -half_width,
-        color,
-    ));
-    true
-}
-
-fn world_vertex(world: Vec2, screen_offset: Vec2, color: Color) -> Vertex {
-    Vertex {
-        world_position: [world.x, world.y],
-        depth: 0.0,
-        screen_offset: [screen_offset.x, screen_offset.y],
-        previous_direction: [0.0; 2],
-        next_direction: [0.0; 2],
-        normal_distance: 0.0,
-        color: color.to_array(),
-    }
-}
-
-fn stroke_vertex(
-    world: Vec2,
-    screen_offset: Vec2,
-    previous_direction: Vec2,
-    next_direction: Vec2,
-    normal_distance: f32,
-    color: Color,
-) -> Vertex {
-    Vertex {
-        world_position: [world.x, world.y],
-        depth: 0.0,
-        screen_offset: [screen_offset.x, screen_offset.y],
-        previous_direction: [previous_direction.x, previous_direction.y],
-        next_direction: [next_direction.x, next_direction.y],
-        normal_distance,
-        color: color.to_array(),
-    }
-}
+mod config;
+mod tessellation;
+mod visualization;
+use config::{
+    MultisampleTarget, create_multisample_target, logical_to_physical_screen,
+    physical_to_logical_screen, validate_scale_factor,
+};
+pub use config::{RendererPresentMode, WgpuRendererOptions};
+use tessellation::{screen_clip_to_scissor, tessellate_scene};
+use visualization::{CachedColorMap, CompositionPipelines, create_composition_pipeline};
+pub use visualization::{LayeredVisualizationError, LayeredVisualizationOptions};
 
 #[cfg(test)]
-mod tests {
-    use std::sync::mpsc;
+use tessellation::world_vertex;
 
-    use super::*;
-
-    fn tessellate_for_test(scene: &Scene) -> (Vec<Vertex>, Vec<PreparedDrawBatch>) {
-        let mut vertices = Vec::new();
-        let mut draw_batches = Vec::new();
-        let _ = tessellate_scene(scene, &mut vertices, &mut draw_batches);
-        (vertices, draw_batches)
-    }
-
-    #[test]
-    fn dynamic_mesh_vertices_require_complete_finite_triangles() {
-        let vertex = DynamicVertex2d::new(Vec2::ZERO, 0.0, Color::WHITE).unwrap();
-        assert!(matches!(
-            dynamic_vertices_to_gpu(&[vertex, vertex]),
-            Err(DynamicMeshError::InvalidVertexCount)
-        ));
-        assert_eq!(
-            DynamicVertex2d::new(Vec2::new(f32::NAN, 0.0), 0.0, Color::WHITE),
-            Err(DynamicMeshError::InvalidVertex)
-        );
-
-        let vertices = dynamic_vertices_to_gpu(&[vertex; 3]).unwrap();
-        assert_eq!(vertices.len(), 3);
-        assert_eq!(dynamic_vertex_capacity(3), 4);
-    }
-
-    #[test]
-    fn particle_instances_validate_visual_contract() {
-        let particle =
-            ParticleInstance2d::new(Vec2::new(3.0, -2.0), 4.5, Color::WHITE, 1.0).unwrap();
-        assert_eq!(particle.world_position(), Vec2::new(3.0, -2.0));
-        assert_eq!(particle.radius(), 4.5);
-        assert_eq!(particle.depth(), 1.0);
-        assert_eq!(particle.color(), Color::WHITE);
-        assert_eq!(
-            ParticleInstance2d::new(Vec2::ZERO, 0.0, Color::WHITE, 0.0),
-            Err(ParticleInstanceError::InvalidRadius)
-        );
-        assert_eq!(
-            ParticleInstance2d::new(Vec2::ZERO, 1.0, Color::WHITE, f32::NAN),
-            Err(ParticleInstanceError::NonFinite)
-        );
-    }
-
-    #[test]
-    fn particle_gpu_instances_preserve_counts_and_capacity_contract() {
-        let particle = ParticleInstance2d::new(Vec2::new(2.0, -3.0), 2.0, Color::WHITE, 4.0)
-            .expect("finite particle should be valid");
-        let gpu_instances = particle_instances_to_gpu(&[particle]).unwrap();
-        assert_eq!(gpu_instances.len(), 1);
-        assert_eq!(particle_instance_capacity(0), 1);
-        assert_eq!(particle_instance_capacity(3), 4);
-        let statistics = particle_statistics(gpu_instances.len(), gpu_instances.len(), 1);
-        assert_eq!(statistics.submitted(), 1);
-        assert_eq!(statistics.visible(), 1);
-        assert_eq!(statistics.culled(), 0);
-        assert_eq!(statistics.dropped(), 0);
-        assert_eq!(statistics.rendered(), 1);
-    }
-
-    #[test]
-    fn particle_culling_keeps_circles_that_intersect_the_logical_viewport() {
-        let camera = Camera2d::new(Vec2::ZERO, 1.0).unwrap();
-        let viewport = LogicalViewport::new(100.0, 100.0).unwrap();
-        let uniform = CameraUniform::new(camera, viewport).unwrap();
-        let visible = ParticleGpu {
-            world_position: [55.0, 0.0],
-            depth: 0.0,
-            radius: 6.0,
-            color: Color::WHITE.to_array(),
-        };
-        let culled = ParticleGpu {
-            world_position: [57.0, 0.0],
-            depth: 0.0,
-            radius: 6.0,
-            color: Color::WHITE.to_array(),
-        };
-        assert!(visible.is_safe_for(uniform));
-        assert!(visible.intersects_viewport(uniform, viewport));
-        assert!(!culled.intersects_viewport(uniform, viewport));
-    }
-
-    #[test]
-    fn particle_partial_updates_require_an_existing_contiguous_range() {
-        assert_eq!(particle_update_range(2, 3, 5), Ok(2..5));
-        assert_eq!(particle_update_range(5, 0, 5), Ok(5..5));
-        assert_eq!(
-            particle_update_range(4, 2, 5),
-            Err(ParticleFieldError::UpdateRangeOutOfBounds)
-        );
-        assert_eq!(
-            particle_update_range(usize::MAX, 1, 5),
-            Err(ParticleFieldError::UpdateRangeOutOfBounds)
-        );
-    }
-
-    fn vertex_screen_position(vertex: Vertex, camera: Camera2d, viewport: LogicalViewport) -> Vec2 {
-        let Some(uniform) = CameraUniform::new(camera, viewport) else {
-            panic!("test camera uniform should be finite");
-        };
-        let world = Vec2::new(vertex.world_position[0], vertex.world_position[1]);
-        let mut screen = uniform.world_to_screen(world, vertex.depth)
-            + Vec2::new(vertex.screen_offset[0], vertex.screen_offset[1]);
-        if vertex.normal_distance.abs() > 0.0 {
-            let previous = uniform.direction_to_screen(Vec2::new(
-                vertex.previous_direction[0],
-                vertex.previous_direction[1],
-            ));
-            let next = uniform.direction_to_screen(Vec2::new(
-                vertex.next_direction[0],
-                vertex.next_direction[1],
-            ));
-            let previous_normal = previous.normalized().perp();
-            let next_normal = next.normalized().perp();
-            let combined_normal = previous_normal + next_normal;
-            let mut extrusion = next_normal * vertex.normal_distance;
-            if combined_normal.length_squared() > 0.000001 {
-                let miter = combined_normal.normalized();
-                let denominator = miter.dot(next_normal);
-                if denominator.abs() > 0.001 {
-                    extrusion = miter * (vertex.normal_distance / denominator);
-                }
-            }
-            screen += extrusion;
-        }
-        screen
-    }
-
-    #[test]
-    fn filled_circle_tessellates_to_triangle_fan() {
-        let mut scene = Scene::new(Color::BLACK).unwrap();
-        scene.circle(Vec2::ZERO, 12.0, ShapeStyle::filled(Color::WHITE));
-
-        let (vertices, draw_batches) = tessellate_for_test(&scene);
-
-        assert_eq!(vertices.len(), CIRCLE_SEGMENTS * 3);
-        assert_eq!(draw_batches.len(), 1);
-    }
-
-    #[test]
-    fn line_tessellates_with_round_caps() {
-        let mut scene = Scene::new(Color::BLACK).unwrap();
-        scene.line(
-            Vec2::new(-10.0, 0.0),
-            Vec2::new(10.0, 0.0),
-            2.0,
-            Color::WHITE,
-        );
-
-        let (vertices, _) = tessellate_for_test(&scene);
-
-        assert_eq!(vertices.len(), 6 + CIRCLE_SEGMENTS * 6);
-    }
-
-    #[test]
-    fn short_accepted_line_emits_vertices() {
-        let mut scene = Scene::new(Color::BLACK).unwrap();
-        assert!(scene.line(Vec2::ZERO, Vec2::new(0.005, 0.0), 2.0, Color::WHITE));
-
-        let (vertices, _) = tessellate_for_test(&scene);
-
-        assert!(!vertices.is_empty());
-    }
-
-    #[test]
-    fn overflowing_finite_geometry_is_reported_as_dropped() {
-        let mut scene = Scene::new(Color::BLACK).unwrap();
-        assert!(scene.circle(
-            Vec2::splat(f32::MAX),
-            f32::MAX,
-            ShapeStyle::filled(Color::WHITE),
-        ));
-        let mut vertices = Vec::new();
-        let mut draw_batches = Vec::new();
-        let stats = tessellate_scene(&scene, &mut vertices, &mut draw_batches);
-
-        assert_eq!(stats.command_count(), 1);
-        assert_eq!(stats.rendered_command_count(), 0);
-        assert_eq!(stats.dropped_command_count(), 1);
-        assert!(vertices.is_empty());
-    }
-
-    #[test]
-    fn invalid_primitives_do_not_emit_vertices() {
-        let mut scene = Scene::new(Color::BLACK).unwrap();
-        scene.circle(Vec2::ZERO, 0.0, ShapeStyle::filled(Color::WHITE));
-        scene.line(Vec2::ZERO, Vec2::ZERO, 2.0, Color::WHITE);
-        scene.line(Vec2::new(-1.0, 0.0), Vec2::new(1.0, 0.0), 0.0, Color::WHITE);
-
-        let (vertices, draw_batches) = tessellate_for_test(&scene);
-
-        assert!(vertices.is_empty());
-        assert!(draw_batches.is_empty());
-    }
-
-    #[test]
-    fn gradient_fill_reaches_vertex_colors() {
-        let mut scene = Scene::new(Color::BLACK).unwrap();
-        scene.rect(
-            Rect::from_center_size(Vec2::ZERO, Vec2::new(2.0, 2.0)),
-            0.0,
-            ShapeStyle::filled_with(Fill::LinearGradient(crate::LinearGradient::new(
-                Vec2::new(-1.0, 0.0),
-                Vec2::new(1.0, 0.0),
-                Color::BLACK,
-                Color::WHITE,
-            ))),
-        );
-
-        let (vertices, _) = tessellate_for_test(&scene);
-
-        assert!(vertices.iter().any(|vertex| vertex.color[0] < 0.01));
-        assert!(vertices.iter().any(|vertex| vertex.color[0] > 0.99));
-    }
-
-    #[test]
-    fn flat_rectangle_emits_every_fan_sector() {
-        let mut scene = Scene::new(Color::BLACK).unwrap();
-        scene.rect(
-            Rect::from_center_size(Vec2::ZERO, Vec2::new(20.0, 10.0)),
-            0.0,
-            ShapeStyle::filled(Color::WHITE),
-        );
-
-        let (vertices, _) = tessellate_for_test(&scene);
-
-        assert_eq!(vertices.len(), 12);
-    }
-
-    #[test]
-    fn projected_circle_follows_camera_tilt() {
-        let Ok(mut camera) = Camera2d::new(Vec2::ZERO, 2.0) else {
-            panic!("test camera should be valid");
-        };
-        let Ok(projection) = crate::Projection2d::new(0.8, 1.0) else {
-            panic!("test projection should be valid");
-        };
-        camera.set_projection(projection);
-        let Ok(viewport) = LogicalViewport::new(800.0, 600.0) else {
-            panic!("test viewport should be valid");
-        };
-        let mut scene = Scene::new(Color::BLACK).unwrap();
-        scene.circle(Vec2::ZERO, 10.0, ShapeStyle::filled(Color::WHITE));
-        let mut vertices = Vec::new();
-        let mut draw_batches = Vec::new();
-
-        tessellate_scene(&scene, &mut vertices, &mut draw_batches);
-
-        let positions: Vec<_> = vertices
-            .iter()
-            .copied()
-            .map(|vertex| vertex_screen_position(vertex, camera, viewport))
-            .collect();
-        let width = positions
-            .iter()
-            .map(|point| point.x)
-            .fold(f32::NEG_INFINITY, f32::max)
-            - positions
-                .iter()
-                .map(|point| point.x)
-                .fold(f32::INFINITY, f32::min);
-        let height = positions
-            .iter()
-            .map(|point| point.y)
-            .fold(f32::NEG_INFINITY, f32::max)
-            - positions
-                .iter()
-                .map(|point| point.y)
-                .fold(f32::INFINITY, f32::min);
-
-        assert!((width - 40.0).abs() < 0.01);
-        assert!((height - 40.0 * 0.8_f32.cos()).abs() < 0.05);
-    }
-
-    #[test]
-    fn camera_uniform_matches_public_camera_projection() {
-        let Ok(mut camera) = Camera2d::new(Vec2::new(17.0, -23.0), 2.75) else {
-            panic!("test camera should be valid");
-        };
-        let Ok(projection) = crate::Projection2d::new(0.63, 4.0) else {
-            panic!("test projection should be valid");
-        };
-        camera.set_projection(projection);
-        if camera.set_rotation(0.31).is_err() {
-            panic!("test rotation should be valid");
-        }
-        let Ok(viewport) = LogicalViewport::new(1_137.0, 683.0) else {
-            panic!("test viewport should be valid");
-        };
-        let Some(uniform) = CameraUniform::new(camera, viewport) else {
-            panic!("test camera uniform should be finite");
-        };
-
-        for (world, depth) in [
-            (Vec2::ZERO, 0.0),
-            (camera.center(), 0.0),
-            (Vec2::new(-81.5, 44.25), 7.5),
-            (Vec2::new(319.0, -127.0), -13.25),
-        ] {
-            let expected = camera
-                .projected_world_to_screen(world, depth, viewport)
-                .unwrap()
-                .to_vec2();
-            let actual = uniform.world_to_screen(world, depth);
-            assert!((actual.x - expected.x).abs() < 0.001);
-            assert!((actual.y - expected.y).abs() < 0.001);
-        }
-    }
-
-    #[test]
-    fn scene_depth_reaches_tessellated_vertices() {
-        let mut scene = Scene::new(Color::BLACK).unwrap();
-        assert!(
-            scene
-                .with_depth(12.5, |scene| {
-                    scene.circle(Vec2::ZERO, 8.0, ShapeStyle::filled(Color::WHITE));
-                })
-                .is_ok()
-        );
-
-        let (vertices, _) = tessellate_for_test(&scene);
-
-        assert!(!vertices.is_empty());
-        assert!(vertices.iter().all(|vertex| vertex.depth == 12.5));
-    }
-
-    #[test]
-    fn maximum_radius_rounded_rect_stroke_has_no_collapsed_directions() {
-        let mut scene = Scene::new(Color::BLACK).unwrap();
-        scene.rect(
-            Rect::from_center_size(Vec2::ZERO, Vec2::splat(20.0)),
-            100.0,
-            ShapeStyle::stroked(3.0, Color::WHITE),
-        );
-
-        let (vertices, _) = tessellate_for_test(&scene);
-
-        assert!(!vertices.is_empty());
-        assert!(vertices.iter().all(|vertex| {
-            Vec2::new(vertex.previous_direction[0], vertex.previous_direction[1]).length_squared()
-                > f32::EPSILON
-                && Vec2::new(vertex.next_direction[0], vertex.next_direction[1]).length_squared()
-                    > f32::EPSILON
-        }));
-    }
-
-    #[test]
-    fn gpu_extrusion_contract_keeps_line_width_in_screen_pixels() {
-        let mut scene = Scene::new(Color::BLACK).unwrap();
-        scene.line(
-            Vec2::new(-20.0, -13.0),
-            Vec2::new(40.0, 27.0),
-            7.0,
-            Color::WHITE,
-        );
-        let (vertices, _) = tessellate_for_test(&scene);
-        let Ok(mut camera) = Camera2d::new(Vec2::new(5.0, 9.0), 6.0) else {
-            panic!("test camera should be valid");
-        };
-        let Ok(projection) = crate::Projection2d::new(0.72, 1.0) else {
-            panic!("test projection should be valid");
-        };
-        camera.set_projection(projection);
-        if camera.set_rotation(-0.41).is_err() {
-            panic!("test rotation should be valid");
-        }
-        let Ok(viewport) = LogicalViewport::new(800.0, 600.0) else {
-            panic!("test viewport should be valid");
-        };
-
-        let positive = vertex_screen_position(vertices[0], camera, viewport);
-        let negative = vertex_screen_position(vertices[5], camera, viewport);
-
-        assert!(((positive - negative).length() - 7.0).abs() < 0.001);
-    }
-
-    #[test]
-    fn geometry_extents_reject_shader_arithmetic_overflow() {
-        let vertices = [world_vertex(
-            Vec2::new(f32::MAX * 0.75, 0.0),
-            Vec2::ZERO,
-            Color::WHITE,
-        )];
-        let extents = GeometryExtents::from_vertices(&vertices);
-        let Ok(camera) = Camera2d::new(Vec2::ZERO, 2.0) else {
-            panic!("test camera should be valid");
-        };
-        let Ok(viewport) = LogicalViewport::new(800.0, 600.0) else {
-            panic!("test viewport should be valid");
-        };
-        let Some(uniform) = CameraUniform::new(camera, viewport) else {
-            panic!("test camera uniform should be finite");
-        };
-
-        assert!(!extents.is_safe_for(uniform));
-    }
-
-    #[test]
-    fn geometry_extents_accept_valid_geometry_relative_to_large_camera_center() {
-        let center = Vec2::new(2.0e38, 0.0);
-        let world = Vec2::new(center.x + 1.0e33, 0.0);
-        let vertices = [world_vertex(world, Vec2::ZERO, Color::WHITE)];
-        let extents = GeometryExtents::from_vertices(&vertices);
-        let Ok(camera) = Camera2d::new(center, 2.0) else {
-            panic!("large finite camera should be valid");
-        };
-        let Ok(viewport) = LogicalViewport::new(800.0, 600.0) else {
-            panic!("test viewport should be valid");
-        };
-        let Some(uniform) = CameraUniform::new(camera, viewport) else {
-            panic!("relative camera uniform should remain finite");
-        };
-
-        assert!(uniform.world_to_screen(world, 0.0).is_finite());
-        assert!(extents.is_safe_for(uniform));
-    }
-
-    #[test]
-    fn non_finite_and_overflowing_geometry_never_reaches_batches() {
-        let mut scene = Scene::new(Color::BLACK).unwrap();
-        assert!(!scene.circle(
-            Vec2::new(f32::NAN, 0.0),
-            10.0,
-            ShapeStyle::filled(Color::WHITE)
-        ));
-        assert!(scene.circle(
-            Vec2::new(f32::MAX, f32::MAX),
-            f32::MAX,
-            ShapeStyle::filled(Color::WHITE)
-        ));
-
-        let (vertices, draw_batches) = tessellate_for_test(&scene);
-
-        assert!(vertices.is_empty());
-        assert!(draw_batches.is_empty());
-    }
-
-    #[test]
-    fn clipped_commands_create_scissor_batches() {
-        let mut scene = Scene::new(Color::BLACK).unwrap();
-        let clip =
-            ScreenClipRect::from_min_size(Vec2::new(10.25, 20.75), Vec2::new(100.0, 80.0)).unwrap();
-        scene
-            .with_screen_clip(clip, |scene| {
-                scene.circle(Vec2::ZERO, 8.0, ShapeStyle::filled(Color::WHITE));
-                scene.circle(Vec2::X, 8.0, ShapeStyle::filled(Color::WHITE));
-            })
-            .unwrap();
-        scene.circle(Vec2::Y, 8.0, ShapeStyle::filled(Color::WHITE));
-
-        let (_, draw_batches) = tessellate_for_test(&scene);
-
-        assert_eq!(draw_batches.len(), 2);
-        assert_eq!(draw_batches[0].screen_clip, Some(clip));
-        assert_eq!(draw_batches[1].screen_clip, None);
-    }
-
-    #[test]
-    fn offscreen_clip_keeps_prepared_geometry_but_resolves_to_no_scissor() {
-        let mut scene = Scene::new(Color::BLACK).unwrap();
-        let screen_clip =
-            ScreenClipRect::from_min_size(Vec2::new(900.0, 700.0), Vec2::new(20.0, 20.0)).unwrap();
-        scene
-            .with_screen_clip(screen_clip, |scene| {
-                scene.circle(Vec2::ZERO, 8.0, ShapeStyle::filled(Color::WHITE))
-            })
-            .unwrap();
-
-        let (vertices, draw_batches) = tessellate_for_test(&scene);
-        let Ok(viewport) = LogicalViewport::new(800.0, 600.0) else {
-            panic!("test viewport should be valid");
-        };
-
-        assert!(!vertices.is_empty());
-        assert_eq!(draw_batches[0].screen_clip, Some(screen_clip));
-        assert_eq!(screen_clip_to_scissor(screen_clip, viewport, 1.0), None);
-    }
-
-    #[test]
-    fn non_finite_screen_clip_is_rejected_immediately() {
-        let scene = Scene::new(Color::BLACK).unwrap();
-        assert_eq!(
-            ScreenClipRect::new(Vec2::new(f32::NAN, 0.0), Vec2::new(100.0, 100.0)),
-            Err(crate::SceneError::InvalidScreenClip)
-        );
-        assert_eq!(scene.command_count(), 0);
-    }
-
-    #[test]
-    fn logical_clip_converts_to_hidpi_physical_scissor() {
-        let Ok(viewport) = LogicalViewport::new(800.0, 600.0) else {
-            panic!("test viewport should be valid");
-        };
-        let clip =
-            ScreenClipRect::from_min_size(Vec2::new(10.25, 20.75), Vec2::new(100.0, 80.0)).unwrap();
-
-        let scissor = screen_clip_to_scissor(clip, viewport, 2.0);
-
-        assert_eq!(
-            scissor,
-            Some(ScissorRect {
-                x: 20,
-                y: 41,
-                width: 201,
-                height: 161,
-            })
-        );
-    }
-
-    #[test]
-    fn renderer_screen_position_conversion_is_explicit_at_hidpi() {
-        let physical = PhysicalScreenPosition::new(800.0, 600.0);
-
-        let logical = physical_to_logical_screen(physical, 2.0).unwrap();
-        let roundtrip = logical_to_physical_screen(logical, 2.0).unwrap();
-
-        assert_eq!(logical, LogicalScreenPosition::new(400.0, 300.0));
-        assert_eq!(roundtrip, physical);
-        assert_eq!(
-            physical_to_logical_screen(PhysicalScreenPosition::new(f32::MAX, 0.0), 0.5),
-            Err(RendererCoordinateError::NonFiniteConversion)
-        );
-    }
-
-    #[test]
-    fn prepared_scene_identity_guard_rejects_another_renderer() {
-        let first_renderer = Arc::new(());
-        let same_renderer = Arc::clone(&first_renderer);
-        let second_renderer = Arc::new(());
-
-        assert!(prepared_scene_belongs_to(&first_renderer, &same_renderer));
-        assert!(!prepared_scene_belongs_to(
-            &first_renderer,
-            &second_renderer
-        ));
-    }
-
-    #[test]
-    fn offscreen_gpu_readback_verifies_camera_depth_and_clip_contract() {
-        pollster::block_on(async {
-            let instance =
-                wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
-            let Ok(adapter) = instance
-                .request_adapter(&wgpu::RequestAdapterOptions {
-                    power_preference: wgpu::PowerPreference::LowPower,
-                    force_fallback_adapter: false,
-                    compatible_surface: None,
-                    apply_limit_buckets: false,
-                })
-                .await
-            else {
-                return;
-            };
-            let Ok((device, queue)) = adapter
-                .request_device(&wgpu::DeviceDescriptor {
-                    label: Some("sim-engine offscreen test device"),
-                    required_features: wgpu::Features::empty(),
-                    required_limits: wgpu::Limits::default(),
-                    experimental_features: wgpu::ExperimentalFeatures::disabled(),
-                    memory_hints: wgpu::MemoryHints::MemoryUsage,
-                    trace: wgpu::Trace::Off,
-                })
-                .await
-            else {
-                panic!("adapter should create a test device");
-            };
-
-            let validation_scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
-            let format = wgpu::TextureFormat::Rgba8UnormSrgb;
-            let (
-                pipeline,
-                particle_pipeline,
-                heatmap_pipeline,
-                target_heatmap_pipeline,
-                _composition_pipelines,
-                target_composition_pipelines,
-                camera_uniform_buffer,
-                camera_bind_group,
-                heatmap_uniform_buffer,
-                heatmap_bind_group_layout,
-            ) = create_pipeline(&device, format, 1);
-            let target = device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("sim-engine offscreen test target"),
-                size: wgpu::Extent3d {
-                    width: 64,
-                    height: 64,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                    | wgpu::TextureUsages::TEXTURE_BINDING
-                    | wgpu::TextureUsages::COPY_SRC,
-                view_formats: &[],
-            });
-            let view = target.create_view(&wgpu::TextureViewDescriptor::default());
-            let mut scene = Scene::new(Color::BLACK).unwrap();
-            let clip =
-                ScreenClipRect::from_min_size(Vec2::new(30.0, 20.0), Vec2::new(8.0, 12.0)).unwrap();
-            assert!(
-                scene
-                    .with_depth(3.0, |scene| {
-                        scene
-                            .with_screen_clip(clip, |scene| {
-                                scene.rect(
-                                    Rect::from_center_size(Vec2::ZERO, Vec2::splat(4.0)),
-                                    0.0,
-                                    ShapeStyle::filled(Color::WHITE),
-                                );
-                            })
-                            .unwrap();
-                    })
-                    .is_ok()
-            );
-            let source_identity = Arc::new(());
-            let prepared =
-                prepare_scene_resources(&device, &queue, Arc::clone(&source_identity), &scene);
-            let replacement_identity = Arc::new(());
-            let restored = restore_prepared_scene_resources(
-                &device,
-                &queue,
-                Arc::clone(&replacement_identity),
-                &prepared,
-            );
-            assert!(prepared_scene_belongs_to(
-                &source_identity,
-                &prepared.renderer_identity
-            ));
-            assert!(!prepared_scene_belongs_to(
-                &source_identity,
-                &restored.renderer_identity
-            ));
-            assert!(prepared_scene_belongs_to(
-                &replacement_identity,
-                &restored.renderer_identity
-            ));
-            assert_eq!(restored.vertex_count(), prepared.vertex_count());
-            assert_eq!(
-                restored.recovery_memory_bytes(),
-                restored.vertex_count() * std::mem::size_of::<Vertex>()
-            );
-            assert!(Arc::ptr_eq(&restored.vertices, &prepared.vertices));
-
-            let dynamic_vertex = DynamicVertex2d::new(Vec2::ZERO, 0.0, Color::WHITE).unwrap();
-            let dynamic_vertices = dynamic_vertices_to_gpu(&[dynamic_vertex; 3]).unwrap();
-            let dynamic_source = DynamicMesh2d {
-                renderer_identity: Arc::clone(&source_identity),
-                vertex_buffer: Arc::new(create_vertex_buffer(&device, 8)),
-                geometry_extents: GeometryExtents::from_vertices(&dynamic_vertices),
-                vertices: dynamic_vertices,
-                vertex_capacity: 8,
-            };
-            queue.write_buffer(
-                &dynamic_source.vertex_buffer,
-                0,
-                bytemuck::cast_slice(dynamic_source.vertices.as_slice()),
-            );
-            let restored_dynamic = restore_dynamic_mesh_resources(
-                &device,
-                &queue,
-                Arc::clone(&replacement_identity),
-                &dynamic_source,
-            );
-            assert_eq!(restored_dynamic.vertex_count(), 3);
-            assert_eq!(restored_dynamic.vertex_capacity(), 8);
-            assert_eq!(
-                restored_dynamic.recovery_memory_bytes(),
-                dynamic_source.recovery_memory_bytes()
-            );
-            assert!(prepared_scene_belongs_to(
-                &replacement_identity,
-                &restored_dynamic.renderer_identity
-            ));
-
-            let scalar_source = ScalarField::new(2, 2, vec![0.0, 0.25, 0.5, 1.0]).unwrap();
-            let scalar_texture = create_scalar_field_texture_resources(
-                &device,
-                &queue,
-                Arc::clone(&source_identity),
-                scalar_source,
-            )
-            .expect("finite scalar texture should upload");
-            assert_eq!((scalar_texture.width(), scalar_texture.height()), (2, 2));
-            assert_eq!(scalar_texture.recovery_memory_bytes(), 16);
-            let restored_scalar_texture = create_scalar_field_texture_resources(
-                &device,
-                &queue,
-                Arc::clone(&replacement_identity),
-                scalar_texture.field.clone(),
-            )
-            .expect("scalar texture should restore");
-            assert_eq!(
-                restored_scalar_texture.field().values(),
-                scalar_texture.field().values()
-            );
-            let heatmap_color_map = ColorMap::linear(Color::BLACK, Color::WHITE).unwrap();
-            let heatmap_lut = create_color_map_texture(&device, &queue, &heatmap_color_map);
-            let heatmap_scalar_view = scalar_texture
-                .texture
-                .create_view(&wgpu::TextureViewDescriptor::default());
-            let heatmap_lut_view = heatmap_lut.create_view(&wgpu::TextureViewDescriptor::default());
-            let heatmap_uniform = HeatmapUniform {
-                value_range: [0.0, 1.0, 0.0, 0.0],
-                dimensions: [2, 2, 0, 0],
-            };
-            queue.write_buffer(
-                &heatmap_uniform_buffer,
-                0,
-                bytemuck::bytes_of(&heatmap_uniform),
-            );
-            let heatmap_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("sim-engine offscreen heatmap bind group"),
-                layout: &heatmap_bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&heatmap_scalar_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::TextureView(&heatmap_lut_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: heatmap_uniform_buffer.as_entire_binding(),
-                    },
-                ],
-            });
-            let heatmap_target = device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("sim-engine offscreen heatmap target"),
-                size: wgpu::Extent3d {
-                    width: 2,
-                    height: 2,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                    | wgpu::TextureUsages::TEXTURE_BINDING
-                    | wgpu::TextureUsages::COPY_SRC,
-                view_formats: &[],
-            });
-            let heatmap_view = heatmap_target.create_view(&wgpu::TextureViewDescriptor::default());
-            let heatmap_readback = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("sim-engine offscreen heatmap readback"),
-                size: 512,
-                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-                mapped_at_creation: false,
-            });
-
-            let Ok(mut camera) = Camera2d::new(Vec2::ZERO, 1.0) else {
-                panic!("test camera should be valid");
-            };
-            let Ok(projection) = crate::Projection2d::new(0.5, 2.0) else {
-                panic!("test projection should be valid");
-            };
-            camera.set_projection(projection);
-            let Ok(viewport) = LogicalViewport::new(64.0, 64.0) else {
-                panic!("test viewport should be valid");
-            };
-            let Some(camera_uniform) = CameraUniform::new(camera, viewport) else {
-                panic!("test camera uniform should be finite");
-            };
-            queue.write_buffer(
-                &camera_uniform_buffer,
-                0,
-                bytemuck::bytes_of(&camera_uniform),
-            );
-            let particle_unit_buffer = create_particle_unit_buffer(&device, &queue);
-            let particle_instances = [
-                ParticleGpu {
-                    world_position: [18.0, -18.0],
-                    depth: 0.0,
-                    radius: 6.0,
-                    color: Color::rgba(1.0, 0.0, 0.0, 1.0).to_array(),
-                },
-                ParticleGpu {
-                    world_position: [1_000.0, 0.0],
-                    depth: 0.0,
-                    radius: 6.0,
-                    color: Color::WHITE.to_array(),
-                },
-            ];
-            let visible_particles =
-                visible_particle_instances(&particle_instances, camera_uniform, viewport).unwrap();
-            assert_eq!(
-                visible_particles.len(),
-                1,
-                "offscreen particle should be culled"
-            );
-            let particle_instance_buffer = create_particle_instance_buffer(&device, 1);
-            queue.write_buffer(
-                &particle_instance_buffer,
-                0,
-                bytemuck::cast_slice(&visible_particles),
-            );
-            let readback = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("sim-engine offscreen readback"),
-                size: (256 * 64) as wgpu::BufferAddress,
-                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-                mapped_at_creation: false,
-            });
-
-            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("sim-engine offscreen test encoder"),
-            });
-            {
-                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("sim-engine offscreen heatmap pass"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &heatmap_view,
-                        depth_slice: None,
-                        resolve_target: None,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(Color::BLACK.to_wgpu()),
-                            store: wgpu::StoreOp::Store,
-                        },
-                    })],
-                    depth_stencil_attachment: None,
-                    timestamp_writes: None,
-                    occlusion_query_set: None,
-                    multiview_mask: None,
-                });
-                pass.set_pipeline(&target_heatmap_pipeline);
-                pass.set_bind_group(0, &heatmap_bind_group, &[]);
-                pass.draw(0..6, 0..1);
-            }
-            {
-                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("sim-engine offscreen test pass"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &view,
-                        depth_slice: None,
-                        resolve_target: None,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(Color::BLACK.to_wgpu()),
-                            store: wgpu::StoreOp::Store,
-                        },
-                    })],
-                    depth_stencil_attachment: None,
-                    timestamp_writes: None,
-                    occlusion_query_set: None,
-                    multiview_mask: None,
-                });
-                pass.set_pipeline(&pipeline);
-                pass.set_bind_group(0, &camera_bind_group, &[]);
-                pass.set_vertex_buffer(0, restored.vertex_buffer.slice(..));
-                for batch in &restored.draw_batches {
-                    if let Some(clip) = batch.screen_clip {
-                        let scissor = screen_clip_to_scissor(clip, viewport, 1.0).unwrap();
-                        pass.set_scissor_rect(scissor.x, scissor.y, scissor.width, scissor.height);
-                    }
-                    pass.draw(batch.vertex_range.clone(), 0..1);
-                }
-            }
-            {
-                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("sim-engine offscreen particle pass"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &view,
-                        depth_slice: None,
-                        resolve_target: None,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Load,
-                            store: wgpu::StoreOp::Store,
-                        },
-                    })],
-                    depth_stencil_attachment: None,
-                    timestamp_writes: None,
-                    occlusion_query_set: None,
-                    multiview_mask: None,
-                });
-                pass.set_pipeline(&particle_pipeline);
-                pass.set_bind_group(0, &camera_bind_group, &[]);
-                pass.set_vertex_buffer(0, particle_unit_buffer.slice(..));
-                pass.set_vertex_buffer(1, particle_instance_buffer.slice(..));
-                pass.draw(0..6, 0..1);
-            }
-            encoder.copy_texture_to_buffer(
-                wgpu::TexelCopyTextureInfo {
-                    texture: &target,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                wgpu::TexelCopyBufferInfo {
-                    buffer: &readback,
-                    layout: wgpu::TexelCopyBufferLayout {
-                        offset: 0,
-                        bytes_per_row: Some(256),
-                        rows_per_image: Some(64),
-                    },
-                },
-                wgpu::Extent3d {
-                    width: 64,
-                    height: 64,
-                    depth_or_array_layers: 1,
-                },
-            );
-            encoder.copy_texture_to_buffer(
-                wgpu::TexelCopyTextureInfo {
-                    texture: &heatmap_target,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                wgpu::TexelCopyBufferInfo {
-                    buffer: &heatmap_readback,
-                    layout: wgpu::TexelCopyBufferLayout {
-                        offset: 0,
-                        bytes_per_row: Some(256),
-                        rows_per_image: Some(2),
-                    },
-                },
-                wgpu::Extent3d {
-                    width: 2,
-                    height: 2,
-                    depth_or_array_layers: 1,
-                },
-            );
-
-            let _submission = queue.submit([encoder.finish()]);
-            if let Err(error) = device.poll(wgpu::PollType::Wait {
-                submission_index: None,
-                timeout: Some(Duration::from_secs(5)),
-            }) {
-                panic!("offscreen GPU submission did not complete: {error:?}");
-            }
-            if let Some(error) = validation_scope.pop().await {
-                panic!("offscreen GPU validation failed: {error}");
-            }
-            let slice = readback.slice(..);
-            let (sender, receiver) = mpsc::channel();
-            slice.map_async(wgpu::MapMode::Read, move |result| {
-                sender.send(result).unwrap()
-            });
-            if let Err(error) = device.poll(wgpu::PollType::Wait {
-                submission_index: None,
-                timeout: Some(Duration::from_secs(5)),
-            }) {
-                panic!("offscreen GPU readback did not complete: {error:?}");
-            }
-            receiver
-                .recv_timeout(Duration::from_secs(5))
-                .expect("offscreen readback callback")
-                .expect("offscreen readback should map");
-            let bytes = slice.get_mapped_range().expect("offscreen mapped bytes");
-            let pixel = |x: usize, y: usize| &bytes[y * 256 + x * 4..y * 256 + x * 4 + 4];
-            assert!(pixel(33, 29)[0] > 200, "camera/depth pixel was not drawn");
-            assert!(pixel(33, 34)[0] < 10, "clip failed to remove outside pixel");
-            assert!(
-                pixel(50, 48)[0] > 200,
-                "instanced particle center was not drawn"
-            );
-            assert!(
-                pixel(50, 48)[1] < 10,
-                "instanced particle color was not applied"
-            );
-            assert!(
-                pixel(56, 54)[0] < 10,
-                "particle circle mask did not discard its corner"
-            );
-            drop(bytes);
-            readback.unmap();
-            let heatmap_slice = heatmap_readback.slice(..);
-            let (heatmap_sender, heatmap_receiver) = mpsc::channel();
-            heatmap_slice.map_async(wgpu::MapMode::Read, move |result| {
-                heatmap_sender.send(result).unwrap()
-            });
-            device
-                .poll(wgpu::PollType::Wait {
-                    submission_index: None,
-                    timeout: Some(Duration::from_secs(5)),
-                })
-                .expect("offscreen heatmap readback should complete");
-            heatmap_receiver
-                .recv_timeout(Duration::from_secs(5))
-                .expect("offscreen heatmap callback")
-                .expect("offscreen heatmap should map");
-            let heatmap_bytes = heatmap_slice
-                .get_mapped_range()
-                .expect("offscreen heatmap bytes");
-            let heatmap_pixel =
-                |x: usize, y: usize| &heatmap_bytes[y * 256 + x * 4..y * 256 + x * 4 + 4];
-            assert!(
-                heatmap_pixel(0, 0)[0] < 8,
-                "minimum scalar should map to black"
-            );
-            assert!(
-                heatmap_pixel(1, 1)[0] > 247,
-                "maximum scalar should map to white"
-            );
-            assert!(
-                heatmap_pixel(1, 0)[0] > 130 && heatmap_pixel(1, 0)[0] < 145,
-                "quarter scalar should map through LUT then sRGB encode"
-            );
-            assert!(
-                heatmap_pixel(0, 1)[0] > 180 && heatmap_pixel(0, 1)[0] < 195,
-                "half scalar should map through LUT then sRGB encode"
-            );
-            drop(heatmap_bytes);
-            heatmap_readback.unmap();
-
-            let composition_target = device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("sim-engine offscreen composition target"),
-                size: wgpu::Extent3d {
-                    width: 2,
-                    height: 2,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-                view_formats: &[],
-            });
-            let composition_target_view =
-                composition_target.create_view(&wgpu::TextureViewDescriptor::default());
-            let composition_uniform = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("sim-engine offscreen composition uniform"),
-                size: std::mem::size_of::<CompositeUniform>() as wgpu::BufferAddress,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            queue.write_buffer(
-                &composition_uniform,
-                0,
-                bytemuck::bytes_of(&CompositeUniform {
-                    opacity: [1.0, 0.0, 0.0, 0.0],
-                }),
-            );
-            let composition_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("sim-engine offscreen composition bind group"),
-                layout: &target_composition_pipelines.bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&heatmap_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: composition_uniform.as_entire_binding(),
-                    },
-                ],
-            });
-            let composition_readback = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("sim-engine offscreen composition readback"),
-                size: 512,
-                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-                mapped_at_creation: false,
-            });
-            let mut composition_encoder =
-                device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("sim-engine offscreen composition encoder"),
-                });
-            {
-                let mut pass = composition_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("sim-engine offscreen composition pass"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &composition_target_view,
-                        depth_slice: None,
-                        resolve_target: None,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(Color::BLACK.to_wgpu()),
-                            store: wgpu::StoreOp::Store,
-                        },
-                    })],
-                    depth_stencil_attachment: None,
-                    timestamp_writes: None,
-                    occlusion_query_set: None,
-                    multiview_mask: None,
-                });
-                pass.set_pipeline(&target_composition_pipelines.alpha);
-                pass.set_bind_group(0, &composition_bind_group, &[]);
-                pass.draw(0..6, 0..1);
-            }
-            composition_encoder.copy_texture_to_buffer(
-                wgpu::TexelCopyTextureInfo {
-                    texture: &composition_target,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                wgpu::TexelCopyBufferInfo {
-                    buffer: &composition_readback,
-                    layout: wgpu::TexelCopyBufferLayout {
-                        offset: 0,
-                        bytes_per_row: Some(256),
-                        rows_per_image: Some(2),
-                    },
-                },
-                wgpu::Extent3d {
-                    width: 2,
-                    height: 2,
-                    depth_or_array_layers: 1,
-                },
-            );
-            queue.submit([composition_encoder.finish()]);
-            let composition_slice = composition_readback.slice(..);
-            let (composition_sender, composition_receiver) = mpsc::channel();
-            composition_slice.map_async(wgpu::MapMode::Read, move |result| {
-                composition_sender.send(result).unwrap()
-            });
-            device
-                .poll(wgpu::PollType::Wait {
-                    submission_index: None,
-                    timeout: Some(Duration::from_secs(5)),
-                })
-                .expect("offscreen composition readback should complete");
-            composition_receiver
-                .recv_timeout(Duration::from_secs(5))
-                .expect("offscreen composition callback")
-                .expect("offscreen composition should map");
-            let composition_bytes = composition_slice
-                .get_mapped_range()
-                .expect("offscreen composition bytes");
-            assert!(
-                composition_bytes[4] > 130 && composition_bytes[4] < 145,
-                "render-target composition should preserve source heatmap color"
-            );
-            drop(composition_bytes);
-            composition_readback.unmap();
-
-            queue.write_buffer(
-                &target_composition_pipelines.secondary_uniform_buffer,
-                0,
-                bytemuck::bytes_of(&CompositeUniform {
-                    opacity: [0.5, 0.0, 0.0, 0.0],
-                }),
-            );
-            queue.write_buffer(
-                &target_composition_pipelines.uniform_buffer,
-                0,
-                bytemuck::bytes_of(&CompositeUniform {
-                    opacity: [0.5, 0.0, 0.0, 0.0],
-                }),
-            );
-            let trail_history_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("sim-engine offscreen trail history bind group"),
-                layout: &target_composition_pipelines.bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&heatmap_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: target_composition_pipelines
-                            .secondary_uniform_buffer
-                            .as_entire_binding(),
-                    },
-                ],
-            });
-            let trail_source_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("sim-engine offscreen trail source bind group"),
-                layout: &target_composition_pipelines.bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&heatmap_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: target_composition_pipelines
-                            .uniform_buffer
-                            .as_entire_binding(),
-                    },
-                ],
-            });
-            let mut trail_encoder =
-                device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("sim-engine offscreen trail encoder"),
-                });
-            {
-                let mut pass = trail_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("sim-engine offscreen trail history pass"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &composition_target_view,
-                        depth_slice: None,
-                        resolve_target: None,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(Color::rgba(0.0, 0.0, 0.0, 0.0).to_wgpu()),
-                            store: wgpu::StoreOp::Store,
-                        },
-                    })],
-                    depth_stencil_attachment: None,
-                    timestamp_writes: None,
-                    occlusion_query_set: None,
-                    multiview_mask: None,
-                });
-                pass.set_pipeline(&target_composition_pipelines.alpha);
-                pass.set_bind_group(0, &trail_history_bind_group, &[]);
-                pass.draw(0..6, 0..1);
-            }
-            {
-                let mut pass = trail_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("sim-engine offscreen trail source pass"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &composition_target_view,
-                        depth_slice: None,
-                        resolve_target: None,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Load,
-                            store: wgpu::StoreOp::Store,
-                        },
-                    })],
-                    depth_stencil_attachment: None,
-                    timestamp_writes: None,
-                    occlusion_query_set: None,
-                    multiview_mask: None,
-                });
-                pass.set_pipeline(&target_composition_pipelines.alpha);
-                pass.set_bind_group(0, &trail_source_bind_group, &[]);
-                pass.draw(0..6, 0..1);
-            }
-            trail_encoder.copy_texture_to_buffer(
-                wgpu::TexelCopyTextureInfo {
-                    texture: &composition_target,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                wgpu::TexelCopyBufferInfo {
-                    buffer: &composition_readback,
-                    layout: wgpu::TexelCopyBufferLayout {
-                        offset: 0,
-                        bytes_per_row: Some(256),
-                        rows_per_image: Some(2),
-                    },
-                },
-                wgpu::Extent3d {
-                    width: 2,
-                    height: 2,
-                    depth_or_array_layers: 1,
-                },
-            );
-            queue.submit([trail_encoder.finish()]);
-            let trail_slice = composition_readback.slice(..);
-            let (trail_sender, trail_receiver) = mpsc::channel();
-            trail_slice.map_async(wgpu::MapMode::Read, move |result| {
-                trail_sender.send(result).unwrap()
-            });
-            device
-                .poll(wgpu::PollType::Wait {
-                    submission_index: None,
-                    timeout: Some(Duration::from_secs(5)),
-                })
-                .expect("offscreen trail readback should complete");
-            trail_receiver
-                .recv_timeout(Duration::from_secs(5))
-                .expect("offscreen trail callback")
-                .expect("offscreen trail should map");
-            let trail_bytes = trail_slice
-                .get_mapped_range()
-                .expect("offscreen trail bytes");
-            assert!(
-                trail_bytes[4] > 112 && trail_bytes[4] < 128,
-                "half-retained history plus half-opacity source should accumulate predictably"
-            );
-            drop(trail_bytes);
-            composition_readback.unmap();
-
-            let linear_uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("sim-engine offscreen linear heatmap uniform"),
-                size: std::mem::size_of::<HeatmapUniform>() as wgpu::BufferAddress,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            queue.write_buffer(
-                &linear_uniform_buffer,
-                0,
-                bytemuck::bytes_of(&HeatmapUniform {
-                    value_range: [0.0, 1.0, 0.0, 0.0],
-                    dimensions: [2, 2, ScalarFieldSampling::Linear.shader_value(), 0],
-                }),
-            );
-            let linear_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("sim-engine offscreen linear heatmap bind group"),
-                layout: &heatmap_bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&heatmap_scalar_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::TextureView(&heatmap_lut_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: linear_uniform_buffer.as_entire_binding(),
-                    },
-                ],
-            });
-            let linear_target = device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("sim-engine offscreen linear heatmap target"),
-                size: wgpu::Extent3d {
-                    width: 1,
-                    height: 1,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-                view_formats: &[],
-            });
-            let linear_view = linear_target.create_view(&wgpu::TextureViewDescriptor::default());
-            let linear_readback = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("sim-engine offscreen linear heatmap readback"),
-                size: 256,
-                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-                mapped_at_creation: false,
-            });
-            let mut linear_encoder =
-                device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("sim-engine offscreen linear heatmap encoder"),
-                });
-            {
-                let mut pass = linear_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("sim-engine offscreen linear heatmap pass"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &linear_view,
-                        depth_slice: None,
-                        resolve_target: None,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(Color::BLACK.to_wgpu()),
-                            store: wgpu::StoreOp::Store,
-                        },
-                    })],
-                    depth_stencil_attachment: None,
-                    timestamp_writes: None,
-                    occlusion_query_set: None,
-                    multiview_mask: None,
-                });
-                pass.set_pipeline(&heatmap_pipeline);
-                pass.set_bind_group(0, &linear_bind_group, &[]);
-                pass.draw(0..6, 0..1);
-            }
-            linear_encoder.copy_texture_to_buffer(
-                wgpu::TexelCopyTextureInfo {
-                    texture: &linear_target,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                wgpu::TexelCopyBufferInfo {
-                    buffer: &linear_readback,
-                    layout: wgpu::TexelCopyBufferLayout {
-                        offset: 0,
-                        bytes_per_row: Some(256),
-                        rows_per_image: Some(1),
-                    },
-                },
-                wgpu::Extent3d {
-                    width: 1,
-                    height: 1,
-                    depth_or_array_layers: 1,
-                },
-            );
-            queue.submit([linear_encoder.finish()]);
-            let linear_slice = linear_readback.slice(..);
-            let (linear_sender, linear_receiver) = mpsc::channel();
-            linear_slice.map_async(wgpu::MapMode::Read, move |result| {
-                linear_sender.send(result).unwrap()
-            });
-            device
-                .poll(wgpu::PollType::Wait {
-                    submission_index: None,
-                    timeout: Some(Duration::from_secs(5)),
-                })
-                .expect("offscreen linear heatmap readback should complete");
-            linear_receiver
-                .recv_timeout(Duration::from_secs(5))
-                .expect("offscreen linear heatmap callback")
-                .expect("offscreen linear heatmap should map");
-            let linear_bytes = linear_slice
-                .get_mapped_range()
-                .expect("offscreen linear heatmap bytes");
-            assert!(
-                linear_bytes[0] > 170 && linear_bytes[0] < 184,
-                "manual linear sampling should average the four source texels"
-            );
-            drop(linear_bytes);
-            linear_readback.unmap();
-        });
-    }
-
-    #[test]
-    fn renderer_options_reject_invalid_scale_factor() {
-        assert!(matches!(
-            WgpuRendererOptions::new(RendererPresentMode::Vsync, f64::NAN),
-            Err(RendererConfigurationError::InvalidScaleFactor { .. })
-        ));
-        assert!(matches!(
-            WgpuRendererOptions::new(RendererPresentMode::Vsync, 0.0),
-            Err(RendererConfigurationError::InvalidScaleFactor { .. })
-        ));
-        assert!(matches!(
-            WgpuRendererOptions::new(RendererPresentMode::Vsync, f64::MIN_POSITIVE),
-            Err(RendererConfigurationError::InvalidScaleFactor { .. })
-        ));
-        assert!(matches!(
-            WgpuRendererOptions::new(RendererPresentMode::Vsync, f32::MIN_POSITIVE as f64),
-            Err(RendererConfigurationError::InvalidScaleFactor { .. })
-        ));
-    }
-
-    #[test]
-    fn render_target_memory_accounting_is_checked_and_format_aware() {
-        assert_eq!(
-            render_target_allocation_bytes(wgpu::TextureFormat::Rgba8UnormSrgb, 3, 5),
-            Some(60)
-        );
-        assert_eq!(
-            render_target_allocation_bytes(wgpu::TextureFormat::Rgba16Float, 3, 5),
-            Some(120)
-        );
-    }
-
-    #[test]
-    fn renderer_present_modes_have_explicit_fallback_contracts() {
-        assert_eq!(
-            RendererPresentMode::Vsync.to_wgpu(),
-            wgpu::PresentMode::Fifo
-        );
-        assert_eq!(
-            RendererPresentMode::NoVsync.to_wgpu(),
-            wgpu::PresentMode::AutoNoVsync
-        );
-    }
-}
+#[cfg(test)]
+mod tests;

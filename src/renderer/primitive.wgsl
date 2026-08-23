@@ -79,6 +79,31 @@ fn vs_main(input: VertexIn) -> VertexOut {
     return output;
 }
 
+struct DynamicIn {
+    @location(0) world_position: vec2<f32>,
+    @location(1) depth: f32,
+    @location(2) color: vec4<f32>,
+};
+
+@vertex
+fn dynamic_vs_main(input: DynamicIn) -> VertexOut {
+    let relative_world = input.world_position - camera.camera_center.xy;
+    let screen = vec2<f32>(
+        dot(camera.world_to_screen_x.xyz, vec3<f32>(relative_world, input.depth)) + camera.world_to_screen_x.w,
+        dot(camera.world_to_screen_y.xyz, vec3<f32>(relative_world, input.depth)) + camera.world_to_screen_y.w,
+    );
+    let clip = vec2<f32>(
+        screen.x * camera.screen_to_clip.x + camera.screen_to_clip.z,
+        screen.y * camera.screen_to_clip.y + camera.screen_to_clip.w,
+    );
+    var output: VertexOut;
+    output.position = vec4<f32>(clip, 0.0, 1.0);
+    output.color = input.color;
+    output.particle_direction = vec2<f32>(0.0, 0.0);
+    output.particle_mask = 0.0;
+    return output;
+}
+
 struct ParticleIn {
     @location(0) unit_direction: vec2<f32>,
     @location(1) world_position: vec2<f32>,
@@ -153,8 +178,8 @@ fn heatmap_fs_main(input: HeatmapOut) -> @location(0) vec4<f32> {
         let amount = fract(source);
         let low = vec2<i32>(max(base, vec2<f32>(0.0, 0.0)));
         let high = min(low + vec2<i32>(1, 1), vec2<i32>(i32(dimensions.x) - 1, i32(dimensions.y) - 1));
-        let top = mix(textureLoad(scalar_field, vec2<i32>(low.x, high.y), 0).x, textureLoad(scalar_field, vec2<i32>(high.x, high.y), 0).x, amount.x);
-        let bottom = mix(textureLoad(scalar_field, low, 0).x, textureLoad(scalar_field, vec2<i32>(high.x, low.y), 0).x, amount.x);
+        let top = mix(textureLoad(scalar_field, low, 0).x, textureLoad(scalar_field, vec2<i32>(high.x, low.y), 0).x, amount.x);
+        let bottom = mix(textureLoad(scalar_field, vec2<i32>(low.x, high.y), 0).x, textureLoad(scalar_field, vec2<i32>(high.x, high.y), 0).x, amount.x);
         scalar = mix(top, bottom, amount.y);
     }
     let normalized = clamp((scalar - heatmap.value_range.x) / heatmap.value_range.y, 0.0, 1.0);
@@ -177,5 +202,12 @@ fn composite_fs_main(input: HeatmapOut) -> @location(0) vec4<f32> {
         dimensions - vec2<u32>(1u, 1u),
     );
     let source = textureLoad(composition_source, vec2<i32>(texel), 0);
-    return vec4<f32>(source.rgb, source.a * composition.opacity.x);
+    // Render targets use source-alpha blending and therefore retain
+    // premultiplied RGB. The presentation and temporal alpha pipelines expect
+    // straight RGB, so unpremultiply exactly once at this boundary.
+    var straight_rgb = vec3<f32>(0.0, 0.0, 0.0);
+    if source.a > 0.0 {
+        straight_rgb = source.rgb / source.a;
+    }
+    return vec4<f32>(straight_rgb, source.a * composition.opacity.x);
 }

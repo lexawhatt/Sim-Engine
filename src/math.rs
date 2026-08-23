@@ -7,10 +7,8 @@ use std::ops::{Add, AddAssign, Div, DivAssign, Mul, MulAssign, Neg, Sub, SubAssi
 /// or another coordinate space.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct Vec2 {
-    /// Horizontal component.
-    pub x: f32,
-    /// Vertical component.
-    pub y: f32,
+    pub(crate) x: f32,
+    pub(crate) y: f32,
 }
 
 impl Vec2 {
@@ -26,6 +24,16 @@ impl Vec2 {
     /// Builds a vector from explicit components.
     pub const fn new(x: f32, y: f32) -> Self {
         Self { x, y }
+    }
+
+    /// Returns the horizontal component.
+    pub const fn x(self) -> f32 {
+        self.x
+    }
+
+    /// Returns the vertical component.
+    pub const fn y(self) -> f32 {
+        self.y
     }
 
     /// Builds a vector with both components set to the same value.
@@ -80,7 +88,13 @@ impl Vec2 {
     ///
     /// `amount` is not clamped so callers can intentionally extrapolate.
     pub fn lerp(self, end: Self, amount: f32) -> Self {
-        self + (end - self) * amount
+        if !self.is_finite() || !end.is_finite() || !amount.is_finite() {
+            return self;
+        }
+        Self::new(
+            stable_lerp_component(self.x, end.x, amount),
+            stable_lerp_component(self.y, end.y, amount),
+        )
     }
 
     /// Returns true when both components are finite values.
@@ -91,7 +105,7 @@ impl Vec2 {
 
 #[cfg(test)]
 mod tests {
-    use super::Vec2;
+    use super::{Rect, Vec2};
 
     #[test]
     fn normalization_preserves_large_finite_direction() {
@@ -100,6 +114,15 @@ mod tests {
         assert!(normalized.is_finite());
         assert!((normalized.length() - 1.0).abs() < 0.0001);
         assert!(normalized.x > 0.0 && normalized.y > 0.0);
+    }
+
+    #[test]
+    fn interpolation_and_rect_center_stay_finite_at_extremes() {
+        let midpoint = Vec2::splat(f32::MAX).lerp(Vec2::splat(-f32::MAX), 0.5);
+        assert_eq!(midpoint, Vec2::ZERO);
+
+        let rect = Rect::new(Vec2::splat(f32::MAX), Vec2::splat(f32::MAX));
+        assert_eq!(rect.center(), Vec2::splat(f32::MAX));
     }
 }
 
@@ -174,16 +197,24 @@ impl Neg for Vec2 {
 /// trusted.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Rect {
-    /// Minimum corner when the rectangle is normalized.
-    pub min: Vec2,
-    /// Maximum corner when the rectangle is normalized.
-    pub max: Vec2,
+    pub(crate) min: Vec2,
+    pub(crate) max: Vec2,
 }
 
 impl Rect {
     /// Builds a rectangle from two corners in the caller's coordinate space.
     pub fn new(min: Vec2, max: Vec2) -> Self {
         Self { min, max }
+    }
+
+    /// Returns the first stored corner, which is the minimum after normalization.
+    pub const fn min(self) -> Vec2 {
+        self.min
+    }
+
+    /// Returns the second stored corner, which is the maximum after normalization.
+    pub const fn max(self) -> Vec2 {
+        self.max
     }
 
     /// Builds a rectangle from its center and size.
@@ -218,7 +249,10 @@ impl Rect {
 
     /// Returns the midpoint between `min` and `max`.
     pub fn center(self) -> Vec2 {
-        (self.min + self.max) * 0.5
+        Vec2::new(
+            stable_midpoint(self.min.x, self.max.x),
+            stable_midpoint(self.min.y, self.max.y),
+        )
     }
 
     /// Expands all edges outward by `amount`.
@@ -238,4 +272,13 @@ impl Rect {
             Vec2::new(self.min.x.max(self.max.x), self.min.y.max(self.max.y)),
         )
     }
+}
+
+fn stable_lerp_component(start: f32, end: f32, amount: f32) -> f32 {
+    let value = f64::from(start) + (f64::from(end) - f64::from(start)) * f64::from(amount);
+    value.clamp(f64::from(f32::MIN), f64::from(f32::MAX)) as f32
+}
+
+fn stable_midpoint(first: f32, second: f32) -> f32 {
+    ((f64::from(first) + f64::from(second)) * 0.5) as f32
 }

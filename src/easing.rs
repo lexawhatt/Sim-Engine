@@ -60,4 +60,26 @@ mod tests {
         assert_eq!(Easing::Linear.sample(2.0), 1.0);
         assert_eq!(Easing::Linear.sample(f32::NAN), 0.0);
     }
+
+    #[test]
+    fn every_curve_has_exact_finite_endpoints() {
+        let curves = [
+            Easing::Linear,
+            Easing::SmoothStep,
+            Easing::EaseInCubic,
+            Easing::EaseOutCubic,
+            Easing::EaseInOutCubic,
+            Easing::EaseOutExpo,
+            Easing::EaseOutBack,
+        ];
+        for curve in curves {
+            assert_eq!(curve.sample(0.0), 0.0, "{curve:?} start");
+            assert_eq!(curve.sample(1.0), 1.0, "{curve:?} end");
+            assert!(curve.sample(0.5).is_finite(), "{curve:?} midpoint");
+            assert!(
+                curve.sample(f32::INFINITY).is_finite(),
+                "{curve:?} infinity"
+            );
+        }
+    }
 }

@@ -1,6 +1,6 @@
 use std::{error::Error, fmt};
 
-use crate::{Color, Vec2};
+use crate::Color;
 
 /// A finite, rectangular scalar grid for dense simulation data.
 #[derive(Debug, Clone, PartialEq)]
@@ -198,127 +198,6 @@ impl fmt::Display for ScalarFieldError {
 
 impl Error for ScalarFieldError {}
 
-/// A finite, rectangular 2D vector grid for velocity or flow visualization.
-#[derive(Debug, Clone, PartialEq)]
-pub struct VectorField {
-    width: usize,
-    height: usize,
-    values: Vec<Vec2>,
-}
-
-impl VectorField {
-    /// Creates a row-major field from finite vectors.
-    pub fn new(width: usize, height: usize, values: Vec<Vec2>) -> Result<Self, VectorFieldError> {
-        let expected = checked_len(width, height).map_err(VectorFieldError::from)?;
-        if values.len() != expected {
-            return Err(VectorFieldError::InvalidValueCount {
-                expected,
-                actual: values.len(),
-            });
-        }
-        if values.iter().any(|value| !value.is_finite()) {
-            return Err(VectorFieldError::NonFiniteValue);
-        }
-        Ok(Self {
-            width,
-            height,
-            values,
-        })
-    }
-
-    /// Returns horizontal vector-cell count.
-    pub fn width(&self) -> usize {
-        self.width
-    }
-
-    /// Returns vertical vector-cell count.
-    pub fn height(&self) -> usize {
-        self.height
-    }
-
-    /// Returns row-major vectors.
-    pub fn values(&self) -> &[Vec2] {
-        &self.values
-    }
-
-    /// Returns a vector, or `None` outside field bounds.
-    pub fn value_at(&self, x: usize, y: usize) -> Option<Vec2> {
-        (x < self.width && y < self.height).then_some(self.values[y * self.width + x])
-    }
-
-    /// Replaces a finite vector at one cell.
-    pub fn set(&mut self, x: usize, y: usize, value: Vec2) -> Result<(), VectorFieldError> {
-        if !value.is_finite() {
-            return Err(VectorFieldError::NonFiniteValue);
-        }
-        if x >= self.width || y >= self.height {
-            return Err(VectorFieldError::OutOfBounds { x, y });
-        }
-        self.values[y * self.width + x] = value;
-        Ok(())
-    }
-}
-
-/// Rejection reason for vector-field construction or mutation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum VectorFieldError {
-    /// Width and height must both be non-zero.
-    ZeroDimension,
-    /// Width multiplied by height overflowed `usize`.
-    DimensionsOverflow,
-    /// Input values did not match the grid dimensions.
-    InvalidValueCount {
-        /// Required row-major cell count.
-        expected: usize,
-        /// Supplied value count.
-        actual: usize,
-    },
-    /// A vector component was NaN or infinite.
-    NonFiniteValue,
-    /// A requested cell lies outside the field dimensions.
-    OutOfBounds {
-        /// Horizontal cell index.
-        x: usize,
-        /// Vertical cell index.
-        y: usize,
-    },
-}
-
-impl From<ScalarFieldError> for VectorFieldError {
-    fn from(error: ScalarFieldError) -> Self {
-        match error {
-            ScalarFieldError::ZeroDimension => Self::ZeroDimension,
-            ScalarFieldError::DimensionsOverflow => Self::DimensionsOverflow,
-            ScalarFieldError::InvalidValueCount { expected, actual } => {
-                Self::InvalidValueCount { expected, actual }
-            }
-            ScalarFieldError::NonFiniteValue => Self::NonFiniteValue,
-            ScalarFieldError::OutOfBounds { x, y } => Self::OutOfBounds { x, y },
-        }
-    }
-}
-
-impl fmt::Display for VectorFieldError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::ZeroDimension => write!(formatter, "vector field dimensions must be non-zero"),
-            Self::DimensionsOverflow => write!(formatter, "vector field dimensions overflow"),
-            Self::InvalidValueCount { expected, actual } => {
-                write!(
-                    formatter,
-                    "vector field needs {expected} values, got {actual}"
-                )
-            }
-            Self::NonFiniteValue => write!(formatter, "vector field values must be finite"),
-            Self::OutOfBounds { x, y } => {
-                write!(formatter, "vector field cell ({x}, {y}) is out of bounds")
-            }
-        }
-    }
-}
-
-impl Error for VectorFieldError {}
-
 /// One normalized color-map control point.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ColorStop {
@@ -327,13 +206,19 @@ pub struct ColorStop {
 }
 
 impl ColorStop {
-    /// Creates a finite stop at a normalized position from `0.0` through `1.0`.
+    /// Creates a stop with normalized position and normalized linear RGBA color.
+    ///
+    /// Normalized colors keep the CPU sampler consistent with the renderer's
+    /// `Rgba8Unorm` heatmap lookup texture instead of silently clipping HDR values.
     pub fn new(position: f32, color: Color) -> Result<Self, ColorMapError> {
         if !position.is_finite() || !color.is_finite() {
             return Err(ColorMapError::NonFiniteStop);
         }
         if !(0.0..=1.0).contains(&position) {
             return Err(ColorMapError::PositionOutOfRange);
+        }
+        if !color.is_normalized() {
+            return Err(ColorMapError::ColorOutOfRange);
         }
         Ok(Self { position, color })
     }
@@ -350,6 +235,10 @@ impl ColorStop {
 }
 
 /// A piecewise-linear map from normalized scalar values to linear RGBA colors.
+///
+/// [`Self::sample`] evaluates the control points exactly on the CPU. The `wgpu`
+/// heatmap renderer samples a documented 256-entry, 8-bit lookup table, so
+/// transitions narrower than one LUT interval can be quantized away.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ColorMap {
     stops: Vec<ColorStop>,
@@ -385,23 +274,27 @@ impl ColorMap {
         if !value.is_finite() {
             return Err(ColorMapError::NonFiniteSample);
         }
+        Ok(self.sample_normalized(value))
+    }
+
+    pub(crate) fn sample_normalized(&self, value: f32) -> Color {
         let value = value.clamp(0.0, 1.0);
         let upper = self.stops.partition_point(|stop| stop.position < value);
         if upper == 0 {
-            return Ok(self.stops[0].color);
+            return self.stops[0].color;
         }
         if upper == self.stops.len() {
-            return Ok(self.stops[upper - 1].color);
+            return self.stops[upper - 1].color;
         }
         let start = self.stops[upper - 1];
         let end = self.stops[upper];
         let amount = (value - start.position) / (end.position - start.position);
-        Ok(Color::rgba(
+        Color::rgba(
             start.color.red() + (end.color.red() - start.color.red()) * amount,
             start.color.green() + (end.color.green() - start.color.green()) * amount,
             start.color.blue() + (end.color.blue() - start.color.blue()) * amount,
             start.color.alpha() + (end.color.alpha() - start.color.alpha()) * amount,
-        ))
+        )
     }
 }
 
@@ -412,6 +305,8 @@ pub enum ColorMapError {
     NonFiniteStop,
     /// A stop position was outside `0.0..=1.0`.
     PositionOutOfRange,
+    /// A linear RGBA stop color had a channel outside `0.0..=1.0`.
+    ColorOutOfRange,
     /// A map needs at least two stops.
     TooFewStops,
     /// Stops must have strictly increasing positions.
@@ -489,21 +384,9 @@ mod tests {
             ColorMap::new(vec![first, second]),
             Err(ColorMapError::StopsNotIncreasing)
         );
-    }
-
-    #[test]
-    fn vector_field_preserves_finite_rectangular_contract() {
-        let mut field = VectorField::new(2, 1, vec![Vec2::X, Vec2::Y]).unwrap();
-        assert_eq!(field.value_at(1, 0), Some(Vec2::Y));
-        field.set(0, 0, Vec2::new(2.0, -3.0)).unwrap();
-        assert_eq!(field.value_at(0, 0), Some(Vec2::new(2.0, -3.0)));
         assert_eq!(
-            field.set(2, 0, Vec2::ZERO),
-            Err(VectorFieldError::OutOfBounds { x: 2, y: 0 })
-        );
-        assert_eq!(
-            VectorField::new(1, 1, vec![Vec2::new(f32::NAN, 0.0)]),
-            Err(VectorFieldError::NonFiniteValue)
+            ColorStop::new(0.5, Color::rgba(1.1, 0.0, 0.0, 1.0)),
+            Err(ColorMapError::ColorOutOfRange)
         );
     }
 }

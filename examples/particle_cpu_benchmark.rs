@@ -28,8 +28,8 @@ fn main() {
         let time_seconds = frame as f32 * (1.0 / 60.0);
         for index in 0..particle_count {
             let particle = particle_instance(index, time_seconds);
-            checksum += particle.world_position().x
-                + particle.world_position().y
+            checksum += particle.world_position().x()
+                + particle.world_position().y()
                 + particle.radius()
                 + particle.depth()
                 + particle.color().alpha();

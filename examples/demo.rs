@@ -6,10 +6,10 @@ use std::{
 
 use sim_engine::{
     BlendMode, Camera2d, Color, ColorMap, DynamicMesh2d, DynamicVertex2d, Easing, Fill,
-    Interpolate, Layer, LinearGradient, Palette, ParticleField2d, ParticleInstance2d,
-    PreparedScene, Rect, RenderTarget2d, RendererFrameMetrics, RendererPresentMode, ScalarField,
-    ScalarFieldTexture, Scene, ScreenClipRect, Shadow, ShapeStyle, TrailBuffer2d, Tween, Vec2,
-    VectorField, WgpuRenderer, WgpuRendererOptions,
+    Interpolate, Layer, LinearGradient, LogicalScreenPosition, LogicalScreenVector, Palette,
+    ParticleField2d, ParticleInstance2d, PreparedScene, Rect, RenderTarget2d, RendererFrameMetrics,
+    RendererPresentMode, ScalarField, ScalarFieldTexture, Scene, ScreenClipRect, Shadow,
+    ShapeStyle, TrailBuffer2d, Tween, Vec2, WgpuRenderer, WgpuRendererOptions,
 };
 use winit::{
     application::ApplicationHandler,
@@ -68,11 +68,10 @@ impl DemoApplication {
             heatmap_color_map: None,
             present_mode: demo_present_mode(),
             camera,
-            zoom: Tween::new(camera.zoom()).to(
-                2.8,
-                Duration::from_millis(1800),
-                Easing::EaseInOutCubic,
-            ),
+            zoom: Tween::new(camera.zoom())
+                .expect("demo camera zoom is a valid tween value")
+                .to(2.8, Duration::from_millis(1800), Easing::EaseInOutCubic)
+                .expect("demo target zoom is finite"),
             frame_metrics: FrameMetrics::new(now),
             dynamic_mesh_segments: benchmark.segments,
             particle_count: particle_demo_count(),
@@ -91,11 +90,16 @@ impl DemoApplication {
         if !self.zoom.is_active() {
             let target = if self.zoom.target() < 2.5 { 2.8 } else { 2.05 };
             self.zoom
-                .set_target(target, Duration::from_millis(1800), Easing::EaseInOutCubic);
+                .set_target(target, Duration::from_millis(1800), Easing::EaseInOutCubic)
+                .expect("demo zoom targets are finite");
         }
 
         self.camera
-            .set_zoom(self.zoom.update(dt))
+            .set_zoom(
+                self.zoom
+                    .update(dt)
+                    .expect("built-in finite zoom interpolation cannot fail"),
+            )
             .expect("demo zoom tween stays positive");
         self.camera
             .set_center(Vec2::new(
@@ -195,7 +199,11 @@ impl ApplicationHandler for DemoApplication {
         } else if demo_uses_prepared_scene() {
             let logical_size = renderer.logical_size();
             let scene = build_scene(0.0, Vec2::new(logical_size.0, logical_size.1));
-            self.prepared_scene = Some(renderer.prepare_scene(&scene));
+            self.prepared_scene = Some(
+                renderer
+                    .prepare_scene(&scene)
+                    .expect("demo scene fits the GPU vertex-buffer limit"),
+            );
             println!("demo geometry mode: Prepared");
         } else {
             println!("demo geometry mode: Streaming");
@@ -606,7 +614,7 @@ impl FrameMetrics {
         let geometry_mode = if renderer_metrics.geometry_reused() {
             "prepared"
         } else if renderer_metrics.geometry_streamed() {
-            "dynamic mesh"
+            "streamed GPU"
         } else {
             "streaming"
         };
@@ -668,10 +676,10 @@ fn build_scene(time_seconds: f32, surface_size: Vec2) -> Scene {
 
     let plot_margin = 48.0;
     let plot_clip = ScreenClipRect::from_min_size(
-        Vec2::splat(plot_margin),
-        Vec2::new(
-            (surface_size.x - plot_margin * 2.0).max(0.0),
-            (surface_size.y - plot_margin * 2.0).max(0.0),
+        LogicalScreenPosition::new(plot_margin, plot_margin),
+        LogicalScreenVector::new(
+            (surface_size.x() - plot_margin * 2.0).max(0.0),
+            (surface_size.y() - plot_margin * 2.0).max(0.0),
         ),
     );
     scene
@@ -690,7 +698,7 @@ fn build_scene(time_seconds: f32, surface_size: Vec2) -> Scene {
             Color::rgba8(255, 255, 255, 42),
         )
         .with_shadow(Shadow::new(
-            Vec2::new(0.0, 18.0),
+            LogicalScreenVector::new(0.0, 18.0),
             12.0,
             Color::BLACK.with_alpha(0.28),
         )),
@@ -724,7 +732,7 @@ fn build_scene(time_seconds: f32, surface_size: Vec2) -> Scene {
             position,
             5.5 + (phase + time_seconds).sin().abs() * 4.5,
             ShapeStyle::filled(color.with_alpha(0.88)).with_shadow(Shadow::new(
-                Vec2::new(0.0, 8.0),
+                LogicalScreenVector::new(0.0, 8.0),
                 6.0,
                 color.with_alpha(0.16),
             )),
@@ -745,7 +753,7 @@ fn build_scene(time_seconds: f32, surface_size: Vec2) -> Scene {
             Color::WHITE.with_alpha(0.32),
         )
         .with_shadow(Shadow::new(
-            Vec2::new(0.0, 14.0),
+            LogicalScreenVector::new(0.0, 14.0),
             14.0,
             palette.warning().with_alpha(0.20),
         )),
@@ -756,35 +764,43 @@ fn build_scene(time_seconds: f32, surface_size: Vec2) -> Scene {
 
 fn build_dynamic_mesh_vertices(time_seconds: f32, segments: usize) -> Vec<DynamicVertex2d> {
     let palette = Palette::sim();
+    let start_color = palette.primary().with_alpha(0.9);
+    let end_color = palette.accent().with_alpha(0.9);
     let mut vertices = Vec::with_capacity(segments * 6);
+    let mut x_start = -260.0;
+    let mut y_start = dynamic_wave_height(x_start, time_seconds);
     for index in 0..segments {
         let amount_start = index as f32 / segments as f32;
         let amount_end = (index + 1) as f32 / segments as f32;
-        let x_start = -260.0 + amount_start * 520.0;
         let x_end = -260.0 + amount_end * 520.0;
-        let y_start = dynamic_wave_height(x_start, time_seconds);
         let y_end = dynamic_wave_height(x_end, time_seconds);
         let half_width = 3.0
             + (amount_start * std::f32::consts::TAU + time_seconds)
                 .sin()
                 .abs()
                 * 2.0;
-        let start_color = palette.primary().with_alpha(0.9);
-        let end_color = palette.accent().with_alpha(0.9);
         let top_start = Vec2::new(x_start, y_start - half_width);
         let bottom_start = Vec2::new(x_start, y_start + half_width);
         let top_end = Vec2::new(x_end, y_end - half_width);
         let bottom_end = Vec2::new(x_end, y_end + half_width);
+        let top_start =
+            DynamicVertex2d::new(top_start, 1.5, start_color).expect("finite dynamic mesh vertex");
+        let bottom_start = DynamicVertex2d::new(bottom_start, 1.5, start_color)
+            .expect("finite dynamic mesh vertex");
+        let top_end =
+            DynamicVertex2d::new(top_end, 1.5, end_color).expect("finite dynamic mesh vertex");
+        let bottom_end =
+            DynamicVertex2d::new(bottom_end, 1.5, end_color).expect("finite dynamic mesh vertex");
         vertices.extend([
-            DynamicVertex2d::new(top_start, 1.5, start_color).expect("finite dynamic mesh vertex"),
-            DynamicVertex2d::new(bottom_start, 1.5, start_color)
-                .expect("finite dynamic mesh vertex"),
-            DynamicVertex2d::new(top_end, 1.5, end_color).expect("finite dynamic mesh vertex"),
-            DynamicVertex2d::new(top_end, 1.5, end_color).expect("finite dynamic mesh vertex"),
-            DynamicVertex2d::new(bottom_start, 1.5, start_color)
-                .expect("finite dynamic mesh vertex"),
-            DynamicVertex2d::new(bottom_end, 1.5, end_color).expect("finite dynamic mesh vertex"),
+            top_start,
+            bottom_start,
+            top_end,
+            top_end,
+            bottom_start,
+            bottom_end,
         ]);
+        x_start = x_end;
+        y_start = y_end;
     }
     vertices
 }
@@ -836,7 +852,7 @@ fn build_heatmap_field(time_seconds: f32) -> ScalarField {
     ScalarField::new(WIDTH, HEIGHT, values).expect("demo heatmap values are finite")
 }
 
-fn build_vector_field(time_seconds: f32) -> VectorField {
+fn build_vector_samples(time_seconds: f32) -> Vec<Vec2> {
     const WIDTH: usize = 25;
     const HEIGHT: usize = 15;
     let mut values = Vec::with_capacity(WIDTH * HEIGHT);
@@ -850,37 +866,39 @@ fn build_vector_field(time_seconds: f32) -> VectorField {
             ));
         }
     }
-    VectorField::new(WIDTH, HEIGHT, values).expect("demo vector field is finite")
+    values
 }
 
 fn build_vector_field_scene(time_seconds: f32, surface_size: Vec2) -> Scene {
+    const WIDTH: usize = 25;
+    const HEIGHT: usize = 15;
     let palette = Palette::sim();
     let mut scene = Scene::new(palette.background()).expect("palette is finite");
-    let field = build_vector_field(time_seconds);
+    let samples = build_vector_samples(time_seconds);
     let spacing = Vec2::new(24.0, 24.0);
     let origin = Vec2::new(
-        -(field.width().saturating_sub(1) as f32) * spacing.x * 0.5,
-        -(field.height().saturating_sub(1) as f32) * spacing.y * 0.5,
+        -(WIDTH.saturating_sub(1) as f32) * spacing.x() * 0.5,
+        -(HEIGHT.saturating_sub(1) as f32) * spacing.y() * 0.5,
     );
 
-    let clip = ScreenClipRect::from_min_size(Vec2::splat(20.0), surface_size - Vec2::splat(40.0))
-        .expect("positive demo viewport clip");
+    let clip = ScreenClipRect::from_min_size(
+        LogicalScreenPosition::new(20.0, 20.0),
+        LogicalScreenVector::from_vec2(surface_size - Vec2::splat(40.0)),
+    )
+    .expect("positive demo viewport clip");
     scene
         .with_screen_clip(clip, |scene| {
-            for y in 0..field.height() {
-                for x in 0..field.width() {
-                    let center = origin + Vec2::new(x as f32 * spacing.x, y as f32 * spacing.y);
-                    let direction = field
-                        .value_at(x, y)
-                        .expect("field indices stay in bounds")
-                        .normalized();
+            for y in 0..HEIGHT {
+                for x in 0..WIDTH {
+                    let center = origin + Vec2::new(x as f32 * spacing.x(), y as f32 * spacing.y());
+                    let direction = samples[y * WIDTH + x].normalized();
                     let tip = center + direction * 8.5;
                     let normal = direction.perp() * 3.0;
                     let color = palette
                         .primary()
                         .interpolate(
                             palette.accent(),
-                            (y as f32 / (field.height() - 1) as f32).clamp(0.0, 1.0),
+                            (y as f32 / (HEIGHT - 1) as f32).clamp(0.0, 1.0),
                         )
                         .with_alpha(0.88);
                     scene.line(center, tip, 1.6, color);

@@ -86,6 +86,14 @@ impl Color {
         self.r.is_finite() && self.g.is_finite() && self.b.is_finite() && self.a.is_finite()
     }
 
+    /// Returns true when every channel is finite and lies in `0.0..=1.0`.
+    pub fn is_normalized(self) -> bool {
+        self.is_finite()
+            && [self.r, self.g, self.b, self.a]
+                .into_iter()
+                .all(|channel| (0.0..=1.0).contains(&channel))
+    }
+
     /// Sanitizes every channel to `0.0..=1.0`.
     ///
     /// NaN channels become `0.0`. Infinite values clamp to the nearest bound.
@@ -141,6 +149,10 @@ impl Interpolate for Color {
             self.b.interpolate(end.b, amount),
             self.a.interpolate(end.a, amount),
         )
+    }
+
+    fn is_valid_interpolation_value(self) -> bool {
+        self.is_finite()
     }
 }
 

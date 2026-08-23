@@ -2,7 +2,7 @@ use std::{error::Error, fmt};
 
 use crate::{
     math::{Rect, Vec2},
-    tween::{Interpolate, Tween},
+    tween::{Interpolate, Tween, TweenError},
 };
 
 const MIN_ZOOM: f32 = 0.0001;
@@ -36,6 +36,40 @@ impl LogicalScreenPosition {
     }
 
     /// Returns true when both coordinates are finite.
+    pub fn is_finite(self) -> bool {
+        self.value.is_finite()
+    }
+}
+
+/// Offset or size measured in logical screen pixels.
+///
+/// This is distinct from [`LogicalScreenPosition`] because vectors do not carry
+/// a screen origin. It prevents world-space and physical-pixel vectors from
+/// entering clipping and screen-effect APIs accidentally.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct LogicalScreenVector {
+    value: Vec2,
+}
+
+impl LogicalScreenVector {
+    /// Builds a logical-pixel vector from horizontal and vertical components.
+    pub const fn new(x: f32, y: f32) -> Self {
+        Self {
+            value: Vec2::new(x, y),
+        }
+    }
+
+    /// Explicitly labels an existing vector as logical screen pixels.
+    pub const fn from_vec2(value: Vec2) -> Self {
+        Self { value }
+    }
+
+    /// Returns the underlying logical-pixel vector.
+    pub const fn to_vec2(self) -> Vec2 {
+        self.value
+    }
+
+    /// Returns true when both components are finite.
     pub fn is_finite(self) -> bool {
         self.value.is_finite()
     }
@@ -643,7 +677,7 @@ impl Camera2d {
     }
 
     /// Creates a tween initialized with this camera state.
-    pub fn tween(self) -> Tween<Self> {
+    pub fn tween(self) -> Result<Tween<Self>, TweenError> {
         Tween::new(self)
     }
 }
@@ -669,6 +703,10 @@ impl Interpolate for Projection2d {
             depth_scale: finite_or(depth_scale, self.depth_scale),
         }
     }
+
+    fn is_valid_interpolation_value(self) -> bool {
+        self.tilt.is_finite() && self.depth_scale.is_finite()
+    }
 }
 
 impl Interpolate for Camera2d {
@@ -691,6 +729,14 @@ impl Interpolate for Camera2d {
             rotation: finite_or(rotation, self.rotation),
             projection: self.projection.interpolate(end.projection, amount),
         }
+    }
+
+    fn is_valid_interpolation_value(self) -> bool {
+        self.center.is_finite()
+            && self.zoom.is_finite()
+            && self.zoom >= MIN_ZOOM
+            && self.rotation.is_finite()
+            && self.projection.is_valid_interpolation_value()
     }
 }
 
