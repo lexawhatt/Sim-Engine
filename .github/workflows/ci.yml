@@ -8,8 +8,19 @@ permissions:
   contents: read
 
 jobs:
+  msrv:
+    name: Rust 1.90 minimum version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.90.0
+      - run: cargo check --all-targets --no-default-features
+      - run: cargo check --all-targets --all-features
+
   quality:
-    name: format, clippy, and core-only
+    name: format and core/all-feature lint
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -17,7 +28,8 @@ jobs:
         with:
           components: rustfmt, clippy
       - run: cargo fmt --all -- --check
-      - run: cargo test --no-default-features
+      - run: cargo test --all-targets --no-default-features
+      - run: cargo clippy --all-targets --no-default-features -- -D warnings
       - run: cargo clippy --all-targets --all-features -- -D warnings
 
   linux-all-targets:

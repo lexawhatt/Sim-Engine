@@ -1,74 +1,77 @@
 # Changelog
 
 All notable user-visible changes to Sim;Engine are recorded here. The project
-uses Keep a Changelog-style sections and Semantic Versioning once the public API
-reaches 1.0.
+uses Keep a Changelog-style structure and follows Semantic Versioning once the
+public API reaches 1.0.
 
 ## Unreleased
 
+No changes yet.
+
+## 0.1.0 - 2026-08-24
+
+Initial Linux development release of the validated 2D scene, scientific
+visualization renderer, and focused retained 3D stereometry path.
+
 ### Added
 
-- The first Sim;Math pseudo-3D foundation: overflow-aware `Vec3`, normalized
-  `Rotation3d`, validated `Transform3d`, perspective/orthographic `Projection3d`,
-  and logical-viewport `Camera3d` projection.
-- A specification for retained stereometry meshes, depth-tested hidden lines,
-  hatched sections, projected anchors, and the cube/octahedron consumer fixture.
-- Comprehensive Integration Guide and Architecture Reference documentation,
-  with the README reused as the generated rustdoc landing page.
-- Hard particle visualization budgets for draw count, GPU allocation, per-frame
-  upload, and camera visibility checks, with observable budget-limited counts.
-- Fused one-submit scalar-field, particle-overlay, and target composition.
-- A bounded supernova-remnant stress fixture with 100k and 1M retained-particle
-  workloads, memory diagnostics, and live device/surface recovery smoke mode.
-- `WgpuRenderer::recover_device_and_surface` for rebuilding transient backend
-  state before retained resources are restored onto a replacement device.
+- Validated 2D primitives, styles, gradients, clipping, cameras, pseudo-depth,
+  and fallible tweening.
+- Streaming scenes, prepared geometry, and capacity-managed dynamic triangles.
+- Instanced particle fields with explicit draw, memory, upload, culling, and
+  visibility-check budgets.
+- Finite scalar fields, incremental `R32Float` texture updates, deterministic
+  nearest/manual-linear sampling, and quantized GPU color maps.
+- Offscreen render targets, explicit alpha/additive/replace composition,
+  bounded trail accumulation, and fused scalar/particle/surface rendering.
+- Renderer metrics covering CPU tessellation, uploads, surface acquisition,
+  submission, command counts, and dropped-command diagnostics.
+- Device and surface recovery with explicit restoration for retained geometry,
+  dynamic meshes, particles, scalar textures, targets, trails, and 3D meshes.
+- Validated `Vec3`, `Rotation3d`, `Transform3d`, `Projection3d`, and `Camera3d`.
+- Retained `Mesh3d` topology, stable `Object3dId` scene handles, independent
+  transforms, hardware depth, and logical-pixel visible/dashed hidden edges.
+- Interactive 2D, particle, star-remnant, cube/octahedron, and cylinder
+  derivation examples with bounded performance diagnostics.
+- Concrete Immediate/Mailbox/FIFO presentation diagnostics and a completed-work
+  GPU synchronization point for controlled benchmarks.
 
 ### Changed
 
-- Defined the 0.1 release as Linux-first; Windows, macOS, and web remain
-  non-blocking future portability targets.
-- Added a single Linux release-gate script and Linux CI jobs for all targets and
-  strict Mesa-backed semantic GPU readback.
-- Separated internal roadmaps, engineering logs, and Sim;X product drafts into
-  an ignored local workbench; release packages now use an explicit include list.
-- Screen clips and shadows now require explicit logical-screen position/vector
-  types instead of unitless vectors.
-- Pseudo-depth affects projection only; commands on one layer retain insertion
-  order.
-- `Vec2`, `Rect`, scene primitives, styles, colors, palettes, and gradients use
-  constructors/accessors instead of externally mutable public fields.
-- Heatmap `ColorMap` stops require normalized linear RGBA and the renderer's
-  256-entry RGBA8 lookup-table quantization is an explicit contract.
-- `Tween::new`, retargeting, snapping, and updates now return `Result`; custom
-  `Interpolate` implementations must define their value-validity predicate.
-- Prepared-scene creation and prepared/dynamic/particle restoration now return
-  capacity errors when retained data cannot fit the active GPU device.
-- Removed the unused public `VectorField`; vector samples remain host-owned and
-  can be submitted as ready scene geometry.
-- Particle updates defer GPU transfer until visibility/budget selection, and
-  color-map lookup textures are cached across unchanged heatmap frames.
+- The first supported release target is explicitly Linux. Windows, macOS, and
+  web are not release-gated platforms.
+- The minimum supported Rust version is 1.90, matching the complete currently
+  resolved renderer dependency graph.
+- Public data fields are private behind validated constructors and accessors.
+- Pseudo-depth affects projection but never reorders commands within a layer.
+- Screen clips and shadow offsets use explicit logical-screen types.
+- GPU color maps use a documented 256-entry RGBA8 lookup table.
+- `ParticleInstance2d` remains available without the `wgpu` feature so visual
+  state generation can be validated and benchmarked CPU-only.
+- No-VSync selection resolves to an advertised concrete surface mode and can
+  be inspected through `RendererSurfacePresentMode`.
 
 ### Fixed
 
-- Corrected vertical orientation in manual bilinear scalar-field sampling.
-- Corrected double-alpha attenuation in render-target and trail composition.
-- Rejected finite inputs whose derived geometry, scalar range, texture extent,
-  gradient math, or tween interpolation would overflow.
-- Corrected particle timing reports for skipped surface frames.
-- Reset stale particle draw/culling statistics after device restoration.
-- Rejected vertex and instance allocations beyond the active device's real
-  buffer-size limit instead of reaching wgpu validation or integer overflow.
-- Included example test harnesses in the full release gate.
+- Unified accepted short-line invariants across Scene and tessellation.
+- Rejected finite source geometry whose derived arithmetic would overflow.
+- Made forward camera and DPI conversions fallible on non-finite output.
+- Validated backgrounds and clips at their public mutation boundaries.
+- Corrected manual bilinear heatmap Y orientation.
+- Corrected double alpha attenuation in target and trail composition.
+- Rejected scalar textures, buffers, and retained resources beyond real device
+  limits before creating invalid GPU objects.
+- Corrected particle metrics for skipped surface frames and recovery.
+- Removed Wayland frame-callback throttling from uncapped example paths.
+- Removed renderer-internal product/debug scene construction.
 
 ### Testing
 
-- GPU readback now verifies camera/depth/clip behavior, all four bilinear texel
-  centers, sRGB conversion, half-alpha target composition, and byte-exact
-  prepared-geometry restoration onto a second logical GPU device.
-- `SIM_ENGINE_REQUIRE_GPU_TESTS=1` makes absence of a GPU adapter fail instead of
-  silently skipping the GPU fixture.
-
-## 0.1.0
-
-Initial development release of the standalone 2D scene, camera, motion, and
-optional `wgpu` renderer foundation.
+- Added finite and overflow boundary coverage across math, cameras, scenes,
+  tweening, scalar fields, particles, resources, and 3D projection.
+- Added semantic GPU readback for camera/depth/clip, scalar sampling direction,
+  sRGB conversion, half-alpha composition, retained-resource restoration,
+  3D depth ordering, coplanar visible edges, and dashed hidden edges.
+- The Linux gate builds and lints all targets with and without default features,
+  checks Rust 1.90, generates warning-free rustdoc, requires a GPU semantic
+  fixture, and verifies the offline package archive.

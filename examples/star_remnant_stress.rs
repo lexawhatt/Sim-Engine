@@ -330,7 +330,9 @@ impl ApplicationHandler for StarRemnantApp {
                 ) else {
                     return;
                 };
-                window.pre_present_notify();
+                if !self.uncapped {
+                    window.pre_present_notify();
+                }
                 let report = renderer
                     .render_layered_visualization(
                         target,

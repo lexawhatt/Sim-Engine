@@ -1,4 +1,5 @@
 use super::*;
+use std::fmt;
 
 pub(super) struct MultisampleTarget {
     pub(super) _texture: wgpu::Texture,
@@ -18,12 +19,65 @@ pub enum RendererPresentMode {
     NoVsync,
 }
 
-impl RendererPresentMode {
-    pub(super) fn to_wgpu(self) -> wgpu::PresentMode {
+/// Concrete presentation mode selected from the active Linux surface.
+///
+/// This is deliberately separate from [`RendererPresentMode`]: `NoVsync` is a
+/// preference with fallbacks, while this type reports the mode actually passed
+/// to `wgpu` after inspecting the surface capabilities. A compositor may still
+/// pace redraw callbacks or scanout independently of this selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RendererSurfacePresentMode {
+    /// Immediate replacement without a presentation queue or refresh pacing.
+    Immediate,
+    /// Single-slot replacement queue synchronized to display refresh.
+    Mailbox,
+    /// Strict first-in-first-out queue synchronized to display refresh.
+    Fifo,
+    /// FIFO that may tear when a frame misses the refresh interval.
+    FifoRelaxed,
+}
+
+impl RendererSurfacePresentMode {
+    pub(super) const fn to_wgpu(self) -> wgpu::PresentMode {
         match self {
-            Self::Vsync => wgpu::PresentMode::Fifo,
-            Self::NoVsync => wgpu::PresentMode::AutoNoVsync,
+            Self::Immediate => wgpu::PresentMode::Immediate,
+            Self::Mailbox => wgpu::PresentMode::Mailbox,
+            Self::Fifo => wgpu::PresentMode::Fifo,
+            Self::FifoRelaxed => wgpu::PresentMode::FifoRelaxed,
         }
+    }
+
+    /// Returns whether this mode presents on display refresh boundaries.
+    pub const fn is_refresh_synchronized(self) -> bool {
+        !matches!(self, Self::Immediate)
+    }
+}
+
+impl fmt::Display for RendererSurfacePresentMode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Immediate => formatter.write_str("Immediate"),
+            Self::Mailbox => formatter.write_str("Mailbox"),
+            Self::Fifo => formatter.write_str("FIFO"),
+            Self::FifoRelaxed => formatter.write_str("FIFO relaxed"),
+        }
+    }
+}
+
+pub(super) fn select_surface_present_mode(
+    requested: RendererPresentMode,
+    supported: &[wgpu::PresentMode],
+) -> RendererSurfacePresentMode {
+    match requested {
+        RendererPresentMode::Vsync => RendererSurfacePresentMode::Fifo,
+        RendererPresentMode::NoVsync => [
+            RendererSurfacePresentMode::Immediate,
+            RendererSurfacePresentMode::Mailbox,
+            RendererSurfacePresentMode::Fifo,
+        ]
+        .into_iter()
+        .find(|candidate| supported.contains(&candidate.to_wgpu()))
+        .unwrap_or(RendererSurfacePresentMode::Fifo),
     }
 }
 
@@ -176,7 +230,12 @@ impl WgpuRenderer {
             .surface
             .get_default_config(&adapter, self.config.width, self.config.height)
             .ok_or(RendererInitError::NoSurfaceConfig)?;
-        config.present_mode = self.config.present_mode;
+        let surface_capabilities = self.surface.get_capabilities(&adapter);
+        let surface_present_mode = select_surface_present_mode(
+            self.requested_present_mode,
+            &surface_capabilities.present_modes,
+        );
+        config.present_mode = surface_present_mode.to_wgpu();
         let sample_count = preferred_sample_count(&adapter, config.format);
         let (
             pipeline,
@@ -195,6 +254,7 @@ impl WgpuRenderer {
         let vertex_buffer = Arc::new(create_vertex_buffer(&device, INITIAL_VERTEX_CAPACITY));
         let particle_unit_buffer = create_particle_unit_buffer(&device, &queue);
         let multisample_target = create_multisample_target(&device, &config, sample_count);
+        let mesh3d_renderer = Mesh3dRenderer::new(&device, config.format);
         self.surface.configure(&device, &config);
 
         self.renderer_identity = Arc::new(());
@@ -205,6 +265,7 @@ impl WgpuRenderer {
         };
         self.retired_devices.push(retired_device);
         self.config = config;
+        self.surface_present_mode = surface_present_mode;
         self.pipeline = pipeline;
         self.dynamic_pipeline = dynamic_pipeline;
         self.particle_pipeline = particle_pipeline;
@@ -213,6 +274,7 @@ impl WgpuRenderer {
         self.target_heatmap_pipeline = target_heatmap_pipeline;
         self.composition_pipelines = composition_pipelines;
         self.target_composition_pipelines = target_composition_pipelines;
+        self.mesh3d_renderer = mesh3d_renderer;
         self.camera_uniform_buffer = camera_uniform_buffer;
         self.camera_bind_group = camera_bind_group;
         self.heatmap_uniform_buffer = heatmap_uniform_buffer;

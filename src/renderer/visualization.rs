@@ -245,15 +245,10 @@ impl WgpuRenderer {
 
         let frame_started_at = Instant::now();
         let upload_started_at = Instant::now();
-        self.cache_color_map(color_map);
+        let color_map_view = self.color_map_view(color_map);
         let scalar_view = scalar
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
-        let color_map_view = &self
-            .color_map_cache
-            .as_ref()
-            .expect("the color-map cache was populated")
-            .view;
         self.queue.write_buffer(
             &self.heatmap_uniform_buffer,
             0,
@@ -277,7 +272,7 @@ impl WgpuRenderer {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: wgpu::BindingResource::TextureView(color_map_view),
+                    resource: wgpu::BindingResource::TextureView(&color_map_view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,

@@ -2,7 +2,7 @@
 name = "sim-engine"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.87"
+rust-version = "1.90"
 license = "MIT OR Apache-2.0"
 description = "A validated high-performance visualization engine for simulations"
 repository = "https://github.com/lexawhatt/Sim-Engine"
@@ -13,11 +13,10 @@ categories = ["graphics", "rendering", "science"]
 include = [
     "/src/**",
     "/examples/**",
-    "/docs/**",
     "/scripts/linux_release_gate.sh",
     "/Cargo.toml",
-    "/Cargo.lock",
     "/README.md",
+    "/DOCUMENTATION.md",
     "/CHANGELOG.md",
     "/LICENSE",
     "/LICENSE-APACHE",
@@ -56,8 +55,15 @@ required-features = ["wgpu"]
 
 [[example]]
 name = "particle_cpu_benchmark"
-required-features = ["wgpu"]
 
 [[example]]
 name = "star_remnant_stress"
+required-features = ["wgpu"]
+
+[[example]]
+name = "stereometry_3d"
+required-features = ["wgpu"]
+
+[[example]]
+name = "cylinder_derivation_3d"
 required-features = ["wgpu"]

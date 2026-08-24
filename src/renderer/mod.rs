@@ -9,9 +9,10 @@ use std::{
 
 use crate::{
     Camera2d, Circle, Color, ColorMap, DrawCommand, Fill, Line, LogicalScreenPosition,
-    LogicalViewport, PhysicalScreenPosition, Polyline, Rect, ScalarField, Scene, ScreenClipRect,
-    Shadow, ShapeStyle, Stroke, Vec2,
+    LogicalViewport, ParticleInstance2d, PhysicalScreenPosition, Polyline, Rect, ScalarField,
+    Scene, ScreenClipRect, Shadow, ShapeStyle, Stroke, Vec2,
 };
+use config::select_surface_present_mode;
 
 const INITIAL_VERTEX_CAPACITY: usize = 4096;
 const CIRCLE_SEGMENTS: usize = 64;
@@ -933,86 +934,6 @@ impl DynamicMeshUpdateReport {
     }
 }
 
-/// One particle instance for the instanced particle renderer.
-///
-/// `world_position` is measured in world units, `radius` is measured in logical
-/// screen pixels, `color` is linear RGBA, and `depth` uses the active camera's
-/// pseudo-depth projection.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct ParticleInstance2d {
-    world_position: Vec2,
-    radius: f32,
-    color: Color,
-    depth: f32,
-}
-
-impl ParticleInstance2d {
-    /// Builds a finite particle instance with a strictly positive logical-pixel radius.
-    pub fn new(
-        world_position: Vec2,
-        radius: f32,
-        color: Color,
-        depth: f32,
-    ) -> Result<Self, ParticleInstanceError> {
-        if !world_position.is_finite()
-            || !radius.is_finite()
-            || !color.is_finite()
-            || !depth.is_finite()
-        {
-            return Err(ParticleInstanceError::NonFinite);
-        }
-        if radius <= 0.0 {
-            return Err(ParticleInstanceError::InvalidRadius);
-        }
-        Ok(Self {
-            world_position,
-            radius,
-            color,
-            depth,
-        })
-    }
-
-    /// Returns the world-space particle center.
-    pub fn world_position(self) -> Vec2 {
-        self.world_position
-    }
-
-    /// Returns the radius in logical screen pixels.
-    pub fn radius(self) -> f32 {
-        self.radius
-    }
-
-    /// Returns the linear RGBA particle color.
-    pub fn color(self) -> Color {
-        self.color
-    }
-
-    /// Returns caller-defined pseudo-depth.
-    pub fn depth(self) -> f32 {
-        self.depth
-    }
-}
-
-/// Rejection reason for a particle instance before it reaches GPU memory.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ParticleInstanceError {
-    /// Position, radius, color, or pseudo-depth contains NaN or infinity.
-    NonFinite,
-    /// Radius must be strictly positive in logical screen pixels.
-    InvalidRadius,
-}
-
-impl fmt::Display for ParticleInstanceError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::NonFinite => write!(formatter, "particle instance values must be finite"),
-            Self::InvalidRadius => write!(formatter, "particle radius must be finite and positive"),
-        }
-    }
-}
-
-impl Error for ParticleInstanceError {}
-
 /// Counts associated with one particle-field update or draw.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ParticleStatistics {
@@ -1643,6 +1564,8 @@ pub struct WgpuRenderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
+    requested_present_mode: RendererPresentMode,
+    surface_present_mode: RendererSurfacePresentMode,
     scale_factor: f64,
     pipeline: wgpu::RenderPipeline,
     dynamic_pipeline: wgpu::RenderPipeline,
@@ -1652,6 +1575,7 @@ pub struct WgpuRenderer {
     target_heatmap_pipeline: wgpu::RenderPipeline,
     composition_pipelines: CompositionPipelines,
     target_composition_pipelines: CompositionPipelines,
+    mesh3d_renderer: Mesh3dRenderer,
     camera_uniform_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
     heatmap_uniform_buffer: wgpu::Buffer,
@@ -1732,10 +1656,15 @@ impl WgpuRenderer {
 
         let width = width.max(1);
         let height = height.max(1);
+        let surface_capabilities = surface.get_capabilities(&adapter);
         let mut config = surface
             .get_default_config(&adapter, width, height)
             .ok_or(RendererInitError::NoSurfaceConfig)?;
-        config.present_mode = options.present_mode().to_wgpu();
+        let surface_present_mode = select_surface_present_mode(
+            options.present_mode(),
+            &surface_capabilities.present_modes,
+        );
+        config.present_mode = surface_present_mode.to_wgpu();
         surface.configure(&device, &config);
 
         let sample_count = preferred_sample_count(&adapter, config.format);
@@ -1756,6 +1685,7 @@ impl WgpuRenderer {
         let vertex_buffer = Arc::new(create_vertex_buffer(&device, INITIAL_VERTEX_CAPACITY));
         let particle_unit_buffer = create_particle_unit_buffer(&device, &queue);
         let multisample_target = create_multisample_target(&device, &config, sample_count);
+        let mesh3d_renderer = Mesh3dRenderer::new(&device, config.format);
 
         Ok(Self {
             renderer_identity: Arc::new(()),
@@ -1765,6 +1695,8 @@ impl WgpuRenderer {
             device,
             queue,
             config,
+            requested_present_mode: options.present_mode(),
+            surface_present_mode,
             scale_factor: options.scale_factor(),
             pipeline,
             dynamic_pipeline,
@@ -1774,6 +1706,7 @@ impl WgpuRenderer {
             target_heatmap_pipeline,
             composition_pipelines,
             target_composition_pipelines,
+            mesh3d_renderer,
             camera_uniform_buffer,
             camera_bind_group,
             heatmap_uniform_buffer,
@@ -1832,6 +1765,26 @@ impl WgpuRenderer {
     /// Returns physical surface pixels per logical screen pixel.
     pub fn scale_factor(&self) -> f64 {
         self.scale_factor
+    }
+
+    /// Returns the concrete presentation mode selected for the active surface.
+    ///
+    /// `RendererPresentMode::NoVsync` prefers Immediate, then Mailbox, then
+    /// FIFO. This method reveals which supported fallback was configured. The
+    /// desktop compositor may still pace host redraw callbacks independently.
+    pub fn surface_present_mode(&self) -> RendererSurfacePresentMode {
+        self.surface_present_mode
+    }
+
+    /// Blocks until all previously submitted GPU work has completed.
+    ///
+    /// This is intended for diagnostic throughput measurements, readback, and
+    /// controlled resource teardown. Calling it in an interactive frame loop
+    /// defeats normal CPU/GPU pipelining.
+    pub fn wait_for_gpu_idle(&self) -> Result<(), wgpu::PollError> {
+        self.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .map(|_| ())
     }
 
     /// Replaces display scale without changing physical surface dimensions.
@@ -2957,15 +2910,10 @@ impl WgpuRenderer {
         frame_started_at: Instant,
     ) -> Result<RenderReport, RendererFrameError> {
         let upload_started_at = Instant::now();
-        self.cache_color_map(color_map);
+        let color_map_view = self.color_map_view(color_map);
         let scalar_view = texture
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
-        let color_map_view = &self
-            .color_map_cache
-            .as_ref()
-            .expect("the color-map cache was populated")
-            .view;
         let uniform = HeatmapUniform {
             value_range: [minimum, value_extent, 0.0, 0.0],
             dimensions: [
@@ -2990,7 +2938,7 @@ impl WgpuRenderer {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: wgpu::BindingResource::TextureView(color_map_view),
+                    resource: wgpu::BindingResource::TextureView(&color_map_view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
@@ -3119,15 +3067,10 @@ impl WgpuRenderer {
         frame_started_at: Instant,
     ) -> RenderReport {
         let upload_started_at = Instant::now();
-        self.cache_color_map(color_map);
+        let color_map_view = self.color_map_view(color_map);
         let scalar_view = texture
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
-        let color_map_view = &self
-            .color_map_cache
-            .as_ref()
-            .expect("the color-map cache was populated")
-            .view;
         self.queue.write_buffer(
             &self.heatmap_uniform_buffer,
             0,
@@ -3151,7 +3094,7 @@ impl WgpuRenderer {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: wgpu::BindingResource::TextureView(color_map_view),
+                    resource: wgpu::BindingResource::TextureView(&color_map_view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
@@ -3848,19 +3791,18 @@ impl WgpuRenderer {
             .ok_or(ScalarFieldTextureError::RendererMismatch)
     }
 
-    fn cache_color_map(&mut self, color_map: &ColorMap) {
-        if self
+    fn color_map_view(&mut self, color_map: &ColorMap) -> wgpu::TextureView {
+        if let Some(cached) = self
             .color_map_cache
             .as_ref()
-            .is_some_and(|cached| cached.source == *color_map)
+            .filter(|cached| cached.source == *color_map)
         {
-            return;
+            return cached.view.clone();
         }
-        self.color_map_cache = Some(create_cached_color_map(
-            &self.device,
-            &self.queue,
-            color_map,
-        ));
+        let cached = create_cached_color_map(&self.device, &self.queue, color_map);
+        let view = cached.view.clone();
+        self.color_map_cache = Some(cached);
+        view
     }
 
     fn validate_render_target(&self, target: &RenderTarget2d) -> Result<(), RenderTargetError> {
@@ -3935,19 +3877,23 @@ fn particle_instances_to_gpu(
         .iter()
         .copied()
         .map(|instance| {
-            if !instance.world_position.is_finite()
-                || !instance.radius.is_finite()
-                || instance.radius <= 0.0
-                || !instance.color.is_finite()
-                || !instance.depth.is_finite()
+            let world_position = instance.world_position();
+            let radius = instance.radius();
+            let color = instance.color();
+            let depth = instance.depth();
+            if !world_position.is_finite()
+                || !radius.is_finite()
+                || radius <= 0.0
+                || !color.is_finite()
+                || !depth.is_finite()
             {
                 return Err(ParticleFieldError::InvalidInstance);
             }
             Ok(ParticleGpu {
-                world_position: [instance.world_position.x, instance.world_position.y],
-                depth: instance.depth,
-                radius: instance.radius,
-                color: instance.color.to_array(),
+                world_position: [world_position.x, world_position.y],
+                depth,
+                radius,
+                color: color.to_array(),
             })
         })
         .collect()
@@ -4930,13 +4876,19 @@ fn create_particle_instance_buffer(device: &wgpu::Device, capacity: usize) -> wg
 }
 
 mod config;
+mod mesh3d;
 mod tessellation;
 mod visualization;
 use config::{
     MultisampleTarget, create_multisample_target, logical_to_physical_screen,
     physical_to_logical_screen, validate_scale_factor,
 };
-pub use config::{RendererPresentMode, WgpuRendererOptions};
+pub use config::{RendererPresentMode, RendererSurfacePresentMode, WgpuRendererOptions};
+use mesh3d::Mesh3dRenderer;
+pub use mesh3d::{
+    Mesh3dInstance, Mesh3dRenderError, Mesh3dRenderReport, Mesh3dResourceError, Object3dId,
+    RenderTarget3d, RetainedMesh3d, Scene3d, Scene3dError,
+};
 use tessellation::{screen_clip_to_scissor, tessellate_scene};
 use visualization::{CachedColorMap, CompositionPipelines, create_composition_pipeline};
 pub use visualization::{LayeredVisualizationError, LayeredVisualizationOptions};

@@ -32,7 +32,7 @@ impl Vec3 {
         }
     }
 
-    const fn new_unchecked(x: f32, y: f32, z: f32) -> Self {
+    pub(crate) const fn new_unchecked(x: f32, y: f32, z: f32) -> Self {
         Self { x, y, z }
     }
 
@@ -285,6 +285,42 @@ impl Transform3d {
         )?;
         self.rotation.rotate(scaled)?.checked_add(self.translation)
     }
+
+    #[cfg(feature = "wgpu")]
+    pub(crate) fn model_rows(self) -> Result<[[f32; 4]; 3], Pseudo3dError> {
+        let x = self.rotation.x as f64;
+        let y = self.rotation.y as f64;
+        let z = self.rotation.z as f64;
+        let w = self.rotation.w as f64;
+        let scale_x = self.scale.x as f64;
+        let scale_y = self.scale.y as f64;
+        let scale_z = self.scale.z as f64;
+        let rows = [
+            [
+                (1.0 - 2.0 * (y * y + z * z)) * scale_x,
+                (2.0 * (x * y - z * w)) * scale_y,
+                (2.0 * (x * z + y * w)) * scale_z,
+                self.translation.x as f64,
+            ],
+            [
+                (2.0 * (x * y + z * w)) * scale_x,
+                (1.0 - 2.0 * (x * x + z * z)) * scale_y,
+                (2.0 * (y * z - x * w)) * scale_z,
+                self.translation.y as f64,
+            ],
+            [
+                (2.0 * (x * z - y * w)) * scale_x,
+                (2.0 * (y * z + x * w)) * scale_y,
+                (1.0 - 2.0 * (x * x + y * y)) * scale_z,
+                self.translation.z as f64,
+            ],
+        ];
+        Ok([
+            f64_row_to_f32(rows[0])?,
+            f64_row_to_f32(rows[1])?,
+            f64_row_to_f32(rows[2])?,
+        ])
+    }
 }
 
 /// Perspective or orthographic camera projection with a finite depth range.
@@ -455,7 +491,7 @@ impl Camera3d {
             return Err(Pseudo3dError::PointBehindCamera);
         }
 
-        let (ndc_x, ndc_y, near, far) = match self.projection.kind {
+        let (ndc_x, ndc_y, normalized_depth, near, far) = match self.projection.kind {
             Projection3dKind::Perspective {
                 vertical_fov_radians,
                 aspect_ratio,
@@ -466,6 +502,8 @@ impl Camera3d {
                 (
                     view_x / (half_height * aspect_ratio as f64),
                     view_y / half_height,
+                    far as f64 / (far as f64 - near as f64)
+                        - (far as f64 * near as f64) / ((far as f64 - near as f64) * view_depth),
                     near,
                     far,
                 )
@@ -475,17 +513,20 @@ impl Camera3d {
                 aspect_ratio,
                 near,
                 far,
-            } => (
-                view_x / (vertical_span as f64 * aspect_ratio as f64 * 0.5),
-                view_y / (vertical_span as f64 * 0.5),
-                near,
-                far,
-            ),
+            } => {
+                let normalized_depth = (view_depth - near as f64) / (far as f64 - near as f64);
+                (
+                    view_x / (vertical_span as f64 * aspect_ratio as f64 * 0.5),
+                    view_y / (vertical_span as f64 * 0.5),
+                    normalized_depth,
+                    near,
+                    far,
+                )
+            }
         };
 
         let screen_x = (ndc_x * 0.5 + 0.5) * viewport.width() as f64;
         let screen_y = (0.5 - ndc_y * 0.5) * viewport.height() as f64;
-        let normalized_depth = (view_depth - near as f64) / (far as f64 - near as f64);
         let screen_x = f64_to_f32(screen_x)?;
         let screen_y = f64_to_f32(screen_y)?;
         let view_depth_f32 = f64_to_f32(view_depth)?;
@@ -500,6 +541,65 @@ impl Camera3d {
             normalized_depth: normalized_depth_f32,
             inside_view,
         })
+    }
+
+    #[cfg(any(feature = "wgpu", test))]
+    pub(crate) fn world_to_clip_rows(self) -> Result<[[f32; 4]; 4], Pseudo3dError> {
+        let right_offset = -dot_f64(self.position, self.right);
+        let up_offset = -dot_f64(self.position, self.up);
+        let depth_offset = -dot_f64(self.position, self.forward);
+        let rows = match self.projection.kind {
+            Projection3dKind::Perspective {
+                vertical_fov_radians,
+                aspect_ratio,
+                near,
+                far,
+            } => {
+                let vertical_scale = (vertical_fov_radians as f64 * 0.5).tan();
+                let horizontal_scale = vertical_scale * aspect_ratio as f64;
+                let depth_scale = far as f64 / (far as f64 - near as f64);
+                let depth_translation = -(far as f64 * near as f64) / (far as f64 - near as f64);
+                [
+                    camera_row(self.right, right_offset, 1.0 / horizontal_scale),
+                    camera_row(self.up, up_offset, 1.0 / vertical_scale),
+                    camera_row(
+                        self.forward,
+                        depth_offset + depth_translation / depth_scale,
+                        depth_scale,
+                    ),
+                    [
+                        self.forward.x as f64,
+                        self.forward.y as f64,
+                        self.forward.z as f64,
+                        depth_offset,
+                    ],
+                ]
+            }
+            Projection3dKind::Orthographic {
+                vertical_span,
+                aspect_ratio,
+                near,
+                far,
+            } => {
+                let depth_extent = far as f64 - near as f64;
+                [
+                    camera_row(
+                        self.right,
+                        right_offset,
+                        2.0 / (vertical_span as f64 * aspect_ratio as f64),
+                    ),
+                    camera_row(self.up, up_offset, 2.0 / vertical_span as f64),
+                    camera_row(self.forward, depth_offset - near as f64, 1.0 / depth_extent),
+                    [0.0, 0.0, 0.0, 1.0],
+                ]
+            }
+        };
+        Ok([
+            f64_row_to_f32(rows[0])?,
+            f64_row_to_f32(rows[1])?,
+            f64_row_to_f32(rows[2])?,
+            f64_row_to_f32(rows[3])?,
+        ])
     }
 }
 
@@ -523,7 +623,11 @@ impl ProjectedPoint3d {
         self.view_depth
     }
 
-    /// Returns depth mapped linearly from near to far, normally in `0.0..=1.0`.
+    /// Returns the hardware depth value, normally in `0.0..=1.0`.
+    ///
+    /// Orthographic depth is linear. Perspective depth follows the nonlinear
+    /// projection used by the GPU depth attachment so CPU anchors and rendered
+    /// surfaces share one visibility coordinate.
     pub const fn normalized_depth(self) -> f32 {
         self.normalized_depth
     }
@@ -634,6 +738,31 @@ fn subtract_f64(left: Vec3, right: Vec3) -> (f64, f64, f64) {
 
 fn dot_f64_tuple(left: (f64, f64, f64), right: Vec3) -> f64 {
     left.0 * right.x as f64 + left.1 * right.y as f64 + left.2 * right.z as f64
+}
+
+#[cfg(any(feature = "wgpu", test))]
+fn dot_f64(left: Vec3, right: Vec3) -> f64 {
+    left.x as f64 * right.x as f64 + left.y as f64 * right.y as f64 + left.z as f64 * right.z as f64
+}
+
+#[cfg(any(feature = "wgpu", test))]
+fn camera_row(axis: Vec3, offset: f64, scale: f64) -> [f64; 4] {
+    [
+        axis.x as f64 * scale,
+        axis.y as f64 * scale,
+        axis.z as f64 * scale,
+        offset * scale,
+    ]
+}
+
+#[cfg(any(feature = "wgpu", test))]
+fn f64_row_to_f32(row: [f64; 4]) -> Result<[f32; 4], Pseudo3dError> {
+    Ok([
+        f64_to_f32(row[0])?,
+        f64_to_f32(row[1])?,
+        f64_to_f32(row[2])?,
+        f64_to_f32(row[3])?,
+    ])
 }
 
 fn cross_f64(left: Vec3, right: Vec3) -> Option<(f64, f64, f64)> {
@@ -762,5 +891,36 @@ mod tests {
             Camera3d::look_at(vector(0.0, 0.0, 5.0), Vec3::ZERO, Vec3::Z, projection),
             Err(Pseudo3dError::InvalidCameraBasis)
         );
+    }
+
+    #[test]
+    fn gpu_clip_rows_match_public_camera_projection() {
+        let viewport = LogicalViewport::new(800.0, 600.0).unwrap();
+        for projection in [
+            Projection3d::perspective(1.1, 800.0 / 600.0, 0.1, 50.0).unwrap(),
+            Projection3d::orthographic(7.0, 800.0 / 600.0, 0.1, 50.0).unwrap(),
+        ] {
+            let camera = Camera3d::look_at(
+                vector(3.0, 2.0, 6.0),
+                vector(0.0, 0.5, 0.0),
+                Vec3::Y,
+                projection,
+            )
+            .unwrap();
+            let point = vector(0.5, 0.25, -1.0);
+            let projected = camera.project_world(point, viewport).unwrap();
+            let rows = camera.world_to_clip_rows().unwrap();
+            let homogeneous = [point.x(), point.y(), point.z(), 1.0];
+            let clip = rows.map(|row| {
+                row[0] * homogeneous[0] + row[1] * homogeneous[1] + row[2] * homogeneous[2] + row[3]
+            });
+            let ndc_x = clip[0] / clip[3];
+            let ndc_y = clip[1] / clip[3];
+            let screen_x = (ndc_x * 0.5 + 0.5) * viewport.width();
+            let screen_y = (0.5 - ndc_y * 0.5) * viewport.height();
+            close(screen_x, projected.logical_position().to_vec2().x());
+            close(screen_y, projected.logical_position().to_vec2().y());
+            close(clip[2] / clip[3], projected.normalized_depth());
+        }
     }
 }

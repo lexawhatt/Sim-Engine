@@ -542,7 +542,9 @@ impl ApplicationHandler for UiDemoApplication {
                 let scene_time = frame_started_at.elapsed();
                 let command_count = scene.command_count();
                 let camera = self.active_camera();
-                window.pre_present_notify();
+                if !self.uncapped {
+                    window.pre_present_notify();
+                }
                 if let Some(renderer) = self.renderer.as_mut() {
                     match renderer.render_with_metrics(&scene, &camera) {
                         Ok(report) => {

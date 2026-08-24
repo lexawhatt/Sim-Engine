@@ -30,23 +30,6 @@ fn dynamic_mesh_vertices_require_complete_finite_triangles() {
 }
 
 #[test]
-fn particle_instances_validate_visual_contract() {
-    let particle = ParticleInstance2d::new(Vec2::new(3.0, -2.0), 4.5, Color::WHITE, 1.0).unwrap();
-    assert_eq!(particle.world_position(), Vec2::new(3.0, -2.0));
-    assert_eq!(particle.radius(), 4.5);
-    assert_eq!(particle.depth(), 1.0);
-    assert_eq!(particle.color(), Color::WHITE);
-    assert_eq!(
-        ParticleInstance2d::new(Vec2::ZERO, 0.0, Color::WHITE, 0.0),
-        Err(ParticleInstanceError::InvalidRadius)
-    );
-    assert_eq!(
-        ParticleInstance2d::new(Vec2::ZERO, 1.0, Color::WHITE, f32::NAN),
-        Err(ParticleInstanceError::NonFinite)
-    );
-}
-
-#[test]
 fn particle_gpu_instances_preserve_counts_and_capacity_contract() {
     let particle = ParticleInstance2d::new(Vec2::new(2.0, -3.0), 2.0, Color::WHITE, 4.0)
         .expect("finite particle should be valid");
@@ -697,6 +680,7 @@ fn offscreen_gpu_readback_verifies_camera_depth_and_clip_contract() {
         let validation_scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
         let recovery_validation_scope =
             recovery_device.push_error_scope(wgpu::ErrorFilter::Validation);
+        mesh3d::assert_gpu_depth_contract(&device, &queue, wgpu::TextureFormat::Rgba8UnormSrgb);
         let vertex_limit = device.limits().max_buffer_size / std::mem::size_of::<Vertex>() as u64;
         if let Ok(first_invalid_capacity) = usize::try_from(vertex_limit.saturating_add(1)) {
             assert!(!buffer_capacity_fits::<Vertex>(
@@ -1748,13 +1732,36 @@ fn render_target_memory_accounting_is_checked_and_format_aware() {
 }
 
 #[test]
-fn renderer_present_modes_have_explicit_fallback_contracts() {
+fn renderer_present_modes_select_concrete_surface_fallbacks() {
     assert_eq!(
-        RendererPresentMode::Vsync.to_wgpu(),
-        wgpu::PresentMode::Fifo
+        select_surface_present_mode(
+            RendererPresentMode::Vsync,
+            &[wgpu::PresentMode::Immediate, wgpu::PresentMode::Fifo]
+        ),
+        RendererSurfacePresentMode::Fifo
     );
     assert_eq!(
-        RendererPresentMode::NoVsync.to_wgpu(),
-        wgpu::PresentMode::AutoNoVsync
+        select_surface_present_mode(
+            RendererPresentMode::NoVsync,
+            &[
+                wgpu::PresentMode::Fifo,
+                wgpu::PresentMode::Mailbox,
+                wgpu::PresentMode::Immediate,
+            ]
+        ),
+        RendererSurfacePresentMode::Immediate
     );
+    assert_eq!(
+        select_surface_present_mode(
+            RendererPresentMode::NoVsync,
+            &[wgpu::PresentMode::Fifo, wgpu::PresentMode::Mailbox]
+        ),
+        RendererSurfacePresentMode::Mailbox
+    );
+    assert_eq!(
+        select_surface_present_mode(RendererPresentMode::NoVsync, &[wgpu::PresentMode::Fifo]),
+        RendererSurfacePresentMode::Fifo
+    );
+    assert!(RendererSurfacePresentMode::Mailbox.is_refresh_synchronized());
+    assert!(!RendererSurfacePresentMode::Immediate.is_refresh_synchronized());
 }

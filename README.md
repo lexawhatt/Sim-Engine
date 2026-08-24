@@ -1,27 +1,24 @@
 # Sim;Engine
 
-Sim;Engine is the visual rendering layer designed around Sim;X. It provides a
-validated, high-performance 2D scene and scientific-visualization renderer,
-with a focused pseudo-3D stereometry path under development for Sim;Math.
+Sim;Engine is a validated visualization library built for simulation products.
+It provides a high-performance 2D renderer, scientific visualization paths,
+and a focused retained 3D stereometry pipeline.
 
-Sim;X is the primary product consumer and design driver. The engine remains
-reusable: hosts provide already-computed visual state, while Sim;Engine owns
-projection, camera control, drawing, clipping, GPU resources, composition,
-recovery, and rendering diagnostics. Physics, chemistry, biology, mathematical
-meaning, simulation stepping, UI navigation, and plugins remain in the host.
+Sim;X is the primary consumer and design driver, but the crate is reusable.
+Applications provide ready visual state. Sim;Engine owns cameras, drawing,
+clipping, interpolation, GPU resources, composition, recovery, and rendering
+diagnostics. Physics, simulation stepping, domain entities, UI navigation, and
+plugins remain in the host application.
 
-The crate is pre-1.0. The first supported release target is Linux and the
-minimum supported Rust version is 1.87.
+The crate is pre-1.0. The first supported release target is Linux. The minimum
+supported Rust version is 1.90.
 
 ## Documentation
 
-- [Integration Guide](docs/INTEGRATION_GUIDE.md) - installation, core concepts,
-  every rendering path, recovery, performance guidance, and API catalogue.
-- [Architecture Reference](docs/ARCHITECTURE_REFERENCE.md) - coordinate/color
-  contracts, CPU/GPU data flow, ownership, validation, and extension rules.
-- [Documentation Index](docs/README.md) - stability, release, changelog, and
-  pseudo-3D specification links.
-- Generated Rust API reference:
+- [Library documentation](DOCUMENTATION.md) - installation, concepts, every
+  rendering path, recovery, performance, architecture, and examples.
+- [Changelog](CHANGELOG.md) - release history and user-visible changes.
+- Generated API reference:
 
   ```bash
   cargo doc --all-features --no-deps --open
@@ -32,40 +29,36 @@ minimum supported Rust version is 1.87.
 - validated circles, rectangles, rounded rectangles, lines, and polylines;
 - solid, linear-gradient, and radial-gradient fills;
 - logical-pixel strokes, shadows, clipping, and stable layer ordering;
-- 2D camera pan, rotation, zoom, cursor anchoring, fit, and picking;
+- 2D camera pan, rotation, zoom, fit, and picking;
 - fallible tweening and easing;
-- streaming and prepared Scene geometry;
-- mutable triangle-list `DynamicMesh2d` resources;
-- instanced `ParticleField2d` with draw, memory, upload, and culling budgets;
-- finite `ScalarField` data, color maps, partial texture updates, and heatmaps;
-- offscreen targets, explicit blend modes, ping-pong trails, and fused
-  field/particle/surface composition;
-- device/surface recovery with explicit retained-resource restoration;
-- CPU frame-stage metrics and semantic GPU readback tests;
-- validated `Vec3`, `Rotation3d`, `Transform3d`, `Projection3d`, and `Camera3d`
-  foundation.
+- streaming, prepared, and dynamic triangle geometry;
+- budgeted instanced particle rendering;
+- scalar-field textures, color maps, partial updates, and heatmaps;
+- offscreen targets, composition, and bounded trails;
+- device recovery with explicit retained-resource restoration;
+- retained 3D meshes, independent transforms, hardware depth, and visible or
+  dashed hidden mathematical edges.
 
-Retained 3D meshes, depth-tested surfaces, and hidden-line rendering are not yet
-implemented. `Projection2d` is a lightweight 2.5D presentation effect, not a
-replacement for the planned stereometry pipeline.
+Translucent section materials, hatching, projected 3D anchors, and 3D picking
+are not part of the current release.
 
-## Quick Start
+## Installation
 
-The default feature set includes `wgpu`:
+The default feature set includes the `wgpu` renderer:
 
 ```toml
 [dependencies]
 sim-engine = "0.1"
 ```
 
-Use CPU visual-state APIs without the renderer:
+Use core visual-state APIs without GPU dependencies:
 
 ```toml
 [dependencies]
 sim-engine = { version = "0.1", default-features = false }
 ```
 
-Build a scene:
+## Quick Start
 
 ```rust
 use sim_engine::{Camera2d, Color, Rect, Scene, ShapeStyle, Vec2};
@@ -88,11 +81,12 @@ scene.try_rect(
     ),
 )?;
 
+# let _ = camera;
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-Window creation stays in the host. Construct `WgpuRenderer` asynchronously from
-a compatible surface target, then render synchronously in the event loop:
+Window creation stays in the host. Renderer initialization is asynchronous;
+steady-state updates and rendering are synchronous submissions:
 
 ```rust,ignore
 let options = WgpuRendererOptions::new(
@@ -109,59 +103,42 @@ let mut renderer = WgpuRenderer::new_with_options(
 let report = renderer.render_with_metrics(&scene, &camera)?;
 ```
 
-See the [Integration Guide](docs/INTEGRATION_GUIDE.md) for HiDPI conversion,
-resource updates, errors, recovery, and complete examples.
+## Choose A Rendering Path
 
-## Rendering Paths
-
-| Workload | Preferred path |
+| Workload | Preferred API |
 | --- | --- |
-| Small changing visual | `Scene` |
-| Static shapes with moving camera | `PreparedScene` |
+| Small changing scene | `Scene` |
+| Static geometry with a moving camera | `PreparedScene` |
 | Frequently changing triangles | `DynamicMesh2d` |
-| Large circle/point population | `ParticleField2d` |
+| Large point or circle population | `ParticleField2d` |
 | Dense scalar grid | `ScalarFieldTexture` |
 | Bounded gas plus particle overlay | `render_layered_visualization` |
-
-The renderer is asynchronous only for adapter/device creation and explicit
-recovery. Frame updates and rendering are synchronous submission methods; the
-engine does not own the host simulation scheduler.
+| Stereometry solids and hidden edges | `Mesh3d` plus `Scene3d` |
 
 ## Examples
 
 ```bash
-# General primitives and renderer modes
 cargo run --release --example demo
-
-# Fluid, Gas, Wave, and Edge Case interactive screens
-cargo run --release --example ui_demo
-
-# Bounded star-remnant visualization workload
+cargo run --release --example ui_demo -- --uncapped
 cargo run --release --example star_remnant_stress -- --benchmark
-
-# CPU-only particle-state baseline
-cargo run --release --example particle_cpu_benchmark
+cargo run --release --no-default-features --example particle_cpu_benchmark
+cargo run --release --example stereometry_3d -- --uncapped
+cargo run --release --example cylinder_derivation_3d -- --uncapped --benchmark
 ```
 
-The star-remnant fixture demonstrates the primary resource rule: rendering a
-large Sim;X state must have explicit visible-instance, upload, visibility-check,
-texture-resolution, and memory budgets so simulation work retains headroom.
+## Verification
 
-## Release Verification
-
-Run the complete Linux gate:
+The Linux release gate checks the declared Rust 1.90 MSRV, all targets with
+and without the renderer, strict clippy, rustdoc, semantic GPU readback, and the
+published package boundary:
 
 ```bash
 ./scripts/linux_release_gate.sh
 ```
 
-It checks formatting, all targets/features, the core-only build, strict clippy,
-semantic GPU readback, whitespace, and an offline package rebuild. See the
-[release checklist](docs/RELEASING.md) for required hardware evidence.
-
 ## License
 
-Licensed under either of the following, at your option:
-
-- [MIT](https://github.com/lexawhatt/Sim-Engine/blob/main/LICENSE)
-- [Apache-2.0](https://github.com/lexawhatt/Sim-Engine/blob/main/LICENSE-APACHE)
+Licensed under either
+[MIT](https://github.com/lexawhatt/Sim-Engine/blob/main/LICENSE) or
+[Apache-2.0](https://github.com/lexawhatt/Sim-Engine/blob/main/LICENSE-APACHE),
+at your option.
