@@ -1,10 +1,4 @@
-//! Sim;Engine is a rendering layer for simulation products.
-//!
-//! It intentionally does not model physics, biology, chemistry, math domains,
-//! constants, entities, or plugins. Those belong to the host application's
-//! domain layer. This crate accepts already-computed visual state and turns it
-//! into a smooth, styled 2D scene.
-
+#![doc = include_str!("../README.md")]
 #![warn(missing_docs)]
 
 mod camera;
@@ -12,6 +6,7 @@ mod color;
 mod easing;
 mod field;
 mod math;
+mod pseudo3d;
 mod scene;
 mod tween;
 
@@ -26,6 +21,9 @@ pub use color::{Color, Palette};
 pub use easing::Easing;
 pub use field::{ColorMap, ColorMapError, ColorStop, ScalarField, ScalarFieldError};
 pub use math::{Rect, Vec2};
+pub use pseudo3d::{
+    Camera3d, ProjectedPoint3d, Projection3d, Pseudo3dError, Rotation3d, Transform3d, Vec3,
+};
 pub use scene::{
     Circle, DrawCommand, Fill, Layer, Line, LinearGradient, Polyline, RadialGradient, RectShape,
     Scene, SceneCommand, SceneError, ScenePrimitive, ScreenClipRect, Shadow, ShapeStyle, Stroke,

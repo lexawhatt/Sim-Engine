@@ -636,7 +636,8 @@ fn scalar_value_range_rejects_finite_subtraction_overflow() {
 #[test]
 fn offscreen_gpu_readback_verifies_camera_depth_and_clip_contract() {
     pollster::block_on(async {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let instance =
+            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
         let Ok(adapter) = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::LowPower,
@@ -653,6 +654,19 @@ fn offscreen_gpu_readback_verifies_camera_depth_and_clip_contract() {
             );
             return;
         };
+        let adapter_info = adapter.get_info();
+        if std::env::var("SIM_ENGINE_REQUIRE_GPU_TESTS").as_deref() == Ok("1") {
+            eprintln!(
+                "sim-engine GPU evidence: name={:?}, type={:?}, backend={:?}, driver={:?}, driver_info={:?}, vendor={:#06x}, device={:#06x}",
+                adapter_info.name,
+                adapter_info.device_type,
+                adapter_info.backend,
+                adapter_info.driver,
+                adapter_info.driver_info,
+                adapter_info.vendor,
+                adapter_info.device,
+            );
+        }
         let Ok((device, queue)) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("sim-engine offscreen test device"),

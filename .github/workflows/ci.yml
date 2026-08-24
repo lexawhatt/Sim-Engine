@@ -20,14 +20,29 @@ jobs:
       - run: cargo test --no-default-features
       - run: cargo clippy --all-targets --all-features -- -D warnings
 
-  all-targets:
-    name: all targets (${{ matrix.os }})
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
+  linux-all-targets:
+    name: Linux all targets
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo test --all-targets --all-features
+
+  linux-gpu-contract:
+    name: Linux strict GPU contract
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Mesa software GPU
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mesa-vulkan-drivers
+      - name: Run semantic shader/readback fixture
+        env:
+          SIM_ENGINE_REQUIRE_GPU_TESTS: "1"
+          WGPU_BACKEND: vulkan
+        run: >-
+          cargo test --all-features
+          renderer::tests::offscreen_gpu_readback_verifies_camera_depth_and_clip_contract
+          -- --nocapture

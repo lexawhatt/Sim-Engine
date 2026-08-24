@@ -2,7 +2,29 @@
 name = "sim-engine"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.87"
 license = "MIT OR Apache-2.0"
+description = "A validated high-performance visualization engine for simulations"
+repository = "https://github.com/lexawhatt/Sim-Engine"
+documentation = "https://docs.rs/sim-engine"
+readme = "README.md"
+keywords = ["graphics", "visualization", "simulation", "wgpu", "2d"]
+categories = ["graphics", "rendering", "science"]
+include = [
+    "/src/**",
+    "/examples/**",
+    "/docs/**",
+    "/scripts/linux_release_gate.sh",
+    "/Cargo.toml",
+    "/Cargo.lock",
+    "/README.md",
+    "/CHANGELOG.md",
+    "/LICENSE",
+    "/LICENSE-APACHE",
+]
+
+[package.metadata.docs.rs]
+all-features = true
 
 [lib]
 name = "sim_engine"

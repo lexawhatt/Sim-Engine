@@ -8,6 +8,13 @@ reaches 1.0.
 
 ### Added
 
+- The first Sim;Math pseudo-3D foundation: overflow-aware `Vec3`, normalized
+  `Rotation3d`, validated `Transform3d`, perspective/orthographic `Projection3d`,
+  and logical-viewport `Camera3d` projection.
+- A specification for retained stereometry meshes, depth-tested hidden lines,
+  hatched sections, projected anchors, and the cube/octahedron consumer fixture.
+- Comprehensive Integration Guide and Architecture Reference documentation,
+  with the README reused as the generated rustdoc landing page.
 - Hard particle visualization budgets for draw count, GPU allocation, per-frame
   upload, and camera visibility checks, with observable budget-limited counts.
 - Fused one-submit scalar-field, particle-overlay, and target composition.
@@ -18,6 +25,12 @@ reaches 1.0.
 
 ### Changed
 
+- Defined the 0.1 release as Linux-first; Windows, macOS, and web remain
+  non-blocking future portability targets.
+- Added a single Linux release-gate script and Linux CI jobs for all targets and
+  strict Mesa-backed semantic GPU readback.
+- Separated internal roadmaps, engineering logs, and Sim;X product drafts into
+  an ignored local workbench; release packages now use an explicit include list.
 - Screen clips and shadows now require explicit logical-screen position/vector
   types instead of unitless vectors.
 - Pseudo-depth affects projection only; commands on one layer retain insertion

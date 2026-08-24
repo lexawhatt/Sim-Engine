@@ -1,5 +1,6 @@
 /target
 .idea/
-READ_FIRST_SIM_ENGINE_CODE_STYLE.md
-READ_FIRST_SIM_ENGINE_ROADMAP.md
-docs/SIM_X_IDEAS.md
+
+# Local design notes, agent instructions, roadmaps, and product drafts.
+# Nothing in this directory is part of the crate or release documentation.
+.workbench/
