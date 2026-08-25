@@ -6,52 +6,11 @@ public API reaches 1.0.
 
 ## Unreleased
 
-### Added
+No unreleased changes.
 
-- Scene provenance in `Object3dId`, preventing a handle from one `Scene3d`
-  from mutating an object with the same local number in another scene.
-- Bounded device-recovery quarantine configuration and telemetry through
-  `WgpuRendererOptions::with_max_quarantined_devices`,
-  `quarantined_device_count`, and `remaining_device_recoveries`.
-- Fallible, byte-budgeted `ScalarField::filled` allocation with an explicit
-  `filled_with_byte_limit` override.
-- Explicit `LogicalPixels`, `WorldLength`, and `PhysicalPerLogical` scalar unit
-  types for 3D edge, projection-range, and target-scale boundaries.
-- Atomic `restore_scene3d` migration that preserves object IDs and instance
-  state while recreating each distinct stale mesh once.
-- Seeded CPU/WGSL clipping equivalence readback and persistent Vulkan adapter
-  evidence artifacts in the local and CI release gates.
+## 0.1.0 - 2026-08-25
 
-### Changed
-
-- Render-bound colors must be normalized linear RGBA. Finite overshoot remains
-  available for interpolation but must be explicitly clamped before insertion.
-- Hidden-line classification is explicitly conservative within two
-  implementation depth units; coplanar and sub-resolution separation resolves
-  visible.
-- CI actions and Rust toolchains are pinned, and CI now verifies doctests,
-  warning-free rustdoc, the package boundary, and the package archive.
-- 3D wireframe metrics, projection distances, and target scale now use opaque
-  unit types instead of interchangeable raw scalars.
-
-### Fixed
-
-- Homogeneously clip 3D display edges against the complete frustum before
-  perspective division, instead of rejecting the whole frame when an edge
-  crosses the camera or near plane.
-- Reject display edges whose distinct indices reference coincident model-space
-  vertices instead of accepting a zero-length mathematical edge.
-- Preflight retained 3D vertex, index, and edge buffer sizes and draw-count
-  representation before fallible host staging allocation.
-- Require and assert Vulkan in the strict Linux semantic GPU gate.
-- Prevent unbounded accumulation of previous logical GPU devices after repeated
-  recovery.
-- Keep extreme homogeneous clipping equivalent on Vulkan implementations that
-  flush subnormal reciprocals by using a shared normal-range scale.
-
-## 0.1.0 - 2026-08-24
-
-Initial Linux development release of the validated 2D scene, scientific
+First official Linux release of the validated 2D scene, scientific
 visualization renderer, and focused retained 3D stereometry path.
 
 ### Added
@@ -76,11 +35,24 @@ visualization renderer, and focused retained 3D stereometry path.
   derivation examples with bounded performance diagnostics.
 - Concrete Immediate/Mailbox/FIFO presentation diagnostics and a completed-work
   GPU synchronization point for controlled benchmarks.
+- Scene provenance in `Object3dId`, preventing a handle from one `Scene3d`
+  from mutating an object with the same local number in another scene.
+- Bounded device-recovery quarantine configuration and telemetry through
+  `WgpuRendererOptions::with_max_quarantined_devices`,
+  `quarantined_device_count`, and `remaining_device_recoveries`.
+- Fallible, byte-budgeted `ScalarField::filled` allocation with an explicit
+  `filled_with_byte_limit` override.
+- Explicit `LogicalPixels`, `WorldLength`, and `PhysicalPerLogical` scalar unit
+  types for 3D edge, projection-range, and target-scale boundaries.
+- Atomic `restore_scene3d` migration that preserves object IDs and instance
+  state while recreating each distinct stale mesh once.
+- Seeded CPU/WGSL clipping equivalence readback and persistent Vulkan adapter
+  evidence artifacts in the local and CI release gates.
 
 ### Changed
 
-- The first supported release target is explicitly Linux. Windows, macOS, and
-  web are not release-gated platforms.
+- The supported v0.1.0 target is explicitly Linux with Vulkan. Windows, macOS,
+  and web are not release-gated platforms.
 - The minimum supported Rust version is 1.90, matching the complete currently
   resolved renderer dependency graph.
 - Public data fields are private behind validated constructors and accessors.
@@ -91,6 +63,15 @@ visualization renderer, and focused retained 3D stereometry path.
   state generation can be validated and benchmarked CPU-only.
 - No-VSync selection resolves to an advertised concrete surface mode and can
   be inspected through `RendererSurfacePresentMode`.
+- Render-bound colors must be normalized linear RGBA. Finite overshoot remains
+  available for interpolation but must be explicitly clamped before insertion.
+- Hidden-line classification is explicitly conservative within two
+  implementation depth units; coplanar and sub-resolution separation resolves
+  visible.
+- CI actions and Rust toolchains are pinned, and CI now verifies doctests,
+  warning-free rustdoc, the package boundary, and the package archive.
+- 3D wireframe metrics, projection distances, and target scale now use opaque
+  unit types instead of interchangeable raw scalars.
 
 ### Fixed
 
@@ -105,6 +86,18 @@ visualization renderer, and focused retained 3D stereometry path.
 - Corrected particle metrics for skipped surface frames and recovery.
 - Removed Wayland frame-callback throttling from uncapped example paths.
 - Removed renderer-internal product/debug scene construction.
+- Homogeneously clip 3D display edges against the complete frustum before
+  perspective division, instead of rejecting the whole frame when an edge
+  crosses the camera or near plane.
+- Reject display edges whose distinct indices reference coincident model-space
+  vertices instead of accepting a zero-length mathematical edge.
+- Preflight retained 3D vertex, index, and edge buffer sizes and draw-count
+  representation before fallible host staging allocation.
+- Require and assert Vulkan in the strict Linux semantic GPU gate.
+- Prevent unbounded accumulation of previous logical GPU devices after repeated
+  recovery.
+- Keep extreme homogeneous clipping equivalent on Vulkan implementations that
+  flush subnormal reciprocals by using a shared normal-range scale.
 
 ### Testing
 
@@ -113,6 +106,9 @@ visualization renderer, and focused retained 3D stereometry path.
 - Added semantic GPU readback for camera/depth/clip, scalar sampling direction,
   sRGB conversion, half-alpha composition, retained-resource restoration,
   3D depth ordering, coplanar visible edges, and dashed hidden edges.
+- Added a 256-case seeded CPU/WGSL homogeneous-clipping equivalence fixture and
+  second-logical-device `Scene3d` recovery validation.
 - The Linux gate builds and lints all targets with and without default features,
   checks Rust 1.90, generates warning-free rustdoc, requires a GPU semantic
-  fixture, and verifies the offline package archive.
+  fixture, records exact adapter/driver evidence, and verifies the offline
+  package archive.

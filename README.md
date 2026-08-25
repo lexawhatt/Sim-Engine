@@ -10,10 +10,11 @@ clipping, interpolation, GPU resources, composition, recovery, and rendering
 diagnostics. Physics, simulation stepping, domain entities, UI navigation, and
 plugins remain in the host application.
 
-The crate is pre-1.0. The first release-gated target is Linux with Vulkan. A
-concrete adapter/driver is supported when the mandatory semantic fixture passes
-on it; untested drivers are not inferred from Mesa evidence. The minimum
-supported Rust version is 1.90.
+Version **0.1.0** is the first official Sim;Engine release. The crate remains
+pre-1.0, and its supported release target is Linux with Vulkan. A concrete
+adapter/driver is supported when the mandatory semantic fixture passes on it;
+untested drivers are not inferred from Mesa evidence. The minimum supported
+Rust version is 1.90.
 
 ## Documentation
 
@@ -38,11 +39,14 @@ supported Rust version is 1.90.
 - scalar-field textures, color maps, partial updates, and heatmaps;
 - offscreen targets, composition, and bounded trails;
 - device recovery with explicit retained-resource restoration;
+- typed logical-pixel, 3D world-length, and target-scale boundaries;
 - retained 3D meshes, independent transforms, hardware depth, and visible or
-  dashed hidden mathematical edges.
+  dashed hidden mathematical edges;
+- atomic retained-3D scene recovery that preserves stable object IDs and visual
+  state across logical-device replacement.
 
 Translucent section materials, hatching, projected 3D anchors, and 3D picking
-are not part of the current release.
+are not part of v0.1.0.
 
 ## Installation
 
@@ -130,9 +134,9 @@ cargo run --release --example cylinder_derivation_3d -- --uncapped --benchmark
 
 ## Verification
 
-The Linux release gate checks the declared Rust 1.90 MSRV, all targets with
+The v0.1.0 Linux release gate checks the declared Rust 1.90 MSRV, all targets with
 and without the renderer, strict clippy, rustdoc, Vulkan semantic GPU readback
-with a backend assertion, and the published package boundary:
+with a backend assertion, and the publishable package boundary:
 
 ```bash
 ./scripts/linux_release_gate.sh

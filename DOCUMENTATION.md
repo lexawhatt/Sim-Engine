@@ -1,7 +1,7 @@
-# Sim;Engine Documentation
+# Sim;Engine v0.1.0 Documentation
 
-This document is the public guide and engineering reference for Sim;Engine
-0.1. It is divided into two parts:
+This document is the public guide and engineering reference for the official
+Sim;Engine v0.1.0 release. It is divided into two parts:
 
 - [Integration Handbook](#part-i-integration-handbook) - how to add the crate,
   construct visual state, choose a rendering path, recover resources, and
@@ -16,8 +16,9 @@ For exact signatures and error variants, generate the Rust API reference:
 cargo doc --all-features --no-deps --open
 ```
 
-Sim;Engine is pre-1.0. Linux is the only release-gated platform, and Rust 1.90
-is the minimum supported Rust version.
+Sim;Engine v0.1.0 is the first official release and remains pre-1.0. Linux with
+Vulkan is its supported release target, and Rust 1.90 is the minimum supported
+Rust version.
 
 ## Part I: Integration Handbook
 
@@ -830,7 +831,7 @@ automation are repeatable.
 - Linux with Vulkan is the only release-gated platform/backend contract.
 - A Vulkan adapter is supported for 0.1 only when the mandatory semantic
   fixture passes on that concrete adapter/driver. CI records Mesa software
-  evidence and the release candidate records Intel Mesa evidence; untested
+  evidence and the v0.1.0 release evidence records Intel Mesa; untested
   AMD/NVIDIA drivers are not silently certified by those results.
 - The crate is pre-1.0.
 - Text shaping and glyph caching are not implemented.
