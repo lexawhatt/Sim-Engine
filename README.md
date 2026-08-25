@@ -10,7 +10,9 @@ clipping, interpolation, GPU resources, composition, recovery, and rendering
 diagnostics. Physics, simulation stepping, domain entities, UI navigation, and
 plugins remain in the host application.
 
-The crate is pre-1.0. The first supported release target is Linux. The minimum
+The crate is pre-1.0. The first release-gated target is Linux with Vulkan. A
+concrete adapter/driver is supported when the mandatory semantic fixture passes
+on it; untested drivers are not inferred from Mesa evidence. The minimum
 supported Rust version is 1.90.
 
 ## Documentation
@@ -135,6 +137,9 @@ with a backend assertion, and the published package boundary:
 ```bash
 ./scripts/linux_release_gate.sh
 ```
+
+The gate records the exact adapter/backend/driver run in
+`target/linux-vulkan-adapter.txt`; CI publishes the same file as an artifact.
 
 ## License
 

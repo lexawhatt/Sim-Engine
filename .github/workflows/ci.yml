@@ -78,8 +78,15 @@ jobs:
         env:
           SIM_ENGINE_REQUIRE_GPU_TESTS: "1"
           SIM_ENGINE_REQUIRE_VULKAN: "1"
+          SIM_ENGINE_GPU_EVIDENCE_PATH: target/linux-vulkan-adapter.txt
           WGPU_BACKEND: vulkan
         run: >-
           cargo test --all-features
           renderer::tests::offscreen_gpu_readback_verifies_camera_depth_and_clip_contract
           -- --nocapture
+      - name: Publish Vulkan adapter evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: linux-vulkan-adapter
+          path: target/linux-vulkan-adapter.txt
+          if-no-files-found: error

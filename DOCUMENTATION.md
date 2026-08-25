@@ -177,13 +177,20 @@ replace the retained 3D path.
 | `Vec2` | caller-defined 2D world/vector value |
 | `LogicalScreenPosition` | logical pixels, top-left origin |
 | `LogicalScreenVector` | logical-pixel offset or size |
+| `LogicalPixels` | positive logical-pixel scalar length |
 | `PhysicalScreenPosition` | surface pixels, top-left origin |
+| `PhysicalPerLogical` | physical target texels per logical pixel |
 | `LogicalViewport` | finite logical viewport dimensions |
+| `WorldLength` | positive scalar distance in caller-defined 3D world units |
 | `RenderTarget2d` dimensions | physical texture pixels |
 
 Camera zoom is logical pixels per world unit. Stroke widths, screen shadows,
 and clips are logical pixels, so monitor scale does not change their intended
-visual size.
+visual size. Retained 3D wireframe widths and dash/gap lengths require
+`LogicalPixels`; projection near/far distances and orthographic span require
+`WorldLength`; `RenderTarget3d::pixels_per_logical` returns
+`PhysicalPerLogical`. Their private representations prevent accidental direct
+substitution between world, logical, and physical scales.
 
 Convert physical pointer input before picking:
 
@@ -417,13 +424,15 @@ surface composition with one command encoder and one queue submission.
 The retained 3D path is intentionally separate from 2D pseudo-depth:
 
 ```rust
-use sim_engine::{Camera3d, LogicalViewport, Projection3d, Transform3d, Vec3};
+use sim_engine::{
+    Camera3d, LogicalViewport, Projection3d, Transform3d, Vec3, WorldLength,
+};
 
 let projection = Projection3d::perspective(
     std::f32::consts::FRAC_PI_3,
     16.0 / 9.0,
-    0.1,
-    100.0,
+    WorldLength::new(0.1)?,
+    WorldLength::new(100.0)?,
 )?;
 let camera = Camera3d::look_at(
     Vec3::new(0.0, 0.0, 5.0)?,
@@ -450,8 +459,16 @@ let retained = renderer.create_mesh3d(topology)?;
 let logical_viewport = LogicalViewport::new(logical_width, logical_height)?;
 let target = renderer.create_render_target3d(width, height, logical_viewport)?;
 
-let wireframe = WireframeStyle3d::visible(Color::WHITE, 2.0)?
-    .with_hidden(Color::rgb(0.45, 0.55, 0.70), 1.25, 7.0, 5.0)?;
+let wireframe = WireframeStyle3d::visible(
+    Color::WHITE,
+    LogicalPixels::new(2.0)?,
+)?
+.with_hidden(
+    Color::rgb(0.45, 0.55, 0.70),
+    LogicalPixels::new(1.25)?,
+    LogicalPixels::new(7.0)?,
+    LogicalPixels::new(5.0)?,
+)?;
 let style = MeshStyle3d::surface(SurfaceStyle3d::opaque(surface_color)?)
     .with_wireframe(wireframe);
 let mut scene = Scene3d::new(Color::BLACK)?;
@@ -509,7 +526,23 @@ resources from the previous identity are rejected until restored.
 | `RenderTarget2d` | `restore_render_target` | empty target; redraw required |
 | `TrailBuffer2d` | `restore_trail_buffer` | empty history; redraw required |
 | `RetainedMesh3d` | `restore_mesh3d` | exact topology and display edges |
+| `Scene3d` | `restore_scene3d` | stable IDs plus exact transform/style/visibility; shared meshes uploaded once |
 | `RenderTarget3d` | `restore_render_target3d` | empty color/depth; redraw required |
+
+For a retained 3D scene, restore the scene and target after device recovery:
+
+```rust,ignore
+renderer.recover_device_and_surface().await?;
+let scene_report = renderer.restore_scene3d(&mut scene)?;
+target = renderer.restore_render_target3d(&target)?;
+
+// Previously stored Object3dId values remain valid in `scene`.
+scene.set_visible(selected_object, true)?;
+```
+
+`restore_scene3d` is atomic at the scene boundary. It recreates every distinct
+stale mesh once and commits replacements only after all uploads succeed, while
+preserving object IDs, order, transforms, styles, visibility, and next-ID state.
 
 CPU-retained resources can recreate their exact content. GPU-only targets and
 history cannot reconstruct prior pixels. Recovery is exceptional; it is not a
@@ -794,7 +827,11 @@ automation are repeatable.
 
 ### 28. Known boundaries
 
-- Linux is the only release-gated platform.
+- Linux with Vulkan is the only release-gated platform/backend contract.
+- A Vulkan adapter is supported for 0.1 only when the mandatory semantic
+  fixture passes on that concrete adapter/driver. CI records Mesa software
+  evidence and the release candidate records Intel Mesa evidence; untested
+  AMD/NVIDIA drivers are not silently certified by those results.
 - The crate is pre-1.0.
 - Text shaping and glyph caching are not implemented.
 - Retained 3D supports opaque surfaces and depth-classified edges, not section
@@ -814,7 +851,10 @@ The complete local Linux release gate is:
 It checks formatting, Rust 1.90 compatibility, all targets with and without
 default features, strict clippy, doctests, warning-free rustdoc, a mandatory
 Vulkan semantic GPU readback fixture with backend assertion, `git diff --check`,
-and the offline package boundary.
+and the offline package boundary. The GPU step writes
+`target/linux-vulkan-adapter.txt`; CI publishes the same manifest as the
+`linux-vulkan-adapter` artifact. The manifest names backend, adapter type,
+vendor/device IDs, driver, and driver version for the exact semantic run.
 
 The gate must run from a clean worktree. Hardware performance or recovery
 claims must additionally name the Linux adapter, backend, driver, workload,

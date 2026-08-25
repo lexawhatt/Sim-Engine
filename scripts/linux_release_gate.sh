@@ -32,9 +32,12 @@ echo "[8/10] strict Linux Vulkan semantics"
 WGPU_BACKEND=vulkan \
 SIM_ENGINE_REQUIRE_GPU_TESTS=1 \
 SIM_ENGINE_REQUIRE_VULKAN=1 \
+SIM_ENGINE_GPU_EVIDENCE_PATH=target/linux-vulkan-adapter.txt \
 cargo test --all-features \
   renderer::tests::offscreen_gpu_readback_verifies_camera_depth_and_clip_contract \
   -- --nocapture
+grep -Fxq 'backend=Vulkan' target/linux-vulkan-adapter.txt
+echo "GPU evidence: target/linux-vulkan-adapter.txt"
 
 echo "[9/10] package boundary"
 git diff --check

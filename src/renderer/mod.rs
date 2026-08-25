@@ -4934,7 +4934,7 @@ pub use config::{RendererPresentMode, RendererSurfacePresentMode, WgpuRendererOp
 use mesh3d::Mesh3dRenderer;
 pub use mesh3d::{
     Mesh3dInstance, Mesh3dRenderError, Mesh3dRenderReport, Mesh3dResourceError, Object3dId,
-    RenderTarget3d, RetainedMesh3d, Scene3d, Scene3dError,
+    RenderTarget3d, RetainedMesh3d, Scene3d, Scene3dError, Scene3dRestoreReport,
 };
 use tessellation::{screen_clip_to_scissor, tessellate_scene};
 use visualization::{CachedColorMap, CompositionPipelines, create_composition_pipeline};

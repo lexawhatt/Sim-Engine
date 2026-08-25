@@ -13,9 +13,10 @@ use std::{
 };
 
 use sim_engine::{
-    BlendMode, Camera3d, Color, LogicalViewport, Mesh3d, MeshEdge3d, MeshStyle3d, Object3dId,
-    Projection3d, RenderTarget3d, RendererPresentMode, Rotation3d, Scene3d, SurfaceStyle3d,
-    Transform3d, Vec3, WgpuRenderer, WgpuRendererOptions, WireframeStyle3d,
+    BlendMode, Camera3d, Color, LogicalPixels, LogicalViewport, Mesh3d, MeshEdge3d, MeshStyle3d,
+    Object3dId, Projection3d, RenderTarget3d, RendererPresentMode, Rotation3d, Scene3d,
+    SurfaceStyle3d, Transform3d, Vec3, WgpuRenderer, WgpuRendererOptions, WireframeStyle3d,
+    WorldLength,
 };
 use winit::{
     application::ApplicationHandler,
@@ -31,6 +32,14 @@ const VOLUME_SLICES: usize = 18;
 const RADIUS: f32 = 1.35;
 const HEIGHT: f32 = 2.8;
 const TIMELINE_SECONDS: f32 = 20.0;
+
+fn logical(value: f32) -> LogicalPixels {
+    LogicalPixels::new(value).expect("example logical pixel value is valid")
+}
+
+fn world(value: f32) -> WorldLength {
+    WorldLength::new(value).expect("example world length is valid")
+}
 
 fn main() -> Result<(), Box<dyn Error>> {
     env_logger::init();
@@ -101,8 +110,8 @@ impl CylinderApplication {
         let projection = Projection3d::perspective(
             46.0_f32.to_radians(),
             viewport.width() / viewport.height(),
-            0.1,
-            100.0,
+            world(0.1),
+            world(100.0),
         )
         .expect("presentation projection is valid");
         Camera3d::look_at(position, Vec3::ZERO, Vec3::Y, projection)
@@ -344,9 +353,14 @@ impl ApplicationHandler for CylinderApplication {
             .expect("create cylinder target");
         let mut scene = Scene3d::new(Color::rgb8(9, 12, 20)).expect("background is opaque");
 
-        let outline = WireframeStyle3d::visible(Color::rgb8(224, 238, 255), 1.7)
+        let outline = WireframeStyle3d::visible(Color::rgb8(224, 238, 255), logical(1.7))
             .expect("outline style is valid")
-            .with_hidden(Color::rgb8(83, 104, 128), 1.0, 6.0, 5.0)
+            .with_hidden(
+                Color::rgb8(83, 104, 128),
+                logical(1.0),
+                logical(6.0),
+                logical(5.0),
+            )
             .expect("hidden outline style is valid");
         let cylinder_style = MeshStyle3d::surface(
             SurfaceStyle3d::opaque(Color::rgb8(32, 137, 166)).expect("surface is opaque"),
@@ -373,7 +387,7 @@ impl ApplicationHandler for CylinderApplication {
             slices.push(id);
         }
 
-        let panel_outline = WireframeStyle3d::visible(Color::rgb8(105, 230, 218), 1.1)
+        let panel_outline = WireframeStyle3d::visible(Color::rgb8(105, 230, 218), logical(1.1))
             .expect("panel outline is valid");
         let panel_style = MeshStyle3d::surface(
             SurfaceStyle3d::opaque(Color::rgb8(25, 114, 150)).expect("panel is opaque"),
@@ -388,7 +402,7 @@ impl ApplicationHandler for CylinderApplication {
             panels.push(id);
         }
 
-        let cap_outline = WireframeStyle3d::visible(Color::rgb8(255, 226, 112), 2.0)
+        let cap_outline = WireframeStyle3d::visible(Color::rgb8(255, 226, 112), logical(2.0))
             .expect("cap outline is valid");
         let cap_style = MeshStyle3d::surface(
             SurfaceStyle3d::opaque(Color::rgb8(232, 174, 55)).expect("cap is opaque"),

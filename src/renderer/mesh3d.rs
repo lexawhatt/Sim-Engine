@@ -1,9 +1,27 @@
 use super::*;
-use crate::{Camera3d, Mesh3d, MeshStyle3d, Transform3d, Vec3, WireframeStyle3d};
+use crate::{
+    Camera3d, LogicalPixels, Mesh3d, MeshStyle3d, PhysicalPerLogical, Transform3d, Vec3,
+    WireframeStyle3d,
+};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(test)]
-use crate::{MeshEdge3d, Projection3d, Rotation3d, SurfaceStyle3d};
+use crate::{MeshEdge3d, Projection3d, Rotation3d, SurfaceStyle3d, WorldLength};
+
+#[cfg(test)]
+fn logical(value: f32) -> LogicalPixels {
+    LogicalPixels::new(value).unwrap()
+}
+
+#[cfg(test)]
+fn physical_per_logical(value: f32) -> PhysicalPerLogical {
+    PhysicalPerLogical::new(value).unwrap()
+}
+
+#[cfg(test)]
+fn world(value: f32) -> WorldLength {
+    WorldLength::new(value).unwrap()
+}
 
 const INITIAL_INSTANCE_CAPACITY: usize = 16;
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
@@ -64,7 +82,7 @@ impl Camera3dUniform {
         camera: Camera3d,
         width: u32,
         height: u32,
-        scale_factor: f32,
+        scale_factor: PhysicalPerLogical,
     ) -> Result<Self, Mesh3dRenderError> {
         let rows = camera
             .world_to_clip_rows()
@@ -74,7 +92,7 @@ impl Camera3dUniform {
             clip_row_1: rows[1],
             clip_row_2: rows[2],
             clip_row_3: rows[3],
-            viewport: [width as f32, height as f32, scale_factor, 0.0],
+            viewport: [width as f32, height as f32, scale_factor.get(), 0.0],
         })
     }
 
@@ -114,6 +132,25 @@ struct EdgeObjectUniform {
     visible_color: [f32; 4],
     hidden_color: [f32; 4],
     edge_style: [f32; 4],
+}
+
+#[cfg(test)]
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct ClipProbeInputGpu {
+    start_clip: [f32; 4],
+    end_clip: [f32; 4],
+}
+
+#[cfg(test)]
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct ClipProbeOutputGpu {
+    start_clip: [f32; 4],
+    end_clip: [f32; 4],
+    range: [f32; 2],
+    visible: u32,
+    padding: u32,
 }
 
 pub(super) struct Mesh3dRenderer {
@@ -581,7 +618,7 @@ pub struct RenderTarget3d {
     _depth_texture: wgpu::Texture,
     depth_view: wgpu::TextureView,
     logical_viewport: LogicalViewport,
-    pixels_per_logical: f32,
+    pixels_per_logical: PhysicalPerLogical,
 }
 
 impl RenderTarget3d {
@@ -601,7 +638,7 @@ impl RenderTarget3d {
     }
 
     /// Returns target texels per logical screen pixel.
-    pub const fn pixels_per_logical(&self) -> f32 {
+    pub const fn pixels_per_logical(&self) -> PhysicalPerLogical {
         self.pixels_per_logical
     }
 
@@ -785,6 +822,37 @@ impl Mesh3dRenderReport {
     }
 }
 
+/// Result of atomically migrating a retained 3D scene to the active renderer device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Scene3dRestoreReport {
+    object_count: usize,
+    migrated_object_count: usize,
+    restored_mesh_count: usize,
+    restored_gpu_bytes: usize,
+}
+
+impl Scene3dRestoreReport {
+    /// Returns all scene objects whose stable IDs and visual state were preserved.
+    pub const fn object_count(self) -> usize {
+        self.object_count
+    }
+
+    /// Returns objects whose stale mesh reference was replaced in this call.
+    pub const fn migrated_object_count(self) -> usize {
+        self.migrated_object_count
+    }
+
+    /// Returns distinct retained mesh resources recreated on the active device.
+    pub const fn restored_mesh_count(self) -> usize {
+        self.restored_mesh_count
+    }
+
+    /// Returns total GPU bytes represented by the recreated distinct meshes.
+    pub const fn restored_gpu_bytes(self) -> usize {
+        self.restored_gpu_bytes
+    }
+}
+
 impl WgpuRenderer {
     /// Uploads validated immutable topology into retained GPU buffers.
     ///
@@ -807,6 +875,25 @@ impl WgpuRenderer {
         source: &RetainedMesh3d,
     ) -> Result<RetainedMesh3d, Mesh3dResourceError> {
         self.create_mesh3d(source.source.clone())
+    }
+
+    /// Atomically restores every stale retained mesh referenced by a 3D scene.
+    ///
+    /// Distinct shared mesh resources are uploaded once. Object IDs, insertion
+    /// order, transforms, styles, visibility, scene provenance, and the next ID
+    /// remain unchanged. If any capacity or host-staging allocation fails, the
+    /// original scene is not modified. Targets remain separate resources and
+    /// must be restored with [`WgpuRenderer::restore_render_target3d`].
+    pub fn restore_scene3d(
+        &self,
+        scene: &mut Scene3d,
+    ) -> Result<Scene3dRestoreReport, Mesh3dResourceError> {
+        restore_scene3d_resources(
+            &self.device,
+            &self.queue,
+            Arc::clone(&self.renderer_identity),
+            scene,
+        )
     }
 
     /// Creates color/depth attachments for an explicit logical viewport.
@@ -912,21 +999,23 @@ impl WgpuRenderer {
                     style,
                     camera_uniform.viewport,
                 )?;
-                let (hidden_color, hidden_width, dash_length, gap_length) = match (
-                    style.hidden_color(),
-                    style.hidden_width(),
-                    style.hidden_pattern(),
-                ) {
-                    (Some(color), Some(width), Some((dash, gap))) => (color, width, dash, gap),
-                    _ => (style.visible_color(), 0.0, 1.0, 1.0),
-                };
+                let hidden_color = style.hidden_color().unwrap_or(style.visible_color());
+                let hidden_width = style.hidden_width().map_or(0.0, LogicalPixels::get);
+                let (dash_length, gap_length) = style
+                    .hidden_pattern()
+                    .map_or((1.0, 1.0), |(dash, gap)| (dash.get(), gap.get()));
                 let edge_uniform = EdgeObjectUniform {
                     model_row_0: model_rows[0],
                     model_row_1: model_rows[1],
                     model_row_2: model_rows[2],
                     visible_color: style.visible_color().to_array(),
                     hidden_color: hidden_color.to_array(),
-                    edge_style: [style.visible_width(), hidden_width, dash_length, gap_length],
+                    edge_style: [
+                        style.visible_width().get(),
+                        hidden_width,
+                        dash_length,
+                        gap_length,
+                    ],
                 };
                 let start = object_index * self.mesh3d_renderer.edge_object_stride;
                 let end = start + std::mem::size_of::<EdgeObjectUniform>();
@@ -1075,6 +1164,54 @@ fn create_retained_mesh(
         index_count: layout.index_count,
         edge_count: layout.edge_count,
         gpu_allocation_bytes: usize::try_from(layout.total_bytes).unwrap_or(usize::MAX),
+    })
+}
+
+fn restore_scene3d_resources(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    renderer_identity: Arc<()>,
+    scene: &mut Scene3d,
+) -> Result<Scene3dRestoreReport, Mesh3dResourceError> {
+    let mut restored = Vec::<(Arc<wgpu::Buffer>, RetainedMesh3d)>::new();
+    for instance in &scene.instances {
+        if Arc::ptr_eq(&renderer_identity, &instance.mesh.renderer_identity)
+            || restored.iter().any(|(old_vertex_buffer, _)| {
+                Arc::ptr_eq(old_vertex_buffer, &instance.mesh.vertex_buffer)
+            })
+        {
+            continue;
+        }
+        let old_vertex_buffer = Arc::clone(&instance.mesh.vertex_buffer);
+        let replacement = create_retained_mesh(
+            device,
+            queue,
+            Arc::clone(&renderer_identity),
+            instance.mesh.source.clone(),
+        )?;
+        restored.push((old_vertex_buffer, replacement));
+    }
+
+    let mut replacement_instances = scene.instances.clone();
+    let mut migrated_object_count = 0;
+    for instance in &mut replacement_instances {
+        let Some((_, replacement)) = restored.iter().find(|(old_vertex_buffer, _)| {
+            Arc::ptr_eq(old_vertex_buffer, &instance.mesh.vertex_buffer)
+        }) else {
+            continue;
+        };
+        instance.mesh = replacement.clone();
+        migrated_object_count += 1;
+    }
+    let restored_gpu_bytes = restored.iter().fold(0_usize, |total, (_, mesh)| {
+        total.saturating_add(mesh.gpu_allocation_bytes())
+    });
+    scene.instances = replacement_instances;
+    Ok(Scene3dRestoreReport {
+        object_count: scene.object_count(),
+        migrated_object_count,
+        restored_mesh_count: restored.len(),
+        restored_gpu_bytes,
     })
 }
 
@@ -1253,7 +1390,11 @@ fn create_depth_texture(device: &wgpu::Device, width: u32, height: u32) -> wgpu:
     })
 }
 
-fn target_pixels_per_logical(width: u32, height: u32, viewport: LogicalViewport) -> Option<f32> {
+fn target_pixels_per_logical(
+    width: u32,
+    height: u32,
+    viewport: LogicalViewport,
+) -> Option<PhysicalPerLogical> {
     let horizontal = width as f64 / viewport.width() as f64;
     let vertical = height as f64 / viewport.height() as f64;
     if !horizontal.is_finite()
@@ -1265,7 +1406,7 @@ fn target_pixels_per_logical(width: u32, height: u32, viewport: LogicalViewport)
     {
         return None;
     }
-    Some(horizontal as f32)
+    PhysicalPerLogical::new(horizontal as f32).ok()
 }
 
 fn aspect_matches(left: f32, right: f32) -> bool {
@@ -1334,12 +1475,14 @@ fn validate_edge_projection(
     style: WireframeStyle3d,
     viewport: [f32; 4],
 ) -> Result<(), Mesh3dRenderError> {
-    if edge_physical_half_width(style.visible_width(), viewport[2]).is_none() {
+    let pixels_per_logical = PhysicalPerLogical::new(viewport[2])
+        .map_err(|_| Mesh3dRenderError::InvalidEdgeProjection)?;
+    if edge_physical_half_width(style.visible_width(), pixels_per_logical).is_none() {
         return Err(Mesh3dRenderError::InvalidEdgeProjection);
     }
     if let (Some(hidden_width), Some((dash, gap))) = (style.hidden_width(), style.hidden_pattern())
-        && (edge_physical_half_width(hidden_width, viewport[2]).is_none()
-            || !(dash + gap).is_finite())
+        && (edge_physical_half_width(hidden_width, pixels_per_logical).is_none()
+            || !(dash.get() + gap.get()).is_finite())
     {
         return Err(Mesh3dRenderError::InvalidEdgeProjection);
     }
@@ -1393,6 +1536,31 @@ fn clip_edge_to_frustum(
     start: [f32; 4],
     end: [f32; 4],
 ) -> Result<Option<[[f32; 4]; 2]>, Mesh3dRenderError> {
+    Ok(clip_edge_to_frustum_details(start, end)?.map(|clipped| clipped.clip))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ClippedEdgeCpu {
+    clip: [[f32; 4]; 2],
+    enter: f32,
+    exit: f32,
+}
+
+fn clip_edge_to_frustum_details(
+    start: [f32; 4],
+    end: [f32; 4],
+) -> Result<Option<ClippedEdgeCpu>, Mesh3dRenderError> {
+    let pair_max = start
+        .into_iter()
+        .chain(end)
+        .map(f32::abs)
+        .fold(0.0_f32, f32::max);
+    if !pair_max.is_finite() {
+        return Err(Mesh3dRenderError::InvalidEdgeProjection);
+    }
+    let homogeneous_scale = (1.0 / pair_max.max(1.0)).max(f32::MIN_POSITIVE);
+    let start = start.map(|component| component * homogeneous_scale);
+    let end = end.map(|component| component * homogeneous_scale);
     let start_distances = clip_plane_distances(start)?;
     let end_distances = clip_plane_distances(end)?;
     let mut enter = 0.0_f32;
@@ -1422,7 +1590,11 @@ fn clip_edge_to_frustum(
     if clipped_start[3] <= 0.0 || clipped_end[3] <= 0.0 {
         return Ok(None);
     }
-    Ok(Some([clipped_start, clipped_end]))
+    Ok(Some(ClippedEdgeCpu {
+        clip: [clipped_start, clipped_end],
+        enter,
+        exit,
+    }))
 }
 
 fn clip_plane_distances(clip: [f32; 4]) -> Result<[f32; 6], Mesh3dRenderError> {
@@ -1467,8 +1639,11 @@ fn shader_lerp_clip(
     Ok(output)
 }
 
-fn edge_physical_half_width(logical_width: f32, pixels_per_logical: f32) -> Option<f32> {
-    let width = logical_width * pixels_per_logical * 0.5;
+fn edge_physical_half_width(
+    logical_width: LogicalPixels,
+    pixels_per_logical: PhysicalPerLogical,
+) -> Option<f32> {
+    let width = logical_width.get() * pixels_per_logical.get() * 0.5;
     (width.is_finite() && width > 0.0).then_some(width)
 }
 
@@ -1595,6 +1770,7 @@ pub(super) fn assert_gpu_depth_contract(
     queue: &wgpu::Queue,
     format: wgpu::TextureFormat,
 ) {
+    assert_gpu_clip_equivalence(device, queue);
     let identity = Arc::new(());
     let mut renderer = Mesh3dRenderer::new(device, format);
     let vertices = vec![
@@ -1642,7 +1818,7 @@ pub(super) fn assert_gpu_depth_contract(
     let classification_mesh =
         create_retained_mesh(device, queue, Arc::clone(&identity), classification_edge)
             .expect("classification test edge should upload");
-    let projection = Projection3d::perspective(0.927_295_2, 1.0, 0.1, 20.0).unwrap();
+    let projection = Projection3d::perspective(0.927_295_2, 1.0, world(0.1), world(20.0)).unwrap();
     let camera = Camera3d::look_at(
         Vec3::new(0.0, 0.0, 5.0).unwrap(),
         Vec3::ZERO,
@@ -1650,7 +1826,7 @@ pub(super) fn assert_gpu_depth_contract(
         projection,
     )
     .unwrap();
-    let camera_uniform = Camera3dUniform::new(camera, 64, 64, 1.0).unwrap();
+    let camera_uniform = Camera3dUniform::new(camera, 64, 64, physical_per_logical(1.0)).unwrap();
     let near_transform = Transform3d::new(
         Vec3::new(0.0, 0.0, 1.0).unwrap(),
         Rotation3d::IDENTITY,
@@ -1670,9 +1846,14 @@ pub(super) fn assert_gpu_depth_contract(
             near_transform,
             MeshStyle3d::surface(SurfaceStyle3d::opaque(Color::rgb(0.0, 1.0, 0.0)).unwrap())
                 .with_wireframe(
-                    WireframeStyle3d::visible(Color::rgb(0.0, 0.0, 1.0), 2.0)
+                    WireframeStyle3d::visible(Color::rgb(0.0, 0.0, 1.0), logical(2.0))
                         .unwrap()
-                        .with_hidden(Color::rgb(1.0, 0.0, 1.0), 2.0, 4.0, 4.0)
+                        .with_hidden(
+                            Color::rgb(1.0, 0.0, 1.0),
+                            logical(2.0),
+                            logical(4.0),
+                            logical(4.0),
+                        )
                         .unwrap(),
                 ),
         )
@@ -1705,9 +1886,9 @@ pub(super) fn assert_gpu_depth_contract(
             far_transform,
             MeshStyle3d::surface(SurfaceStyle3d::opaque(Color::rgb(1.0, 0.0, 0.0)).unwrap())
                 .with_wireframe(
-                    WireframeStyle3d::visible(Color::rgb(1.0, 0.0, 0.0), 2.0)
+                    WireframeStyle3d::visible(Color::rgb(1.0, 0.0, 0.0), logical(2.0))
                         .unwrap()
-                        .with_hidden(Color::WHITE, 2.0, 4.0, 4.0)
+                        .with_hidden(Color::WHITE, logical(2.0), logical(4.0), logical(4.0))
                         .unwrap(),
                 ),
         )
@@ -1717,7 +1898,7 @@ pub(super) fn assert_gpu_depth_contract(
             &near_crossing_mesh,
             Transform3d::IDENTITY,
             MeshStyle3d::wireframe(
-                WireframeStyle3d::visible(Color::rgb(1.0, 1.0, 0.0), 2.0).unwrap(),
+                WireframeStyle3d::visible(Color::rgb(1.0, 1.0, 0.0), logical(2.0)).unwrap(),
             ),
         )
         .unwrap();
@@ -1732,9 +1913,14 @@ pub(super) fn assert_gpu_depth_contract(
             &classification_mesh,
             coplanar_transform,
             MeshStyle3d::wireframe(
-                WireframeStyle3d::visible(Color::rgb(0.0, 1.0, 1.0), 2.0)
+                WireframeStyle3d::visible(Color::rgb(0.0, 1.0, 1.0), logical(2.0))
                     .unwrap()
-                    .with_hidden(Color::rgb(1.0, 0.0, 1.0), 2.0, 4.0, 4.0)
+                    .with_hidden(
+                        Color::rgb(1.0, 0.0, 1.0),
+                        logical(2.0),
+                        logical(4.0),
+                        logical(4.0),
+                    )
                     .unwrap(),
             ),
         )
@@ -1750,9 +1936,14 @@ pub(super) fn assert_gpu_depth_contract(
             &classification_mesh,
             sub_depth_resolution_transform,
             MeshStyle3d::wireframe(
-                WireframeStyle3d::visible(Color::rgb(1.0, 0.5, 0.0), 2.0)
+                WireframeStyle3d::visible(Color::rgb(1.0, 0.5, 0.0), logical(2.0))
                     .unwrap()
-                    .with_hidden(Color::rgb(1.0, 0.0, 1.0), 2.0, 4.0, 4.0)
+                    .with_hidden(
+                        Color::rgb(1.0, 0.0, 1.0),
+                        logical(2.0),
+                        logical(4.0),
+                        logical(4.0),
+                    )
                     .unwrap(),
             ),
         )
@@ -2000,6 +2191,332 @@ pub(super) fn assert_gpu_depth_contract(
 }
 
 #[cfg(test)]
+pub(super) fn assert_gpu_scene_recovery_contract(
+    source_device: &wgpu::Device,
+    source_queue: &wgpu::Queue,
+    recovery_device: &wgpu::Device,
+    recovery_queue: &wgpu::Queue,
+) {
+    let source_identity = Arc::new(());
+    let recovery_identity = Arc::new(());
+    let topology = Mesh3d::with_display_edges(
+        vec![
+            Vec3::new(-0.5, -0.5, 0.0).unwrap(),
+            Vec3::new(0.5, -0.5, 0.0).unwrap(),
+            Vec3::new(0.0, 0.5, 0.0).unwrap(),
+        ],
+        vec![0, 1, 2],
+        vec![MeshEdge3d::new(0, 1).unwrap()],
+    )
+    .unwrap();
+    let source_mesh = create_retained_mesh(
+        source_device,
+        source_queue,
+        Arc::clone(&source_identity),
+        topology,
+    )
+    .unwrap();
+    let transform_a = Transform3d::IDENTITY;
+    let transform_b = Transform3d::new(
+        Vec3::new(1.0, 2.0, 3.0).unwrap(),
+        Rotation3d::IDENTITY,
+        Vec3::new(2.0, 2.0, 2.0).unwrap(),
+    )
+    .unwrap();
+    let style = MeshStyle3d::surface(SurfaceStyle3d::opaque(Color::WHITE).unwrap())
+        .with_wireframe(WireframeStyle3d::visible(Color::BLACK, logical(1.0)).unwrap());
+    let mut scene = Scene3d::new(Color::BLACK).unwrap();
+    let first_id = scene.try_push(&source_mesh, transform_a, style).unwrap();
+    let second_id = scene.try_push(&source_mesh, transform_b, style).unwrap();
+    scene.set_visible(second_id, false).unwrap();
+
+    assert_eq!(
+        validate_mesh_identity(&recovery_identity, scene.instances()[0].mesh()),
+        Err(Mesh3dRenderError::RendererMismatch)
+    );
+    let report = restore_scene3d_resources(
+        recovery_device,
+        recovery_queue,
+        Arc::clone(&recovery_identity),
+        &mut scene,
+    )
+    .unwrap();
+    assert_eq!(report.object_count(), 2);
+    assert_eq!(report.migrated_object_count(), 2);
+    assert_eq!(report.restored_mesh_count(), 1);
+    assert_eq!(
+        report.restored_gpu_bytes(),
+        source_mesh.gpu_allocation_bytes()
+    );
+    assert_eq!(scene.instances()[0].id(), first_id);
+    assert_eq!(scene.instances()[1].id(), second_id);
+    assert_eq!(scene.instances()[0].transform(), transform_a);
+    assert_eq!(scene.instances()[1].transform(), transform_b);
+    assert_eq!(scene.instances()[0].style(), style);
+    assert_eq!(scene.instances()[1].style(), style);
+    assert!(scene.instances()[0].is_visible());
+    assert!(!scene.instances()[1].is_visible());
+    assert!(Arc::ptr_eq(
+        &scene.instances()[0].mesh.vertex_buffer,
+        &scene.instances()[1].mesh.vertex_buffer,
+    ));
+    for instance in scene.instances() {
+        assert_eq!(
+            validate_mesh_identity(&recovery_identity, instance.mesh()),
+            Ok(())
+        );
+        assert_eq!(
+            validate_mesh_identity(&source_identity, instance.mesh()),
+            Err(Mesh3dRenderError::RendererMismatch)
+        );
+    }
+
+    let no_op_report = restore_scene3d_resources(
+        recovery_device,
+        recovery_queue,
+        recovery_identity,
+        &mut scene,
+    )
+    .unwrap();
+    assert_eq!(no_op_report.object_count(), 2);
+    assert_eq!(no_op_report.migrated_object_count(), 0);
+    assert_eq!(no_op_report.restored_mesh_count(), 0);
+    assert_eq!(no_op_report.restored_gpu_bytes(), 0);
+}
+
+#[cfg(test)]
+fn assert_gpu_clip_equivalence(device: &wgpu::Device, queue: &wgpu::Queue) {
+    let inputs = seeded_clip_probe_inputs();
+    let input_bytes = bytemuck::cast_slice(&inputs);
+    let output_size = (inputs.len() * std::mem::size_of::<ClipProbeOutputGpu>()) as u64;
+    let input_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("sim-engine 3D clip probe input"),
+        size: input_bytes.len() as u64,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let output_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("sim-engine 3D clip probe output"),
+        size: output_size,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let readback = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("sim-engine 3D clip probe readback"),
+        size: output_size,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    queue.write_buffer(&input_buffer, 0, input_bytes);
+
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("sim-engine 3D clip equivalence shader"),
+        source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("mesh3d.wgsl"))),
+    });
+    let empty_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("sim-engine empty clip probe layout"),
+        entries: &[],
+    });
+    let probe_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("sim-engine 3D clip probe layout"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: false },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+        ],
+    });
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("sim-engine 3D clip probe pipeline layout"),
+        bind_group_layouts: &[
+            Some(&empty_layout),
+            Some(&empty_layout),
+            Some(&probe_layout),
+        ],
+        immediate_size: 0,
+    });
+    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("sim-engine 3D clip probe pipeline"),
+        layout: Some(&pipeline_layout),
+        module: &shader,
+        entry_point: Some("mesh3d_clip_probe_main"),
+        compilation_options: wgpu::PipelineCompilationOptions::default(),
+        cache: None,
+    });
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("sim-engine 3D clip probe bind group"),
+        layout: &probe_layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: input_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: output_buffer.as_entire_binding(),
+            },
+        ],
+    });
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("sim-engine 3D clip probe encoder"),
+    });
+    {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("sim-engine 3D clip probe pass"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&pipeline);
+        pass.set_bind_group(2, &bind_group, &[]);
+        pass.dispatch_workgroups((inputs.len() as u32).div_ceil(64), 1, 1);
+    }
+    encoder.copy_buffer_to_buffer(&output_buffer, 0, &readback, 0, output_size);
+    queue.submit([encoder.finish()]);
+    device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .expect("3D clip probe submission should complete");
+    let slice = readback.slice(..);
+    let (sender, receiver) = std::sync::mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |result| {
+        sender.send(result).unwrap();
+    });
+    device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .expect("3D clip probe mapping should complete");
+    receiver
+        .recv_timeout(Duration::from_secs(5))
+        .expect("3D clip probe callback should run")
+        .expect("3D clip probe readback should map");
+    let bytes = slice.get_mapped_range().expect("3D clip probe bytes");
+    let outputs: &[ClipProbeOutputGpu] = bytemuck::cast_slice(&bytes);
+    for (case_index, (input, actual)) in inputs.iter().zip(outputs).enumerate() {
+        let expected = clip_edge_to_frustum_details(input.start_clip, input.end_clip)
+            .expect("finite seeded clip input should not overflow after normalization");
+        assert_eq!(
+            actual.visible,
+            u32::from(expected.is_some()),
+            "CPU/WGSL clip visibility differs for seeded case {case_index}: {input:?}"
+        );
+        let Some(expected) = expected else {
+            continue;
+        };
+        for (actual, expected) in actual
+            .start_clip
+            .into_iter()
+            .chain(actual.end_clip)
+            .chain(actual.range)
+            .zip(
+                expected.clip[0]
+                    .into_iter()
+                    .chain(expected.clip[1])
+                    .chain([expected.enter, expected.exit]),
+            )
+        {
+            let tolerance = 32.0 * f32::EPSILON * expected.abs().max(1.0);
+            assert!(
+                (actual - expected).abs() <= tolerance,
+                "CPU/WGSL clip value differs for seeded case {case_index}: actual={actual}, expected={expected}, tolerance={tolerance}, input={input:?}"
+            );
+        }
+    }
+    drop(bytes);
+    readback.unmap();
+}
+
+#[cfg(test)]
+fn seeded_clip_probe_inputs() -> Vec<ClipProbeInputGpu> {
+    let maximum = f32::from_bits(f32::MAX.to_bits() - 1);
+    let mut inputs = vec![
+        ClipProbeInputGpu {
+            start_clip: [0.0, 0.0, 0.5, 1.0],
+            end_clip: [0.5, 0.5, 0.75, 1.0],
+        },
+        ClipProbeInputGpu {
+            start_clip: [-2.0, 0.0, 0.5, 1.0],
+            end_clip: [0.5, 0.0, 0.5, 1.0],
+        },
+        ClipProbeInputGpu {
+            start_clip: [0.0, 0.0, 0.5, 1.0],
+            end_clip: [2.0, 0.0, 0.5, 1.0],
+        },
+        ClipProbeInputGpu {
+            start_clip: [0.0, -2.0, 0.5, 1.0],
+            end_clip: [0.0, 0.5, 0.5, 1.0],
+        },
+        ClipProbeInputGpu {
+            start_clip: [0.0, 0.0, 0.5, 1.0],
+            end_clip: [0.0, 2.0, 0.5, 1.0],
+        },
+        ClipProbeInputGpu {
+            start_clip: [0.0, 0.0, -1.0, 1.0],
+            end_clip: [0.0, 0.0, 0.5, 1.0],
+        },
+        ClipProbeInputGpu {
+            start_clip: [0.0, 0.0, 0.5, 1.0],
+            end_clip: [0.0, 0.0, 2.0, 1.0],
+        },
+        ClipProbeInputGpu {
+            start_clip: [-2.0, -2.0, 0.5, 1.0],
+            end_clip: [0.5, 0.5, 0.5, 1.0],
+        },
+        ClipProbeInputGpu {
+            start_clip: [0.0, 0.0, 0.5, 1.0],
+            end_clip: [2.0, 2.0, 2.0, 1.0],
+        },
+        ClipProbeInputGpu {
+            start_clip: [-1.0, 1.0, 0.0, 1.0],
+            end_clip: [1.0, -1.0, 1.0, 1.0],
+        },
+        ClipProbeInputGpu {
+            start_clip: [maximum, 0.0, maximum * 0.5, maximum],
+            end_clip: [-maximum, maximum, maximum, maximum],
+        },
+        ClipProbeInputGpu {
+            start_clip: [0.0, 0.0, -maximum, -maximum],
+            end_clip: [0.0, 0.0, -maximum * 0.5, -maximum * 0.5],
+        },
+    ];
+    let mut state = 0x5eed_c1a5_u32;
+    for _ in 0..244 {
+        let mut next_component = || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            ((state >> 8) as f32 / 16_777_215.0) * 4.0 - 2.0
+        };
+        inputs.push(ClipProbeInputGpu {
+            start_clip: [
+                next_component(),
+                next_component(),
+                next_component(),
+                next_component(),
+            ],
+            end_clip: [
+                next_component(),
+                next_component(),
+                next_component(),
+                next_component(),
+            ],
+        });
+    }
+    debug_assert_eq!(inputs.len(), 256);
+    inputs
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -2025,7 +2542,7 @@ mod tests {
             Vec3::new(0.0, 0.0, 5.0).unwrap(),
             Vec3::ZERO,
             Vec3::Y,
-            Projection3d::orthographic(4.0, 1.0, 0.1, 20.0).unwrap(),
+            Projection3d::orthographic(world(4.0), 1.0, world(0.1), world(20.0)).unwrap(),
         )
         .unwrap();
         assert_eq!(
@@ -2061,10 +2578,10 @@ mod tests {
             Vec3::ZERO,
             Vec3::new(0.0, 0.0, -1.0).unwrap(),
             Vec3::Y,
-            Projection3d::perspective(1.0, 1.0, 0.1, 10.0).unwrap(),
+            Projection3d::perspective(1.0, 1.0, world(0.1), world(10.0)).unwrap(),
         )
         .unwrap();
-        let style = WireframeStyle3d::visible(Color::WHITE, 1.0).unwrap();
+        let style = WireframeStyle3d::visible(Color::WHITE, logical(1.0)).unwrap();
         assert_eq!(
             validate_edge_projection(
                 &mesh,
@@ -2092,7 +2609,7 @@ mod tests {
             Vec3::ZERO,
             Vec3::new(0.0, 0.0, -1.0).unwrap(),
             Vec3::Y,
-            Projection3d::perspective(1.0, 1.0, 0.1, 10.0).unwrap(),
+            Projection3d::perspective(1.0, 1.0, world(0.1), world(10.0)).unwrap(),
         )
         .unwrap();
         assert_eq!(
@@ -2100,7 +2617,7 @@ mod tests {
                 &mesh,
                 Transform3d::IDENTITY.model_rows().unwrap(),
                 camera.world_to_clip_rows().unwrap(),
-                WireframeStyle3d::visible(Color::WHITE, 1.0).unwrap(),
+                WireframeStyle3d::visible(Color::WHITE, logical(1.0)).unwrap(),
                 [100.0, 100.0, 1.0, 0.0],
             ),
             Ok(())
@@ -2133,8 +2650,14 @@ mod tests {
     #[test]
     fn target_pixel_scale_is_independent_of_window_dpi() {
         let viewport = LogicalViewport::new(1000.0, 500.0).unwrap();
-        assert_eq!(target_pixels_per_logical(2000, 1000, viewport), Some(2.0));
-        assert_eq!(target_pixels_per_logical(500, 250, viewport), Some(0.5));
+        assert_eq!(
+            target_pixels_per_logical(2000, 1000, viewport),
+            Some(physical_per_logical(2.0))
+        );
+        assert_eq!(
+            target_pixels_per_logical(500, 250, viewport),
+            Some(physical_per_logical(0.5))
+        );
         assert_eq!(target_pixels_per_logical(500, 300, viewport), None);
         assert!(aspect_matches(16.0 / 9.0, 1920.0 / 1080.0));
         assert!(!aspect_matches(16.0 / 9.0, 4.0 / 3.0));
@@ -2146,7 +2669,7 @@ mod tests {
             Vec3::new(0.0, 0.0, 5.0).unwrap(),
             Vec3::ZERO,
             Vec3::Y,
-            Projection3d::perspective(1.0, 16.0 / 9.0, 0.1, 10.0).unwrap(),
+            Projection3d::perspective(1.0, 16.0 / 9.0, world(0.1), world(10.0)).unwrap(),
         )
         .unwrap();
         let target = LogicalViewport::new(800.0, 600.0).unwrap();
@@ -2158,11 +2681,14 @@ mod tests {
 
     #[test]
     fn logical_edge_width_is_equal_for_native_and_half_resolution_target() {
-        let logical_width = 1.0;
-        for pixels_per_logical in [2.0, 0.5] {
+        let logical_width = logical(1.0);
+        for pixels_per_logical in [physical_per_logical(2.0), physical_per_logical(0.5)] {
             let physical_width =
                 edge_physical_half_width(logical_width, pixels_per_logical).unwrap() * 2.0;
-            assert_eq!(physical_width / pixels_per_logical, logical_width);
+            assert_eq!(
+                physical_width / pixels_per_logical.get(),
+                logical_width.get()
+            );
         }
     }
 

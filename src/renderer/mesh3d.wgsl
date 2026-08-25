@@ -92,25 +92,36 @@ fn project_edge_point(model_position: vec3<f32>) -> vec4<f32> {
 struct ClippedEdge {
     start_clip: vec4<f32>,
     end_clip: vec4<f32>,
+    enter: f32,
+    exit: f32,
     visible: bool,
 };
 
 fn clip_edge_to_frustum(start_clip: vec4<f32>, end_clip: vec4<f32>) -> ClippedEdge {
+    let start_max = max(max(abs(start_clip.x), abs(start_clip.y)), max(abs(start_clip.z), abs(start_clip.w)));
+    let end_max = max(max(abs(end_clip.x), abs(end_clip.y)), max(abs(end_clip.z), abs(end_clip.w)));
+    let pair_max = max(start_max, end_max);
+    // Keep the common homogeneous scale normal. Some Vulkan implementations
+    // flush subnormal reciprocals of f32::MAX to zero, which would erase the
+    // segment even though uniform homogeneous scaling is valid.
+    let homogeneous_scale = max(1.0 / max(pair_max, 1.0), 1.17549435e-38);
+    let normalized_start = start_clip * homogeneous_scale;
+    let normalized_end = end_clip * homogeneous_scale;
     let start_distances = array<f32, 6>(
-        start_clip.w + start_clip.x,
-        start_clip.w - start_clip.x,
-        start_clip.w + start_clip.y,
-        start_clip.w - start_clip.y,
-        start_clip.z,
-        start_clip.w - start_clip.z,
+        normalized_start.w + normalized_start.x,
+        normalized_start.w - normalized_start.x,
+        normalized_start.w + normalized_start.y,
+        normalized_start.w - normalized_start.y,
+        normalized_start.z,
+        normalized_start.w - normalized_start.z,
     );
     let end_distances = array<f32, 6>(
-        end_clip.w + end_clip.x,
-        end_clip.w - end_clip.x,
-        end_clip.w + end_clip.y,
-        end_clip.w - end_clip.y,
-        end_clip.z,
-        end_clip.w - end_clip.z,
+        normalized_end.w + normalized_end.x,
+        normalized_end.w - normalized_end.x,
+        normalized_end.w + normalized_end.y,
+        normalized_end.w - normalized_end.y,
+        normalized_end.z,
+        normalized_end.w - normalized_end.z,
     );
     var enter = 0.0;
     var exit = 1.0;
@@ -129,16 +140,52 @@ fn clip_edge_to_frustum(start_clip: vec4<f32>, end_clip: vec4<f32>) -> ClippedEd
     visible = visible && enter <= exit;
     if !visible {
         let fallback = vec4<f32>(0.0, 0.0, 0.0, 1.0);
-        return ClippedEdge(fallback, fallback, false);
+        return ClippedEdge(fallback, fallback, enter, exit, false);
     }
-    let delta = end_clip - start_clip;
-    let clipped_start = start_clip + delta * enter;
-    let clipped_end = start_clip + delta * exit;
+    let delta = normalized_end - normalized_start;
+    let clipped_start = normalized_start + delta * enter;
+    let clipped_end = normalized_start + delta * exit;
     if clipped_start.w <= 0.0 || clipped_end.w <= 0.0 {
         let fallback = vec4<f32>(0.0, 0.0, 0.0, 1.0);
-        return ClippedEdge(fallback, fallback, false);
+        return ClippedEdge(fallback, fallback, enter, exit, false);
     }
-    return ClippedEdge(clipped_start, clipped_end, true);
+    return ClippedEdge(clipped_start, clipped_end, enter, exit, true);
+}
+
+struct ClipProbeInput {
+    start_clip: vec4<f32>,
+    end_clip: vec4<f32>,
+};
+
+struct ClipProbeOutput {
+    start_clip: vec4<f32>,
+    end_clip: vec4<f32>,
+    range: vec2<f32>,
+    visible: u32,
+    padding: u32,
+};
+
+@group(2) @binding(0)
+var<storage, read> clip_probe_inputs: array<ClipProbeInput>;
+
+@group(2) @binding(1)
+var<storage, read_write> clip_probe_outputs: array<ClipProbeOutput>;
+
+@compute @workgroup_size(64)
+fn mesh3d_clip_probe_main(@builtin(global_invocation_id) invocation: vec3<u32>) {
+    let index = invocation.x;
+    if index >= arrayLength(&clip_probe_inputs) {
+        return;
+    }
+    let input = clip_probe_inputs[index];
+    let clipped = clip_edge_to_frustum(input.start_clip, input.end_clip);
+    clip_probe_outputs[index] = ClipProbeOutput(
+        clipped.start_clip,
+        clipped.end_clip,
+        vec2<f32>(clipped.enter, clipped.exit),
+        select(0u, 1u, clipped.visible),
+        0u,
+    );
 }
 
 fn edge_vertex(

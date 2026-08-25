@@ -15,6 +15,12 @@ public API reaches 1.0.
   `quarantined_device_count`, and `remaining_device_recoveries`.
 - Fallible, byte-budgeted `ScalarField::filled` allocation with an explicit
   `filled_with_byte_limit` override.
+- Explicit `LogicalPixels`, `WorldLength`, and `PhysicalPerLogical` scalar unit
+  types for 3D edge, projection-range, and target-scale boundaries.
+- Atomic `restore_scene3d` migration that preserves object IDs and instance
+  state while recreating each distinct stale mesh once.
+- Seeded CPU/WGSL clipping equivalence readback and persistent Vulkan adapter
+  evidence artifacts in the local and CI release gates.
 
 ### Changed
 
@@ -25,6 +31,8 @@ public API reaches 1.0.
   visible.
 - CI actions and Rust toolchains are pinned, and CI now verifies doctests,
   warning-free rustdoc, the package boundary, and the package archive.
+- 3D wireframe metrics, projection distances, and target scale now use opaque
+  unit types instead of interchangeable raw scalars.
 
 ### Fixed
 
@@ -38,6 +46,8 @@ public API reaches 1.0.
 - Require and assert Vulkan in the strict Linux semantic GPU gate.
 - Prevent unbounded accumulation of previous logical GPU devices after repeated
   recovery.
+- Keep extreme homogeneous clipping equivalent on Vulkan implementations that
+  flush subnormal reciprocals by using a shared normal-range scale.
 
 ## 0.1.0 - 2026-08-24
 

@@ -11,6 +11,7 @@ mod particle;
 mod pseudo3d;
 mod scene;
 mod tween;
+mod units;
 
 #[cfg(feature = "wgpu")]
 mod renderer;
@@ -36,6 +37,7 @@ pub use scene::{
     Scene, SceneCommand, SceneError, ScenePrimitive, ScreenClipRect, Shadow, ShapeStyle, Stroke,
 };
 pub use tween::{Interpolate, Tween, TweenError};
+pub use units::{LogicalPixels, PhysicalPerLogical, UnitError, WorldLength};
 
 #[cfg(feature = "wgpu")]
 pub use renderer::{
@@ -49,5 +51,6 @@ pub use renderer::{
     RendererFrameError, RendererFrameMetrics, RendererInitError, RendererPresentMode,
     RendererSurfacePresentMode, RendererSurfaceStatus, RetainedMesh3d, ScalarFieldRenderError,
     ScalarFieldSampling, ScalarFieldTexture, ScalarFieldTextureError, ScalarFieldUploadReport,
-    Scene3d, Scene3dError, TessellationStats, TrailBuffer2d, WgpuRenderer, WgpuRendererOptions,
+    Scene3d, Scene3dError, Scene3dRestoreReport, TessellationStats, TrailBuffer2d, WgpuRenderer,
+    WgpuRendererOptions,
 };

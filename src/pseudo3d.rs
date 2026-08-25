@@ -1,6 +1,6 @@
 use std::{error::Error, fmt};
 
-use crate::{LogicalScreenPosition, LogicalViewport};
+use crate::{LogicalScreenPosition, LogicalViewport, WorldLength};
 
 /// Finite vector or point in a right-handed 3D coordinate space.
 ///
@@ -334,14 +334,14 @@ enum Projection3dKind {
     Perspective {
         vertical_fov_radians: f32,
         aspect_ratio: f32,
-        near: f32,
-        far: f32,
+        near: WorldLength,
+        far: WorldLength,
     },
     Orthographic {
-        vertical_span: f32,
+        vertical_span: WorldLength,
         aspect_ratio: f32,
-        near: f32,
-        far: f32,
+        near: WorldLength,
+        far: WorldLength,
     },
 }
 
@@ -353,10 +353,10 @@ impl Projection3d {
     pub fn perspective(
         vertical_fov_radians: f32,
         aspect_ratio: f32,
-        near: f32,
-        far: f32,
+        near: WorldLength,
+        far: WorldLength,
     ) -> Result<Self, Pseudo3dError> {
-        if !valid_projection_range(aspect_ratio, near, far)
+        if !valid_projection_range(aspect_ratio, near.get(), far.get())
             || !vertical_fov_radians.is_finite()
             || vertical_fov_radians <= 0.0
             || vertical_fov_radians >= std::f32::consts::PI
@@ -376,15 +376,12 @@ impl Projection3d {
 
     /// Builds an orthographic projection from its vertical world-space span.
     pub fn orthographic(
-        vertical_span: f32,
+        vertical_span: WorldLength,
         aspect_ratio: f32,
-        near: f32,
-        far: f32,
+        near: WorldLength,
+        far: WorldLength,
     ) -> Result<Self, Pseudo3dError> {
-        if !valid_projection_range(aspect_ratio, near, far)
-            || !vertical_span.is_finite()
-            || vertical_span <= 0.0
-        {
+        if !valid_projection_range(aspect_ratio, near.get(), far.get()) {
             return Err(Pseudo3dError::InvalidProjection);
         }
         Ok(Self {
@@ -406,7 +403,7 @@ impl Projection3d {
     }
 
     /// Returns the nearest visible positive view-space depth.
-    pub const fn near(self) -> f32 {
+    pub const fn near(self) -> WorldLength {
         match self.kind {
             Projection3dKind::Perspective { near, .. }
             | Projection3dKind::Orthographic { near, .. } => near,
@@ -414,7 +411,7 @@ impl Projection3d {
     }
 
     /// Returns the farthest visible positive view-space depth.
-    pub const fn far(self) -> f32 {
+    pub const fn far(self) -> WorldLength {
         match self.kind {
             Projection3dKind::Perspective { far, .. }
             | Projection3dKind::Orthographic { far, .. } => far,
@@ -498,12 +495,15 @@ impl Camera3d {
                 near,
                 far,
             } => {
+                let near_value = near.get();
+                let far_value = far.get();
                 let half_height = view_depth * (vertical_fov_radians as f64 * 0.5).tan();
                 (
                     view_x / (half_height * aspect_ratio as f64),
                     view_y / half_height,
-                    far as f64 / (far as f64 - near as f64)
-                        - (far as f64 * near as f64) / ((far as f64 - near as f64) * view_depth),
+                    far_value as f64 / (far_value as f64 - near_value as f64)
+                        - (far_value as f64 * near_value as f64)
+                            / ((far_value as f64 - near_value as f64) * view_depth),
                     near,
                     far,
                 )
@@ -514,10 +514,13 @@ impl Camera3d {
                 near,
                 far,
             } => {
-                let normalized_depth = (view_depth - near as f64) / (far as f64 - near as f64);
+                let near_value = near.get();
+                let far_value = far.get();
+                let normalized_depth =
+                    (view_depth - near_value as f64) / (far_value as f64 - near_value as f64);
                 (
-                    view_x / (vertical_span as f64 * aspect_ratio as f64 * 0.5),
-                    view_y / (vertical_span as f64 * 0.5),
+                    view_x / (vertical_span.get() as f64 * aspect_ratio as f64 * 0.5),
+                    view_y / (vertical_span.get() as f64 * 0.5),
                     normalized_depth,
                     near,
                     far,
@@ -531,8 +534,8 @@ impl Camera3d {
         let screen_y = f64_to_f32(screen_y)?;
         let view_depth_f32 = f64_to_f32(view_depth)?;
         let normalized_depth_f32 = f64_to_f32(normalized_depth)?;
-        let inside_view = view_depth >= near as f64
-            && view_depth <= far as f64
+        let inside_view = view_depth >= near.get() as f64
+            && view_depth <= far.get() as f64
             && (-1.0..=1.0).contains(&ndc_x)
             && (-1.0..=1.0).contains(&ndc_y);
         Ok(ProjectedPoint3d {
@@ -555,10 +558,12 @@ impl Camera3d {
                 near,
                 far,
             } => {
+                let near = near.get() as f64;
+                let far = far.get() as f64;
                 let vertical_scale = (vertical_fov_radians as f64 * 0.5).tan();
                 let horizontal_scale = vertical_scale * aspect_ratio as f64;
-                let depth_scale = far as f64 / (far as f64 - near as f64);
-                let depth_translation = -(far as f64 * near as f64) / (far as f64 - near as f64);
+                let depth_scale = far / (far - near);
+                let depth_translation = -(far * near) / (far - near);
                 [
                     camera_row(self.right, right_offset, 1.0 / horizontal_scale),
                     camera_row(self.up, up_offset, 1.0 / vertical_scale),
@@ -581,15 +586,18 @@ impl Camera3d {
                 near,
                 far,
             } => {
-                let depth_extent = far as f64 - near as f64;
+                let near = near.get() as f64;
+                let far = far.get() as f64;
+                let vertical_span = vertical_span.get() as f64;
+                let depth_extent = far - near;
                 [
                     camera_row(
                         self.right,
                         right_offset,
-                        2.0 / (vertical_span as f64 * aspect_ratio as f64),
+                        2.0 / (vertical_span * aspect_ratio as f64),
                     ),
-                    camera_row(self.up, up_offset, 2.0 / vertical_span as f64),
-                    camera_row(self.forward, depth_offset - near as f64, 1.0 / depth_extent),
+                    camera_row(self.up, up_offset, 2.0 / vertical_span),
+                    camera_row(self.forward, depth_offset - near, 1.0 / depth_extent),
                     [0.0, 0.0, 0.0, 1.0],
                 ]
             }
@@ -785,10 +793,14 @@ fn normalize_f64(vector: (f64, f64, f64)) -> Option<Vec3> {
 #[cfg(test)]
 mod tests {
     use super::{Camera3d, Projection3d, Pseudo3dError, Rotation3d, Transform3d, Vec3};
-    use crate::LogicalViewport;
+    use crate::{LogicalViewport, WorldLength};
 
     fn vector(x: f32, y: f32, z: f32) -> Vec3 {
         Vec3::new(x, y, z).unwrap()
+    }
+
+    fn world(value: f32) -> WorldLength {
+        WorldLength::new(value).unwrap()
     }
 
     fn close(actual: f32, expected: f32) {
@@ -836,9 +848,13 @@ mod tests {
     #[test]
     fn perspective_camera_projects_center_and_reports_clip_membership() {
         let viewport = LogicalViewport::new(800.0, 600.0).unwrap();
-        let projection =
-            Projection3d::perspective(std::f32::consts::FRAC_PI_2, 800.0 / 600.0, 0.1, 100.0)
-                .unwrap();
+        let projection = Projection3d::perspective(
+            std::f32::consts::FRAC_PI_2,
+            800.0 / 600.0,
+            world(0.1),
+            world(100.0),
+        )
+        .unwrap();
         let camera =
             Camera3d::look_at(vector(0.0, 0.0, 5.0), Vec3::ZERO, Vec3::Y, projection).unwrap();
         let projected = camera.project_world(Vec3::ZERO, viewport).unwrap();
@@ -860,7 +876,9 @@ mod tests {
     #[test]
     fn orthographic_camera_preserves_size_across_depth() {
         let viewport = LogicalViewport::new(800.0, 600.0).unwrap();
-        let projection = Projection3d::orthographic(6.0, 800.0 / 600.0, 0.1, 100.0).unwrap();
+        let projection =
+            Projection3d::orthographic(world(6.0), 800.0 / 600.0, world(0.1), world(100.0))
+                .unwrap();
         let camera =
             Camera3d::look_at(vector(0.0, 0.0, 5.0), Vec3::ZERO, Vec3::Y, projection).unwrap();
         let near = camera
@@ -879,10 +897,10 @@ mod tests {
     #[test]
     fn camera_and_projection_reject_degenerate_configuration() {
         assert_eq!(
-            Projection3d::perspective(0.0, 1.0, 0.1, 10.0),
+            Projection3d::perspective(0.0, 1.0, world(0.1), world(10.0)),
             Err(Pseudo3dError::InvalidProjection)
         );
-        let projection = Projection3d::perspective(1.0, 1.0, 0.1, 10.0).unwrap();
+        let projection = Projection3d::perspective(1.0, 1.0, world(0.1), world(10.0)).unwrap();
         assert_eq!(
             Camera3d::look_at(Vec3::ZERO, Vec3::ZERO, Vec3::Y, projection),
             Err(Pseudo3dError::ZeroLengthVector)
@@ -897,8 +915,8 @@ mod tests {
     fn gpu_clip_rows_match_public_camera_projection() {
         let viewport = LogicalViewport::new(800.0, 600.0).unwrap();
         for projection in [
-            Projection3d::perspective(1.1, 800.0 / 600.0, 0.1, 50.0).unwrap(),
-            Projection3d::orthographic(7.0, 800.0 / 600.0, 0.1, 50.0).unwrap(),
+            Projection3d::perspective(1.1, 800.0 / 600.0, world(0.1), world(50.0)).unwrap(),
+            Projection3d::orthographic(world(7.0), 800.0 / 600.0, world(0.1), world(50.0)).unwrap(),
         ] {
             let camera = Camera3d::look_at(
                 vector(3.0, 2.0, 6.0),

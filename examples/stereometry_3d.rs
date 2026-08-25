@@ -7,9 +7,10 @@
 use std::{error::Error, sync::Arc, time::Instant};
 
 use sim_engine::{
-    BlendMode, Camera3d, Color, LogicalViewport, Mesh3d, MeshEdge3d, MeshStyle3d, Object3dId,
-    Projection3d, RenderTarget3d, RendererPresentMode, Rotation3d, Scene3d, SurfaceStyle3d,
-    Transform3d, Vec3, WgpuRenderer, WgpuRendererOptions, WireframeStyle3d,
+    BlendMode, Camera3d, Color, LogicalPixels, LogicalViewport, Mesh3d, MeshEdge3d, MeshStyle3d,
+    Object3dId, Projection3d, RenderTarget3d, RendererPresentMode, Rotation3d, Scene3d,
+    SurfaceStyle3d, Transform3d, Vec3, WgpuRenderer, WgpuRendererOptions, WireframeStyle3d,
+    WorldLength,
 };
 use winit::{
     application::ApplicationHandler,
@@ -19,6 +20,14 @@ use winit::{
     keyboard::{KeyCode, PhysicalKey},
     window::{Window, WindowId},
 };
+
+fn logical(value: f32) -> LogicalPixels {
+    LogicalPixels::new(value).expect("example logical pixel value is valid")
+}
+
+fn world(value: f32) -> WorldLength {
+    WorldLength::new(value).expect("example world length is valid")
+}
 
 fn main() -> Result<(), Box<dyn Error>> {
     env_logger::init();
@@ -106,8 +115,13 @@ impl StereometryApplication {
 
     fn camera(&self, width: u32, height: u32) -> Camera3d {
         let aspect_ratio = width as f32 / height.max(1) as f32;
-        let projection = Projection3d::perspective(50.0_f32.to_radians(), aspect_ratio, 0.1, 100.0)
-            .expect("fixture projection is valid");
+        let projection = Projection3d::perspective(
+            50.0_f32.to_radians(),
+            aspect_ratio,
+            world(0.1),
+            world(100.0),
+        )
+        .expect("fixture projection is valid");
         let sine = self.camera_orbit.sin();
         let cosine = self.camera_orbit.cos();
         Camera3d::look_at(
@@ -229,8 +243,15 @@ impl ApplicationHandler for StereometryApplication {
             .expect("create stereometry color/depth target");
         let mut scene =
             Scene3d::new(Color::rgb(0.008, 0.012, 0.025)).expect("fixture background is opaque");
-        let cube_wireframe = WireframeStyle3d::visible(Color::rgb(0.92, 0.97, 1.0), 2.0)
-            .and_then(|style| style.with_hidden(Color::rgb(0.46, 0.58, 0.72), 1.25, 7.0, 5.0))
+        let cube_wireframe = WireframeStyle3d::visible(Color::rgb(0.92, 0.97, 1.0), logical(2.0))
+            .and_then(|style| {
+                style.with_hidden(
+                    Color::rgb(0.46, 0.58, 0.72),
+                    logical(1.25),
+                    logical(7.0),
+                    logical(5.0),
+                )
+            })
             .expect("cube edge style is valid");
         let cube_style = MeshStyle3d::surface(
             SurfaceStyle3d::opaque(Color::rgb(0.12, 0.46, 0.92)).expect("cube surface is opaque"),
@@ -239,9 +260,17 @@ impl ApplicationHandler for StereometryApplication {
         let cube_id = scene
             .try_push(&cube, Transform3d::IDENTITY, cube_style)
             .expect("insert cube");
-        let octahedron_wireframe = WireframeStyle3d::visible(Color::rgb(1.0, 0.94, 0.78), 2.0)
-            .and_then(|style| style.with_hidden(Color::rgb(0.68, 0.39, 0.20), 1.25, 6.0, 4.0))
-            .expect("octahedron edge style is valid");
+        let octahedron_wireframe =
+            WireframeStyle3d::visible(Color::rgb(1.0, 0.94, 0.78), logical(2.0))
+                .and_then(|style| {
+                    style.with_hidden(
+                        Color::rgb(0.68, 0.39, 0.20),
+                        logical(1.25),
+                        logical(6.0),
+                        logical(4.0),
+                    )
+                })
+                .expect("octahedron edge style is valid");
         let octahedron_style = MeshStyle3d::surface(
             SurfaceStyle3d::opaque(Color::rgb(0.95, 0.42, 0.10))
                 .expect("octahedron surface is opaque"),

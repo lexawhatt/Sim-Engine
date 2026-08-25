@@ -1,6 +1,6 @@
 use std::{collections::BTreeSet, error::Error, fmt, sync::Arc};
 
-use crate::{Color, Vec3};
+use crate::{Color, LogicalPixels, Vec3};
 
 const MAX_LOGICAL_EDGE_METRIC: f32 = 1_048_576.0;
 
@@ -86,21 +86,21 @@ impl MeshStyle3d {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct WireframeStyle3d {
     visible_color: Color,
-    visible_width: f32,
+    visible_width: LogicalPixels,
     hidden: Option<HiddenEdgeStyle3d>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct HiddenEdgeStyle3d {
     color: Color,
-    width: f32,
-    dash_length: f32,
-    gap_length: f32,
+    width: LogicalPixels,
+    dash_length: LogicalPixels,
+    gap_length: LogicalPixels,
 }
 
 impl WireframeStyle3d {
     /// Creates solid visible edges with hidden fragments disabled.
-    pub fn visible(color: Color, width: f32) -> Result<Self, Mesh3dStyleError> {
+    pub fn visible(color: Color, width: LogicalPixels) -> Result<Self, Mesh3dStyleError> {
         validate_edge_color_width(color, width)?;
         Ok(Self {
             visible_color: color,
@@ -116,18 +116,14 @@ impl WireframeStyle3d {
     pub fn with_hidden(
         mut self,
         color: Color,
-        width: f32,
-        dash_length: f32,
-        gap_length: f32,
+        width: LogicalPixels,
+        dash_length: LogicalPixels,
+        gap_length: LogicalPixels,
     ) -> Result<Self, Mesh3dStyleError> {
         validate_edge_color_width(color, width)?;
-        if !dash_length.is_finite()
-            || dash_length <= 0.0
-            || dash_length > MAX_LOGICAL_EDGE_METRIC
-            || !gap_length.is_finite()
-            || gap_length <= 0.0
-            || gap_length > MAX_LOGICAL_EDGE_METRIC
-            || !(dash_length + gap_length).is_finite()
+        if dash_length.get() > MAX_LOGICAL_EDGE_METRIC
+            || gap_length.get() > MAX_LOGICAL_EDGE_METRIC
+            || !(dash_length.get() + gap_length.get()).is_finite()
         {
             return Err(Mesh3dStyleError::InvalidDashPattern);
         }
@@ -146,7 +142,7 @@ impl WireframeStyle3d {
     }
 
     /// Returns visible-edge width in logical screen pixels.
-    pub const fn visible_width(self) -> f32 {
+    pub const fn visible_width(self) -> LogicalPixels {
         self.visible_width
     }
 
@@ -164,7 +160,7 @@ impl WireframeStyle3d {
     }
 
     /// Returns hidden-edge width in logical screen pixels when enabled.
-    pub const fn hidden_width(self) -> Option<f32> {
+    pub const fn hidden_width(self) -> Option<LogicalPixels> {
         match self.hidden {
             Some(hidden) => Some(hidden.width),
             None => None,
@@ -172,7 +168,7 @@ impl WireframeStyle3d {
     }
 
     /// Returns hidden dash and gap lengths in logical screen pixels.
-    pub const fn hidden_pattern(self) -> Option<(f32, f32)> {
+    pub const fn hidden_pattern(self) -> Option<(LogicalPixels, LogicalPixels)> {
         match self.hidden {
             Some(hidden) => Some((hidden.dash_length, hidden.gap_length)),
             None => None,
@@ -207,13 +203,8 @@ impl fmt::Display for Mesh3dStyleError {
 
 impl Error for Mesh3dStyleError {}
 
-fn validate_edge_color_width(color: Color, width: f32) -> Result<(), Mesh3dStyleError> {
-    if color.is_normalized()
-        && color.alpha() == 1.0
-        && width.is_finite()
-        && width > 0.0
-        && width <= MAX_LOGICAL_EDGE_METRIC
-    {
+fn validate_edge_color_width(color: Color, width: LogicalPixels) -> Result<(), Mesh3dStyleError> {
+    if color.is_normalized() && color.alpha() == 1.0 && width.get() <= MAX_LOGICAL_EDGE_METRIC {
         Ok(())
     } else {
         Err(Mesh3dStyleError::InvalidColorOrWidth)
@@ -525,10 +516,14 @@ mod tests {
         Mesh3d, Mesh3dError, Mesh3dStyleError, MeshEdge3d, MeshStyle3d, SurfaceStyle3d,
         WireframeStyle3d,
     };
-    use crate::{Color, Vec3};
+    use crate::{Color, LogicalPixels, UnitError, Vec3};
 
     fn vector(x: f32, y: f32, z: f32) -> Vec3 {
         Vec3::new(x, y, z).unwrap()
+    }
+
+    fn logical(value: f32) -> LogicalPixels {
+        LogicalPixels::new(value).unwrap()
     }
 
     #[test]
@@ -634,34 +629,44 @@ mod tests {
 
     #[test]
     fn wireframe_style_validates_logical_pixel_contract() {
-        let style = WireframeStyle3d::visible(Color::WHITE, 2.0)
+        let style = WireframeStyle3d::visible(Color::WHITE, logical(2.0))
             .unwrap()
-            .with_hidden(Color::rgba(0.5, 0.5, 0.5, 1.0), 1.5, 6.0, 4.0)
+            .with_hidden(
+                Color::rgba(0.5, 0.5, 0.5, 1.0),
+                logical(1.5),
+                logical(6.0),
+                logical(4.0),
+            )
             .unwrap();
-        assert_eq!(style.visible_width(), 2.0);
-        assert_eq!(style.hidden_pattern(), Some((6.0, 4.0)));
+        assert_eq!(style.visible_width(), logical(2.0));
+        assert_eq!(style.hidden_pattern(), Some((logical(6.0), logical(4.0))));
         assert_eq!(
-            WireframeStyle3d::visible(Color::WHITE, 0.0),
+            LogicalPixels::new(0.0),
+            Err(UnitError::InvalidLogicalPixels { value: 0.0 })
+        );
+        assert_eq!(
+            WireframeStyle3d::visible(Color::WHITE, logical(f32::MAX)),
             Err(Mesh3dStyleError::InvalidColorOrWidth)
         );
         assert_eq!(
-            WireframeStyle3d::visible(Color::WHITE, f32::MAX),
+            WireframeStyle3d::visible(Color::rgb(-0.01, 0.0, 0.0), logical(1.0)),
             Err(Mesh3dStyleError::InvalidColorOrWidth)
         );
         assert_eq!(
-            WireframeStyle3d::visible(Color::rgb(-0.01, 0.0, 0.0), 1.0),
-            Err(Mesh3dStyleError::InvalidColorOrWidth)
-        );
-        assert_eq!(
-            WireframeStyle3d::visible(Color::WHITE, 1.0)
+            WireframeStyle3d::visible(Color::WHITE, logical(1.0))
                 .unwrap()
-                .with_hidden(Color::WHITE, 1.0, 0.0, 2.0),
+                .with_hidden(Color::WHITE, logical(1.0), logical(f32::MAX), logical(2.0),),
             Err(Mesh3dStyleError::InvalidDashPattern)
         );
         assert_eq!(
-            WireframeStyle3d::visible(Color::WHITE, 1.0)
+            WireframeStyle3d::visible(Color::WHITE, logical(1.0))
                 .unwrap()
-                .with_hidden(Color::WHITE, 1.0, f32::MAX, f32::MAX),
+                .with_hidden(
+                    Color::WHITE,
+                    logical(1.0),
+                    logical(f32::MAX),
+                    logical(f32::MAX),
+                ),
             Err(Mesh3dStyleError::InvalidDashPattern)
         );
     }
@@ -669,7 +674,7 @@ mod tests {
     #[test]
     fn mesh_style_keeps_surface_and_wireframe_extensible() {
         let surface = SurfaceStyle3d::opaque(Color::rgb(0.2, 0.3, 0.4)).unwrap();
-        let wireframe = WireframeStyle3d::visible(Color::WHITE, 2.0).unwrap();
+        let wireframe = WireframeStyle3d::visible(Color::WHITE, logical(2.0)).unwrap();
         let style = MeshStyle3d::surface(surface).with_wireframe(wireframe);
         assert_eq!(style.surface_style(), Some(surface));
         assert_eq!(style.wireframe_style(), Some(wireframe));

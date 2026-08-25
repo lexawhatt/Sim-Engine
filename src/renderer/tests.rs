@@ -651,6 +651,22 @@ fn offscreen_gpu_readback_verifies_camera_depth_and_clip_contract() {
             return;
         };
         let adapter_info = adapter.get_info();
+        if let Ok(path) = std::env::var("SIM_ENGINE_GPU_EVIDENCE_PATH") {
+            let clean = |value: &str| value.replace(['\n', '\r', '='], " ");
+            let evidence = format!(
+                "format_version=1\ncrate_version={}\nbackend={:?}\nname={}\ndevice_type={:?}\ndriver={}\ndriver_info={}\nvendor={:#06x}\ndevice={:#06x}\n",
+                env!("CARGO_PKG_VERSION"),
+                adapter_info.backend,
+                clean(&adapter_info.name),
+                adapter_info.device_type,
+                clean(&adapter_info.driver),
+                clean(&adapter_info.driver_info),
+                adapter_info.vendor,
+                adapter_info.device,
+            );
+            std::fs::write(&path, evidence)
+                .unwrap_or_else(|error| panic!("write GPU evidence to {path}: {error}"));
+        }
         if std::env::var("SIM_ENGINE_REQUIRE_GPU_TESTS").as_deref() == Ok("1") {
             eprintln!(
                 "sim-engine GPU evidence: name={:?}, type={:?}, backend={:?}, driver={:?}, driver_info={:?}, vendor={:#06x}, device={:#06x}",
@@ -701,6 +717,12 @@ fn offscreen_gpu_readback_verifies_camera_depth_and_clip_contract() {
         let recovery_validation_scope =
             recovery_device.push_error_scope(wgpu::ErrorFilter::Validation);
         mesh3d::assert_gpu_depth_contract(&device, &queue, wgpu::TextureFormat::Rgba8UnormSrgb);
+        mesh3d::assert_gpu_scene_recovery_contract(
+            &device,
+            &queue,
+            &recovery_device,
+            &recovery_queue,
+        );
         let vertex_limit = device.limits().max_buffer_size / std::mem::size_of::<Vertex>() as u64;
         if let Ok(first_invalid_capacity) = usize::try_from(vertex_limit.saturating_add(1)) {
             assert!(!buffer_capacity_fits::<Vertex>(
