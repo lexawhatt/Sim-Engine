@@ -22,7 +22,7 @@ pub enum ScenePrimitive {
 /// Reason a command or temporary scene state was rejected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SceneError {
-    /// Clear color contains NaN or infinity.
+    /// Clear color is non-finite or outside normalized RGBA.
     InvalidBackground,
     /// Primitive coordinates contain NaN or infinity.
     NonFiniteGeometry(ScenePrimitive),
@@ -67,9 +67,9 @@ pub struct Scene {
 }
 
 impl Scene {
-    /// Creates an empty scene with a finite background color.
+    /// Creates an empty scene with a normalized linear-RGBA background color.
     pub fn new(background: Color) -> Result<Self, SceneError> {
-        if !background.is_finite() {
+        if !background.is_normalized() {
             return Err(SceneError::InvalidBackground);
         }
         Ok(Self {
@@ -81,14 +81,14 @@ impl Scene {
         })
     }
 
-    /// Returns the finite clear color used before drawing commands.
+    /// Returns the normalized clear color used before drawing commands.
     pub fn background(&self) -> Color {
         self.background
     }
 
     /// Replaces the clear color used before drawing commands.
     pub fn set_background(&mut self, background: Color) -> Result<(), SceneError> {
-        if !background.is_finite() {
+        if !background.is_normalized() {
             return Err(SceneError::InvalidBackground);
         }
         self.background = background;
@@ -927,7 +927,7 @@ impl Fill {
 
     fn is_valid(self) -> bool {
         match self {
-            Self::Solid(color) => color.is_finite(),
+            Self::Solid(color) => color.is_normalized(),
             Self::LinearGradient(gradient) => gradient.is_valid(),
             Self::RadialGradient(gradient) => gradient.is_valid(),
         }
@@ -996,8 +996,8 @@ impl LinearGradient {
     fn is_valid(self) -> bool {
         self.start.is_finite()
             && self.end.is_finite()
-            && self.start_color.is_finite()
-            && self.end_color.is_finite()
+            && self.start_color.is_normalized()
+            && self.end_color.is_normalized()
             && self.start != self.end
     }
 }
@@ -1098,8 +1098,8 @@ impl RadialGradient {
             && self.outer_radius.is_finite()
             && self.inner_radius >= 0.0
             && self.outer_radius >= self.inner_radius
-            && self.inner_color.is_finite()
-            && self.outer_color.is_finite()
+            && self.inner_color.is_normalized()
+            && self.outer_color.is_normalized()
     }
 }
 
@@ -1124,7 +1124,7 @@ impl Stroke {
         self.color
     }
     fn is_valid(self) -> bool {
-        self.width.is_finite() && self.width > 0.0 && self.color.is_finite()
+        self.width.is_finite() && self.width > 0.0 && self.color.is_normalized()
     }
 }
 
@@ -1164,7 +1164,7 @@ impl Shadow {
             && self.spread.is_finite()
             && self.spread >= 0.0
             && (self.spread * 2.0).is_finite()
-            && self.color.is_finite()
+            && self.color.is_normalized()
     }
 }
 
@@ -1345,6 +1345,10 @@ mod tests {
             Scene::new(Color::rgba(f32::NAN, 0.0, 0.0, 1.0)),
             Err(SceneError::InvalidBackground)
         ));
+        assert!(matches!(
+            Scene::new(Color::rgb(1.01, 0.0, 0.0)),
+            Err(SceneError::InvalidBackground)
+        ));
         assert_eq!(
             ScreenClipRect::new(
                 LogicalScreenPosition::new(0.0, 0.0),
@@ -1359,6 +1363,24 @@ mod tests {
             ),
             Err(SceneError::InvalidScreenClip)
         );
+    }
+
+    #[test]
+    fn render_bound_scene_colors_must_be_normalized() {
+        let mut scene = Scene::new(Color::BLACK).unwrap();
+        assert_eq!(
+            scene.try_circle(
+                Vec2::ZERO,
+                1.0,
+                ShapeStyle::filled(Color::rgb(2.0, 0.0, 0.0)),
+            ),
+            Err(SceneError::InvalidFill(ScenePrimitive::Circle))
+        );
+        assert_eq!(
+            scene.try_line(Vec2::ZERO, Vec2::X, 1.0, Color::rgba(0.0, 0.0, 0.0, -0.01),),
+            Err(SceneError::InvalidStroke(ScenePrimitive::Line))
+        );
+        assert_eq!(scene.command_count(), 0);
     }
 
     #[test]

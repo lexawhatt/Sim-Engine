@@ -1,6 +1,9 @@
 use super::*;
 use std::fmt;
 
+const DEFAULT_MAX_QUARANTINED_DEVICES: usize = 4;
+const MAX_QUARANTINED_DEVICES: usize = 8;
+
 pub(super) struct MultisampleTarget {
     pub(super) _texture: wgpu::Texture,
     pub(super) view: wgpu::TextureView,
@@ -86,6 +89,7 @@ pub(super) fn select_surface_present_mode(
 pub struct WgpuRendererOptions {
     present_mode: RendererPresentMode,
     scale_factor: f64,
+    max_quarantined_devices: usize,
 }
 
 impl WgpuRendererOptions {
@@ -102,7 +106,26 @@ impl WgpuRendererOptions {
         Ok(Self {
             present_mode,
             scale_factor,
+            max_quarantined_devices: DEFAULT_MAX_QUARANTINED_DEVICES,
         })
+    }
+
+    /// Sets the bounded number of previous logical devices retained after recovery.
+    ///
+    /// The default is 4 and the supported range is `1..=8`. Retention avoids a
+    /// native Linux driver crash observed when a healthy device is destroyed
+    /// immediately after surface migration. Once the limit is reached, another
+    /// recovery returns [`RendererInitError::RecoveryLimitReached`] before
+    /// requesting or installing a replacement device.
+    pub fn with_max_quarantined_devices(
+        mut self,
+        limit: usize,
+    ) -> Result<Self, RendererConfigurationError> {
+        if !(1..=MAX_QUARANTINED_DEVICES).contains(&limit) {
+            return Err(RendererConfigurationError::InvalidRecoveryLimit { limit });
+        }
+        self.max_quarantined_devices = limit;
+        Ok(self)
     }
 
     /// Returns presentation behavior for the surface.
@@ -114,6 +137,11 @@ impl WgpuRendererOptions {
     pub fn scale_factor(self) -> f64 {
         self.scale_factor
     }
+
+    /// Returns the maximum previous logical devices retained after recovery.
+    pub fn max_quarantined_devices(self) -> usize {
+        self.max_quarantined_devices
+    }
 }
 
 impl Default for WgpuRendererOptions {
@@ -121,6 +149,7 @@ impl Default for WgpuRendererOptions {
         Self {
             present_mode: RendererPresentMode::Vsync,
             scale_factor: 1.0,
+            max_quarantined_devices: DEFAULT_MAX_QUARANTINED_DEVICES,
         }
     }
 }
@@ -198,12 +227,21 @@ impl WgpuRenderer {
     /// them with the matching `restore_*` methods after this call succeeds.
     /// Targets and trails restore empty and must be redrawn.
     ///
-    /// Replaced logical devices remain retained until this renderer is dropped.
-    /// Some native swapchain drivers crash if a healthy previous device is
-    /// destroyed immediately after the surface migrates to its replacement.
-    /// Device recovery should therefore remain exceptional rather than a normal
-    /// quality-switching mechanism.
+    /// Replaced logical devices enter a bounded quarantine until this renderer
+    /// is dropped. Some native swapchain drivers crash if a healthy previous
+    /// device is destroyed immediately after the surface migrates to its
+    /// replacement. Device recovery should therefore remain exceptional rather
+    /// than a normal quality switch. Query
+    /// [`WgpuRenderer::remaining_device_recoveries`] before attempting it.
     pub async fn recover_device_and_surface(&mut self) -> Result<(), RendererInitError> {
+        if !recovery_quarantine_has_capacity(
+            self.retired_devices.len(),
+            self.max_quarantined_devices,
+        ) {
+            return Err(RendererInitError::RecoveryLimitReached {
+                limit: self.max_quarantined_devices,
+            });
+        }
         let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
         let adapter = self
             ._instance
@@ -289,4 +327,8 @@ impl WgpuRenderer {
         self.draw_batches.clear();
         Ok(())
     }
+}
+
+pub(super) fn recovery_quarantine_has_capacity(retired: usize, limit: usize) -> bool {
+    retired < limit
 }

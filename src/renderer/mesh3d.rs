@@ -1,5 +1,6 @@
 use super::*;
 use crate::{Camera3d, Mesh3d, MeshStyle3d, Transform3d, Vec3, WireframeStyle3d};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(test)]
 use crate::{MeshEdge3d, Projection3d, Rotation3d, SurfaceStyle3d};
@@ -12,6 +13,7 @@ const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 // resolve solid, while occlusion must exceed that tolerance to resolve dashed.
 const HIDDEN_EDGE_DEPTH_BIAS: i32 = 1;
 const VISIBLE_EDGE_DEPTH_BIAS: i32 = -1;
+static NEXT_SCENE3D_ID: AtomicU64 = AtomicU64::new(1);
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
@@ -363,12 +365,18 @@ impl RetainedMesh3d {
 
 /// Stable scene handle for a retained 3D object.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Object3dId(u64);
+pub struct Object3dId {
+    scene_id: u64,
+    object_id: u64,
+}
 
 impl Object3dId {
-    /// Returns the stable numeric value for diagnostics and host maps.
+    /// Returns the stable scene-local numeric value for diagnostics.
+    ///
+    /// Equality and hashing also include private scene provenance. Store the
+    /// complete handle, rather than only this number, in host object maps.
     pub const fn get(self) -> u64 {
-        self.0
+        self.object_id
     }
 }
 
@@ -431,18 +439,25 @@ impl Mesh3dInstance {
 
 /// Ready 3D visual state rendered with one camera and depth attachment.
 pub struct Scene3d {
+    scene_id: u64,
     background: Color,
     instances: Vec<Mesh3dInstance>,
     next_object_id: u64,
 }
 
 impl Scene3d {
-    /// Creates an empty scene with a finite opaque clear color.
+    /// Creates an empty scene with a normalized opaque clear color.
     pub fn new(background: Color) -> Result<Self, Scene3dError> {
-        if !background.is_finite() || background.alpha() != 1.0 {
+        if !background.is_normalized() || background.alpha() != 1.0 {
             return Err(Scene3dError::InvalidBackground);
         }
+        let scene_id = NEXT_SCENE3D_ID
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            })
+            .map_err(|_| Scene3dError::SceneIdExhausted)?;
         Ok(Self {
+            scene_id,
             background,
             instances: Vec::new(),
             next_object_id: 0,
@@ -457,7 +472,10 @@ impl Scene3d {
         style: MeshStyle3d,
     ) -> Result<Object3dId, Scene3dError> {
         validate_mesh_style(mesh, style)?;
-        let id = Object3dId(self.next_object_id);
+        let id = Object3dId {
+            scene_id: self.scene_id,
+            object_id: self.next_object_id,
+        };
         self.next_object_id = self
             .next_object_id
             .checked_add(1)
@@ -546,6 +564,9 @@ impl Scene3d {
     }
 
     fn instance_mut(&mut self, object_id: Object3dId) -> Result<&mut Mesh3dInstance, Scene3dError> {
+        if object_id.scene_id != self.scene_id {
+            return Err(Scene3dError::ObjectNotFound { object_id });
+        }
         self.instances
             .iter_mut()
             .find(|instance| instance.id == object_id)
@@ -602,12 +623,14 @@ impl RenderTarget3d {
 /// Rejection reason for 3D scene visual state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scene3dError {
-    /// The target clear color must be finite and opaque.
+    /// The target clear color must be normalized and opaque.
     InvalidBackground,
     /// Surface and wireframe were both disabled.
     EmptyStyle,
     /// The selected surface/edge modes have no corresponding mesh topology.
     StyleHasNoMatchingGeometry,
+    /// No more process-unique scene identifiers can be allocated.
+    SceneIdExhausted,
     /// No more stable object identifiers can be allocated.
     ObjectIdExhausted,
     /// An object update referenced a missing stable handle.
@@ -626,10 +649,11 @@ impl fmt::Display for Scene3dError {
                 formatter,
                 "3D object style has no matching triangles or display edges"
             ),
+            Self::SceneIdExhausted => write!(formatter, "3D scene identifiers exhausted"),
             Self::ObjectIdExhausted => write!(formatter, "3D scene object identifiers exhausted"),
             Self::ObjectNotFound { object_id } => write!(
                 formatter,
-                "3D scene object {} does not exist",
+                "3D scene object {} does not exist in this scene",
                 object_id.get()
             ),
         }
@@ -650,8 +674,13 @@ fn validate_mesh_style(mesh: &RetainedMesh3d, style: MeshStyle3d) -> Result<(), 
 /// Resource creation or ownership failure for retained 3D rendering.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Mesh3dResourceError {
-    /// Vertex or index data exceeds the active device's buffer-size limit.
+    /// Vertex, index, or edge data exceeds the active device's buffer-size limit.
     CapacityTooLarge,
+    /// Host staging memory could not be reserved after capacity preflight.
+    HostAllocationFailed {
+        /// Bytes requested for the rejected staging buffer.
+        requested_bytes: u64,
+    },
     /// Color/depth target creation failed.
     Target(RenderTargetError),
     /// Physical texture and logical viewport aspect ratios differ.
@@ -662,6 +691,10 @@ impl fmt::Display for Mesh3dResourceError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::CapacityTooLarge => write!(formatter, "3D mesh exceeds GPU buffer limits"),
+            Self::HostAllocationFailed { requested_bytes } => write!(
+                formatter,
+                "3D mesh could not reserve a {requested_bytes}-byte host staging buffer"
+            ),
             Self::Target(error) => write!(formatter, "3D target creation failed: {error}"),
             Self::InvalidViewportAspect => write!(
                 formatter,
@@ -707,7 +740,7 @@ impl fmt::Display for Mesh3dRenderError {
             ),
             Self::InvalidEdgeProjection => write!(
                 formatter,
-                "3D edge crosses the camera plane or overflows screen-space arithmetic"
+                "3D edge clipping or screen-space arithmetic overflowed"
             ),
         }
     }
@@ -753,7 +786,12 @@ impl Mesh3dRenderReport {
 }
 
 impl WgpuRenderer {
-    /// Uploads validated immutable topology into retained vertex/index buffers.
+    /// Uploads validated immutable topology into retained GPU buffers.
+    ///
+    /// Counts, byte arithmetic, draw-count representation, and active-device
+    /// buffer limits are checked before conversion staging allocation. Host
+    /// staging reservation failure is returned explicitly; GPU allocation
+    /// itself follows wgpu's device-error model.
     pub fn create_mesh3d(&self, source: Mesh3d) -> Result<RetainedMesh3d, Mesh3dResourceError> {
         create_retained_mesh(
             &self.device,
@@ -963,60 +1001,47 @@ fn create_retained_mesh(
     renderer_identity: Arc<()>,
     source: Mesh3d,
 ) -> Result<RetainedMesh3d, Mesh3dResourceError> {
-    let vertices: Vec<_> = source
-        .vertices()
-        .iter()
-        .map(|vertex| MeshVertexGpu {
-            position: [vertex.x(), vertex.y(), vertex.z()],
-        })
-        .collect();
-    let index_count = u32::try_from(source.triangle_indices().len())
-        .map_err(|_| Mesh3dResourceError::CapacityTooLarge)?;
-    let edges: Vec<_> = source
-        .display_edges()
-        .iter()
-        .map(|edge| {
-            let start = source.vertices()[edge.start() as usize];
-            let end = source.vertices()[edge.end() as usize];
-            MeshEdgeGpu {
-                start: [start.x(), start.y(), start.z()],
-                end: [end.x(), end.y(), end.z()],
-            }
-        })
-        .collect();
-    let edge_count =
-        u32::try_from(edges.len()).map_err(|_| Mesh3dResourceError::CapacityTooLarge)?;
-    if !buffer_capacity_fits::<MeshVertexGpu>(device, vertices.len())
-        || !buffer_capacity_fits::<u32>(device, source.triangle_indices().len())
-        || (!edges.is_empty() && !buffer_capacity_fits::<MeshEdgeGpu>(device, edges.len()))
-    {
-        return Err(Mesh3dResourceError::CapacityTooLarge);
-    }
-    let vertex_bytes = vertices
-        .len()
-        .checked_mul(std::mem::size_of::<MeshVertexGpu>())
-        .ok_or(Mesh3dResourceError::CapacityTooLarge)?;
-    let index_bytes = source
-        .triangle_indices()
-        .len()
-        .checked_mul(std::mem::size_of::<u32>())
-        .ok_or(Mesh3dResourceError::CapacityTooLarge)?;
-    let edge_bytes = edges
-        .len()
-        .checked_mul(std::mem::size_of::<MeshEdgeGpu>())
-        .ok_or(Mesh3dResourceError::CapacityTooLarge)?;
+    let layout = preflight_mesh3d_upload(
+        source.vertices().len(),
+        source.triangle_indices().len(),
+        source.display_edges().len(),
+        device.limits().max_buffer_size,
+    )?;
+    let mut vertices = Vec::new();
+    vertices
+        .try_reserve_exact(source.vertices().len())
+        .map_err(|_| Mesh3dResourceError::HostAllocationFailed {
+            requested_bytes: layout.vertex_bytes,
+        })?;
+    vertices.extend(source.vertices().iter().map(|vertex| MeshVertexGpu {
+        position: [vertex.x(), vertex.y(), vertex.z()],
+    }));
+    let mut edges = Vec::new();
+    edges
+        .try_reserve_exact(source.display_edges().len())
+        .map_err(|_| Mesh3dResourceError::HostAllocationFailed {
+            requested_bytes: layout.edge_bytes,
+        })?;
+    edges.extend(source.display_edges().iter().map(|edge| {
+        let start = source.vertices()[edge.start() as usize];
+        let end = source.vertices()[edge.end() as usize];
+        MeshEdgeGpu {
+            start: [start.x(), start.y(), start.z()],
+            end: [end.x(), end.y(), end.z()],
+        }
+    }));
     let vertex_buffer = Arc::new(device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("sim-engine retained 3D vertex buffer"),
-        size: vertex_bytes as wgpu::BufferAddress,
+        size: layout.vertex_bytes,
         usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     }));
-    let index_buffer = if index_bytes == 0 {
+    let index_buffer = if layout.index_bytes == 0 {
         None
     } else {
         Some(Arc::new(device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("sim-engine retained 3D index buffer"),
-            size: index_bytes as wgpu::BufferAddress,
+            size: layout.index_bytes,
             usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         })))
@@ -1029,12 +1054,12 @@ fn create_retained_mesh(
             bytemuck::cast_slice(source.triangle_indices()),
         );
     }
-    let edge_buffer = if edges.is_empty() {
+    let edge_buffer = if layout.edge_bytes == 0 {
         None
     } else {
         let buffer = Arc::new(device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("sim-engine retained 3D edge buffer"),
-            size: edge_bytes as wgpu::BufferAddress,
+            size: layout.edge_bytes,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         }));
@@ -1047,11 +1072,53 @@ fn create_retained_mesh(
         index_buffer,
         edge_buffer,
         source,
-        index_count,
-        edge_count,
-        gpu_allocation_bytes: vertex_bytes
-            .saturating_add(index_bytes)
-            .saturating_add(edge_bytes),
+        index_count: layout.index_count,
+        edge_count: layout.edge_count,
+        gpu_allocation_bytes: usize::try_from(layout.total_bytes).unwrap_or(usize::MAX),
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Mesh3dUploadLayout {
+    vertex_bytes: u64,
+    index_bytes: u64,
+    edge_bytes: u64,
+    total_bytes: u64,
+    index_count: u32,
+    edge_count: u32,
+}
+
+fn preflight_mesh3d_upload(
+    vertex_count: usize,
+    index_count: usize,
+    edge_count: usize,
+    max_buffer_size: u64,
+) -> Result<Mesh3dUploadLayout, Mesh3dResourceError> {
+    let draw_index_count =
+        u32::try_from(index_count).map_err(|_| Mesh3dResourceError::CapacityTooLarge)?;
+    let draw_edge_count =
+        u32::try_from(edge_count).map_err(|_| Mesh3dResourceError::CapacityTooLarge)?;
+    let checked_buffer_bytes = |element_size: usize, element_count: usize| {
+        u64::try_from(element_size)
+            .ok()
+            .and_then(|size| u64::try_from(element_count).ok()?.checked_mul(size))
+            .filter(|bytes| *bytes <= max_buffer_size)
+            .ok_or(Mesh3dResourceError::CapacityTooLarge)
+    };
+    let vertex_bytes = checked_buffer_bytes(std::mem::size_of::<MeshVertexGpu>(), vertex_count)?;
+    let index_bytes = checked_buffer_bytes(std::mem::size_of::<u32>(), index_count)?;
+    let edge_bytes = checked_buffer_bytes(std::mem::size_of::<MeshEdgeGpu>(), edge_count)?;
+    let total_bytes = vertex_bytes
+        .checked_add(index_bytes)
+        .and_then(|bytes| bytes.checked_add(edge_bytes))
+        .ok_or(Mesh3dResourceError::CapacityTooLarge)?;
+    Ok(Mesh3dUploadLayout {
+        vertex_bytes,
+        index_bytes,
+        edge_bytes,
+        total_bytes,
+        index_count: draw_index_count,
+        edge_count: draw_edge_count,
     })
 }
 
@@ -1278,7 +1345,7 @@ fn validate_edge_projection(
     }
 
     for edge in mesh.display_edges() {
-        let mut screen = [[0.0_f32; 2]; 2];
+        let mut clip = [[0.0_f32; 4]; 2];
         for (endpoint_index, vertex_index) in [edge.start(), edge.end()].into_iter().enumerate() {
             let vertex = mesh.vertices()[vertex_index as usize];
             let model = [vertex.x(), vertex.y(), vertex.z(), 1.0];
@@ -1288,15 +1355,18 @@ fn validate_edge_projection(
                 shader_dot(model_rows[2], model)?,
                 1.0,
             ];
-            let clip = [
+            clip[endpoint_index] = [
                 shader_dot(camera_rows[0], world)?,
                 shader_dot(camera_rows[1], world)?,
                 shader_dot(camera_rows[2], world)?,
                 shader_dot(camera_rows[3], world)?,
             ];
-            if clip[3] <= 0.0 || clip[2] < 0.0 {
-                return Err(Mesh3dRenderError::InvalidEdgeProjection);
-            }
+        }
+        let Some(clipped) = clip_edge_to_frustum(clip[0], clip[1])? else {
+            continue;
+        };
+        let mut screen = [[0.0_f32; 2]; 2];
+        for (endpoint_index, clip) in clipped.into_iter().enumerate() {
             let ndc_x = clip[0] / clip[3];
             let ndc_y = clip[1] / clip[3];
             screen[endpoint_index] = [
@@ -1317,6 +1387,84 @@ fn validate_edge_projection(
         }
     }
     Ok(())
+}
+
+fn clip_edge_to_frustum(
+    start: [f32; 4],
+    end: [f32; 4],
+) -> Result<Option<[[f32; 4]; 2]>, Mesh3dRenderError> {
+    let start_distances = clip_plane_distances(start)?;
+    let end_distances = clip_plane_distances(end)?;
+    let mut enter = 0.0_f32;
+    let mut exit = 1.0_f32;
+    for (start_distance, end_distance) in start_distances.into_iter().zip(end_distances) {
+        if start_distance < 0.0 && end_distance < 0.0 {
+            return Ok(None);
+        }
+        if start_distance < 0.0 || end_distance < 0.0 {
+            let denominator = start_distance - end_distance;
+            let amount = start_distance / denominator;
+            if !denominator.is_finite() || !amount.is_finite() {
+                return Err(Mesh3dRenderError::InvalidEdgeProjection);
+            }
+            if start_distance < 0.0 {
+                enter = enter.max(amount);
+            } else {
+                exit = exit.min(amount);
+            }
+        }
+    }
+    if enter > exit {
+        return Ok(None);
+    }
+    let clipped_start = shader_lerp_clip(start, end, enter)?;
+    let clipped_end = shader_lerp_clip(start, end, exit)?;
+    if clipped_start[3] <= 0.0 || clipped_end[3] <= 0.0 {
+        return Ok(None);
+    }
+    Ok(Some([clipped_start, clipped_end]))
+}
+
+fn clip_plane_distances(clip: [f32; 4]) -> Result<[f32; 6], Mesh3dRenderError> {
+    let add = |left: f32, right: f32| {
+        let result = left + right;
+        result
+            .is_finite()
+            .then_some(result)
+            .ok_or(Mesh3dRenderError::InvalidEdgeProjection)
+    };
+    let subtract = |left: f32, right: f32| {
+        let result = left - right;
+        result
+            .is_finite()
+            .then_some(result)
+            .ok_or(Mesh3dRenderError::InvalidEdgeProjection)
+    };
+    Ok([
+        add(clip[3], clip[0])?,
+        subtract(clip[3], clip[0])?,
+        add(clip[3], clip[1])?,
+        subtract(clip[3], clip[1])?,
+        clip[2],
+        subtract(clip[3], clip[2])?,
+    ])
+}
+
+fn shader_lerp_clip(
+    start: [f32; 4],
+    end: [f32; 4],
+    amount: f32,
+) -> Result<[f32; 4], Mesh3dRenderError> {
+    let mut output = [0.0_f32; 4];
+    for axis in 0..4 {
+        let delta = end[axis] - start[axis];
+        let value = start[axis] + delta * amount;
+        if !delta.is_finite() || !value.is_finite() {
+            return Err(Mesh3dRenderError::InvalidEdgeProjection);
+        }
+        output[axis] = value;
+    }
+    Ok(output)
 }
 
 fn edge_physical_half_width(logical_width: f32, pixels_per_logical: f32) -> Option<f32> {
@@ -1470,6 +1618,30 @@ pub(super) fn assert_gpu_depth_contract(
         .expect("3D test mesh should upload");
     let far_mesh = create_retained_mesh(device, queue, Arc::clone(&identity), far_triangle)
         .expect("3D test mesh should upload");
+    let near_crossing_edge = Mesh3d::with_display_edges(
+        vec![
+            Vec3::new(0.0, 0.0, 4.95).unwrap(),
+            Vec3::new(0.5, 0.5, 4.0).unwrap(),
+        ],
+        Vec::new(),
+        vec![MeshEdge3d::new(0, 1).unwrap()],
+    )
+    .unwrap();
+    let near_crossing_mesh =
+        create_retained_mesh(device, queue, Arc::clone(&identity), near_crossing_edge)
+            .expect("near-crossing 3D test edge should upload");
+    let classification_edge = Mesh3d::with_display_edges(
+        vec![
+            Vec3::new(-0.5, -0.5, 0.0).unwrap(),
+            Vec3::new(0.5, -0.5, 0.0).unwrap(),
+        ],
+        Vec::new(),
+        vec![MeshEdge3d::new(0, 1).unwrap()],
+    )
+    .unwrap();
+    let classification_mesh =
+        create_retained_mesh(device, queue, Arc::clone(&identity), classification_edge)
+            .expect("classification test edge should upload");
     let projection = Projection3d::perspective(0.927_295_2, 1.0, 0.1, 20.0).unwrap();
     let camera = Camera3d::look_at(
         Vec3::new(0.0, 0.0, 5.0).unwrap(),
@@ -1505,6 +1677,28 @@ pub(super) fn assert_gpu_depth_contract(
                 ),
         )
         .unwrap();
+    let mut other_scene = Scene3d::new(Color::BLACK).unwrap();
+    let other_scene_id = other_scene
+        .try_push(
+            &near_mesh,
+            Transform3d::IDENTITY,
+            MeshStyle3d::surface(SurfaceStyle3d::opaque(Color::WHITE).unwrap()),
+        )
+        .unwrap();
+    assert_eq!(near_id.get(), other_scene_id.get());
+    assert_ne!(near_id, other_scene_id);
+    assert_eq!(
+        other_scene.set_visible(near_id, false),
+        Err(Scene3dError::ObjectNotFound { object_id: near_id })
+    );
+    assert_eq!(other_scene.visible_object_count(), 1);
+    assert_eq!(
+        scene.set_visible(other_scene_id, false),
+        Err(Scene3dError::ObjectNotFound {
+            object_id: other_scene_id,
+        })
+    );
+    assert_eq!(scene.visible_object_count(), 1);
     let far_id = scene
         .try_push(
             &far_mesh,
@@ -1518,6 +1712,51 @@ pub(super) fn assert_gpu_depth_contract(
                 ),
         )
         .unwrap();
+    scene
+        .try_push(
+            &near_crossing_mesh,
+            Transform3d::IDENTITY,
+            MeshStyle3d::wireframe(
+                WireframeStyle3d::visible(Color::rgb(1.0, 1.0, 0.0), 2.0).unwrap(),
+            ),
+        )
+        .unwrap();
+    let coplanar_transform = Transform3d::new(
+        Vec3::new(0.0, 0.0, 1.0).unwrap(),
+        Rotation3d::IDENTITY,
+        Vec3::new(1.0, 1.0, 1.0).unwrap(),
+    )
+    .unwrap();
+    scene
+        .try_push(
+            &classification_mesh,
+            coplanar_transform,
+            MeshStyle3d::wireframe(
+                WireframeStyle3d::visible(Color::rgb(0.0, 1.0, 1.0), 2.0)
+                    .unwrap()
+                    .with_hidden(Color::rgb(1.0, 0.0, 1.0), 2.0, 4.0, 4.0)
+                    .unwrap(),
+            ),
+        )
+        .unwrap();
+    let sub_depth_resolution_transform = Transform3d::new(
+        Vec3::new(0.0, 0.2, 0.999_999).unwrap(),
+        Rotation3d::IDENTITY,
+        Vec3::new(1.0, 1.0, 1.0).unwrap(),
+    )
+    .unwrap();
+    scene
+        .try_push(
+            &classification_mesh,
+            sub_depth_resolution_transform,
+            MeshStyle3d::wireframe(
+                WireframeStyle3d::visible(Color::rgb(1.0, 0.5, 0.0), 2.0)
+                    .unwrap()
+                    .with_hidden(Color::rgb(1.0, 0.0, 1.0), 2.0, 4.0, 4.0)
+                    .unwrap(),
+            ),
+        )
+        .unwrap();
     let moved_near_transform = Transform3d::new(
         Vec3::new(0.25, 0.0, 1.0).unwrap(),
         Rotation3d::IDENTITY,
@@ -1529,11 +1768,13 @@ pub(super) fn assert_gpu_depth_contract(
     assert_eq!(scene.instances()[1].transform(), far_transform);
     assert_eq!(scene.instances()[1].id(), far_id);
     scene.set_visible(far_id, false).unwrap();
-    assert_eq!(scene.visible_object_count(), 1);
+    assert_eq!(scene.visible_object_count(), 4);
     scene.set_visible(far_id, true).unwrap();
-    assert_eq!(scene.visible_object_count(), 2);
+    assert_eq!(scene.visible_object_count(), 5);
     scene.set_transform(near_id, near_transform).unwrap();
-    renderer.ensure_instance_capacity(device, 2).unwrap();
+    renderer
+        .ensure_instance_capacity(device, scene.object_count())
+        .unwrap();
     renderer.instances = scene
         .instances()
         .iter()
@@ -1543,13 +1784,17 @@ pub(super) fn assert_gpu_depth_contract(
                 model_row_0: rows[0],
                 model_row_1: rows[1],
                 model_row_2: rows[2],
-                color: instance.style.surface_style().unwrap().color().to_array(),
+                color: instance
+                    .style
+                    .surface_style()
+                    .map_or(Color::BLACK, SurfaceStyle3d::color)
+                    .to_array(),
             }
         })
         .collect();
     renderer
         .edge_object_bytes
-        .resize(2 * renderer.edge_object_stride, 0);
+        .resize(scene.object_count() * renderer.edge_object_stride, 0);
     let near_rows = near_transform.model_rows().unwrap();
     let near_edge_uniform = EdgeObjectUniform {
         model_row_0: near_rows[0],
@@ -1574,6 +1819,45 @@ pub(super) fn assert_gpu_depth_contract(
     let edge_end = edge_start + std::mem::size_of::<EdgeObjectUniform>();
     renderer.edge_object_bytes[edge_start..edge_end]
         .copy_from_slice(bytemuck::bytes_of(&far_edge_uniform));
+    let crossing_rows = Transform3d::IDENTITY.model_rows().unwrap();
+    let crossing_edge_uniform = EdgeObjectUniform {
+        model_row_0: crossing_rows[0],
+        model_row_1: crossing_rows[1],
+        model_row_2: crossing_rows[2],
+        visible_color: Color::rgb(1.0, 1.0, 0.0).to_array(),
+        hidden_color: Color::rgb(1.0, 1.0, 0.0).to_array(),
+        edge_style: [2.0, 0.0, 1.0, 1.0],
+    };
+    let crossing_edge_start = 2 * renderer.edge_object_stride;
+    let crossing_edge_end = crossing_edge_start + std::mem::size_of::<EdgeObjectUniform>();
+    renderer.edge_object_bytes[crossing_edge_start..crossing_edge_end]
+        .copy_from_slice(bytemuck::bytes_of(&crossing_edge_uniform));
+    let coplanar_rows = coplanar_transform.model_rows().unwrap();
+    let coplanar_edge_uniform = EdgeObjectUniform {
+        model_row_0: coplanar_rows[0],
+        model_row_1: coplanar_rows[1],
+        model_row_2: coplanar_rows[2],
+        visible_color: Color::rgb(0.0, 1.0, 1.0).to_array(),
+        hidden_color: Color::rgb(1.0, 0.0, 1.0).to_array(),
+        edge_style: [2.0, 2.0, 4.0, 4.0],
+    };
+    let coplanar_edge_start = 3 * renderer.edge_object_stride;
+    let coplanar_edge_end = coplanar_edge_start + std::mem::size_of::<EdgeObjectUniform>();
+    renderer.edge_object_bytes[coplanar_edge_start..coplanar_edge_end]
+        .copy_from_slice(bytemuck::bytes_of(&coplanar_edge_uniform));
+    let sub_depth_rows = sub_depth_resolution_transform.model_rows().unwrap();
+    let sub_depth_edge_uniform = EdgeObjectUniform {
+        model_row_0: sub_depth_rows[0],
+        model_row_1: sub_depth_rows[1],
+        model_row_2: sub_depth_rows[2],
+        visible_color: Color::rgb(1.0, 0.5, 0.0).to_array(),
+        hidden_color: Color::rgb(1.0, 0.0, 1.0).to_array(),
+        edge_style: [2.0, 2.0, 4.0, 4.0],
+    };
+    let sub_depth_edge_start = 4 * renderer.edge_object_stride;
+    let sub_depth_edge_end = sub_depth_edge_start + std::mem::size_of::<EdgeObjectUniform>();
+    renderer.edge_object_bytes[sub_depth_edge_start..sub_depth_edge_end]
+        .copy_from_slice(bytemuck::bytes_of(&sub_depth_edge_uniform));
     queue.write_buffer(
         &renderer.camera_uniform_buffer,
         0,
@@ -1687,6 +1971,30 @@ pub(super) fn assert_gpu_depth_contract(
             && hidden_pattern.windows(2).any(|pair| pair == [false, true]),
         "hidden edge must alternate ordered white dashes and gaps: {hidden_pattern:?}"
     );
+    let near_clipped_yellow_pixels = bytes
+        .chunks_exact(4)
+        .filter(|pixel| pixel[0] > 180 && pixel[1] > 180 && pixel[2] < 80)
+        .count();
+    assert!(
+        near_clipped_yellow_pixels >= 4,
+        "edge crossing the near plane must remain visible after homogeneous clipping: {near_clipped_yellow_pixels} yellow pixels"
+    );
+    let different_object_coplanar_pixels = bytes
+        .chunks_exact(4)
+        .filter(|pixel| pixel[0] < 80 && pixel[1] > 180 && pixel[2] > 180)
+        .count();
+    assert!(
+        different_object_coplanar_pixels >= 4,
+        "a coplanar edge from another object must resolve visible: {different_object_coplanar_pixels} cyan pixels"
+    );
+    let sub_depth_resolution_pixels = bytes
+        .chunks_exact(4)
+        .filter(|pixel| pixel[0] > 180 && pixel[1] > 100 && pixel[2] < 80)
+        .count();
+    assert!(
+        sub_depth_resolution_pixels >= 4,
+        "sub-depth-resolution separation must conservatively resolve visible: {sub_depth_resolution_pixels} orange pixels"
+    );
     drop(bytes);
     readback.unmap();
 }
@@ -1731,11 +2039,19 @@ mod tests {
     }
 
     #[test]
-    fn edge_crossing_camera_plane_is_rejected_before_wgsl_division() {
+    fn scene3d_rejects_out_of_range_clear_colors() {
+        assert!(matches!(
+            Scene3d::new(Color::rgb(1.01, 0.0, 0.0)),
+            Err(Scene3dError::InvalidBackground)
+        ));
+    }
+
+    #[test]
+    fn edge_crossing_near_plane_is_clipped_before_wgsl_division() {
         let mesh = Mesh3d::with_display_edges(
             vec![
-                Vec3::new(0.0, 0.0, 0.0).unwrap(),
-                Vec3::new(1.0, 0.0, -1.0).unwrap(),
+                Vec3::new(0.0, 0.0, -0.05).unwrap(),
+                Vec3::new(0.5, 0.0, -1.0).unwrap(),
             ],
             Vec::new(),
             vec![MeshEdge3d::new(0, 1).unwrap()],
@@ -1757,7 +2073,60 @@ mod tests {
                 style,
                 [100.0, 100.0, 1.0, 0.0],
             ),
-            Err(Mesh3dRenderError::InvalidEdgeProjection)
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn fully_clipped_edges_do_not_reject_the_frame() {
+        let mesh = Mesh3d::with_display_edges(
+            vec![
+                Vec3::new(0.0, 0.0, -0.01).unwrap(),
+                Vec3::new(0.01, 0.0, -0.05).unwrap(),
+            ],
+            Vec::new(),
+            vec![MeshEdge3d::new(0, 1).unwrap()],
+        )
+        .unwrap();
+        let camera = Camera3d::look_at(
+            Vec3::ZERO,
+            Vec3::new(0.0, 0.0, -1.0).unwrap(),
+            Vec3::Y,
+            Projection3d::perspective(1.0, 1.0, 0.1, 10.0).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            validate_edge_projection(
+                &mesh,
+                Transform3d::IDENTITY.model_rows().unwrap(),
+                camera.world_to_clip_rows().unwrap(),
+                WireframeStyle3d::visible(Color::WHITE, 1.0).unwrap(),
+                [100.0, 100.0, 1.0, 0.0],
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn homogeneous_edge_clipping_covers_near_far_and_camera_half_spaces() {
+        let near = clip_edge_to_frustum([0.0, 0.0, -0.5, 1.0], [0.0, 0.0, 0.5, 1.0])
+            .unwrap()
+            .unwrap();
+        assert!(near[0][2].abs() <= f32::EPSILON);
+        assert_eq!(near[1], [0.0, 0.0, 0.5, 1.0]);
+
+        let far = clip_edge_to_frustum([0.0, 0.0, 0.5, 1.0], [0.0, 0.0, 2.0, 1.0])
+            .unwrap()
+            .unwrap();
+        assert!((far[1][2] - far[1][3]).abs() <= f32::EPSILON);
+
+        assert_eq!(
+            clip_edge_to_frustum([0.0, 0.0, -2.0, -1.0], [0.0, 0.0, -1.0, -0.5]),
+            Ok(None)
+        );
+        assert_eq!(
+            clip_edge_to_frustum([-3.0, 0.0, 0.5, 1.0], [-2.0, 0.0, 0.5, 1.0]),
+            Ok(None)
         );
     }
 
@@ -1794,6 +2163,41 @@ mod tests {
             let physical_width =
                 edge_physical_half_width(logical_width, pixels_per_logical).unwrap() * 2.0;
             assert_eq!(physical_width / pixels_per_logical, logical_width);
+        }
+    }
+
+    #[test]
+    fn mesh_upload_preflight_rejects_each_buffer_before_staging_allocation() {
+        let max_buffer_size = 48;
+        let layout = preflight_mesh3d_upload(4, 12, 2, max_buffer_size).unwrap();
+        assert_eq!(layout.vertex_bytes, 48);
+        assert_eq!(layout.index_bytes, 48);
+        assert_eq!(layout.edge_bytes, 48);
+        assert_eq!(layout.total_bytes, 144);
+
+        assert_eq!(
+            preflight_mesh3d_upload(5, 0, 0, max_buffer_size),
+            Err(Mesh3dResourceError::CapacityTooLarge)
+        );
+        assert_eq!(
+            preflight_mesh3d_upload(1, 13, 0, max_buffer_size),
+            Err(Mesh3dResourceError::CapacityTooLarge)
+        );
+        assert_eq!(
+            preflight_mesh3d_upload(1, 0, 3, max_buffer_size),
+            Err(Mesh3dResourceError::CapacityTooLarge)
+        );
+
+        if usize::BITS > u32::BITS {
+            let first_draw_count_overflow = u32::MAX as usize + 1;
+            assert_eq!(
+                preflight_mesh3d_upload(1, first_draw_count_overflow, 0, u64::MAX),
+                Err(Mesh3dResourceError::CapacityTooLarge)
+            );
+            assert_eq!(
+                preflight_mesh3d_upload(1, 0, first_draw_count_overflow, u64::MAX),
+                Err(Mesh3dResourceError::CapacityTooLarge)
+            );
         }
     }
 }

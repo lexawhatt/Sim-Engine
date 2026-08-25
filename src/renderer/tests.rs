@@ -1,5 +1,6 @@
 use std::sync::mpsc;
 
+use super::config::recovery_quarantine_has_capacity;
 use super::*;
 use crate::LogicalScreenVector;
 
@@ -19,6 +20,10 @@ fn dynamic_mesh_vertices_require_complete_finite_triangles() {
     ));
     assert_eq!(
         DynamicVertex2d::new(Vec2::new(f32::NAN, 0.0), 0.0, Color::WHITE),
+        Err(DynamicMeshError::InvalidVertex)
+    );
+    assert_eq!(
+        DynamicVertex2d::new(Vec2::ZERO, 0.0, Color::rgb(1.01, 0.0, 0.0)),
         Err(DynamicMeshError::InvalidVertex)
     );
 
@@ -96,6 +101,14 @@ fn layered_visualization_options_reject_invalid_composition_contracts() {
             (0.0, 1.0),
             Color::rgba(f32::NAN, 0.0, 0.0, 1.0),
             Color::BLACK
+        ),
+        Err(LayeredVisualizationError::InvalidBackground)
+    );
+    assert_eq!(
+        LayeredVisualizationOptions::new(
+            (0.0, 1.0),
+            Color::BLACK,
+            Color::rgba(0.0, 0.0, 0.0, 1.01),
         ),
         Err(LayeredVisualizationError::InvalidBackground)
     );
@@ -649,6 +662,13 @@ fn offscreen_gpu_readback_verifies_camera_depth_and_clip_contract() {
                 adapter_info.vendor,
                 adapter_info.device,
             );
+            if std::env::var("SIM_ENGINE_REQUIRE_VULKAN").as_deref() == Ok("1") {
+                assert_eq!(
+                    adapter_info.backend,
+                    wgpu::Backend::Vulkan,
+                    "SIM_ENGINE_REQUIRE_VULKAN=1 requires a Vulkan adapter"
+                );
+            }
         }
         let Ok((device, queue)) = adapter
             .request_device(&wgpu::DeviceDescriptor {
@@ -1717,6 +1737,30 @@ fn renderer_options_reject_invalid_scale_factor() {
         WgpuRendererOptions::new(RendererPresentMode::Vsync, f32::MIN_POSITIVE as f64),
         Err(RendererConfigurationError::InvalidScaleFactor { .. })
     ));
+}
+
+#[test]
+fn renderer_options_bound_device_recovery_quarantine() {
+    let options = WgpuRendererOptions::new(RendererPresentMode::Vsync, 1.0).unwrap();
+    assert_eq!(options.max_quarantined_devices(), 4);
+    assert_eq!(
+        options
+            .with_max_quarantined_devices(2)
+            .unwrap()
+            .max_quarantined_devices(),
+        2
+    );
+    assert_eq!(
+        options.with_max_quarantined_devices(0),
+        Err(RendererConfigurationError::InvalidRecoveryLimit { limit: 0 })
+    );
+    assert_eq!(
+        options.with_max_quarantined_devices(9),
+        Err(RendererConfigurationError::InvalidRecoveryLimit { limit: 9 })
+    );
+    assert!(recovery_quarantine_has_capacity(3, 4));
+    assert!(!recovery_quarantine_has_capacity(4, 4));
+    assert!(!recovery_quarantine_has_capacity(usize::MAX, 4));
 }
 
 #[test]

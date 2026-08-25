@@ -677,6 +677,11 @@ pub enum RendererInitError {
     RequestDevice(wgpu::RequestDeviceError),
     /// The surface did not expose a usable default configuration.
     NoSurfaceConfig,
+    /// The bounded previous-device quarantine is full.
+    RecoveryLimitReached {
+        /// Configured maximum number of quarantined logical devices.
+        limit: usize,
+    },
 }
 
 impl fmt::Display for RendererInitError {
@@ -686,6 +691,10 @@ impl fmt::Display for RendererInitError {
             Self::RequestAdapter(error) => write!(formatter, "failed to request adapter: {error}"),
             Self::RequestDevice(error) => write!(formatter, "failed to request device: {error}"),
             Self::NoSurfaceConfig => write!(formatter, "surface has no supported default config"),
+            Self::RecoveryLimitReached { limit } => write!(
+                formatter,
+                "device recovery limit reached with {limit} quarantined devices"
+            ),
         }
     }
 }
@@ -700,6 +709,11 @@ pub enum RendererConfigurationError {
         /// Rejected physical pixels per logical screen pixel.
         scale_factor: f64,
     },
+    /// Previous-device quarantine must remain inside the supported bounded range.
+    InvalidRecoveryLimit {
+        /// Rejected maximum retained-device count.
+        limit: usize,
+    },
 }
 
 impl fmt::Display for RendererConfigurationError {
@@ -708,6 +722,10 @@ impl fmt::Display for RendererConfigurationError {
             Self::InvalidScaleFactor { scale_factor } => write!(
                 formatter,
                 "renderer scale factor must be finite, positive, representable as f32, and keep a u32 surface finite in logical pixels, got {scale_factor}"
+            ),
+            Self::InvalidRecoveryLimit { limit } => write!(
+                formatter,
+                "renderer recovery quarantine must retain between 1 and 8 devices, got {limit}"
             ),
         }
     }
@@ -811,7 +829,7 @@ pub struct DynamicVertex2d {
 impl DynamicVertex2d {
     /// Builds a finite dynamic vertex.
     pub fn new(world_position: Vec2, depth: f32, color: Color) -> Result<Self, DynamicMeshError> {
-        if !world_position.is_finite() || !depth.is_finite() || !color.is_finite() {
+        if !world_position.is_finite() || !depth.is_finite() || !color.is_normalized() {
             return Err(DynamicMeshError::InvalidVertex);
         }
         Ok(Self {
@@ -859,7 +877,10 @@ impl fmt::Display for DynamicMeshError {
                 formatter,
                 "dynamic mesh vertex count must be divisible by three"
             ),
-            Self::InvalidVertex => write!(formatter, "dynamic mesh vertices must be finite"),
+            Self::InvalidVertex => write!(
+                formatter,
+                "dynamic mesh positions/depth must be finite and colors normalized"
+            ),
             Self::UpdateRangeOutOfBounds => write!(
                 formatter,
                 "dynamic mesh update range is outside the current mesh"
@@ -1219,7 +1240,7 @@ impl ParticleFieldUpdateReport {
 pub enum ParticleFieldRenderError {
     /// The field belongs to another renderer and GPU device.
     RendererMismatch,
-    /// The clear color is non-finite.
+    /// The clear color is not normalized linear RGBA.
     InvalidBackground,
     /// Camera transformation would produce non-finite particle geometry.
     InvalidGeometryTransform,
@@ -1234,7 +1255,7 @@ impl fmt::Display for ParticleFieldRenderError {
                 write!(formatter, "particle field belongs to a different renderer")
             }
             Self::InvalidBackground => {
-                write!(formatter, "particle field background must be finite")
+                write!(formatter, "particle field background must be normalized")
             }
             Self::InvalidGeometryTransform => {
                 write!(formatter, "particle field geometry transform is invalid")
@@ -1366,7 +1387,7 @@ pub enum RenderTargetError {
     InvalidOpacity,
     /// A temporal source must not be one of its destination ping-pong targets.
     SourceAliasesDestination,
-    /// The destination clear color was non-finite.
+    /// The destination clear color was not normalized linear RGBA.
     InvalidBackground,
     /// Surface acquisition or presentation failed.
     Frame(RendererFrameError),
@@ -1392,7 +1413,9 @@ impl fmt::Display for RenderTargetError {
                     "trail source must be distinct from its destination targets"
                 )
             }
-            Self::InvalidBackground => write!(formatter, "render target background must be finite"),
+            Self::InvalidBackground => {
+                write!(formatter, "render target background must be normalized")
+            }
             Self::Frame(error) => write!(formatter, "render target frame failed: {error}"),
         }
     }
@@ -1456,7 +1479,7 @@ pub enum ScalarFieldRenderError {
         /// Upper bound supplied by the caller.
         maximum: f32,
     },
-    /// The clear color is non-finite.
+    /// The clear color is not normalized linear RGBA.
     InvalidBackground,
     /// Surface acquisition or presentation failed.
     Frame(RendererFrameError),
@@ -1472,7 +1495,9 @@ impl fmt::Display for ScalarFieldRenderError {
             Self::InvalidValueRange { minimum, maximum } => {
                 write!(formatter, "invalid scalar value range {minimum}..{maximum}")
             }
-            Self::InvalidBackground => write!(formatter, "scalar field background must be finite"),
+            Self::InvalidBackground => {
+                write!(formatter, "scalar field background must be normalized")
+            }
             Self::Frame(error) => write!(formatter, "scalar field frame failed: {error}"),
         }
     }
@@ -1504,7 +1529,7 @@ impl ScalarFieldUploadReport {
 pub enum DynamicMeshRenderError {
     /// The mesh belongs to another renderer and GPU device.
     RendererMismatch,
-    /// The clear color is non-finite.
+    /// The clear color is not normalized linear RGBA.
     InvalidBackground,
     /// Frame rendering failed after dynamic-mesh ownership validation.
     Frame(RendererFrameError),
@@ -1516,7 +1541,9 @@ impl fmt::Display for DynamicMeshRenderError {
             Self::RendererMismatch => {
                 write!(formatter, "dynamic mesh belongs to a different renderer")
             }
-            Self::InvalidBackground => write!(formatter, "dynamic mesh background must be finite"),
+            Self::InvalidBackground => {
+                write!(formatter, "dynamic mesh background must be normalized")
+            }
             Self::Frame(error) => write!(formatter, "dynamic mesh frame failed: {error}"),
         }
     }
@@ -1589,6 +1616,7 @@ pub struct WgpuRenderer {
     vertices: Vec<Vertex>,
     draw_batches: Vec<PreparedDrawBatch>,
     retired_devices: Vec<RetiredDevice>,
+    max_quarantined_devices: usize,
 }
 
 struct RetiredDevice {
@@ -1720,6 +1748,7 @@ impl WgpuRenderer {
             vertices: Vec::with_capacity(INITIAL_VERTEX_CAPACITY),
             draw_batches: Vec::new(),
             retired_devices: Vec::new(),
+            max_quarantined_devices: options.max_quarantined_devices(),
         })
     }
 
@@ -1774,6 +1803,22 @@ impl WgpuRenderer {
     /// desktop compositor may still pace host redraw callbacks independently.
     pub fn surface_present_mode(&self) -> RendererSurfacePresentMode {
         self.surface_present_mode
+    }
+
+    /// Returns previous logical devices retained for safe native-driver teardown.
+    pub fn quarantined_device_count(&self) -> usize {
+        self.retired_devices.len()
+    }
+
+    /// Returns the configured maximum previous-device quarantine size.
+    pub fn max_quarantined_device_count(&self) -> usize {
+        self.max_quarantined_devices
+    }
+
+    /// Returns successful recoveries available before the bounded quarantine is full.
+    pub fn remaining_device_recoveries(&self) -> usize {
+        self.max_quarantined_devices
+            .saturating_sub(self.retired_devices.len())
     }
 
     /// Blocks until all previously submitted GPU work has completed.
@@ -2065,7 +2110,7 @@ impl WgpuRenderer {
         })
     }
 
-    /// Draws dynamic triangle-list geometry with a finite clear color.
+    /// Draws dynamic triangle-list geometry with a normalized clear color.
     pub fn render_dynamic_mesh(
         &mut self,
         mesh: &DynamicMesh2d,
@@ -2085,7 +2130,7 @@ impl WgpuRenderer {
     ) -> Result<RenderReport, DynamicMeshRenderError> {
         self.validate_dynamic_mesh(mesh)
             .map_err(|_| DynamicMeshRenderError::RendererMismatch)?;
-        if !background.is_finite() {
+        if !background.is_normalized() {
             return Err(DynamicMeshRenderError::InvalidBackground);
         }
         let draw_batches = (!mesh.vertices.is_empty()).then_some(PreparedDrawBatch {
@@ -2391,7 +2436,7 @@ impl WgpuRenderer {
         color: Color,
     ) -> Result<RenderReport, RenderTargetError> {
         self.validate_trail_buffer(trails)?;
-        if !color.is_finite() {
+        if !color.is_normalized() {
             return Err(RenderTargetError::InvalidBackground);
         }
         Ok(self.draw_clear_trail_buffer(trails, color, Instant::now()))
@@ -2503,7 +2548,7 @@ impl WgpuRenderer {
             .map_err(|_| ScalarFieldRenderError::RendererMismatch)?;
         let value_extent = scalar_value_range_extent(minimum, maximum)
             .ok_or(ScalarFieldRenderError::InvalidValueRange { minimum, maximum })?;
-        if !background.is_finite() {
+        if !background.is_normalized() {
             return Err(ScalarFieldRenderError::InvalidBackground);
         }
         self.draw_scalar_field_texture(
@@ -2531,7 +2576,7 @@ impl WgpuRenderer {
             .map_err(|_| ScalarFieldRenderError::RendererMismatch)?;
         let value_extent = scalar_value_range_extent(minimum, maximum)
             .ok_or(ScalarFieldRenderError::InvalidValueRange { minimum, maximum })?;
-        if !background.is_finite() {
+        if !background.is_normalized() {
             return Err(ScalarFieldRenderError::InvalidBackground);
         }
         self.draw_scalar_field_texture(
@@ -2582,7 +2627,7 @@ impl WgpuRenderer {
             .map_err(|_| ScalarFieldRenderError::RendererMismatch)?;
         let value_extent = scalar_value_range_extent(minimum, maximum)
             .ok_or(ScalarFieldRenderError::InvalidValueRange { minimum, maximum })?;
-        if !background.is_finite() {
+        if !background.is_normalized() {
             return Err(ScalarFieldRenderError::InvalidBackground);
         }
         Ok(self.draw_scalar_field_texture_to_target(
@@ -2609,14 +2654,14 @@ impl WgpuRenderer {
         if !opacity.is_finite() || !(0.0..=1.0).contains(&opacity) {
             return Err(RenderTargetError::InvalidOpacity);
         }
-        if !background.is_finite() {
+        if !background.is_normalized() {
             return Err(RenderTargetError::InvalidBackground);
         }
         self.draw_composed_render_target(target, blend_mode, opacity, background, Instant::now())
             .map_err(RenderTargetError::Frame)
     }
 
-    /// Draws a particle field with a finite clear color.
+    /// Draws a particle field with a normalized clear color.
     pub fn render_particle_field(
         &mut self,
         field: &mut ParticleField2d,
@@ -2636,7 +2681,7 @@ impl WgpuRenderer {
     ) -> Result<RenderReport, ParticleFieldRenderError> {
         self.validate_particle_field(field)
             .map_err(|_| ParticleFieldRenderError::RendererMismatch)?;
-        if !background.is_finite() {
+        if !background.is_normalized() {
             return Err(ParticleFieldRenderError::InvalidBackground);
         }
         self.draw_particle_field(background, field, *camera, Instant::now())
@@ -2665,7 +2710,7 @@ impl WgpuRenderer {
             .map_err(|_| ParticleFieldRenderError::RendererMismatch)?;
         self.validate_particle_field(field)
             .map_err(|_| ParticleFieldRenderError::RendererMismatch)?;
-        if matches!(load, RenderTargetLoad::Clear(color) if !color.is_finite()) {
+        if matches!(load, RenderTargetLoad::Clear(color) if !color.is_normalized()) {
             return Err(ParticleFieldRenderError::InvalidBackground);
         }
         self.draw_particle_field_to_target(target, field, *camera, load, Instant::now())
@@ -3853,7 +3898,9 @@ fn validate_dynamic_vertices(vertices: &[DynamicVertex2d]) -> Result<(), Dynamic
     // invariant of DynamicVertex2d. Keep the assertion in development without
     // rescanning an already-validated high-volume stream in release builds.
     debug_assert!(vertices.iter().all(|vertex| {
-        vertex.world_position.is_finite() && vertex.depth.is_finite() && vertex.color.is_finite()
+        vertex.world_position.is_finite()
+            && vertex.depth.is_finite()
+            && vertex.color.is_normalized()
     }));
     Ok(())
 }
@@ -3884,7 +3931,7 @@ fn particle_instances_to_gpu(
             if !world_position.is_finite()
                 || !radius.is_finite()
                 || radius <= 0.0
-                || !color.is_finite()
+                || !color.is_normalized()
                 || !depth.is_finite()
             {
                 return Err(ParticleFieldError::InvalidInstance);

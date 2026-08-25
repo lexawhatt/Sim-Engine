@@ -130,7 +130,9 @@ discarding invalid optional decoration is intentional.
 Styles include solid, linear-gradient, and radial-gradient fills; strokes; and
 logical-screen shadows. Colors are straight linear RGBA internally.
 `Color::rgb8` and `Color::rgba8` convert familiar sRGB bytes to linear light.
-`Color::rgb` and `Color::rgba` accept values already in linear space.
+`Color::rgb` and `Color::rgba` accept values already in linear space. Render
+boundaries require every channel in `0.0..=1.0`; animation may overshoot, but
+the host must call `Color::clamp` explicitly before inserting that value.
 
 ### 5. Ordering, clipping, and pseudo-depth
 
@@ -364,6 +366,10 @@ rendering leaves capacity for the simulation itself.
 match the value count. Full replacement and rectangular region updates are
 validated atomically.
 
+`ScalarField::filled` performs a fallible reservation under a 256 MiB default
+value-buffer budget. Use `filled_with_byte_limit` for a different explicit host
+budget, or `ScalarField::new` when the host already owns the allocated values.
+
 ```rust,ignore
 let field = ScalarField::filled(160, 96, 0.0)?;
 let mut texture = renderer.create_scalar_field_texture(field)?;
@@ -463,23 +469,25 @@ renderer.compose_render_target(
 
 Triangle indices define optional surfaces. Explicit `MeshEdge3d` values define
 only mathematical display edges, so triangulation diagonals need not appear.
-Edge-only meshes are valid. `Object3dId` is a stable opaque scene handle, and
-`Scene3d::set_visible` hides an object without releasing its retained topology.
+Edge-only meshes are valid. `Object3dId` is a stable opaque handle carrying
+private scene provenance. A handle from another `Scene3d` returns
+`ObjectNotFound` even when both objects have the same local numeric value.
+`Scene3d::set_visible` hides an object without releasing retained topology.
 
-Opaque surfaces write `Depth32Float`. Hidden edge fragments are classified
-behind rendered surfaces and receive a logical-pixel dash pattern; visible
-fragments are rendered solid afterward. Host insertion order does not decide
-3D visibility.
+Opaque surfaces write `Depth32Float`. Edge classification is conservative:
+fragments occluded beyond a two-implementation-depth-unit tolerance receive a
+logical-pixel dash pattern, while coplanar and sub-depth-resolution separations
+resolve visible and solid. Host insertion order does not decide 3D visibility.
 
 Every `RenderTarget3d` declares both physical texture dimensions and the
 logical viewport represented by those texels. Their aspect ratios must match,
 and the camera projection aspect must match the target logical aspect. This
 keeps edge width stable for native, downsampled, and supersampled targets.
 
-Wireframe endpoints reaching or crossing the camera/near plane are rejected
-before shader perspective division. The hidden and visible edge passes use a
-documented two-depth-unit coplanar tolerance so a mesh's own surface edge
-resolves as visible instead of flickering between classifications.
+Display-edge segments are homogeneously clipped against all six frustum planes
+before shader perspective division and screen-space expansion. A partially
+visible edge is shortened; a fully clipped edge emits no fragments without
+rejecting the rest of the frame.
 
 Current 3D scope is deliberately focused: opaque surfaces, retained transforms,
 hardware depth, solid visible edges, and dashed hidden edges. Translucent or
@@ -505,7 +513,11 @@ resources from the previous identity are rejected until restored.
 
 CPU-retained resources can recreate their exact content. GPU-only targets and
 history cannot reconstruct prior pixels. Recovery is exceptional; it is not a
-normal quality or adapter switch.
+normal quality or adapter switch. Previous logical devices enter a bounded
+quarantine because immediate teardown crashes some native Linux drivers. The
+default limit is four and can be configured from one through eight. Once full,
+recovery returns `RecoveryLimitReached` before creating another device; inspect
+`quarantined_device_count` and `remaining_device_recoveries` in diagnostics.
 
 ### 16. Performance guidance
 
@@ -627,6 +639,7 @@ vector operations use wider intermediates before checked `f32` output.
 
 - Public `Color` is straight linear RGBA.
 - Byte constructors decode sRGB to linear light.
+- Render-bound colors require every channel in `0.0..=1.0`.
 - Scene vertices remain linear through tessellation.
 - Surface formats apply their configured output conversion.
 - Offscreen target storage is premultiplied alpha.
@@ -667,11 +680,11 @@ target, and cached lookup resources.
 Renderer-owned external resources store the identity of the logical device
 that created them. Every operation checks that identity before touching GPU
 handles. Cross-renderer use therefore becomes a structured error before wgpu
-validation.
+validation. `Object3dId` similarly carries private scene provenance.
 
-Capacity-bearing APIs validate integer arithmetic and active device buffer or
-texture limits before allocation. Mutating fallible methods validate first and
-replace retained state only after all checks pass.
+Capacity-bearing APIs validate integer arithmetic, host byte budgets, and active
+device buffer or texture limits before allocation. Mutating fallible methods
+validate first and replace retained state only after all checks pass.
 
 ### 24. GPU path internals
 
@@ -710,11 +723,18 @@ finite value range through a cached lookup texture.
 #### Retained 3D
 
 Immutable vertex/index/edge topology is mirrored into GPU buffers and retained
-on the CPU for recovery. Scene objects store stable IDs and independent model
-transforms. Opaque surfaces populate color and depth, hidden edges render
-behind the depth surface with dashes, and visible edges render last as solid
-lines. Edge expansion uses the target's logical-to-physical ratio rather than
-the window DPI.
+on the CPU for recovery. Scene objects store scene-provenance IDs and
+independent model transforms. Opaque surfaces populate color and depth. Display
+edges are homogeneously clipped, conservatively classified against depth,
+rendered dashed when hidden beyond the coplanar tolerance, and rendered solid
+when visible. Edge expansion uses the target's logical-to-physical ratio rather
+than the window DPI.
+
+Mesh upload preflights vertex, index, and edge counts, checked byte sizes,
+draw-count representation, and the active device's `max_buffer_size` before
+allocating conversion staging memory. Staging vectors use fallible reservation
+and report `HostAllocationFailed`. GPU buffer creation still follows wgpu's
+device-error model and is not presented as a catchable system-OOM boundary.
 
 ### 25. Validation philosophy
 
@@ -724,6 +744,8 @@ The nearest public boundary rejects:
 - prohibited zero or negative dimensions, radii, zoom, and scale;
 - derived overflow from otherwise finite inputs;
 - invalid gradient or value-range arithmetic;
+- non-normalized render-bound colors;
+- filled scalar allocations beyond the active host byte budget;
 - allocation beyond active device limits;
 - resource/renderer identity mismatch;
 - update regions outside retained state;
@@ -791,8 +813,8 @@ The complete local Linux release gate is:
 
 It checks formatting, Rust 1.90 compatibility, all targets with and without
 default features, strict clippy, doctests, warning-free rustdoc, a mandatory
-semantic GPU readback fixture, `git diff --check`, and the offline package
-boundary.
+Vulkan semantic GPU readback fixture with backend assertion, `git diff --check`,
+and the offline package boundary.
 
 The gate must run from a clean worktree. Hardware performance or recovery
 claims must additionally name the Linux adapter, backend, driver, workload,

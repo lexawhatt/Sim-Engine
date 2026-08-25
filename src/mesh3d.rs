@@ -17,7 +17,7 @@ pub struct SurfaceStyle3d {
 impl SurfaceStyle3d {
     /// Creates an opaque linear-RGBA surface.
     pub fn opaque(color: Color) -> Result<Self, Mesh3dStyleError> {
-        if !color.is_finite() || color.alpha() != 1.0 {
+        if !color.is_normalized() || color.alpha() != 1.0 {
             return Err(Mesh3dStyleError::InvalidSurfaceColor);
         }
         Ok(Self { color })
@@ -76,9 +76,13 @@ impl MeshStyle3d {
 
 /// Logical-screen presentation for explicit mathematical mesh edges.
 ///
-/// Visible fragments are solid. Hidden fragments may be disabled or drawn with
-/// a logical-pixel dash/gap pattern after depth classification against opaque
-/// surfaces.
+/// Visible fragments are solid. Fragments occluded beyond the depth buffer's
+/// conservative coplanar tolerance may be drawn with a logical-pixel dash/gap
+/// pattern. Classification uses one implementation depth unit away from the
+/// camera for hidden fragments and one unit toward it for visible fragments,
+/// with visible fragments rendered last. Therefore coplanar and
+/// sub-depth-resolution separations intentionally resolve as visible; this is
+/// raster visibility, not exact analytic solid geometry.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct WireframeStyle3d {
     visible_color: Color,
@@ -105,7 +109,10 @@ impl WireframeStyle3d {
         })
     }
 
-    /// Enables dashed hidden fragments in logical screen pixels.
+    /// Enables dashed depth-occluded fragments in logical screen pixels.
+    ///
+    /// Occlusion must exceed the conservative two-unit coplanar tolerance
+    /// documented on [`WireframeStyle3d`] before a fragment resolves hidden.
     pub fn with_hidden(
         mut self,
         color: Color,
@@ -176,9 +183,9 @@ impl WireframeStyle3d {
 /// Rejection reason for logical-screen 3D edge presentation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mesh3dStyleError {
-    /// Surface color must be finite and opaque in the initial material mode.
+    /// Surface color must be normalized and opaque in the initial material mode.
     InvalidSurfaceColor,
-    /// Edge color must be finite and opaque, and width must be finite and positive.
+    /// Edge color must be normalized and opaque, and width must be finite and positive.
     InvalidColorOrWidth,
     /// Hidden dash and gap lengths must both be finite and positive.
     InvalidDashPattern,
@@ -201,7 +208,7 @@ impl fmt::Display for Mesh3dStyleError {
 impl Error for Mesh3dStyleError {}
 
 fn validate_edge_color_width(color: Color, width: f32) -> Result<(), Mesh3dStyleError> {
-    if color.is_finite()
+    if color.is_normalized()
         && color.alpha() == 1.0
         && width.is_finite()
         && width > 0.0
@@ -227,7 +234,7 @@ impl MeshEdge3d {
     /// Describes an edge between two distinct vertex indices.
     pub fn new(start: u32, end: u32) -> Result<Self, Mesh3dError> {
         if start == end {
-            return Err(Mesh3dError::DegenerateDisplayEdge { vertex: start });
+            return Err(Mesh3dError::DegenerateDisplayEdge { start, end });
         }
         Ok(Self { start, end })
     }
@@ -281,7 +288,8 @@ impl Mesh3d {
     /// Construction rejects an empty vertex set, geometry with neither
     /// triangles nor display edges, incomplete triangle lists, out-of-range
     /// indices, repeated/collinear triangle vertices, duplicate display edges,
-    /// and display edges outside the vertex array.
+    /// display edges with coincident endpoints, and display edges outside the
+    /// vertex array.
     pub fn with_display_edges(
         vertices: Vec<Vec3>,
         triangle_indices: Vec<u32>,
@@ -321,6 +329,12 @@ impl Mesh3d {
         for edge in &display_edges {
             validate_index(edge.start, vertices.len())?;
             validate_index(edge.end, vertices.len())?;
+            if vertices[edge.start as usize] == vertices[edge.end as usize] {
+                return Err(Mesh3dError::DegenerateDisplayEdge {
+                    start: edge.start,
+                    end: edge.end,
+                });
+            }
             if !unique_edges.insert(edge.canonical()) {
                 return Err(Mesh3dError::DuplicateDisplayEdge {
                     start: edge.start,
@@ -411,10 +425,12 @@ pub enum Mesh3dError {
         /// Zero-based triangle number in the index list.
         triangle: usize,
     },
-    /// A display edge used the same endpoint twice.
+    /// A display edge used one index twice or referenced coincident vertices.
     DegenerateDisplayEdge {
-        /// Repeated vertex index.
-        vertex: u32,
+        /// First endpoint in the rejected declaration.
+        start: u32,
+        /// Second endpoint in the rejected declaration.
+        end: u32,
     },
     /// The same undirected display edge appeared more than once.
     DuplicateDisplayEdge {
@@ -446,8 +462,8 @@ impl fmt::Display for Mesh3dError {
             Self::DegenerateTriangle { triangle } => {
                 write!(formatter, "3D mesh triangle {triangle} has zero area")
             }
-            Self::DegenerateDisplayEdge { vertex } => {
-                write!(formatter, "3D display edge repeats vertex {vertex}")
+            Self::DegenerateDisplayEdge { start, end } => {
+                write!(formatter, "3D display edge {start}-{end} has zero length")
             }
             Self::DuplicateDisplayEdge { start, end } => {
                 write!(formatter, "3D display edge {start}-{end} is duplicated")
@@ -584,7 +600,19 @@ mod tests {
         );
         assert_eq!(
             MeshEdge3d::new(2, 2),
-            Err(Mesh3dError::DegenerateDisplayEdge { vertex: 2 })
+            Err(Mesh3dError::DegenerateDisplayEdge { start: 2, end: 2 })
+        );
+    }
+
+    #[test]
+    fn mesh_rejects_geometrically_zero_length_display_edges() {
+        assert_eq!(
+            Mesh3d::with_display_edges(
+                vec![vector(1.0, 2.0, 3.0), vector(1.0, 2.0, 3.0)],
+                Vec::new(),
+                vec![MeshEdge3d::new(0, 1).unwrap()],
+            ),
+            Err(Mesh3dError::DegenerateDisplayEdge { start: 0, end: 1 })
         );
     }
 
@@ -621,6 +649,10 @@ mod tests {
             Err(Mesh3dStyleError::InvalidColorOrWidth)
         );
         assert_eq!(
+            WireframeStyle3d::visible(Color::rgb(-0.01, 0.0, 0.0), 1.0),
+            Err(Mesh3dStyleError::InvalidColorOrWidth)
+        );
+        assert_eq!(
             WireframeStyle3d::visible(Color::WHITE, 1.0)
                 .unwrap()
                 .with_hidden(Color::WHITE, 1.0, 0.0, 2.0),
@@ -643,6 +675,10 @@ mod tests {
         assert_eq!(style.wireframe_style(), Some(wireframe));
         assert_eq!(
             SurfaceStyle3d::opaque(Color::rgba(1.0, 1.0, 1.0, 0.5)),
+            Err(Mesh3dStyleError::InvalidSurfaceColor)
+        );
+        assert_eq!(
+            SurfaceStyle3d::opaque(Color::rgb(1.01, 0.0, 0.0)),
             Err(Mesh3dStyleError::InvalidSurfaceColor)
         );
         assert_eq!(MeshStyle3d::wireframe(wireframe).surface_style(), None);

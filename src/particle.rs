@@ -25,12 +25,11 @@ impl ParticleInstance2d {
         color: Color,
         depth: f32,
     ) -> Result<Self, ParticleInstanceError> {
-        if !world_position.is_finite()
-            || !radius.is_finite()
-            || !color.is_finite()
-            || !depth.is_finite()
-        {
+        if !world_position.is_finite() || !radius.is_finite() || !depth.is_finite() {
             return Err(ParticleInstanceError::NonFinite);
+        }
+        if !color.is_normalized() {
+            return Err(ParticleInstanceError::InvalidColor);
         }
         if radius <= 0.0 {
             return Err(ParticleInstanceError::InvalidRadius);
@@ -71,6 +70,8 @@ pub enum ParticleInstanceError {
     NonFinite,
     /// Radius must be strictly positive in logical screen pixels.
     InvalidRadius,
+    /// Color must be normalized linear RGBA.
+    InvalidColor,
 }
 
 impl fmt::Display for ParticleInstanceError {
@@ -78,6 +79,9 @@ impl fmt::Display for ParticleInstanceError {
         match self {
             Self::NonFinite => write!(formatter, "particle instance values must be finite"),
             Self::InvalidRadius => write!(formatter, "particle radius must be finite and positive"),
+            Self::InvalidColor => {
+                write!(formatter, "particle color must be normalized linear RGBA")
+            }
         }
     }
 }
@@ -104,6 +108,14 @@ mod tests {
         assert_eq!(
             ParticleInstance2d::new(Vec2::ZERO, 1.0, Color::WHITE, f32::NAN),
             Err(ParticleInstanceError::NonFinite)
+        );
+        assert_eq!(
+            ParticleInstance2d::new(Vec2::ZERO, 1.0, Color::rgb(1.01, 0.0, 0.0), 0.0),
+            Err(ParticleInstanceError::InvalidColor)
+        );
+        assert_eq!(
+            ParticleInstance2d::new(Vec2::ZERO, 1.0, Color::rgba(0.0, 0.0, 0.0, -0.01), 0.0,),
+            Err(ParticleInstanceError::InvalidColor)
         );
     }
 }

@@ -120,7 +120,7 @@ impl LayeredVisualizationOptions {
     ) -> Result<Self, LayeredVisualizationError> {
         let value_extent = scalar_value_range_extent(minimum, maximum)
             .ok_or(LayeredVisualizationError::InvalidValueRange { minimum, maximum })?;
-        if !target_background.is_finite() || !surface_background.is_finite() {
+        if !target_background.is_normalized() || !surface_background.is_normalized() {
             return Err(LayeredVisualizationError::InvalidBackground);
         }
         Ok(Self {
@@ -206,7 +206,12 @@ impl fmt::Display for LayeredVisualizationError {
             Self::InvalidValueRange { minimum, maximum } => {
                 write!(formatter, "invalid scalar value range {minimum}..{maximum}")
             }
-            Self::InvalidBackground => write!(formatter, "visualization colors must be finite"),
+            Self::InvalidBackground => {
+                write!(
+                    formatter,
+                    "visualization colors must be normalized linear RGBA"
+                )
+            }
             Self::InvalidOpacity => write!(formatter, "visualization opacity must be in 0..=1"),
             Self::InvalidGeometryTransform => {
                 write!(formatter, "particle camera transform is invalid")

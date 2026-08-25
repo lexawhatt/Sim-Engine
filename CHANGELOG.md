@@ -6,7 +6,38 @@ public API reaches 1.0.
 
 ## Unreleased
 
-No changes yet.
+### Added
+
+- Scene provenance in `Object3dId`, preventing a handle from one `Scene3d`
+  from mutating an object with the same local number in another scene.
+- Bounded device-recovery quarantine configuration and telemetry through
+  `WgpuRendererOptions::with_max_quarantined_devices`,
+  `quarantined_device_count`, and `remaining_device_recoveries`.
+- Fallible, byte-budgeted `ScalarField::filled` allocation with an explicit
+  `filled_with_byte_limit` override.
+
+### Changed
+
+- Render-bound colors must be normalized linear RGBA. Finite overshoot remains
+  available for interpolation but must be explicitly clamped before insertion.
+- Hidden-line classification is explicitly conservative within two
+  implementation depth units; coplanar and sub-resolution separation resolves
+  visible.
+- CI actions and Rust toolchains are pinned, and CI now verifies doctests,
+  warning-free rustdoc, the package boundary, and the package archive.
+
+### Fixed
+
+- Homogeneously clip 3D display edges against the complete frustum before
+  perspective division, instead of rejecting the whole frame when an edge
+  crosses the camera or near plane.
+- Reject display edges whose distinct indices reference coincident model-space
+  vertices instead of accepting a zero-length mathematical edge.
+- Preflight retained 3D vertex, index, and edge buffer sizes and draw-count
+  representation before fallible host staging allocation.
+- Require and assert Vulkan in the strict Linux semantic GPU gate.
+- Prevent unbounded accumulation of previous logical GPU devices after repeated
+  recovery.
 
 ## 0.1.0 - 2026-08-24
 

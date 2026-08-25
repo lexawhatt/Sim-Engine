@@ -89,14 +89,70 @@ fn project_edge_point(model_position: vec3<f32>) -> vec4<f32> {
     );
 }
 
+struct ClippedEdge {
+    start_clip: vec4<f32>,
+    end_clip: vec4<f32>,
+    visible: bool,
+};
+
+fn clip_edge_to_frustum(start_clip: vec4<f32>, end_clip: vec4<f32>) -> ClippedEdge {
+    let start_distances = array<f32, 6>(
+        start_clip.w + start_clip.x,
+        start_clip.w - start_clip.x,
+        start_clip.w + start_clip.y,
+        start_clip.w - start_clip.y,
+        start_clip.z,
+        start_clip.w - start_clip.z,
+    );
+    let end_distances = array<f32, 6>(
+        end_clip.w + end_clip.x,
+        end_clip.w - end_clip.x,
+        end_clip.w + end_clip.y,
+        end_clip.w - end_clip.y,
+        end_clip.z,
+        end_clip.w - end_clip.z,
+    );
+    var enter = 0.0;
+    var exit = 1.0;
+    var visible = true;
+    for (var plane = 0u; plane < 6u; plane += 1u) {
+        let start_distance = start_distances[plane];
+        let end_distance = end_distances[plane];
+        if start_distance < 0.0 && end_distance < 0.0 {
+            visible = false;
+        } else if start_distance < 0.0 {
+            enter = max(enter, start_distance / (start_distance - end_distance));
+        } else if end_distance < 0.0 {
+            exit = min(exit, start_distance / (start_distance - end_distance));
+        }
+    }
+    visible = visible && enter <= exit;
+    if !visible {
+        let fallback = vec4<f32>(0.0, 0.0, 0.0, 1.0);
+        return ClippedEdge(fallback, fallback, false);
+    }
+    let delta = end_clip - start_clip;
+    let clipped_start = start_clip + delta * enter;
+    let clipped_end = start_clip + delta * exit;
+    if clipped_start.w <= 0.0 || clipped_end.w <= 0.0 {
+        let fallback = vec4<f32>(0.0, 0.0, 0.0, 1.0);
+        return ClippedEdge(fallback, fallback, false);
+    }
+    return ClippedEdge(clipped_start, clipped_end, true);
+}
+
 fn edge_vertex(
     input: Mesh3dEdgeIn,
     vertex_index: u32,
     logical_width: f32,
     color: vec4<f32>,
 ) -> Mesh3dEdgeOut {
-    let start_clip = project_edge_point(input.model_start);
-    let end_clip = project_edge_point(input.model_end);
+    let clipped = clip_edge_to_frustum(
+        project_edge_point(input.model_start),
+        project_edge_point(input.model_end),
+    );
+    let start_clip = clipped.start_clip;
+    let end_clip = clipped.end_clip;
     let start_ndc = start_clip.xy / start_clip.w;
     let end_ndc = end_clip.xy / end_clip.w;
     let dimensions = max(camera3d.viewport.xy, vec2<f32>(1.0, 1.0));
@@ -130,7 +186,7 @@ fn edge_vertex(
     clip.y += ndc_offset.y * clip.w;
     var output: Mesh3dEdgeOut;
     output.position = clip;
-    output.color = color;
+    output.color = vec4<f32>(color.rgb, select(0.0, color.a, clipped.visible));
     output.logical_distance = select(0.0, screen_length / camera3d.viewport.z, use_end);
     output.dash_gap = edge_object.edge_style.zw;
     output.normal_distance = side_pattern[vertex_index] * raster_half_width;

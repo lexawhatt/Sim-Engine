@@ -11,6 +11,13 @@ pub struct ScalarField {
 }
 
 impl ScalarField {
+    /// Default maximum allocation performed by [`ScalarField::filled`].
+    ///
+    /// Hosts needing a different explicit budget can use
+    /// [`ScalarField::filled_with_byte_limit`] or pass an already allocated
+    /// buffer to [`ScalarField::new`].
+    pub const DEFAULT_MAX_FILLED_BYTES: usize = 256 * 1024 * 1024;
+
     /// Creates a field from row-major values, validating dimensions and finiteness.
     pub fn new(width: usize, height: usize, values: Vec<f32>) -> Result<Self, ScalarFieldError> {
         let expected_len = checked_len(width, height)?;
@@ -31,15 +38,47 @@ impl ScalarField {
     }
 
     /// Creates a finite field filled with one finite scalar value.
+    ///
+    /// Allocation is limited to [`ScalarField::DEFAULT_MAX_FILLED_BYTES`] and
+    /// uses fallible reservation before initialization.
     pub fn filled(width: usize, height: usize, value: f32) -> Result<Self, ScalarFieldError> {
+        Self::filled_with_byte_limit(width, height, value, Self::DEFAULT_MAX_FILLED_BYTES)
+    }
+
+    /// Creates a filled field under an explicit host-memory byte limit.
+    ///
+    /// `maximum_bytes` applies to the row-major `f32` value buffer. Reservation
+    /// failure is returned without partially constructing the field. Supplying
+    /// a larger limit is an explicit host decision; system overcommit can still
+    /// make physical memory exhaustion unrecoverable on some platforms.
+    pub fn filled_with_byte_limit(
+        width: usize,
+        height: usize,
+        value: f32,
+        maximum_bytes: usize,
+    ) -> Result<Self, ScalarFieldError> {
         let len = checked_len(width, height)?;
         if !value.is_finite() {
             return Err(ScalarFieldError::NonFiniteValue);
         }
+        let requested_bytes = len
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or(ScalarFieldError::DimensionsOverflow)?;
+        if requested_bytes > maximum_bytes {
+            return Err(ScalarFieldError::AllocationLimitExceeded {
+                requested_bytes,
+                maximum_bytes,
+            });
+        }
+        let mut values = Vec::new();
+        values
+            .try_reserve_exact(len)
+            .map_err(|_| ScalarFieldError::AllocationFailed { requested_bytes })?;
+        values.resize(len, value);
         Ok(Self {
             width,
             height,
-            values: vec![value; len],
+            values,
         })
     }
 
@@ -168,6 +207,18 @@ pub enum ScalarFieldError {
     },
     /// A scalar value was NaN or infinite.
     NonFiniteValue,
+    /// A filled field exceeds the explicit host-memory budget.
+    AllocationLimitExceeded {
+        /// Bytes required by the row-major `f32` values.
+        requested_bytes: usize,
+        /// Maximum bytes authorized by the caller or default policy.
+        maximum_bytes: usize,
+    },
+    /// The allocator rejected a value-buffer reservation within the byte limit.
+    AllocationFailed {
+        /// Bytes requested from the allocator.
+        requested_bytes: usize,
+    },
     /// A requested cell lies outside the field dimensions.
     OutOfBounds {
         /// Horizontal cell index.
@@ -189,6 +240,17 @@ impl fmt::Display for ScalarFieldError {
                 )
             }
             Self::NonFiniteValue => write!(formatter, "scalar field values must be finite"),
+            Self::AllocationLimitExceeded {
+                requested_bytes,
+                maximum_bytes,
+            } => write!(
+                formatter,
+                "scalar field needs {requested_bytes} bytes, exceeding the {maximum_bytes}-byte allocation limit"
+            ),
+            Self::AllocationFailed { requested_bytes } => write!(
+                formatter,
+                "scalar field could not reserve {requested_bytes} bytes"
+            ),
             Self::OutOfBounds { x, y } => {
                 write!(formatter, "scalar field cell ({x}, {y}) is out of bounds")
             }
@@ -351,6 +413,39 @@ mod tests {
         assert_eq!(
             ScalarField::filled(1, 1, f32::NAN),
             Err(ScalarFieldError::NonFiniteValue)
+        );
+        assert_eq!(
+            ScalarField::filled(usize::MAX, 1, 0.0),
+            Err(ScalarFieldError::DimensionsOverflow)
+        );
+        let first_over_default_limit =
+            ScalarField::DEFAULT_MAX_FILLED_BYTES / std::mem::size_of::<f32>() + 1;
+        assert_eq!(
+            ScalarField::filled(first_over_default_limit, 1, 0.0),
+            Err(ScalarFieldError::AllocationLimitExceeded {
+                requested_bytes: first_over_default_limit * std::mem::size_of::<f32>(),
+                maximum_bytes: ScalarField::DEFAULT_MAX_FILLED_BYTES,
+            })
+        );
+        assert_eq!(
+            ScalarField::filled_with_byte_limit(2, 2, 0.0, 15),
+            Err(ScalarFieldError::AllocationLimitExceeded {
+                requested_bytes: 16,
+                maximum_bytes: 15,
+            })
+        );
+        assert_eq!(
+            ScalarField::filled_with_byte_limit(2, 2, 3.0, 16)
+                .unwrap()
+                .values(),
+            &[3.0; 4]
+        );
+        let first_vector_capacity_overflow = isize::MAX as usize / std::mem::size_of::<f32>() + 1;
+        assert_eq!(
+            ScalarField::filled_with_byte_limit(first_vector_capacity_overflow, 1, 0.0, usize::MAX,),
+            Err(ScalarFieldError::AllocationFailed {
+                requested_bytes: first_vector_capacity_overflow * std::mem::size_of::<f32>(),
+            })
         );
         field.replace_region(0, 1, 2, 1, &[7.0, 8.0]).unwrap();
         assert_eq!(field.values(), &[1.0, 6.0, 7.0, 8.0]);

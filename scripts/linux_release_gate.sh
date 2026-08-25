@@ -28,8 +28,11 @@ echo "[7/10] public documentation"
 cargo test --doc --all-features
 RUSTDOCFLAGS="-D warnings" cargo doc --all-features --no-deps
 
-echo "[8/10] strict Linux GPU semantics"
-SIM_ENGINE_REQUIRE_GPU_TESTS=1 cargo test --all-features \
+echo "[8/10] strict Linux Vulkan semantics"
+WGPU_BACKEND=vulkan \
+SIM_ENGINE_REQUIRE_GPU_TESTS=1 \
+SIM_ENGINE_REQUIRE_VULKAN=1 \
+cargo test --all-features \
   renderer::tests::offscreen_gpu_readback_verifies_camera_depth_and_clip_contract \
   -- --nocapture
 

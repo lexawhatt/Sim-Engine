@@ -129,8 +129,8 @@ cargo run --release --example cylinder_derivation_3d -- --uncapped --benchmark
 ## Verification
 
 The Linux release gate checks the declared Rust 1.90 MSRV, all targets with
-and without the renderer, strict clippy, rustdoc, semantic GPU readback, and the
-published package boundary:
+and without the renderer, strict clippy, rustdoc, Vulkan semantic GPU readback
+with a backend assertion, and the published package boundary:
 
 ```bash
 ./scripts/linux_release_gate.sh
