@@ -274,6 +274,16 @@ pub enum SceneError {
     InvalidDimension(ScenePrimitive),
     /// Line or polyline has no drawable segment.
     DegenerateGeometry(ScenePrimitive),
+    /// Consecutive polyline segments reverse exactly through the same vertex.
+    ///
+    /// A retraced centerline has no interior-disjoint alpha-blended stroke
+    /// representation. `vertex_index` identifies the reversing path point.
+    DegenerateStrokeTurn {
+        /// Primitive containing the reversal.
+        primitive: ScenePrimitive,
+        /// Zero-based index of the shared reversing point.
+        vertex_index: usize,
+    },
     /// Shape has no fill, stroke, or shadow.
     MissingStyle(ScenePrimitive),
     /// Fill color or gradient configuration is invalid.
@@ -1319,6 +1329,26 @@ fn validate_stroke_path(
     style: StrokeStyle2d,
     primitive: ScenePrimitive,
 ) -> Result<(), SceneError> {
+    if points
+        .windows(2)
+        .any(|pair| !drawable_segment(pair[0], pair[1]))
+    {
+        return Err(SceneError::DegenerateGeometry(primitive));
+    }
+    for (index, window) in points.windows(3).enumerate() {
+        let incoming = window[1] - window[0];
+        let outgoing = window[2] - window[1];
+        let cross = f64::from(incoming.x) * f64::from(outgoing.y)
+            - f64::from(incoming.y) * f64::from(outgoing.x);
+        let dot = f64::from(incoming.x) * f64::from(outgoing.x)
+            + f64::from(incoming.y) * f64::from(outgoing.y);
+        if cross == 0.0 && dot < 0.0 {
+            return Err(SceneError::DegenerateStrokeTurn {
+                primitive,
+                vertex_index: index + 1,
+            });
+        }
+    }
     let maximum_offset = f64::from(style.stroke.width) * 0.5 * f64::from(style.miter_limit);
     if !maximum_offset.is_finite() || maximum_offset > f64::from(f32::MAX) {
         return Err(SceneError::InvalidStroke(primitive));
@@ -1696,8 +1726,10 @@ impl StrokeDashPattern2d {
 ///
 /// Marker dimensions are logical pixels even when the line body uses a world
 /// width, keeping scientific annotations readable under camera zoom. A marked
-/// endpoint ignores the ordinary cap: the body is trimmed to the marker base
-/// and shares only that boundary with the filled triangle.
+/// endpoint ignores the ordinary cap: the body ends with a butt boundary at
+/// the path endpoint, which is also the marker base. The filled triangle grows
+/// outward from the path, so markers remain interior-disjoint from arbitrarily
+/// short, dashed, or camera-scaled terminal segments.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct StrokeMarker2d {
     length: LogicalPixels,
@@ -1788,13 +1820,13 @@ impl StrokeStyle2d {
         self
     }
 
-    /// Adds a reusable triangular marker at the first path point.
+    /// Adds an outward-pointing triangular marker based at the first path point.
     pub const fn with_start_marker(mut self, marker: StrokeMarker2d) -> Self {
         self.start_marker = Some(marker);
         self
     }
 
-    /// Adds a reusable triangular marker at the last path point.
+    /// Adds an outward-pointing triangular marker based at the last path point.
     pub const fn with_end_marker(mut self, marker: StrokeMarker2d) -> Self {
         self.end_marker = Some(marker);
         self
@@ -2755,6 +2787,22 @@ mod tests {
         assert!(matches!(
             DrawCommand::styled_line(Vec2::ZERO, Vec2::X, unsafe_logical),
             Err(SceneError::InvalidStroke(ScenePrimitive::Line))
+        ));
+    }
+
+    #[test]
+    fn polyline_rejects_zero_segments_and_exact_reversals() {
+        let style = StrokeStyle2d::logical(LogicalPixels::new(2.0).unwrap(), Color::WHITE);
+        assert!(matches!(
+            DrawCommand::styled_polyline(vec![Vec2::ZERO, Vec2::ZERO, Vec2::X], style),
+            Err(SceneError::DegenerateGeometry(ScenePrimitive::Polyline))
+        ));
+        assert!(matches!(
+            DrawCommand::styled_polyline(vec![Vec2::ZERO, Vec2::X, Vec2::ZERO], style),
+            Err(SceneError::DegenerateStrokeTurn {
+                primitive: ScenePrimitive::Polyline,
+                vertex_index: 1,
+            })
         ));
     }
 

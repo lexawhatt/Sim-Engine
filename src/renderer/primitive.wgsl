@@ -78,6 +78,7 @@ fn vs_main(input: VertexIn) -> VertexOut {
         let next_tangent = safe_unit(next_screen);
         let combined_normal = previous_normal + next_normal;
         let turn = cross_2d(previous_tangent, next_tangent);
+        let reverses = abs(turn) <= 0.000001 && dot(previous_tangent, next_tangent) < 0.0;
         let side = sign(input.normal_distance);
         let outer_side = -sign(turn);
         var extrusion = next_normal * input.normal_distance + next_tangent * input.tangent_distance;
@@ -100,7 +101,12 @@ fn vs_main(input: VertexIn) -> VertexOut {
         // uses the selected corner, except for an in-limit miter join. This
         // makes adjacent segment quads disjoint in their interiors.
         if input.stroke_role >= 1.0 && input.stroke_role <= 3.0 {
-            if abs(turn) <= 0.000001 {
+            if reverses {
+                // Scene validation rejects exact source retraces. Collapsing a
+                // projection-induced reversal still prevents a crossed quad
+                // from injecting NaN or backend-dependent winding.
+                extrusion = vec2<f32>(0.0, 0.0);
+            } else if abs(turn) <= 0.000001 {
                 extrusion = next_normal * input.normal_distance;
             } else if !same_side(side, outer_side) {
                 if miter_valid && miter_multiple <= input.miter_limit {

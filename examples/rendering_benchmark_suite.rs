@@ -5,14 +5,15 @@
 //! deterministic work counters. `--gate` applies the project's Linux release
 //! floor; it does not claim that raw timings transfer across unrelated GPUs.
 
-use std::{error::Error, sync::Arc, time::Instant};
+use std::{error::Error, path::Path, sync::Arc, time::Instant};
 
 use sim_engine::{
     Camera2d, Color, FrameBudget, FramePassOptions, FrameReport, GlyphAtlasBudget, GlyphAtlasEntry,
     GlyphId, GlyphRunBudget, ImageBatchBudget, ImageBudget, ImageSampling, ImageSprite2d,
     ImageTexelRect, Layer, LogicalPixels, LogicalScreenPosition, LogicalScreenVector,
-    LogicalViewport, LogicalViewportRegion, PositionedGlyph2d, PreparedScreenScene, Rect, Scene,
-    SceneBudget, ScreenScene, ShapeStyle, Vec2, WgpuRenderer, WgpuRendererOptions,
+    LogicalViewport, LogicalViewportRegion, PositionedGlyph2d, PreparedScreenScene, Rect,
+    RendererSurfacePresentMode, Scene, SceneBudget, ScreenScene, ShapeStyle, Vec2, WgpuRenderer,
+    WgpuRendererOptions,
 };
 use winit::{
     application::ApplicationHandler,
@@ -33,6 +34,12 @@ struct GateThresholds {
     minimum_fps: f64,
     maximum_renderer_work_p95_ms: f64,
     maximum_surface_acquire_p95_ms: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PerformanceGateKind {
+    UncappedThroughput,
+    RefreshSynchronizedWork,
 }
 
 fn gate_thresholds(fixture: &str) -> Option<GateThresholds> {
@@ -102,11 +109,81 @@ struct HidpiTransitionState {
     window: Arc<Window>,
     renderer: WgpuRenderer,
     prepared: PreparedScreenScene,
+    evidence: HidpiEvidenceTracker,
+    auto_exit: bool,
+    ready_announced: bool,
+}
+
+#[derive(Debug)]
+struct HidpiEvidenceTracker {
     scale_events: usize,
     resize_events: usize,
     paired_transitions: usize,
-    rendered_after_scale: usize,
-    awaiting_resize: bool,
+    completed_transitions: usize,
+    next_serial: u64,
+    pending: Option<PendingHidpiTransition>,
+    committed_scale_factor: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct PendingHidpiTransition {
+    serial: u64,
+    resized: bool,
+    scale_factor: f64,
+    physical_width: u32,
+    physical_height: u32,
+}
+
+impl HidpiEvidenceTracker {
+    fn new(initial_scale_factor: f64) -> Self {
+        Self {
+            scale_events: 0,
+            resize_events: 0,
+            paired_transitions: 0,
+            completed_transitions: 0,
+            next_serial: 0,
+            pending: None,
+            committed_scale_factor: initial_scale_factor,
+        }
+    }
+
+    fn observe_scale(&mut self, scale_factor: f64, physical_width: u32, physical_height: u32) {
+        if scale_factor == self.committed_scale_factor {
+            return;
+        }
+        self.scale_events = self.scale_events.saturating_add(1);
+        self.next_serial = self.next_serial.saturating_add(1);
+        self.pending = Some(PendingHidpiTransition {
+            serial: self.next_serial,
+            resized: false,
+            scale_factor,
+            physical_width,
+            physical_height,
+        });
+    }
+
+    fn observe_resize(&mut self, physical_width: u32, physical_height: u32) {
+        self.resize_events = self.resize_events.saturating_add(1);
+        let Some(pending) = self.pending.as_mut() else {
+            return;
+        };
+        pending.physical_width = physical_width;
+        pending.physical_height = physical_height;
+        if !pending.resized {
+            pending.resized = true;
+            self.paired_transitions = self.paired_transitions.saturating_add(1);
+        }
+    }
+
+    fn observe_successful_present(&mut self) -> Option<PendingHidpiTransition> {
+        if !self.pending.is_some_and(|pending| pending.resized) {
+            return None;
+        }
+        self.completed_transitions = self.completed_transitions.saturating_add(1);
+        let completed = self.pending.take()?;
+        self.committed_scale_factor = completed.scale_factor;
+        Some(completed)
+    }
 }
 
 impl BenchmarkApplication {
@@ -161,16 +238,16 @@ impl ApplicationHandler for BenchmarkApplication {
                     println!(
                         "hidpi_transition: move this window to a monitor with a different scale factor, then press Esc"
                     );
+                    let initial_scale_factor = window.scale_factor();
                     window.request_redraw();
                     self.hidpi = Some(HidpiTransitionState {
                         window,
                         renderer,
                         prepared,
-                        scale_events: 0,
-                        resize_events: 0,
-                        paired_transitions: 0,
-                        rendered_after_scale: 0,
-                        awaiting_resize: false,
+                        evidence: HidpiEvidenceTracker::new(initial_scale_factor),
+                        auto_exit: std::env::var("SIM_ENGINE_HIDPI_AUTO_EXIT")
+                            .is_ok_and(|value| value == "1"),
+                        ready_announced: false,
                     });
                     Ok(())
                 }
@@ -210,9 +287,10 @@ impl ApplicationHandler for BenchmarkApplication {
         );
         let result = match event {
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
-                state.scale_events = state.scale_events.saturating_add(1);
-                state.awaiting_resize = true;
                 let size = state.window.inner_size();
+                state
+                    .evidence
+                    .observe_scale(scale_factor, size.width.max(1), size.height.max(1));
                 println!(
                     "event=ScaleFactorChanged scale={scale_factor:.3} compositor_physical={}x{}",
                     size.width, size.height
@@ -223,11 +301,9 @@ impl ApplicationHandler for BenchmarkApplication {
                     .map_err(|error| error.to_string())
             }
             WindowEvent::Resized(size) => {
-                state.resize_events = state.resize_events.saturating_add(1);
-                if state.awaiting_resize {
-                    state.paired_transitions = state.paired_transitions.saturating_add(1);
-                    state.awaiting_resize = false;
-                }
+                state
+                    .evidence
+                    .observe_resize(size.width.max(1), size.height.max(1));
                 println!(
                     "event=Resized physical={}x{} scale={:.3}",
                     size.width,
@@ -244,18 +320,33 @@ impl ApplicationHandler for BenchmarkApplication {
                     .map_err(|error| error.to_string())
             }
             WindowEvent::RedrawRequested => {
-                let result = (|| -> Result<(), Box<dyn Error>> {
+                let result = (|| -> Result<bool, Box<dyn Error>> {
                     let mut frame = state
                         .renderer
                         .begin_frame(Color::rgb8(9, 12, 18), FrameBudget::default())?;
                     frame.draw_prepared_screen_scene(&state.prepared, FramePassOptions::new(0))?;
-                    let _ = frame.present()?;
-                    Ok(())
+                    Ok(matches!(
+                        frame.present()?.status(),
+                        sim_engine::RenderStatus::Drawn
+                    ))
                 })();
-                if state.scale_events > 0 && result.is_ok() {
-                    state.rendered_after_scale = state.rendered_after_scale.saturating_add(1);
-                }
-                result.map_err(|error| error.to_string())
+                (|| -> Result<(), String> {
+                    let drawn = result.map_err(|error| error.to_string())?;
+                    if drawn && state.evidence.pending.is_none() && !state.ready_announced {
+                        if let Ok(path) = std::env::var("SIM_ENGINE_HIDPI_READY_PATH") {
+                            std::fs::write(path, "ready\n").map_err(|error| error.to_string())?;
+                        }
+                        state.ready_announced = true;
+                    }
+                    if drawn && let Some(completed) = state.evidence.observe_successful_present() {
+                        write_hidpi_evidence(state, completed)
+                            .map_err(|error| error.to_string())?;
+                        if state.auto_exit {
+                            event_loop.exit();
+                        }
+                    }
+                    Ok(())
+                })()
             }
             WindowEvent::KeyboardInput { event, .. }
                 if event.state == ElementState::Pressed
@@ -283,33 +374,54 @@ impl ApplicationHandler for BenchmarkApplication {
 
 fn finish_hidpi_transition(state: &HidpiTransitionState) -> Result<(), &'static str> {
     println!(
-        "hidpi_transition scale_events={} resize_events={} paired_transitions={} rendered_after_scale={}",
-        state.scale_events,
-        state.resize_events,
-        state.paired_transitions,
-        state.rendered_after_scale
+        "hidpi_transition scale_events={} resize_events={} paired_transitions={} completed_transitions={} pending={}",
+        state.evidence.scale_events,
+        state.evidence.resize_events,
+        state.evidence.paired_transitions,
+        state.evidence.completed_transitions,
+        state.evidence.pending.is_some()
     );
-    validate_hidpi_evidence(
-        state.scale_events,
-        state.paired_transitions,
-        state.rendered_after_scale,
-    )
+    validate_hidpi_evidence(&state.evidence)
 }
 
-fn validate_hidpi_evidence(
-    scale_events: usize,
-    paired_transitions: usize,
-    rendered_after_scale: usize,
-) -> Result<(), &'static str> {
-    if scale_events == 0 {
+fn validate_hidpi_evidence(evidence: &HidpiEvidenceTracker) -> Result<(), &'static str> {
+    if evidence.scale_events == 0 {
         return Err("no real ScaleFactorChanged event was observed");
     }
-    if paired_transitions == 0 {
+    if evidence.paired_transitions == 0 {
         return Err("no Resized event followed the compositor scale transition");
     }
-    if rendered_after_scale == 0 {
-        return Err("the renderer did not present after the compositor scale transition");
+    if evidence.completed_transitions == 0 {
+        return Err("the renderer did not present after the paired resize");
     }
+    if evidence.pending.is_some() {
+        return Err("a compositor scale transition remains incomplete");
+    }
+    Ok(())
+}
+
+fn write_hidpi_evidence(
+    state: &HidpiTransitionState,
+    completed: PendingHidpiTransition,
+) -> Result<(), Box<dyn Error>> {
+    let Ok(path) = std::env::var("SIM_ENGINE_HIDPI_EVIDENCE_PATH") else {
+        return Ok(());
+    };
+    let revision = std::env::var("SIM_ENGINE_RELEASE_SHA").unwrap_or_else(|_| "unknown".into());
+    let body = format!(
+        "format_version=1\nvcs_sha={revision}\nbackend={}\nadapter={}\ntransition_serial={}\nscale_factor={:.3}\nphysical_width={}\nphysical_height={}\nscale_events={}\nresize_events={}\npaired_transitions={}\ncompleted_transitions={}\n",
+        state.renderer.adapter_backend(),
+        state.renderer.adapter_name(),
+        completed.serial,
+        completed.scale_factor,
+        completed.physical_width,
+        completed.physical_height,
+        state.evidence.scale_events,
+        state.evidence.resize_events,
+        state.evidence.paired_transitions,
+        state.evidence.completed_transitions,
+    );
+    std::fs::write(Path::new(&path), body)?;
     Ok(())
 }
 
@@ -319,19 +431,27 @@ mod tests {
 
     #[test]
     fn hidpi_evidence_requires_a_real_event_and_post_transition_present() {
+        let mut evidence = HidpiEvidenceTracker::new(1.0);
         assert_eq!(
-            validate_hidpi_evidence(0, 1, 1),
+            validate_hidpi_evidence(&evidence),
             Err("no real ScaleFactorChanged event was observed")
         );
+        evidence.observe_scale(1.25, 1_600, 900);
         assert_eq!(
-            validate_hidpi_evidence(1, 0, 1),
+            validate_hidpi_evidence(&evidence),
             Err("no Resized event followed the compositor scale transition")
         );
+        assert_eq!(evidence.observe_successful_present(), None);
+        evidence.observe_resize(1_600, 900);
         assert_eq!(
-            validate_hidpi_evidence(1, 1, 0),
-            Err("the renderer did not present after the compositor scale transition")
+            validate_hidpi_evidence(&evidence),
+            Err("the renderer did not present after the paired resize")
         );
-        assert_eq!(validate_hidpi_evidence(1, 1, 1), Ok(()));
+        let completed = evidence
+            .observe_successful_present()
+            .expect("the paired resize may now complete");
+        assert_eq!(completed.serial, 1);
+        assert_eq!(validate_hidpi_evidence(&evidence), Ok(()));
     }
 
     #[test]
@@ -342,6 +462,60 @@ mod tests {
         assert_eq!(retained.maximum_renderer_work_p95_ms, 5.0);
         assert_eq!(streaming.maximum_renderer_work_p95_ms, 25.0);
         assert!(gate_thresholds("unknown").is_none());
+    }
+
+    #[test]
+    fn performance_gate_separates_uncapped_throughput_from_refresh_pacing() {
+        let thresholds = gate_thresholds("four_viewports").unwrap();
+        assert_eq!(
+            validate_performance_gate(
+                "four_viewports",
+                "vulkan",
+                RendererSurfacePresentMode::Immediate,
+                120.0,
+                1.0,
+                0.5,
+                thresholds,
+            ),
+            Ok(PerformanceGateKind::UncappedThroughput)
+        );
+        assert_eq!(
+            validate_performance_gate(
+                "four_viewports",
+                "vulkan",
+                RendererSurfacePresentMode::Fifo,
+                50.0,
+                1.0,
+                30.0,
+                thresholds,
+            ),
+            Ok(PerformanceGateKind::RefreshSynchronizedWork)
+        );
+        assert!(
+            validate_performance_gate(
+                "four_viewports",
+                "gl",
+                RendererSurfacePresentMode::Immediate,
+                120.0,
+                1.0,
+                0.5,
+                thresholds,
+            )
+            .unwrap_err()
+            .contains("Vulkan")
+        );
+        assert!(
+            validate_performance_gate(
+                "four_viewports",
+                "vulkan",
+                RendererSurfacePresentMode::Immediate,
+                59.0,
+                1.0,
+                0.5,
+                thresholds,
+            )
+            .is_err()
+        );
     }
 }
 
@@ -698,35 +872,68 @@ fn measure_frames(
     if gate {
         let thresholds = gate_thresholds(name)
             .ok_or_else(|| format!("{name} does not define release-gate thresholds"))?;
-        if wall_fps < thresholds.minimum_fps {
-            return Err(format!(
-                "{name} wall throughput {wall_fps:.1} FPS is below the {:.1} FPS gate",
+        let kind = validate_performance_gate(
+            name,
+            renderer.adapter_backend(),
+            renderer.surface_present_mode(),
+            wall_fps,
+            work_p95,
+            acquire_p95,
+            thresholds,
+        )
+        .map_err(|error| -> Box<dyn Error> { error.into() })?;
+        match kind {
+            PerformanceGateKind::UncappedThroughput => println!(
+                "gate=passed kind=uncapped_throughput min_fps={:.1} max_renderer_work_p95_ms={:.3} max_surface_acquire_p95_ms={:.3}",
                 thresholds.minimum_fps,
-            )
-            .into());
-        }
-        if work_p95 > thresholds.maximum_renderer_work_p95_ms {
-            return Err(format!(
-                "{name} renderer work p95 {work_p95:.3} ms exceeds {:.3} ms",
                 thresholds.maximum_renderer_work_p95_ms,
-            )
-            .into());
-        }
-        if acquire_p95 > thresholds.maximum_surface_acquire_p95_ms {
-            return Err(format!(
-                "{name} surface acquire p95 {acquire_p95:.3} ms exceeds {:.3} ms",
                 thresholds.maximum_surface_acquire_p95_ms,
-            )
-            .into());
+            ),
+            PerformanceGateKind::RefreshSynchronizedWork => println!(
+                "gate=passed kind=refresh_synchronized_work wall_fps_and_acquire=informational max_renderer_work_p95_ms={:.3}",
+                thresholds.maximum_renderer_work_p95_ms,
+            ),
         }
-        println!(
-            "gate=passed min_fps={:.1} max_renderer_work_p95_ms={:.3} max_surface_acquire_p95_ms={:.3}",
-            thresholds.minimum_fps,
-            thresholds.maximum_renderer_work_p95_ms,
-            thresholds.maximum_surface_acquire_p95_ms,
-        );
     }
     Ok(())
+}
+
+fn validate_performance_gate(
+    fixture: &str,
+    backend: &str,
+    present_mode: RendererSurfacePresentMode,
+    wall_fps: f64,
+    renderer_work_p95_ms: f64,
+    surface_acquire_p95_ms: f64,
+    thresholds: GateThresholds,
+) -> Result<PerformanceGateKind, String> {
+    if backend != "vulkan" {
+        return Err(format!(
+            "{fixture} release performance evidence requires Vulkan, selected backend was {backend}"
+        ));
+    }
+    if renderer_work_p95_ms > thresholds.maximum_renderer_work_p95_ms {
+        return Err(format!(
+            "{fixture} renderer work p95 {renderer_work_p95_ms:.3} ms exceeds {:.3} ms",
+            thresholds.maximum_renderer_work_p95_ms,
+        ));
+    }
+    if present_mode.is_refresh_synchronized() {
+        return Ok(PerformanceGateKind::RefreshSynchronizedWork);
+    }
+    if wall_fps < thresholds.minimum_fps {
+        return Err(format!(
+            "{fixture} wall throughput {wall_fps:.1} FPS is below the {:.1} FPS gate",
+            thresholds.minimum_fps,
+        ));
+    }
+    if surface_acquire_p95_ms > thresholds.maximum_surface_acquire_p95_ms {
+        return Err(format!(
+            "{fixture} surface acquire p95 {surface_acquire_p95_ms:.3} ms exceeds {:.3} ms",
+            thresholds.maximum_surface_acquire_p95_ms,
+        ));
+    }
+    Ok(PerformanceGateKind::UncappedThroughput)
 }
 
 fn validate_fixture_contract(

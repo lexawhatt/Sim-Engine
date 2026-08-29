@@ -486,12 +486,8 @@ fn endpoint_tangent(style: crate::StrokeStyle2d, start: bool, is_path_endpoint: 
     } else {
         style.end_marker()
     };
-    if is_path_endpoint && let Some(marker) = marker {
-        return if start {
-            marker.length().get()
-        } else {
-            -marker.length().get()
-        };
+    if is_path_endpoint && marker.is_some() {
+        return 0.0;
     }
     if style.cap() == crate::StrokeCap2d::Square {
         let half_width = style.stroke().width() * 0.5;
@@ -899,6 +895,9 @@ fn world_join_endpoint_offset(
         .x
         .mul_add(outgoing_unit.y, -incoming_unit.y * outgoing_unit.x);
     if turn.abs() <= 0.000001 {
+        if incoming_unit.dot(outgoing_unit) < 0.0 {
+            return Vec2::ZERO;
+        }
         return outgoing_unit.perp() * (side * half_width);
     }
     let outer_side = -turn.signum();
@@ -1096,10 +1095,10 @@ fn push_stroke_marker(
     color: Color,
     vertices: &mut Vec<Vertex>,
 ) {
-    let base_tangent = if start {
-        marker.length().get()
-    } else {
+    let tip_tangent = if start {
         -marker.length().get()
+    } else {
+        marker.length().get()
     };
     let half_width = marker.width().get() * 0.5;
     vertices.extend_from_slice(&[
@@ -1109,7 +1108,7 @@ fn push_stroke_marker(
             direction,
             direction,
             0.0,
-            0.0,
+            tip_tangent,
             1.0,
             color,
         ),
@@ -1119,7 +1118,7 @@ fn push_stroke_marker(
             direction,
             direction,
             half_width,
-            base_tangent,
+            0.0,
             1.0,
             color,
         ),
@@ -1129,7 +1128,7 @@ fn push_stroke_marker(
             direction,
             direction,
             -half_width,
-            base_tangent,
+            0.0,
             1.0,
             color,
         ),

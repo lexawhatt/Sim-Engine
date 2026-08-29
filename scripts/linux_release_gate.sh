@@ -40,6 +40,8 @@ grep -Fxq 'backend=Vulkan' target/linux-vulkan-adapter.txt
 echo "GPU evidence: target/linux-vulkan-adapter.txt"
 
 echo "[9/11] named rendering performance matrix"
+WGPU_BACKEND=vulkan \
+SIM_ENGINE_REQUIRE_VULKAN=1 \
 ./scripts/rendering_benchmark_matrix.sh
 
 echo "[10/11] package boundary"

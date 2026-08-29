@@ -167,17 +167,22 @@ Run the complete named performance/contract matrix on a Vulkan-capable Linux
 machine with `./scripts/rendering_benchmark_matrix.sh`. Absolute timings are
 comparable only when adapter, driver, backend, present mode, and workload are
 recorded together; deterministic command/vertex/upload counters are portable.
-The matrix enforces at least 60 observed FPS plus fixture-specific p95 ceilings
-for renderer work excluding surface acquisition and a separate acquire p95
-ceiling. Retained paths keep tighter ceilings than the deliberately streaming
-`ui_90_10` workload. Use
-`rendering_benchmark_suite --fixture hidpi_transition` separately and move the
-window between differently scaled monitors to verify a real compositor event.
+The matrix requires Vulkan and always enforces fixture-specific p95 ceilings
+for renderer work excluding surface acquisition. When the surface actually
+selects Immediate, it also enforces at least 60 observed FPS and a separate
+acquire p95 ceiling. Mailbox/FIFO results keep wall FPS and acquire wait as
+refresh-pacing diagnostics, so a correct 50/59.94 Hz compositor is not treated
+as a renderer regression. The matrix also drives a nested KWin compositor
+through a real scale 1.00-to-1.25 transition and records the paired event and
+successful redraw for the exact revision.
+The automatic transition requires `dbus-run-session`, `kwin_wayland`, and
+`kscreen-doctor`; a missing executable fails the matrix instead of silently
+skipping HiDPI evidence.
 
 `stroke_gallery` is the visual oracle for the v0.2 stroke contract. Pages 1-4
 show every cap/join, half-alpha overlap probes, bounded animated dashes,
-trimmed arrow markers, miter fallback, camera rotation, and the accepted
-0.005-world-unit line at zoom 10,000. Press `Space`, arrows, `+`/`-`, or `R`
+outward endpoint arrow markers, miter fallback, camera rotation, and the
+accepted 0.005-world-unit line at zoom 10,000. Press `Space`, arrows, `+`/`-`, or `R`
 to pause, scrub, zoom, and reset.
 
 `ui_demo` includes a retained host-rasterized scientific glyph probe above all
@@ -189,15 +194,17 @@ text shaping.
 
 The v0.2.0 Linux release gate checks the declared Rust 1.90 MSRV, all targets
 with and without the renderer, strict clippy, rustdoc, Vulkan semantic GPU
-readback with a backend assertion, the named 60-FPS performance matrix on a
-real surface, and the publishable package boundary:
+readback with a backend assertion, the Vulkan performance matrix on a real
+surface, a transactional nested-compositor HiDPI transition, and the
+publishable package boundary:
 
 ```bash
 ./scripts/linux_release_gate.sh
 ```
 
-The gate records the exact adapter/backend/driver run in
-`target/linux-vulkan-adapter.txt`; CI publishes the same file as an artifact.
+The gate records exact adapter/backend/driver evidence in
+`target/linux-vulkan-adapter.txt` and compositor-transition evidence in
+`target/linux-hidpi-transition.txt`.
 
 ## License
 

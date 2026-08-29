@@ -2037,7 +2037,8 @@ impl WgpuRenderer {
         height: u32,
         options: WgpuRendererOptions,
     ) -> Result<Self, RendererInitError> {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let instance =
+            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
         let surface = instance
             .create_surface(surface_target)
             .map_err(RendererInitError::CreateSurface)?;

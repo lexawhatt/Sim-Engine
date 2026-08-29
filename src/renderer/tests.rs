@@ -198,6 +198,7 @@ fn vertex_screen_position(vertex: Vertex, camera: Camera2d, viewport: LogicalVie
         let turn = previous_tangent
             .x
             .mul_add(next_tangent.y, -previous_tangent.y * next_tangent.x);
+        let reverses = turn.abs() <= 0.000001 && previous_tangent.dot(next_tangent) < 0.0;
         let side = vertex.normal_distance.signum();
         let outer_side = -turn.signum();
         let mut extrusion =
@@ -215,7 +216,9 @@ fn vertex_screen_position(vertex: Vertex, camera: Camera2d, viewport: LogicalVie
             }
         }
         if (1.0..=3.0).contains(&vertex.stroke_role) {
-            if turn.abs() <= 0.000001 {
+            if reverses {
+                extrusion = Vec2::ZERO;
+            } else if turn.abs() <= 0.000001 {
                 extrusion = next_normal * vertex.normal_distance;
             } else if side * outer_side <= 0.0 {
                 extrusion = if miter_valid && miter_multiple <= vertex.miter_limit {
@@ -359,6 +362,39 @@ fn richer_strokes_have_deterministic_bounded_topology() {
         )
         .unwrap();
     assert_eq!(tessellate_for_test(&dashed).0.len(), 3 * 6);
+}
+
+#[test]
+fn short_endpoint_markers_extend_outward_from_a_butt_boundary() {
+    let marker = crate::StrokeMarker2d::arrow(
+        crate::LogicalPixels::new(3.0).unwrap(),
+        crate::LogicalPixels::new(4.0).unwrap(),
+    );
+    let mut scene = Scene::new(Color::BLACK).unwrap();
+    scene
+        .try_styled_line(
+            Vec2::ZERO,
+            Vec2::new(4.0, 0.0),
+            crate::StrokeStyle2d::logical(crate::LogicalPixels::new(2.0).unwrap(), Color::WHITE)
+                .with_cap(crate::StrokeCap2d::Round)
+                .with_start_marker(marker)
+                .with_end_marker(marker),
+        )
+        .unwrap();
+
+    let vertices = tessellate_for_test(&scene).0;
+    assert_eq!(vertices.len(), 12);
+    assert!(
+        vertices[..6]
+            .iter()
+            .all(|vertex| vertex.tangent_distance == 0.0)
+    );
+    assert_eq!(vertices[6].tangent_distance, -3.0);
+    assert_eq!(vertices[7].tangent_distance, 0.0);
+    assert_eq!(vertices[8].tangent_distance, 0.0);
+    assert_eq!(vertices[9].tangent_distance, 3.0);
+    assert_eq!(vertices[10].tangent_distance, 0.0);
+    assert_eq!(vertices[11].tangent_distance, 0.0);
 }
 
 #[test]
@@ -668,7 +704,12 @@ fn scene_budget_estimate_bounds_actual_tessellation_and_upload() {
         .unwrap();
     scene
         .try_polyline(
-            vec![Vec2::ZERO, Vec2::X, Vec2::X, Vec2::new(2.0, 1.0)],
+            vec![
+                Vec2::ZERO,
+                Vec2::X,
+                Vec2::new(1.5, 0.25),
+                Vec2::new(2.0, 1.0),
+            ],
             1.0,
             Color::WHITE,
         )
@@ -1027,6 +1068,245 @@ fn scalar_value_range_rejects_finite_subtraction_overflow() {
     assert_eq!(scalar_value_range_extent(-f32::MAX, f32::MAX), None);
 }
 
+async fn assert_gpu_stroke_pixel_matrix(
+    adapter: &wgpu::Adapter,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    format: wgpu::TextureFormat,
+) {
+    const WIDTH: u32 = 256;
+    const HEIGHT: u32 = 216;
+    const ROW_BYTES: u32 = WIDTH * 4;
+    let sample_count = preferred_sample_count(adapter, format);
+    let PipelineResources {
+        pipeline,
+        camera_uniform_buffer,
+        camera_bind_group,
+        ..
+    } = create_pipeline(device, format, sample_count);
+    let target = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("sim-engine stroke pixel-matrix resolve target"),
+        size: wgpu::Extent3d {
+            width: WIDTH,
+            height: HEIGHT,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
+    let multisample = (sample_count > 1).then(|| {
+        device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("sim-engine stroke pixel-matrix multisample target"),
+            size: wgpu::Extent3d {
+                width: WIDTH,
+                height: HEIGHT,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        })
+    });
+    let multisample_view = multisample
+        .as_ref()
+        .map(|texture| texture.create_view(&wgpu::TextureViewDescriptor::default()));
+    let viewport = LogicalViewport::new(WIDTH as f32, HEIGHT as f32).unwrap();
+    let camera = Camera2d::new(Vec2::ZERO, 1.0).unwrap();
+    let camera_uniform = CameraUniform::new(camera, viewport).unwrap();
+    queue.write_buffer(
+        &camera_uniform_buffer,
+        0,
+        bytemuck::bytes_of(&camera_uniform),
+    );
+
+    let caps = [
+        crate::StrokeCap2d::Butt,
+        crate::StrokeCap2d::Square,
+        crate::StrokeCap2d::Round,
+    ];
+    let joins = [
+        crate::StrokeJoin2d::Bevel,
+        crate::StrokeJoin2d::Miter,
+        crate::StrokeJoin2d::Round,
+    ];
+    let mut scene = Scene::new(Color::BLACK).unwrap();
+    for width_mode in 0..2 {
+        for (cap_index, cap) in caps.iter().copied().enumerate() {
+            for (join_index, join) in joins.iter().copied().enumerate() {
+                let row = cap_index * joins.len() + join_index;
+                let center_x = if width_mode == 0 { 64.0 } else { 192.0 };
+                let center_y = 12.0 + row as f32 * 24.0;
+                let screen_to_world =
+                    |x: f32, y: f32| Vec2::new(x - WIDTH as f32 * 0.5, HEIGHT as f32 * 0.5 - y);
+                let points = vec![
+                    screen_to_world(center_x - 14.0, center_y + 6.0),
+                    screen_to_world(center_x, center_y - 6.0),
+                    screen_to_world(center_x + 14.0, center_y + 6.0),
+                ];
+                let color = Color::rgba(1.0, 1.0, 1.0, 0.5);
+                let style = if width_mode == 0 {
+                    crate::StrokeStyle2d::logical(crate::LogicalPixels::new(10.0).unwrap(), color)
+                } else {
+                    crate::StrokeStyle2d::world(crate::WorldLength::new(10.0).unwrap(), color)
+                }
+                .with_cap(cap)
+                .with_join(join)
+                .with_miter_limit(4.0)
+                .unwrap();
+                scene.try_styled_polyline(points, style).unwrap();
+            }
+        }
+    }
+    let identity = Arc::new(());
+    let prepared = prepare_scene_resources(device, queue, identity, &scene)
+        .expect("stroke pixel matrix should prepare");
+    let readback = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("sim-engine stroke pixel-matrix readback"),
+        size: u64::from(ROW_BYTES) * u64::from(HEIGHT),
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("sim-engine stroke pixel-matrix encoder"),
+    });
+    {
+        let attachment_view = multisample_view.as_ref().unwrap_or(&target_view);
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("sim-engine stroke pixel-matrix pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: attachment_view,
+                depth_slice: None,
+                resolve_target: multisample_view.as_ref().map(|_| &target_view),
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(Color::BLACK.to_wgpu()),
+                    store: if multisample_view.is_some() {
+                        wgpu::StoreOp::Discard
+                    } else {
+                        wgpu::StoreOp::Store
+                    },
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pass.set_pipeline(&pipeline);
+        pass.set_bind_group(0, &camera_bind_group, &[]);
+        pass.set_vertex_buffer(0, prepared.vertex_buffer.slice(..));
+        for batch in &prepared.draw_batches {
+            pass.draw(batch.vertex_range.clone(), 0..1);
+        }
+    }
+    encoder.copy_texture_to_buffer(
+        wgpu::TexelCopyTextureInfo {
+            texture: &target,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::TexelCopyBufferInfo {
+            buffer: &readback,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(ROW_BYTES),
+                rows_per_image: Some(HEIGHT),
+            },
+        },
+        wgpu::Extent3d {
+            width: WIDTH,
+            height: HEIGHT,
+            depth_or_array_layers: 1,
+        },
+    );
+    let submission = queue.submit([encoder.finish()]);
+    device
+        .poll(wgpu::PollType::Wait {
+            submission_index: Some(submission),
+            timeout: Some(Duration::from_secs(5)),
+        })
+        .expect("stroke pixel-matrix submission should complete");
+    let slice = readback.slice(..);
+    let (sender, receiver) = mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |result| {
+        sender.send(result).unwrap()
+    });
+    device
+        .poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: Some(Duration::from_secs(5)),
+        })
+        .expect("stroke pixel-matrix readback should complete");
+    receiver
+        .recv_timeout(Duration::from_secs(5))
+        .expect("stroke pixel-matrix callback")
+        .expect("stroke pixel-matrix should map");
+    let bytes = slice
+        .get_mapped_range()
+        .expect("stroke pixel-matrix mapped bytes");
+    let pixel = |x: usize, y: usize| &bytes[y * ROW_BYTES as usize + x * 4..][..4];
+    let mut covered = [[0usize; 9]; 2];
+    for (width_mode, counts) in covered.iter_mut().enumerate() {
+        let center_x = if width_mode == 0 { 64usize } else { 192usize };
+        for (row, count) in counts.iter_mut().enumerate() {
+            let center_y = 12usize + row * 24;
+            let mut maximum = 0u8;
+            for y in center_y.saturating_sub(11)..=(center_y + 11).min(HEIGHT as usize - 1) {
+                for x in center_x - 22..=center_x + 22 {
+                    let value = pixel(x, y)[0];
+                    maximum = maximum.max(value);
+                    *count += usize::from(value > 32);
+                }
+            }
+            assert!(
+                (175..=210).contains(&maximum),
+                "stroke matrix width_mode={width_mode} row={row} has missing or multiply blended pixels: maximum={maximum}, samples={sample_count}"
+            );
+            assert!(
+                *count > 100,
+                "stroke matrix width_mode={width_mode} row={row} did not rasterize enough pixels: {count}"
+            );
+        }
+        for join in 0..3 {
+            assert!(counts[3 + join] > counts[join]);
+            assert!(counts[6 + join] > counts[join]);
+        }
+        for cap in 0..3 {
+            assert!(
+                counts[cap * 3 + 1] > counts[cap * 3],
+                "miter/bevel coverage did not differ for cap {cap}: {counts:?}"
+            );
+            assert!(
+                counts[cap * 3 + 2] > counts[cap * 3],
+                "round/bevel coverage did not differ for cap {cap}: {counts:?}"
+            );
+        }
+    }
+    for (row, (logical, world)) in covered[0]
+        .iter()
+        .copied()
+        .zip(covered[1].iter().copied())
+        .enumerate()
+    {
+        assert!(
+            logical.abs_diff(world) <= 24,
+            "logical/world stroke matrix diverged in row {row}: {:?}",
+            [logical, world]
+        );
+    }
+    drop(bytes);
+    readback.unmap();
+    eprintln!("sim-engine stroke pixel matrix: sample_count={sample_count}");
+}
+
 #[test]
 fn offscreen_gpu_readback_verifies_camera_depth_and_clip_contract() {
     pollster::block_on(async {
@@ -1114,6 +1394,13 @@ fn offscreen_gpu_readback_verifies_camera_depth_and_clip_contract() {
         let validation_scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
         let recovery_validation_scope =
             recovery_device.push_error_scope(wgpu::ErrorFilter::Validation);
+        assert_gpu_stroke_pixel_matrix(
+            &adapter,
+            &device,
+            &queue,
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+        )
+        .await;
         mesh3d::assert_gpu_depth_contract(&device, &queue, wgpu::TextureFormat::Rgba8UnormSrgb);
         mesh3d::assert_gpu_scene_recovery_contract(
             &device,
@@ -1908,12 +2195,12 @@ fn offscreen_gpu_readback_verifies_camera_depth_and_clip_contract() {
             "over-limit miter spike was not replaced by bevel geometry: {:?}",
             pixel(50, 17)
         );
-        assert_uniform_translucency(pixel(20, 53), pixel(35, 53), 2, "arrow marker");
+        assert_uniform_translucency(pixel(20, 53), pixel(42, 53), 2, "arrow marker");
         assert_uniform_translucency(pixel(20, 53), pixel(6, 53), 2, "round cap");
         assert!(
-            pixel(40, 53)[2] < 10,
+            pixel(48, 53)[2] < 10,
             "the endpoint cap protruded beyond the arrow tip: {:?}",
-            pixel(40, 53)
+            pixel(48, 53)
         );
         assert!(
             pixel(50, 48)[0] > 200,

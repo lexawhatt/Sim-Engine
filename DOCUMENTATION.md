@@ -172,7 +172,11 @@ continues across polyline vertices and receives the configured join. Width is
 independent: `StrokeStyle2d::logical` stays constant under camera zoom, while
 `StrokeStyle2d::world` uses a validated `WorldLength` and scales with the
 camera. Endpoint markers always use logical pixels so annotations remain
-readable.
+readable. A marker's base is the path endpoint and its tip extends outward;
+the marked body endpoint is forced to a butt boundary. Marker length therefore
+cannot invert a short body or collide with a terminal join. Exact 180-degree
+retraces and repeated adjacent points are rejected as structured scene errors
+because no interior-disjoint translucent stroke topology exists for them.
 
 Every dash pattern carries `max_subsegments` in `1..=1_000_000`. Scene insertion counts visible
 pieces before tessellation and returns
@@ -894,28 +898,39 @@ The named release-mode matrix is:
 ./scripts/rendering_benchmark_matrix.sh
 ```
 
+The real compositor fixture requires the Linux executables
+`dbus-run-session`, `kwin_wayland`, and `kscreen-doctor`. Their absence is a
+hard gate failure, not a skipped test.
+
 It runs `ui_static_10k`, `ui_90_10`, `four_viewports`, `image_atlas`,
 `scientific_text`, `mixed_layers`, `budget_rejection`, `dpi_reconfigure`, and
 `recovery_frame`. The viewport fixture owns four distinct prepared world
 scenes and four distinct cameras. Surface fixtures print p50/p95/p99 renderer
 work excluding acquire, separate acquire percentiles, observed wall
 throughput, construction time, source counts, vertices, uploads, unique
-retained memory, textures, and draw calls. With `--gate`, each named surface
-fixture must sustain at least 60 observed FPS and acquire p95 no greater than
-25 ms. Renderer-work p95 is capped at 5 ms for retained UI, four-camera,
+retained memory, textures, and draw calls. Every gated surface fixture must run
+on Vulkan. Renderer-work p95 is capped at 5 ms for retained UI, four-camera,
 image, and glyph workloads, 10 ms for repeated DPI reconfiguration, and 25 ms
 for `ui_90_10`, which deliberately rebuilds and tessellates one thousand
 commands per frame. These fixture-specific ceilings keep a streaming baseline
-from weakening the retained-path oracle. `mixed_layers` remains core-only;
+from weakening the retained-path oracle. If the selected surface mode is
+Immediate, the gate additionally requires at least 60 observed FPS and acquire
+p95 no greater than 25 ms. Mailbox and FIFO are refresh-synchronized: their
+wall FPS and acquire percentiles remain recorded but are not compared with an
+uncapped throughput threshold. `mixed_layers` remains core-only;
 `recovery_frame` is the mandatory Vulkan semantic fixture because it restores
 every retained source on a second logical device and verifies bytes/pixels.
 Record the adapter, driver, backend, and concrete present mode with results.
 The checked thresholds are the project's Linux release floor, not a claim that
 raw timings transfer between unrelated GPUs.
 
-The automated `dpi_reconfigure` workload deliberately tests the renderer API,
-not a compositor event. For the real boundary, move the interactive fixture
-between monitors with different scaling and press Esc only after the event:
+The automated `dpi_reconfigure` workload deliberately tests the renderer API.
+The matrix additionally starts a nested KWin compositor and changes its real
+output scale from 1.00 to 1.25 through `kscreen-doctor`. It accepts evidence
+only when `ScaleFactorChanged`, its following `Resized`, and a drawn frame form
+one completed transaction for the exact release revision. The same fixture can
+still be inspected manually by moving its window between differently scaled
+monitors and pressing Esc after the transition:
 
 ```bash
 cargo run --release --example rendering_benchmark_suite -- \
@@ -923,8 +938,8 @@ cargo run --release --example rendering_benchmark_suite -- \
 ```
 
 It logs `ScaleFactorChanged` and `Resized` order, applies the compositor's
-physical size and scale at their event boundaries, and fails unless a frame is
-presented after a real scale transition.
+physical size and scale at their event boundaries, and does not count an
+unpaired redraw or the initial window-creation events as transition evidence.
 
 ### 17. Examples
 
@@ -1229,11 +1244,14 @@ The complete local Linux release gate is:
 
 It checks formatting, Rust 1.90 compatibility, all targets with and without
 default features, strict clippy, doctests, warning-free rustdoc, a mandatory
-Vulkan semantic GPU readback fixture with backend assertion, `git diff --check`,
+Vulkan semantic GPU readback fixture with backend assertion, the Vulkan-pinned
+performance matrix, a real nested-KWin HiDPI transition, `git diff --check`,
 and the offline package boundary. The GPU step writes
 `target/linux-vulkan-adapter.txt`; CI publishes the same manifest as the
 `linux-vulkan-adapter` artifact. The manifest names backend, adapter type,
 vendor/device IDs, driver, and driver version for the exact semantic run.
+The HiDPI step writes `target/linux-hidpi-transition.txt` with the exact VCS
+revision, Vulkan backend, scale, physical size, and transactional event counts.
 
 The gate must run from a clean worktree. Hardware performance or recovery
 claims must additionally name the Linux adapter, backend, driver, workload,

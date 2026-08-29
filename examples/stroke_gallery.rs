@@ -64,7 +64,7 @@ impl GalleryPage {
         match self {
             Self::CapsAndJoins => "caps + bevel/miter/round joins",
             Self::AlphaContract => "translucent joins: body and corner must match",
-            Self::DashesAndMarkers => "bounded dashes + trimmed arrow markers",
+            Self::DashesAndMarkers => "bounded dashes + outward arrow markers",
             Self::CameraAndEdges => "camera stress + short accepted geometry",
         }
     }
@@ -421,16 +421,18 @@ fn draw_dashes_and_markers(
     let dash = StrokeDashPattern2d::new(&[28.0, 22.0, 10.0, 22.0], phase, 2_048)?;
     let arrow = StrokeMarker2d::arrow(px(30.0), px(28.0));
     let rows = [
-        (Color::rgb8(65, 196, 255), false, true),
-        (Color::rgb8(255, 176, 70), true, false),
-        (Color::rgba(0.2, 1.0, 0.45, 0.5), true, true),
+        (Color::rgb8(65, 196, 255), false, false, true),
+        (Color::rgb8(255, 176, 70), true, false, false),
+        (Color::rgba(0.2, 1.0, 0.45, 0.5), true, true, false),
     ];
-    for (index, (color, start, end)) in rows.into_iter().enumerate() {
+    for (index, (color, start, end, dashed)) in rows.into_iter().enumerate() {
         let y = height * 0.28 + index as f32 * 155.0;
         let mut style = StrokeStyle2d::logical(px(14.0), color)
             .with_cap(StrokeCap2d::Round)
-            .with_join(StrokeJoin2d::Round)
-            .with_dash_pattern(dash);
+            .with_join(StrokeJoin2d::Round);
+        if dashed {
+            style = style.with_dash_pattern(dash);
+        }
         if start {
             style = style.with_start_marker(arrow);
         }
@@ -447,6 +449,15 @@ fn draw_dashes_and_markers(
             style,
         )?;
     }
+    let short_center = width * 0.5;
+    scene.try_styled_line(
+        p(short_center - 2.0, height - 82.0),
+        p(short_center + 2.0, height - 82.0),
+        StrokeStyle2d::logical(px(14.0), Color::rgba(0.72, 0.42, 1.0, 0.5))
+            .with_cap(StrokeCap2d::Round)
+            .with_start_marker(arrow)
+            .with_end_marker(arrow),
+    )?;
     Ok(())
 }
 

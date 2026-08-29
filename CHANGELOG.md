@@ -57,6 +57,8 @@ composed frames, fixed-screen UI, retained images, and host-shaped text.
   named static-10k, 90/10 prepared/streaming, four-viewport, image-atlas,
   scientific-text, mixed-layer, budget-rejection, HiDPI-resize, and retained-
   resource recovery fixtures.
+- Nested-KWin HiDPI gate scripts, packaged with the crate, which fail closed
+  when the required compositor or output-control tooling is unavailable.
 - A retained scientific glyph-atlas probe in `ui_demo`, reused above all four
   world-camera workloads without steady-state atlas or instance upload.
 
@@ -72,8 +74,12 @@ composed frames, fixed-screen UI, retained images, and host-shaped text.
 - Open strokes now use one non-overlapping joined topology. Inner segment
   corners meet at a bounded intersection, only the projected outer bevel/round
   fan survives, and over-limit logical miters produce a real bevel wedge.
-- Arrow markers trim the stroke body to their base and force a butt boundary at
-  the marked endpoint, independently of the style's ordinary cap.
+- Arrow markers use the path endpoint as a shared butt boundary and extend
+  outward from it. The body never reverses or overlaps a marker, even when two
+  markers are longer than a short path or the terminal dash run is absent.
+- Exact 180-degree polyline retraces and repeated adjacent points are rejected
+  during scene validation instead of producing crossed, multiply blended
+  stroke quads.
 - Frame retained-memory diagnostics count each referenced CPU, GPU buffer, and
   texture allocation once even when the same resource is drawn multiple times.
 - Target and heatmap composition uniforms now carry an explicit logical
@@ -97,16 +103,22 @@ composed frames, fixed-screen UI, retained images, and host-shaped text.
 - Added complete cap/join combinations, miter fallback, dash phase/continuity,
   clipping, logical/world zoom behavior, finite-width overflow, bounded dash
   expansion, deterministic topology, and real GPU dash/gap readback coverage.
-- Extended the mandatory GPU oracle with half-alpha pixel comparisons for
-  round/bevel joins, round caps, arrow markers, and miter-to-bevel fallback;
-  it also rejects a cap protruding beyond an arrow tip.
+- Extended the mandatory GPU oracle with half-alpha pixel comparisons for all
+  18 cap/join/width-mode combinations at the production-selected MSAA count,
+  plus arrow-marker and miter-to-bevel probes. It rejects repeated alpha
+  blending and any cap protruding through a marker boundary.
 - Replaced the synthetic `hidpi_resize` claim with a deterministic
-  `dpi_reconfigure` workload and an event-driven `hidpi_transition` fixture
-  that requires a real `ScaleFactorChanged` event plus a successful present.
+  `dpi_reconfigure` workload and an event-driven `hidpi_transition` fixture.
+  The release matrix drives a nested KWin compositor from scale 1.00 to 1.25
+  and accepts evidence only for one paired `ScaleFactorChanged -> Resized ->
+  successful present` transaction from the exact release revision.
 - The named matrix now uses four independent prepared world scenes and four
   independent cameras, reports renderer work separately from surface acquire,
   prints the actual adapter/backend/driver and present mode, validates fixture
-  source/count contracts, and enforces 60-FPS/per-fixture-p95 thresholds.
+  source/count contracts, requires Vulkan, and enforces per-fixture renderer-
+  work p95 thresholds. The 60-FPS/acquire thresholds apply only to Immediate;
+  Mailbox/FIFO evidence treats wall FPS and acquire wait as refresh-pacing
+  diagnostics rather than renderer-throughput failures.
 - Added the interactive `stroke_gallery` visual oracle with four pages for all
   v0.2 stroke styles, alpha contracts, markers, dashes, camera motion, and short
   accepted geometry.
