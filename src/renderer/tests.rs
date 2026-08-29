@@ -190,19 +190,84 @@ fn vertex_screen_position(vertex: Vertex, camera: Camera2d, viewport: LogicalVie
             vertex.next_direction[0],
             vertex.next_direction[1],
         ));
-        let previous_normal = previous.normalized().perp();
-        let next_normal = next.normalized().perp();
-        let combined_normal = previous_normal + next_normal;
+        let previous_tangent = previous.normalized();
         let next_tangent = next.normalized();
+        let previous_normal = previous_tangent.perp();
+        let next_normal = next_tangent.perp();
+        let combined_normal = previous_normal + next_normal;
+        let turn = previous_tangent
+            .x
+            .mul_add(next_tangent.y, -previous_tangent.y * next_tangent.x);
+        let side = vertex.normal_distance.signum();
+        let outer_side = -turn.signum();
         let mut extrusion =
             next_normal * vertex.normal_distance + next_tangent * vertex.tangent_distance;
+        let mut miter_offset = Vec2::ZERO;
+        let mut miter_multiple = f32::INFINITY;
+        let mut miter_valid = false;
         if combined_normal.length_squared() > 0.000001 {
             let miter = combined_normal.normalized();
             let denominator = miter.dot(next_normal);
-            if denominator.abs() > 0.001 && (1.0 / denominator).abs() <= vertex.miter_limit {
-                extrusion = miter * (vertex.normal_distance / denominator)
-                    + next_tangent * vertex.tangent_distance;
+            if denominator.abs() > 0.001 {
+                miter_multiple = (1.0 / denominator).abs();
+                miter_offset = miter * (vertex.normal_distance / denominator);
+                miter_valid = true;
             }
+        }
+        if (1.0..=3.0).contains(&vertex.stroke_role) {
+            if turn.abs() <= 0.000001 {
+                extrusion = next_normal * vertex.normal_distance;
+            } else if side * outer_side <= 0.0 {
+                extrusion = if miter_valid && miter_multiple <= vertex.miter_limit {
+                    miter_offset
+                } else {
+                    Vec2::ZERO
+                };
+            } else if vertex.stroke_role == 2.0
+                && miter_valid
+                && miter_multiple <= vertex.miter_limit
+            {
+                extrusion = miter_offset;
+            } else if vertex.stroke_parameter < 0.0 {
+                extrusion = previous_normal * vertex.normal_distance;
+            } else {
+                extrusion = next_normal * vertex.normal_distance;
+            }
+            extrusion += next_tangent * vertex.tangent_distance;
+        } else if vertex.stroke_role >= 4.0 {
+            let inner = matches!(vertex.stroke_role as i32, 5 | 7 | 9);
+            let candidate_side = if inner { -side } else { side };
+            let mut join_active = turn.abs() > 0.000001 && candidate_side * outer_side > 0.0;
+            if matches!(vertex.stroke_role as i32, 6 | 7) {
+                join_active &= !miter_valid || miter_multiple > vertex.miter_limit;
+            }
+            extrusion = if !join_active {
+                Vec2::ZERO
+            } else if inner {
+                if miter_valid && miter_multiple <= vertex.miter_limit {
+                    miter_offset
+                } else {
+                    Vec2::ZERO
+                }
+            } else if vertex.stroke_role == 8.0 {
+                let start = previous_normal * candidate_side;
+                let finish = next_normal * candidate_side;
+                let angle = start
+                    .x
+                    .mul_add(finish.y, -start.y * finish.x)
+                    .atan2(start.dot(finish))
+                    * vertex.stroke_parameter;
+                Vec2::new(
+                    start.x.mul_add(angle.cos(), -start.y * angle.sin()),
+                    start.x.mul_add(angle.sin(), start.y * angle.cos()),
+                ) * vertex.normal_distance.abs()
+            } else if vertex.stroke_parameter < 0.0 {
+                previous_normal * vertex.normal_distance
+            } else {
+                next_normal * vertex.normal_distance
+            };
+        } else if miter_valid && miter_multiple <= vertex.miter_limit {
+            extrusion = miter_offset + next_tangent * vertex.tangent_distance;
         }
         screen += extrusion;
     }
@@ -251,7 +316,9 @@ fn polyline_uses_joined_strip_and_only_two_round_caps() {
 
     let (vertices, _) = tessellate_for_test(&scene);
 
-    assert_eq!(vertices.len(), 3 * 6 + ROUND_CAP_SEGMENTS * 6);
+    // Miter fallback candidates are retained for each join because the final
+    // limit decision is made after camera projection in WGSL.
+    assert_eq!(vertices.len(), 3 * 6 + 2 * 6 + ROUND_CAP_SEGMENTS * 6);
     assert!(vertices.iter().copied().all(Vertex::is_finite));
 }
 
@@ -272,15 +339,15 @@ fn richer_strokes_have_deterministic_bounded_topology() {
 
     let base = crate::StrokeStyle2d::logical(logical_width, Color::WHITE)
         .with_cap(crate::StrokeCap2d::Butt);
-    assert_eq!(vertex_count(base.with_join(crate::StrokeJoin2d::Miter)), 12);
+    assert_eq!(vertex_count(base.with_join(crate::StrokeJoin2d::Miter)), 18);
     assert_eq!(vertex_count(base.with_join(crate::StrokeJoin2d::Bevel)), 18);
     assert_eq!(
         vertex_count(base.with_join(crate::StrokeJoin2d::Round)),
-        12 + ROUND_CAP_SEGMENTS * 3
+        12 + ROUND_CAP_SEGMENTS * 6
     );
 
     let marked = base.with_start_marker(marker).with_end_marker(marker);
-    assert_eq!(vertex_count(marked), 18);
+    assert_eq!(vertex_count(marked), 24);
 
     let dash = crate::StrokeDashPattern2d::new(&[2.0, 2.0], 0.0, 4).unwrap();
     let mut dashed = Scene::new(Color::BLACK).unwrap();
@@ -312,11 +379,12 @@ fn dash_run_crossing_a_polyline_vertex_uses_one_join_without_internal_caps() {
 
     let vertices = tessellate_for_test(&scene).0;
 
-    // Two quads form one visible dash, the bend receives one circular join,
-    // and only the two actual dash endpoints receive semicircular caps.
+    // Two quads form one visible dash, the bend carries two projected-turn
+    // candidates (only one survives in WGSL), and only the two actual dash
+    // endpoints receive semicircular caps.
     assert_eq!(
         vertices.len(),
-        2 * 6 + ROUND_CAP_SEGMENTS * 3 + 2 * ROUND_CAP_SEGMENTS * 3
+        2 * 6 + ROUND_CAP_SEGMENTS * 6 + 2 * ROUND_CAP_SEGMENTS * 3
     );
     assert!(vertices.iter().copied().all(Vertex::is_finite));
     assert!(scene.statistics().estimated_tessellated_vertices() >= vertices.len());
@@ -1129,6 +1197,73 @@ fn offscreen_gpu_readback_verifies_camera_depth_and_clip_contract() {
                 .with_dash_pattern(stroke_dash),
             )
             .unwrap();
+        let translucent_red = Color::rgba(1.0, 0.0, 0.0, 0.5);
+        scene
+            .try_styled_polyline(
+                vec![
+                    Vec2::new(-26.0, -8.0),
+                    Vec2::new(-18.0, -2.0),
+                    Vec2::new(-10.0, -8.0),
+                ],
+                crate::StrokeStyle2d::logical(
+                    crate::LogicalPixels::new(6.0).unwrap(),
+                    translucent_red,
+                )
+                .with_cap(crate::StrokeCap2d::Butt)
+                .with_join(crate::StrokeJoin2d::Round),
+            )
+            .unwrap();
+        let translucent_green = Color::rgba(0.0, 1.0, 0.0, 0.5);
+        scene
+            .try_styled_polyline(
+                vec![
+                    Vec2::new(2.0, -8.0),
+                    Vec2::new(10.0, -2.0),
+                    Vec2::new(18.0, -8.0),
+                ],
+                crate::StrokeStyle2d::logical(
+                    crate::LogicalPixels::new(6.0).unwrap(),
+                    translucent_green,
+                )
+                .with_cap(crate::StrokeCap2d::Butt)
+                .with_join(crate::StrokeJoin2d::Bevel),
+            )
+            .unwrap();
+        let translucent_yellow = Color::rgba(1.0, 1.0, 0.0, 0.5);
+        scene
+            .try_styled_polyline(
+                vec![
+                    Vec2::new(10.0, 4.5),
+                    Vec2::new(18.0, 11.4),
+                    Vec2::new(26.0, 4.5),
+                ],
+                crate::StrokeStyle2d::logical(
+                    crate::LogicalPixels::new(6.0).unwrap(),
+                    translucent_yellow,
+                )
+                .with_cap(crate::StrokeCap2d::Butt)
+                .with_join(crate::StrokeJoin2d::Miter)
+                .with_miter_limit(1.0)
+                .unwrap(),
+            )
+            .unwrap();
+        let translucent_blue = Color::rgba(0.0, 0.0, 1.0, 0.5);
+        let arrow = crate::StrokeMarker2d::arrow(
+            crate::LogicalPixels::new(8.0).unwrap(),
+            crate::LogicalPixels::new(12.0).unwrap(),
+        );
+        scene
+            .try_styled_line(
+                Vec2::new(-24.0, -24.0),
+                Vec2::new(6.0, -24.0),
+                crate::StrokeStyle2d::logical(
+                    crate::LogicalPixels::new(6.0).unwrap(),
+                    translucent_blue,
+                )
+                .with_cap(crate::StrokeCap2d::Round)
+                .with_end_marker(arrow),
+            )
+            .unwrap();
         let source_identity = Arc::new(());
         let prepared =
             prepare_scene_resources(&device, &queue, Arc::clone(&source_identity), &scene)
@@ -1755,6 +1890,31 @@ fn offscreen_gpu_readback_verifies_camera_depth_and_clip_contract() {
         assert!(pixel(14, 14)[0] > 200, "styled dash body was not drawn");
         assert!(pixel(18, 14)[0] < 10, "styled dash gap was not preserved");
         assert!(pixel(22, 14)[0] > 200, "styled dash phase did not repeat");
+        let assert_uniform_translucency = |body: &[u8], detail: &[u8], channel: usize, name| {
+            assert!(
+                (160..=210).contains(&body[channel]),
+                "{name} body did not preserve half-alpha linear color: {body:?}"
+            );
+            assert!(
+                body[channel].abs_diff(detail[channel]) <= 8,
+                "{name} detail was alpha-blended more than once: body={body:?}, detail={detail:?}"
+            );
+        };
+        assert_uniform_translucency(pixel(10, 37), pixel(14, 32), 0, "round join");
+        assert_uniform_translucency(pixel(38, 37), pixel(42, 32), 1, "bevel join");
+        assert_uniform_translucency(pixel(46, 25), pixel(50, 20), 0, "miter fallback");
+        assert!(
+            pixel(50, 17)[0] < 10 && pixel(50, 17)[1] < 10,
+            "over-limit miter spike was not replaced by bevel geometry: {:?}",
+            pixel(50, 17)
+        );
+        assert_uniform_translucency(pixel(20, 53), pixel(35, 53), 2, "arrow marker");
+        assert_uniform_translucency(pixel(20, 53), pixel(6, 53), 2, "round cap");
+        assert!(
+            pixel(40, 53)[2] < 10,
+            "the endpoint cap protruded beyond the arrow tip: {:?}",
+            pixel(40, 53)
+        );
         assert!(
             pixel(50, 48)[0] > 200,
             "instanced particle center was not drawn"

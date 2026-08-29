@@ -430,6 +430,10 @@ advertised non-VSync mode and may fall back to FIFO. Query
 `renderer.surface_present_mode()` for the concrete Immediate, Mailbox, FIFO,
 or FIFO-relaxed configuration chosen by the surface. This does not guarantee
 that a desktop compositor will scan out above the monitor refresh rate.
+`adapter_name()`, `adapter_backend()`, `adapter_driver()`, and
+`adapter_driver_info()` expose the exact adapter/API evidence that must travel
+with benchmark results; recovery updates all four values to the replacement
+logical device.
 
 On Wayland, `Window::pre_present_notify()` installs compositor pacing. Call it
 for ordinary VSync presentation. An explicit uncapped diagnostic loop may omit
@@ -446,9 +450,11 @@ match renderer.render_with_metrics(&scene, &camera) {
     Ok(report) => {
         let status = report.status();
         let metrics = report.metrics();
-        let renderer_cpu = metrics.total_cpu();
+        let renderer_total = metrics.total_cpu();
+        let surface_wait = metrics.surface_acquire();
+        let renderer_work = renderer_total.saturating_sub(surface_wait);
         let dropped = metrics.tessellation_stats().dropped_command_count();
-        record(status, renderer_cpu, dropped);
+        record(status, renderer_work, surface_wait, dropped);
     }
     Err(error) => handle_render_error(error),
 }
@@ -457,8 +463,12 @@ match renderer.render_with_metrics(&scene, &camera) {
 `RenderStatus::Skipped` is not a drawn frame. A timeout, occlusion, outdated
 surface, or zero-sized surface can be transient. `RendererFrameMetrics`
 contains CPU wall-clock durations for tessellation, upload, camera-uniform
-upload, surface acquisition, encode/submit/present dispatch, and total renderer
-work. It does not measure GPU completion or display scanout.
+upload, surface acquisition, encode/submit/present dispatch, and total call
+time. `total_cpu()` includes `surface_acquire()`; subtract it when comparing
+engine-side CPU work and report acquisition separately because FIFO/compositor
+back-pressure normally appears there. These metrics do not measure display
+scanout; the bounded matrix additionally uses completed wall throughput as its
+GPU/back-pressure regression signal.
 
 `TessellationStats` distinguishes accepted commands, rendered commands, and
 dropped commands, and groups each by circle/rectangle/line/polyline category.
@@ -468,10 +478,11 @@ APIs and hosts should surface a non-zero dropped count in diagnostics.
 
 For heterogeneous frames, `FrameStatistics::source_counts` separates
 streaming scenes, prepared scenes, dynamic meshes, particles, scalar fields,
-images, glyph runs, and targets. `retained_cpu_bytes` and
-`retained_buffer_bytes` complement deduplicated `texture_bytes`; the CPU value
-is intentionally conservative and counts repeated item references. This makes
-the prepared/static invariant directly observable: after warm-up,
+images, glyph runs, and targets. `retained_cpu_bytes`,
+`retained_buffer_bytes`, and `texture_bytes` count unique referenced resource
+allocations: drawing one prepared scene in several viewports does not multiply
+its memory. Work counts still count every draw. This makes the prepared/static
+invariant directly observable: after warm-up,
 `streaming_vertex_count` and `streaming_upload_bytes` must include only sources
 that actually changed.
 
@@ -884,14 +895,36 @@ The named release-mode matrix is:
 ```
 
 It runs `ui_static_10k`, `ui_90_10`, `four_viewports`, `image_atlas`,
-`scientific_text`, `mixed_layers`, `budget_rejection`, `hidpi_resize`, and
-`recovery_frame`. Surface fixtures print p50/p95/p99 renderer CPU, observed
-wall throughput, construction time, source counts, vertices, uploads, retained
-memory, textures, and draw calls. `mixed_layers` remains core-only;
+`scientific_text`, `mixed_layers`, `budget_rejection`, `dpi_reconfigure`, and
+`recovery_frame`. The viewport fixture owns four distinct prepared world
+scenes and four distinct cameras. Surface fixtures print p50/p95/p99 renderer
+work excluding acquire, separate acquire percentiles, observed wall
+throughput, construction time, source counts, vertices, uploads, unique
+retained memory, textures, and draw calls. With `--gate`, each named surface
+fixture must sustain at least 60 observed FPS and acquire p95 no greater than
+25 ms. Renderer-work p95 is capped at 5 ms for retained UI, four-camera,
+image, and glyph workloads, 10 ms for repeated DPI reconfiguration, and 25 ms
+for `ui_90_10`, which deliberately rebuilds and tessellates one thousand
+commands per frame. These fixture-specific ceilings keep a streaming baseline
+from weakening the retained-path oracle. `mixed_layers` remains core-only;
 `recovery_frame` is the mandatory Vulkan semantic fixture because it restores
 every retained source on a second logical device and verifies bytes/pixels.
-Record the adapter, driver, backend, and concrete present mode with results;
-do not apply one universal millisecond threshold across different GPUs.
+Record the adapter, driver, backend, and concrete present mode with results.
+The checked thresholds are the project's Linux release floor, not a claim that
+raw timings transfer between unrelated GPUs.
+
+The automated `dpi_reconfigure` workload deliberately tests the renderer API,
+not a compositor event. For the real boundary, move the interactive fixture
+between monitors with different scaling and press Esc only after the event:
+
+```bash
+cargo run --release --example rendering_benchmark_suite -- \
+  --fixture hidpi_transition
+```
+
+It logs `ScaleFactorChanged` and `Resized` order, applies the compositor's
+physical size and scale at their event boundaries, and fails unless a frame is
+presented after a real scale transition.
 
 ### 17. Examples
 
@@ -911,6 +944,9 @@ cargo run --release --no-default-features --example particle_cpu_benchmark
 
 # Named surface benchmark (default fixture is ui_90_10)
 cargo run --release --example rendering_benchmark_suite -- --fixture ui_90_10
+
+# Interactive pixel-level gallery for caps, joins, alpha, dashes, and markers
+cargo run --release --example stroke_gallery -- --uncapped
 
 # Complete named performance/contract matrix
 ./scripts/rendering_benchmark_matrix.sh

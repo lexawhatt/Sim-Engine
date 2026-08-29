@@ -57,7 +57,8 @@ host-shaped glyph runs, explicitly budgeted dynamic triangles, richer bounded
   state across logical-device replacement;
 - primitive/source-grouped diagnostics and repeatable release-mode workloads
   for static UI, prepared/streaming UI, viewports, atlases, glyphs, mixed
-  layers, budget rejection, HiDPI resize, and recovery.
+  layers, budget rejection, DPI reconfiguration, real compositor scale
+  transitions, and recovery.
 
 Ordinary scenes support explicit construction, tessellation, and upload
 budgets, fixed logical-screen geometry, and independent positioned viewport or
@@ -157,6 +158,7 @@ cargo run --release --example star_remnant_stress -- --benchmark
 cargo run --release --no-default-features --example particle_cpu_benchmark
 cargo run --release --no-default-features --example scene_construction_benchmark
 cargo run --release --example rendering_benchmark_suite -- --fixture ui_90_10
+cargo run --release --example stroke_gallery -- --uncapped
 cargo run --release --example stereometry_3d -- --uncapped
 cargo run --release --example cylinder_derivation_3d -- --uncapped --benchmark
 ```
@@ -165,6 +167,18 @@ Run the complete named performance/contract matrix on a Vulkan-capable Linux
 machine with `./scripts/rendering_benchmark_matrix.sh`. Absolute timings are
 comparable only when adapter, driver, backend, present mode, and workload are
 recorded together; deterministic command/vertex/upload counters are portable.
+The matrix enforces at least 60 observed FPS plus fixture-specific p95 ceilings
+for renderer work excluding surface acquisition and a separate acquire p95
+ceiling. Retained paths keep tighter ceilings than the deliberately streaming
+`ui_90_10` workload. Use
+`rendering_benchmark_suite --fixture hidpi_transition` separately and move the
+window between differently scaled monitors to verify a real compositor event.
+
+`stroke_gallery` is the visual oracle for the v0.2 stroke contract. Pages 1-4
+show every cap/join, half-alpha overlap probes, bounded animated dashes,
+trimmed arrow markers, miter fallback, camera rotation, and the accepted
+0.005-world-unit line at zoom 10,000. Press `Space`, arrows, `+`/`-`, or `R`
+to pause, scrub, zoom, and reset.
 
 `ui_demo` includes a retained host-rasterized scientific glyph probe above all
 four independently changing scene workloads. It demonstrates one-time atlas
@@ -173,9 +187,10 @@ text shaping.
 
 ## Verification
 
-The v0.2.0 Linux release gate checks the declared Rust 1.90 MSRV, all targets with
-and without the renderer, strict clippy, rustdoc, Vulkan semantic GPU readback
-with a backend assertion, and the publishable package boundary:
+The v0.2.0 Linux release gate checks the declared Rust 1.90 MSRV, all targets
+with and without the renderer, strict clippy, rustdoc, Vulkan semantic GPU
+readback with a backend assertion, the named 60-FPS performance matrix on a
+real surface, and the publishable package boundary:
 
 ```bash
 ./scripts/linux_release_gate.sh

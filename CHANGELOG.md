@@ -69,6 +69,13 @@ composed frames, fixed-screen UI, retained images, and host-shaped text.
   batches in addition to command outcomes and primitive categories.
 - Dash phase remains continuous through polyline vertices; a visible dash that
   crosses a bend receives one configured join and no artificial internal caps.
+- Open strokes now use one non-overlapping joined topology. Inner segment
+  corners meet at a bounded intersection, only the projected outer bevel/round
+  fan survives, and over-limit logical miters produce a real bevel wedge.
+- Arrow markers trim the stroke body to their base and force a butt boundary at
+  the marked endpoint, independently of the style's ordinary cap.
+- Frame retained-memory diagnostics count each referenced CPU, GPU buffer, and
+  texture allocation once even when the same resource is drawn multiple times.
 - Target and heatmap composition uniforms now carry an explicit logical
   destination, allowing offscreen resources to scale into bounded frame
   viewports without abusing scissor clipping.
@@ -90,6 +97,19 @@ composed frames, fixed-screen UI, retained images, and host-shaped text.
 - Added complete cap/join combinations, miter fallback, dash phase/continuity,
   clipping, logical/world zoom behavior, finite-width overflow, bounded dash
   expansion, deterministic topology, and real GPU dash/gap readback coverage.
+- Extended the mandatory GPU oracle with half-alpha pixel comparisons for
+  round/bevel joins, round caps, arrow markers, and miter-to-bevel fallback;
+  it also rejects a cap protruding beyond an arrow tip.
+- Replaced the synthetic `hidpi_resize` claim with a deterministic
+  `dpi_reconfigure` workload and an event-driven `hidpi_transition` fixture
+  that requires a real `ScaleFactorChanged` event plus a successful present.
+- The named matrix now uses four independent prepared world scenes and four
+  independent cameras, reports renderer work separately from surface acquire,
+  prints the actual adapter/backend/driver and present mode, validates fixture
+  source/count contracts, and enforces 60-FPS/per-fixture-p95 thresholds.
+- Added the interactive `stroke_gallery` visual oracle with four pages for all
+  v0.2 stroke styles, alpha contracts, markers, dashes, camera motion, and short
+  accepted geometry.
 
 ## 0.1.0 - 2026-08-25
 

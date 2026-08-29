@@ -34,18 +34,21 @@ fn run() -> Result<(), String> {
         return Err("command and iteration counts must be non-zero".into());
     }
 
-    let vertices = command_count.saturating_mul(192);
+    let template = DrawCommand::circle(Vec2::ZERO, 1.0, ShapeStyle::filled(Color::WHITE))
+        .map_err(debug_error)?;
+    let mut probe = Scene::new(Color::BLACK).map_err(debug_error)?;
+    probe.try_push(template.clone()).map_err(debug_error)?;
+    let per_command = probe.statistics();
+    let vertices = command_count.saturating_mul(per_command.estimated_tessellated_vertices());
     let budget = SceneBudget::new(
         command_count,
         0,
         vertices,
-        command_count.saturating_mul(256),
-        vertices.saturating_mul(64),
-        command_count,
+        command_count.saturating_mul(per_command.retained_bytes()),
+        command_count.saturating_mul(per_command.estimated_upload_bytes()),
+        command_count.saturating_mul(per_command.estimated_draw_batches()),
     );
     let mut samples = Vec::with_capacity(iterations);
-    let template = DrawCommand::circle(Vec2::ZERO, 1.0, ShapeStyle::filled(Color::WHITE))
-        .map_err(debug_error)?;
     for iteration in 0..iterations {
         let mut scene = Scene::with_budget(Color::BLACK, budget).map_err(debug_error)?;
         let started = Instant::now();

@@ -32,6 +32,8 @@ struct Vertex {
     normal_distance: f32,
     tangent_distance: f32,
     miter_limit: f32,
+    stroke_role: f32,
+    stroke_parameter: f32,
     color: [f32; 4],
 }
 
@@ -275,7 +277,7 @@ enum TessellationError {
 }
 
 impl Vertex {
-    const ATTRIBUTES: [wgpu::VertexAttribute; 9] = wgpu::vertex_attr_array![
+    const ATTRIBUTES: [wgpu::VertexAttribute; 11] = wgpu::vertex_attr_array![
         0 => Float32x2,
         1 => Float32,
         2 => Float32x2,
@@ -284,7 +286,9 @@ impl Vertex {
         5 => Float32,
         6 => Float32,
         7 => Float32,
-        8 => Float32x4
+        8 => Float32,
+        9 => Float32,
+        10 => Float32x4
     ];
 
     const LAYOUT: wgpu::VertexBufferLayout<'static> = wgpu::VertexBufferLayout {
@@ -305,6 +309,8 @@ impl Vertex {
             && self.normal_distance.is_finite()
             && self.tangent_distance.is_finite()
             && self.miter_limit.is_finite()
+            && self.stroke_role.is_finite()
+            && self.stroke_parameter.is_finite()
             && self.color.iter().all(|value| value.is_finite())
     }
 }
@@ -1959,6 +1965,7 @@ pub struct WgpuRenderer {
     _instance: wgpu::Instance,
     surface: wgpu::Surface<'static>,
     _adapter: wgpu::Adapter,
+    adapter_info: wgpu::AdapterInfo,
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
@@ -2043,6 +2050,7 @@ impl WgpuRenderer {
             })
             .await
             .map_err(RendererInitError::RequestAdapter)?;
+        let adapter_info = adapter.get_info();
 
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
@@ -2097,6 +2105,7 @@ impl WgpuRenderer {
             _instance: instance,
             surface,
             _adapter: adapter,
+            adapter_info,
             device,
             queue,
             config,
@@ -2183,6 +2192,26 @@ impl WgpuRenderer {
     /// desktop compositor may still pace host redraw callbacks independently.
     pub fn surface_present_mode(&self) -> RendererSurfacePresentMode {
         self.surface_present_mode
+    }
+
+    /// Returns the active graphics adapter's human-readable name.
+    pub fn adapter_name(&self) -> &str {
+        &self.adapter_info.name
+    }
+
+    /// Returns the active graphics API backend as a stable lowercase name.
+    pub fn adapter_backend(&self) -> &'static str {
+        self.adapter_info.backend.to_str()
+    }
+
+    /// Returns the driver name reported by the active graphics adapter.
+    pub fn adapter_driver(&self) -> &str {
+        &self.adapter_info.driver
+    }
+
+    /// Returns the driver version or implementation detail reported by the adapter.
+    pub fn adapter_driver_info(&self) -> &str {
+        &self.adapter_info.driver_info
     }
 
     /// Returns previous logical devices retained for safe native-driver teardown.

@@ -65,6 +65,10 @@ name = "rendering_benchmark_suite"
 required-features = ["wgpu"]
 
 [[example]]
+name = "stroke_gallery"
+required-features = ["wgpu"]
+
+[[example]]
 name = "star_remnant_stress"
 required-features = ["wgpu"]
 

@@ -361,39 +361,11 @@ fn tessellate_open_stroke(
     style: crate::StrokeStyle2d,
     vertices: &mut Vec<Vertex>,
 ) -> Result<(), TessellationError> {
-    let width = style.stroke().width();
     let color = style.stroke().color();
     if let Some(dash) = style.dash_pattern() {
-        visit_dash_stroke(points, dash, |event| match event {
-            DashStrokeEvent::Segment {
-                from,
-                to,
-                start_cap,
-                end_cap,
-            } => push_stroke_segment(from, to, style, start_cap, end_cap, vertices),
-            DashStrokeEvent::Join {
-                previous,
-                center,
-                next,
-            } => push_stroke_join(previous, center, next, style, vertices),
-        });
-    } else if style.width_mode() == crate::StrokeWidthMode2d::LogicalPixels
-        && style.join() == crate::StrokeJoin2d::Miter
-    {
-        for (index, pair) in points.windows(2).enumerate() {
-            push_logical_miter_segment(points, index, pair[0], pair[1], style, vertices);
-        }
+        tessellate_dashed_stroke(points, dash, style, vertices)?;
     } else {
-        for (index, pair) in points.windows(2).enumerate() {
-            let from = pair[0];
-            let to = pair[1];
-            let start_cap = index == 0;
-            let end_cap = index + 2 == points.len();
-            push_stroke_segment(from, to, style, start_cap, end_cap, vertices);
-            if !end_cap {
-                push_stroke_join(from, to, points[index + 2], style, vertices);
-            }
-        }
+        tessellate_stroke_run(points, style, true, true, vertices);
     }
 
     if let Some(marker) = style.start_marker() {
@@ -418,156 +390,16 @@ fn tessellate_open_stroke(
         );
     }
 
-    debug_assert!(width.is_finite() && width > 0.0);
+    debug_assert!(style.stroke().width().is_finite() && style.stroke().width() > 0.0);
     Ok(())
 }
 
-fn push_logical_miter_segment(
-    points: &[Vec2],
-    index: usize,
-    from: Vec2,
-    to: Vec2,
-    style: crate::StrokeStyle2d,
-    vertices: &mut Vec<Vertex>,
-) {
-    let direction = to - from;
-    let previous = index
-        .checked_sub(1)
-        .map_or(direction, |previous| from - points[previous]);
-    let next = points.get(index + 2).map_or(direction, |next| *next - to);
-    let start_cap = index == 0;
-    let end_cap = index + 2 == points.len();
-    let half_width = style.stroke().width() * 0.5;
-    let start_tangent = if start_cap && style.cap() == crate::StrokeCap2d::Square {
-        -half_width
-    } else {
-        0.0
-    };
-    let end_tangent = if end_cap && style.cap() == crate::StrokeCap2d::Square {
-        half_width
-    } else {
-        0.0
-    };
-    let color = style.stroke().color();
-    let vertex = |world, previous_direction, next_direction, normal_distance, tangent_distance| {
-        stroke_vertex(
-            world,
-            Vec2::ZERO,
-            previous_direction,
-            next_direction,
-            normal_distance,
-            tangent_distance,
-            style.miter_limit(),
-            color,
-        )
-    };
-    let start_positive = vertex(from, previous, direction, half_width, start_tangent);
-    let end_positive = vertex(to, direction, next, half_width, end_tangent);
-    let end_negative = vertex(to, direction, next, -half_width, end_tangent);
-    let start_negative = vertex(from, previous, direction, -half_width, start_tangent);
-    vertices.extend_from_slice(&[
-        start_positive,
-        end_positive,
-        end_negative,
-        start_positive,
-        end_negative,
-        start_negative,
-    ]);
-    if style.cap() == crate::StrokeCap2d::Round {
-        if start_cap {
-            push_logical_round_cap(from, direction, half_width, true, color, vertices);
-        }
-        if end_cap {
-            push_logical_round_cap(to, direction, half_width, false, color, vertices);
-        }
-    }
-}
-
-fn push_stroke_segment(
-    from: Vec2,
-    to: Vec2,
-    style: crate::StrokeStyle2d,
-    start_cap: bool,
-    end_cap: bool,
-    vertices: &mut Vec<Vertex>,
-) {
-    let width = style.stroke().width();
-    let color = style.stroke().color();
-    let half_width = width * 0.5;
-    let direction = to - from;
-    match style.width_mode() {
-        crate::StrokeWidthMode2d::LogicalPixels => {
-            let start_tangent = if start_cap && style.cap() == crate::StrokeCap2d::Square {
-                -half_width
-            } else {
-                0.0
-            };
-            let end_tangent = if end_cap && style.cap() == crate::StrokeCap2d::Square {
-                half_width
-            } else {
-                0.0
-            };
-            push_logical_stroke_quad(
-                from,
-                to,
-                direction,
-                half_width,
-                start_tangent,
-                end_tangent,
-                color,
-                vertices,
-            );
-            if style.cap() == crate::StrokeCap2d::Round {
-                if start_cap {
-                    push_logical_round_cap(from, direction, half_width, true, color, vertices);
-                }
-                if end_cap {
-                    push_logical_round_cap(to, direction, half_width, false, color, vertices);
-                }
-            }
-        }
-        crate::StrokeWidthMode2d::WorldUnits => {
-            push_world_stroke_quad(
-                from,
-                to,
-                half_width,
-                start_cap && style.cap() == crate::StrokeCap2d::Square,
-                end_cap && style.cap() == crate::StrokeCap2d::Square,
-                color,
-                vertices,
-            );
-            if style.cap() == crate::StrokeCap2d::Round {
-                if start_cap {
-                    push_world_round_cap(from, direction, half_width, true, color, vertices);
-                }
-                if end_cap {
-                    push_world_round_cap(to, direction, half_width, false, color, vertices);
-                }
-            }
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-enum DashStrokeEvent {
-    Segment {
-        from: Vec2,
-        to: Vec2,
-        start_cap: bool,
-        end_cap: bool,
-    },
-    Join {
-        previous: Vec2,
-        center: Vec2,
-        next: Vec2,
-    },
-}
-
-fn visit_dash_stroke(
+fn tessellate_dashed_stroke(
     points: &[Vec2],
     dash: crate::StrokeDashPattern2d,
-    mut visit: impl FnMut(DashStrokeEvent),
-) {
+    style: crate::StrokeStyle2d,
+    vertices: &mut Vec<Vertex>,
+) -> Result<(), TessellationError> {
     let lengths = dash.lengths();
     let total: f64 = lengths.iter().map(|length| f64::from(*length)).sum();
     let mut phase = f64::from(dash.phase()).rem_euclid(total);
@@ -577,7 +409,7 @@ fn visit_dash_stroke(
         pattern_index = (pattern_index + 1) % lengths.len();
     }
     let mut pattern_remaining = f64::from(lengths[pattern_index]) - phase;
-    let mut visible_run_start = pattern_index.is_multiple_of(2);
+    let mut run = Vec::new();
 
     for (segment_index, pair) in points.windows(2).enumerate() {
         let from = pair[0];
@@ -593,19 +425,24 @@ fn visit_dash_stroke(
             let finishes_path = finishes_segment && segment_index + 2 == points.len();
             let visible = pattern_index.is_multiple_of(2);
             if visible && consumed > 0.0 {
-                visit(DashStrokeEvent::Segment {
-                    from: segment_point(from, to, segment_consumed / segment_length),
-                    to: segment_point(from, to, (segment_consumed + consumed) / segment_length),
-                    start_cap: visible_run_start,
-                    end_cap: finishes_pattern || finishes_path,
-                });
-                visible_run_start = false;
-                if finishes_segment && !finishes_path && !finishes_pattern {
-                    visit(DashStrokeEvent::Join {
-                        previous: from,
-                        center: to,
-                        next: points[segment_index + 2],
-                    });
+                let piece_from = segment_point(from, to, segment_consumed / segment_length);
+                let piece_to =
+                    segment_point(from, to, (segment_consumed + consumed) / segment_length);
+                if run.last().is_none_or(|point| *point != piece_from) {
+                    reserve_items(&mut run, 1)?;
+                    run.push(piece_from);
+                }
+                if run.last().is_none_or(|point| *point != piece_to) {
+                    reserve_items(&mut run, 1)?;
+                    run.push(piece_to);
+                }
+                if finishes_pattern || finishes_path {
+                    if run.len() >= 2 {
+                        let starts_path = run[0] == points[0];
+                        let ends_path = run[run.len() - 1] == points[points.len() - 1];
+                        tessellate_stroke_run(&run, style, starts_path, ends_path, vertices);
+                    }
+                    run.clear();
                 }
             }
             segment_consumed += consumed;
@@ -613,10 +450,10 @@ fn visit_dash_stroke(
             if pattern_remaining <= 0.0 {
                 pattern_index = (pattern_index + 1) % lengths.len();
                 pattern_remaining = f64::from(lengths[pattern_index]);
-                visible_run_start = pattern_index.is_multiple_of(2);
             }
         }
     }
+    Ok(())
 }
 
 fn segment_point(from: Vec2, to: Vec2, amount: f64) -> Vec2 {
@@ -626,68 +463,544 @@ fn segment_point(from: Vec2, to: Vec2, amount: f64) -> Vec2 {
     )
 }
 
-#[allow(clippy::too_many_arguments)]
-fn push_logical_stroke_quad(
-    from: Vec2,
-    to: Vec2,
-    direction: Vec2,
-    half_width: f32,
-    start_tangent: f32,
-    end_tangent: f32,
-    color: Color,
+fn tessellate_stroke_run(
+    points: &[Vec2],
+    style: crate::StrokeStyle2d,
+    starts_path: bool,
+    ends_path: bool,
     vertices: &mut Vec<Vertex>,
 ) {
-    let vertex = |world, normal_distance, tangent_distance| {
-        stroke_vertex(
-            world,
-            Vec2::ZERO,
-            direction,
-            direction,
-            normal_distance,
-            tangent_distance,
-            1.0,
-            color,
-        )
-    };
-    let start_positive = vertex(from, half_width, start_tangent);
-    let end_positive = vertex(to, half_width, end_tangent);
-    let end_negative = vertex(to, -half_width, end_tangent);
-    let start_negative = vertex(from, -half_width, start_tangent);
-    vertices.extend_from_slice(&[
-        start_positive,
-        end_positive,
-        end_negative,
-        start_positive,
-        end_negative,
-        start_negative,
-    ]);
+    match style.width_mode() {
+        crate::StrokeWidthMode2d::LogicalPixels => {
+            push_logical_stroke_run(points, style, starts_path, ends_path, vertices)
+        }
+        crate::StrokeWidthMode2d::WorldUnits => {
+            push_world_stroke_run(points, style, starts_path, ends_path, vertices)
+        }
+    }
 }
 
-fn push_world_stroke_quad(
-    from: Vec2,
-    to: Vec2,
-    half_width: f32,
-    extend_start: bool,
-    extend_end: bool,
-    color: Color,
+fn endpoint_tangent(style: crate::StrokeStyle2d, start: bool, is_path_endpoint: bool) -> f32 {
+    let marker = if start {
+        style.start_marker()
+    } else {
+        style.end_marker()
+    };
+    if is_path_endpoint && let Some(marker) = marker {
+        return if start {
+            marker.length().get()
+        } else {
+            -marker.length().get()
+        };
+    }
+    if style.cap() == crate::StrokeCap2d::Square {
+        let half_width = style.stroke().width() * 0.5;
+        if start { -half_width } else { half_width }
+    } else {
+        0.0
+    }
+}
+
+fn endpoint_has_round_cap(
+    style: crate::StrokeStyle2d,
+    start: bool,
+    is_path_endpoint: bool,
+) -> bool {
+    let marker = if start {
+        style.start_marker()
+    } else {
+        style.end_marker()
+    };
+    style.cap() == crate::StrokeCap2d::Round && (!is_path_endpoint || marker.is_none())
+}
+
+fn logical_join_role(join: crate::StrokeJoin2d) -> f32 {
+    match join {
+        crate::StrokeJoin2d::Bevel => 1.0,
+        crate::StrokeJoin2d::Miter => 2.0,
+        crate::StrokeJoin2d::Round => 3.0,
+    }
+}
+
+fn push_logical_stroke_run(
+    points: &[Vec2],
+    style: crate::StrokeStyle2d,
+    starts_path: bool,
+    ends_path: bool,
     vertices: &mut Vec<Vertex>,
 ) {
-    let unit = precise_unit(to - from);
-    let normal = unit.perp() * half_width;
-    let start = from - unit * if extend_start { half_width } else { 0.0 };
-    let end = to + unit * if extend_end { half_width } else { 0.0 };
-    let start_positive = world_vertex(start + normal, Vec2::ZERO, color);
-    let end_positive = world_vertex(end + normal, Vec2::ZERO, color);
-    let end_negative = world_vertex(end - normal, Vec2::ZERO, color);
-    let start_negative = world_vertex(start - normal, Vec2::ZERO, color);
-    vertices.extend_from_slice(&[
-        start_positive,
-        end_positive,
-        end_negative,
-        start_positive,
-        end_negative,
-        start_negative,
-    ]);
+    let half_width = style.stroke().width() * 0.5;
+    let color = style.stroke().color();
+    for (index, pair) in points.windows(2).enumerate() {
+        let from = pair[0];
+        let to = pair[1];
+        let direction = to - from;
+        let start_joint = index > 0;
+        let end_joint = index + 2 < points.len();
+        let previous = if start_joint {
+            from - points[index - 1]
+        } else {
+            direction
+        };
+        let next = if end_joint {
+            points[index + 2] - to
+        } else {
+            direction
+        };
+        let start_tangent = if start_joint {
+            0.0
+        } else {
+            endpoint_tangent(style, true, starts_path)
+        };
+        let end_tangent = if end_joint {
+            0.0
+        } else {
+            endpoint_tangent(style, false, ends_path)
+        };
+        let start_role = if start_joint {
+            logical_join_role(style.join())
+        } else {
+            0.0
+        };
+        let end_role = if end_joint {
+            logical_join_role(style.join())
+        } else {
+            0.0
+        };
+        let vertex = |world,
+                      previous_direction,
+                      next_direction,
+                      normal_distance,
+                      tangent_distance,
+                      role,
+                      parameter| {
+            stroke_vertex_with_role(
+                world,
+                Vec2::ZERO,
+                previous_direction,
+                next_direction,
+                normal_distance,
+                tangent_distance,
+                style.miter_limit(),
+                role,
+                parameter,
+                color,
+            )
+        };
+        let start_positive = vertex(
+            from,
+            previous,
+            direction,
+            half_width,
+            start_tangent,
+            start_role,
+            1.0,
+        );
+        let end_positive = vertex(to, direction, next, half_width, end_tangent, end_role, -1.0);
+        let end_negative = vertex(
+            to,
+            direction,
+            next,
+            -half_width,
+            end_tangent,
+            end_role,
+            -1.0,
+        );
+        let start_negative = vertex(
+            from,
+            previous,
+            direction,
+            -half_width,
+            start_tangent,
+            start_role,
+            1.0,
+        );
+        vertices.extend_from_slice(&[
+            start_positive,
+            end_positive,
+            end_negative,
+            start_positive,
+            end_negative,
+            start_negative,
+        ]);
+    }
+    for window in points.windows(3) {
+        push_logical_join_fill(window[0], window[1], window[2], style, vertices);
+    }
+    let start_direction = points[1] - points[0];
+    if endpoint_has_round_cap(style, true, starts_path) {
+        push_logical_round_cap(
+            points[0],
+            start_direction,
+            half_width,
+            true,
+            color,
+            vertices,
+        );
+    }
+    let last = points.len() - 1;
+    let end_direction = points[last] - points[last - 1];
+    if endpoint_has_round_cap(style, false, ends_path) {
+        push_logical_round_cap(
+            points[last],
+            end_direction,
+            half_width,
+            false,
+            color,
+            vertices,
+        );
+    }
+}
+
+fn push_logical_join_fill(
+    previous: Vec2,
+    center: Vec2,
+    next: Vec2,
+    style: crate::StrokeStyle2d,
+    vertices: &mut Vec<Vertex>,
+) {
+    let incoming = center - previous;
+    let outgoing = next - center;
+    let half_width = style.stroke().width() * 0.5;
+    let color = style.stroke().color();
+    let (corner_role, inner_role) = match style.join() {
+        crate::StrokeJoin2d::Bevel => (4.0, 5.0),
+        crate::StrokeJoin2d::Miter => (6.0, 7.0),
+        crate::StrokeJoin2d::Round => (8.0, 9.0),
+    };
+    for candidate_side in [-1.0, 1.0] {
+        let inner = stroke_vertex_with_role(
+            center,
+            Vec2::ZERO,
+            incoming,
+            outgoing,
+            -candidate_side * half_width,
+            0.0,
+            style.miter_limit(),
+            inner_role,
+            candidate_side,
+            color,
+        );
+        if style.join() == crate::StrokeJoin2d::Round {
+            for index in 0..ROUND_CAP_SEGMENTS {
+                let start = index as f32 / ROUND_CAP_SEGMENTS as f32;
+                let end = (index + 1) as f32 / ROUND_CAP_SEGMENTS as f32;
+                vertices.extend_from_slice(&[
+                    inner,
+                    stroke_vertex_with_role(
+                        center,
+                        Vec2::ZERO,
+                        incoming,
+                        outgoing,
+                        candidate_side * half_width,
+                        0.0,
+                        style.miter_limit(),
+                        corner_role,
+                        start,
+                        color,
+                    ),
+                    stroke_vertex_with_role(
+                        center,
+                        Vec2::ZERO,
+                        incoming,
+                        outgoing,
+                        candidate_side * half_width,
+                        0.0,
+                        style.miter_limit(),
+                        corner_role,
+                        end,
+                        color,
+                    ),
+                ]);
+            }
+        } else {
+            vertices.extend_from_slice(&[
+                inner,
+                stroke_vertex_with_role(
+                    center,
+                    Vec2::ZERO,
+                    incoming,
+                    outgoing,
+                    candidate_side * half_width,
+                    0.0,
+                    style.miter_limit(),
+                    corner_role,
+                    -1.0,
+                    color,
+                ),
+                stroke_vertex_with_role(
+                    center,
+                    Vec2::ZERO,
+                    incoming,
+                    outgoing,
+                    candidate_side * half_width,
+                    0.0,
+                    style.miter_limit(),
+                    corner_role,
+                    1.0,
+                    color,
+                ),
+            ]);
+        }
+    }
+}
+
+fn push_world_stroke_run(
+    points: &[Vec2],
+    style: crate::StrokeStyle2d,
+    starts_path: bool,
+    ends_path: bool,
+    vertices: &mut Vec<Vertex>,
+) {
+    let half_width = style.stroke().width() * 0.5;
+    let color = style.stroke().color();
+    for (index, pair) in points.windows(2).enumerate() {
+        let from = pair[0];
+        let to = pair[1];
+        let direction = to - from;
+        let start_joint = index > 0;
+        let end_joint = index + 2 < points.len();
+        let start_center = if !start_joint
+            && endpoint_tangent(style, true, starts_path) < 0.0
+            && !(starts_path && style.start_marker().is_some())
+        {
+            from - precise_unit(direction) * half_width
+        } else {
+            from
+        };
+        let end_center = if !end_joint
+            && endpoint_tangent(style, false, ends_path) > 0.0
+            && !(ends_path && style.end_marker().is_some())
+        {
+            to + precise_unit(direction) * half_width
+        } else {
+            to
+        };
+        let start_offset = |side| {
+            if start_joint {
+                world_join_endpoint_offset(
+                    from - points[index - 1],
+                    direction,
+                    side,
+                    half_width,
+                    style,
+                    false,
+                )
+            } else {
+                precise_unit(direction).perp() * (side * half_width)
+            }
+        };
+        let end_offset = |side| {
+            if end_joint {
+                world_join_endpoint_offset(
+                    direction,
+                    points[index + 2] - to,
+                    side,
+                    half_width,
+                    style,
+                    true,
+                )
+            } else {
+                precise_unit(direction).perp() * (side * half_width)
+            }
+        };
+        let start_trim = if starts_path && index == 0 && style.start_marker().is_some() {
+            endpoint_tangent(style, true, true)
+        } else {
+            0.0
+        };
+        let end_trim = if ends_path && index + 2 == points.len() && style.end_marker().is_some() {
+            endpoint_tangent(style, false, true)
+        } else {
+            0.0
+        };
+        let vertex = |world, tangent| {
+            stroke_vertex(
+                world,
+                Vec2::ZERO,
+                direction,
+                direction,
+                0.0,
+                tangent,
+                1.0,
+                color,
+            )
+        };
+        let start_positive = vertex(start_center + start_offset(1.0), start_trim);
+        let end_positive = vertex(end_center + end_offset(1.0), end_trim);
+        let end_negative = vertex(end_center + end_offset(-1.0), end_trim);
+        let start_negative = vertex(start_center + start_offset(-1.0), start_trim);
+        vertices.extend_from_slice(&[
+            start_positive,
+            end_positive,
+            end_negative,
+            start_positive,
+            end_negative,
+            start_negative,
+        ]);
+    }
+    for window in points.windows(3) {
+        push_world_join_fill(window[0], window[1], window[2], style, vertices);
+    }
+    let start_direction = points[1] - points[0];
+    if endpoint_has_round_cap(style, true, starts_path) {
+        push_world_round_cap(
+            points[0],
+            start_direction,
+            half_width,
+            true,
+            color,
+            vertices,
+        );
+    }
+    let last = points.len() - 1;
+    let end_direction = points[last] - points[last - 1];
+    if endpoint_has_round_cap(style, false, ends_path) {
+        push_world_round_cap(
+            points[last],
+            end_direction,
+            half_width,
+            false,
+            color,
+            vertices,
+        );
+    }
+}
+
+fn world_miter_offset(
+    incoming: Vec2,
+    outgoing: Vec2,
+    side: f32,
+    half_width: f32,
+) -> Option<(Vec2, f32)> {
+    let incoming_normal = precise_unit(incoming).perp();
+    let outgoing_normal = precise_unit(outgoing).perp();
+    let miter = precise_unit(incoming_normal + outgoing_normal);
+    let denominator = miter.dot(outgoing_normal);
+    (denominator.abs() > 0.001).then(|| {
+        (
+            miter * (side * half_width / denominator),
+            (1.0 / denominator).abs(),
+        )
+    })
+}
+
+fn world_join_endpoint_offset(
+    incoming: Vec2,
+    outgoing: Vec2,
+    side: f32,
+    half_width: f32,
+    style: crate::StrokeStyle2d,
+    incoming_segment: bool,
+) -> Vec2 {
+    let incoming_unit = precise_unit(incoming);
+    let outgoing_unit = precise_unit(outgoing);
+    let turn = incoming_unit
+        .x
+        .mul_add(outgoing_unit.y, -incoming_unit.y * outgoing_unit.x);
+    if turn.abs() <= 0.000001 {
+        return outgoing_unit.perp() * (side * half_width);
+    }
+    let outer_side = -turn.signum();
+    let miter = world_miter_offset(incoming, outgoing, side, half_width);
+    if side != outer_side {
+        return miter.map_or(Vec2::ZERO, |(offset, multiple)| {
+            if multiple <= style.miter_limit() {
+                offset
+            } else {
+                Vec2::ZERO
+            }
+        });
+    }
+    if style.join() == crate::StrokeJoin2d::Miter
+        && let Some((offset, multiple)) = miter
+        && multiple <= style.miter_limit()
+    {
+        return offset;
+    }
+    let normal = if incoming_segment {
+        incoming_unit.perp()
+    } else {
+        outgoing_unit.perp()
+    };
+    normal * (side * half_width)
+}
+
+fn push_world_join_fill(
+    previous: Vec2,
+    center: Vec2,
+    next: Vec2,
+    style: crate::StrokeStyle2d,
+    vertices: &mut Vec<Vertex>,
+) {
+    let incoming = center - previous;
+    let outgoing = next - center;
+    let incoming_unit = precise_unit(incoming);
+    let outgoing_unit = precise_unit(outgoing);
+    let turn = incoming_unit
+        .x
+        .mul_add(outgoing_unit.y, -incoming_unit.y * outgoing_unit.x);
+    if turn.abs() <= 0.000001 {
+        return;
+    }
+    let outer_side = -turn.signum();
+    let half_width = style.stroke().width() * 0.5;
+    let color = style.stroke().color();
+    let miter = world_miter_offset(incoming, outgoing, outer_side, half_width);
+    if style.join() == crate::StrokeJoin2d::Miter
+        && miter.is_some_and(|(_, multiple)| multiple <= style.miter_limit())
+    {
+        return;
+    }
+    let inner = center
+        + world_miter_offset(incoming, outgoing, -outer_side, half_width).map_or(
+            Vec2::ZERO,
+            |(offset, multiple)| {
+                if multiple <= style.miter_limit() {
+                    offset
+                } else {
+                    Vec2::ZERO
+                }
+            },
+        );
+    let incoming_outer = center + incoming_unit.perp() * (outer_side * half_width);
+    let outgoing_outer = center + outgoing_unit.perp() * (outer_side * half_width);
+    if style.join() == crate::StrokeJoin2d::Round {
+        let start = incoming_unit.perp() * outer_side;
+        let finish = outgoing_unit.perp() * outer_side;
+        let angle = start
+            .x
+            .mul_add(finish.y, -start.y * finish.x)
+            .atan2(start.dot(finish));
+        for index in 0..ROUND_CAP_SEGMENTS {
+            let rotate = |amount: f32| {
+                let radians = angle * amount;
+                Vec2::new(
+                    start.x.mul_add(radians.cos(), -start.y * radians.sin()),
+                    start.x.mul_add(radians.sin(), start.y * radians.cos()),
+                )
+            };
+            vertices.extend_from_slice(&[
+                world_vertex(inner, Vec2::ZERO, color),
+                world_vertex(
+                    center + rotate(index as f32 / ROUND_CAP_SEGMENTS as f32) * half_width,
+                    Vec2::ZERO,
+                    color,
+                ),
+                world_vertex(
+                    center + rotate((index + 1) as f32 / ROUND_CAP_SEGMENTS as f32) * half_width,
+                    Vec2::ZERO,
+                    color,
+                ),
+            ]);
+        }
+    } else {
+        vertices.extend_from_slice(&[
+            world_vertex(inner, Vec2::ZERO, color),
+            world_vertex(incoming_outer, Vec2::ZERO, color),
+            world_vertex(outgoing_outer, Vec2::ZERO, color),
+        ]);
+    }
 }
 
 fn precise_unit(direction: Vec2) -> Vec2 {
@@ -775,140 +1088,6 @@ fn push_world_round_cap(
     }
 }
 
-fn push_stroke_join(
-    previous: Vec2,
-    center: Vec2,
-    next: Vec2,
-    style: crate::StrokeStyle2d,
-    vertices: &mut Vec<Vertex>,
-) {
-    let incoming = center - previous;
-    let outgoing = next - center;
-    let half_width = style.stroke().width() * 0.5;
-    let color = style.stroke().color();
-    match style.width_mode() {
-        crate::StrokeWidthMode2d::LogicalPixels => match style.join() {
-            crate::StrokeJoin2d::Round => {
-                push_circle_screen_at_world(center, half_width, color, Vec2::ZERO, vertices);
-            }
-            crate::StrokeJoin2d::Bevel | crate::StrokeJoin2d::Miter => {
-                push_logical_join(center, incoming, outgoing, half_width, style, vertices);
-            }
-        },
-        crate::StrokeWidthMode2d::WorldUnits => match style.join() {
-            crate::StrokeJoin2d::Round => {
-                push_circle_fill_world(center, half_width, Fill::Solid(color), Vec2::ZERO, vertices)
-            }
-            crate::StrokeJoin2d::Bevel | crate::StrokeJoin2d::Miter => {
-                push_world_join(center, incoming, outgoing, half_width, style, vertices);
-            }
-        },
-    }
-}
-
-fn push_logical_join(
-    center: Vec2,
-    incoming: Vec2,
-    outgoing: Vec2,
-    half_width: f32,
-    style: crate::StrokeStyle2d,
-    vertices: &mut Vec<Vertex>,
-) {
-    let color = style.stroke().color();
-    let center_vertex = stroke_vertex(center, Vec2::ZERO, incoming, outgoing, 0.0, 0.0, 1.0, color);
-    for side in [-1.0, 1.0] {
-        let incoming_corner = stroke_vertex(
-            center,
-            Vec2::ZERO,
-            incoming,
-            incoming,
-            side * half_width,
-            0.0,
-            1.0,
-            color,
-        );
-        let outgoing_corner = stroke_vertex(
-            center,
-            Vec2::ZERO,
-            outgoing,
-            outgoing,
-            side * half_width,
-            0.0,
-            1.0,
-            color,
-        );
-        if style.join() == crate::StrokeJoin2d::Miter {
-            let miter = stroke_vertex(
-                center,
-                Vec2::ZERO,
-                incoming,
-                outgoing,
-                side * half_width,
-                0.0,
-                style.miter_limit(),
-                color,
-            );
-            vertices.extend_from_slice(&[
-                center_vertex,
-                incoming_corner,
-                miter,
-                center_vertex,
-                miter,
-                outgoing_corner,
-            ]);
-        } else {
-            vertices.extend_from_slice(&[center_vertex, incoming_corner, outgoing_corner]);
-        }
-    }
-}
-
-fn push_world_join(
-    center: Vec2,
-    incoming: Vec2,
-    outgoing: Vec2,
-    half_width: f32,
-    style: crate::StrokeStyle2d,
-    vertices: &mut Vec<Vertex>,
-) {
-    let incoming_normal = precise_unit(incoming).perp();
-    let outgoing_normal = precise_unit(outgoing).perp();
-    let color = style.stroke().color();
-    let center_vertex = world_vertex(center, Vec2::ZERO, color);
-    for side in [-1.0, 1.0] {
-        let incoming_corner = center + incoming_normal * (side * half_width);
-        let outgoing_corner = center + outgoing_normal * (side * half_width);
-        if style.join() == crate::StrokeJoin2d::Miter {
-            let combined = incoming_normal + outgoing_normal;
-            let miter_direction = precise_unit(combined);
-            let denominator = miter_direction.dot(outgoing_normal);
-            let multiple = if denominator.abs() > 0.001 {
-                (1.0 / denominator).abs()
-            } else {
-                f32::INFINITY
-            };
-            let miter = if multiple <= style.miter_limit() {
-                center + miter_direction * (side * half_width / denominator)
-            } else {
-                outgoing_corner
-            };
-            vertices.extend_from_slice(&[
-                center_vertex,
-                world_vertex(incoming_corner, Vec2::ZERO, color),
-                world_vertex(miter, Vec2::ZERO, color),
-                center_vertex,
-                world_vertex(miter, Vec2::ZERO, color),
-                world_vertex(outgoing_corner, Vec2::ZERO, color),
-            ]);
-        } else {
-            vertices.extend_from_slice(&[
-                center_vertex,
-                world_vertex(incoming_corner, Vec2::ZERO, color),
-                world_vertex(outgoing_corner, Vec2::ZERO, color),
-            ]);
-        }
-    }
-}
-
 fn push_stroke_marker(
     center: Vec2,
     direction: Vec2,
@@ -955,35 +1134,6 @@ fn push_stroke_marker(
             color,
         ),
     ]);
-}
-
-fn push_circle_screen_at_world(
-    center_world: Vec2,
-    radius: f32,
-    color: Color,
-    screen_offset: Vec2,
-    vertices: &mut Vec<Vertex>,
-) {
-    if radius <= 0.0 {
-        return;
-    }
-
-    let center_vertex = world_vertex(center_world, screen_offset, color);
-    for index in 0..ROUND_CAP_SEGMENTS {
-        let angle_start = index as f32 / ROUND_CAP_SEGMENTS as f32 * std::f32::consts::TAU;
-        let angle_end = (index + 1) as f32 / ROUND_CAP_SEGMENTS as f32 * std::f32::consts::TAU;
-        vertices.push(center_vertex);
-        vertices.push(world_vertex(
-            center_world,
-            screen_offset + Vec2::new(angle_start.cos(), -angle_start.sin()) * radius,
-            color,
-        ));
-        vertices.push(world_vertex(
-            center_world,
-            screen_offset + Vec2::new(angle_end.cos(), -angle_end.sin()) * radius,
-            color,
-        ));
-    }
 }
 
 fn push_circle_fill_world(
@@ -1223,6 +1373,8 @@ pub(super) fn world_vertex(world: Vec2, screen_offset: Vec2, color: Color) -> Ve
         normal_distance: 0.0,
         tangent_distance: 0.0,
         miter_limit: 1.0,
+        stroke_role: 0.0,
+        stroke_parameter: 0.0,
         color: color.to_array(),
     }
 }
@@ -1258,6 +1410,33 @@ fn stroke_vertex(
     miter_limit: f32,
     color: Color,
 ) -> Vertex {
+    stroke_vertex_with_role(
+        world,
+        screen_offset,
+        previous_direction,
+        next_direction,
+        normal_distance,
+        tangent_distance,
+        miter_limit,
+        0.0,
+        0.0,
+        color,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn stroke_vertex_with_role(
+    world: Vec2,
+    screen_offset: Vec2,
+    previous_direction: Vec2,
+    next_direction: Vec2,
+    normal_distance: f32,
+    tangent_distance: f32,
+    miter_limit: f32,
+    stroke_role: f32,
+    stroke_parameter: f32,
+    color: Color,
+) -> Vertex {
     let previous_direction = precise_unit(previous_direction);
     let next_direction = precise_unit(next_direction);
     Vertex {
@@ -1269,6 +1448,8 @@ fn stroke_vertex(
         normal_distance,
         tangent_distance,
         miter_limit,
+        stroke_role,
+        stroke_parameter,
         color: color.to_array(),
     }
 }

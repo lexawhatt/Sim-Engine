@@ -351,7 +351,7 @@ impl From<RendererFrameError> for FrameComposerError {
     }
 }
 
-/// Conservative work referenced by one composed frame.
+/// Bounded work and unique retained allocations referenced by one composed frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct FrameStatistics {
     pass_count: usize,
@@ -406,21 +406,23 @@ impl FrameStatistics {
 
     /// Returns retained texture bytes referenced by frame items.
     ///
-    /// Repeated image and render-target identities are deduplicated. Scalar
-    /// field and color-map work is conservatively counted per item.
+    /// Repeated image, scalar-field, and render-target identities are
+    /// deduplicated. Per-draw transient color-map LUT work remains counted per
+    /// item because each item owns a distinct upload/allocation operation.
     pub const fn texture_bytes(self) -> usize {
         self.texture_bytes
     }
 
-    /// Returns conservative CPU recovery or source bytes referenced by items.
+    /// Returns CPU recovery or source bytes held by unique referenced resources.
     ///
-    /// Unlike texture allocation bytes, repeated retained sources are counted
-    /// per item so the value remains cheap and conservative during building.
+    /// Drawing the same scene, buffer, image, atlas, or run more than once does
+    /// not multiply this value. Distinct retained resources are summed even when
+    /// their contents happen to be equal.
     pub const fn retained_cpu_bytes(self) -> usize {
         self.retained_cpu_bytes
     }
 
-    /// Returns retained GPU vertex or instance-buffer bytes referenced by items.
+    /// Returns GPU vertex or instance-buffer bytes held by unique referenced resources.
     pub const fn retained_buffer_bytes(self) -> usize {
         self.retained_buffer_bytes
     }
@@ -531,9 +533,75 @@ pub struct FrameComposer<'frame> {
     background: Color,
     budget: FrameBudget,
     items: Vec<FrameItem<'frame>>,
-    texture_resources: Vec<usize>,
+    retained_resources: Vec<RetainedResourceKey>,
     planned: FrameStatistics,
     next_insertion: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RetainedResourceKey {
+    address: usize,
+    class: u8,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RetainedResourceAccounting {
+    key: RetainedResourceKey,
+    cpu_bytes: usize,
+    buffer_bytes: usize,
+    texture_bytes: usize,
+}
+
+impl RetainedResourceAccounting {
+    const fn new(
+        key: RetainedResourceKey,
+        cpu_bytes: usize,
+        buffer_bytes: usize,
+        texture_bytes: usize,
+    ) -> Self {
+        Self {
+            key,
+            cpu_bytes,
+            buffer_bytes,
+            texture_bytes,
+        }
+    }
+}
+
+fn retained_key<T>(resource: &T, class: u8) -> RetainedResourceKey {
+    RetainedResourceKey {
+        address: std::ptr::from_ref(resource).cast::<()>() as usize,
+        class,
+    }
+}
+
+fn retained_arc_key<T>(resource: &Arc<T>, class: u8) -> RetainedResourceKey {
+    RetainedResourceKey {
+        address: Arc::as_ptr(resource).cast::<()>() as usize,
+        class,
+    }
+}
+
+fn account_new_retained_resources(
+    existing: &[RetainedResourceKey],
+    resources: &[RetainedResourceAccounting],
+    mut work: FrameStatistics,
+) -> (FrameStatistics, usize) {
+    let mut missing = 0usize;
+    for (index, resource) in resources.iter().enumerate() {
+        let already_in_request = resources[..index]
+            .iter()
+            .any(|previous| previous.key == resource.key);
+        if !already_in_request && !existing.contains(&resource.key) {
+            missing = missing.saturating_add(1);
+            work.retained_cpu_bytes = work.retained_cpu_bytes.saturating_add(resource.cpu_bytes);
+            work.retained_buffer_bytes = work
+                .retained_buffer_bytes
+                .saturating_add(resource.buffer_bytes);
+            work.texture_bytes = work.texture_bytes.saturating_add(resource.texture_bytes);
+        }
+    }
+    (work, missing)
 }
 
 enum FrameItem<'frame> {
@@ -670,7 +738,7 @@ impl WgpuRenderer {
             background,
             budget,
             items: Vec::new(),
-            texture_resources: Vec::new(),
+            retained_resources: Vec::new(),
             planned: FrameStatistics::default(),
             next_insertion: 0,
         })
@@ -697,12 +765,18 @@ impl<'frame> FrameComposer<'frame> {
                 .saturating_add(std::mem::size_of::<CameraUniform>()),
             streaming_upload_bytes: statistics.estimated_upload_bytes(),
             texture_bytes: 0,
-            retained_cpu_bytes: statistics.retained_bytes(),
+            retained_cpu_bytes: 0,
             retained_buffer_bytes: 0,
             draw_calls: statistics.estimated_draw_batches(),
             source_counts: FrameSourceStatistics::single(FrameSourceKind::StreamingScene),
         };
-        self.push_item(
+        self.push_accounted_item(
+            &[RetainedResourceAccounting::new(
+                retained_key(scene, 1),
+                statistics.retained_bytes(),
+                0,
+                0,
+            )],
             work,
             FrameItem::Scene {
                 scene,
@@ -731,12 +805,18 @@ impl<'frame> FrameComposer<'frame> {
                 .saturating_add(std::mem::size_of::<CameraUniform>()),
             streaming_upload_bytes: statistics.estimated_upload_bytes(),
             texture_bytes: 0,
-            retained_cpu_bytes: statistics.retained_bytes(),
+            retained_cpu_bytes: 0,
             retained_buffer_bytes: 0,
             draw_calls: statistics.estimated_draw_batches(),
             source_counts: FrameSourceStatistics::single(FrameSourceKind::StreamingScene),
         };
-        self.push_item(
+        self.push_accounted_item(
+            &[RetainedResourceAccounting::new(
+                retained_key(scene, 2),
+                statistics.retained_bytes(),
+                0,
+                0,
+            )],
             work,
             FrameItem::ScreenScene {
                 scene,
@@ -767,12 +847,21 @@ impl<'frame> FrameComposer<'frame> {
             upload_bytes: std::mem::size_of::<CameraUniform>(),
             streaming_upload_bytes: 0,
             texture_bytes: 0,
-            retained_cpu_bytes: scene.recovery_memory_bytes(),
-            retained_buffer_bytes: scene.recovery_memory_bytes(),
+            retained_cpu_bytes: 0,
+            retained_buffer_bytes: 0,
             draw_calls: scene.draw_batches.len(),
             source_counts: FrameSourceStatistics::single(FrameSourceKind::PreparedScene),
         };
-        self.push_item(
+        self.push_accounted_item(
+            &[RetainedResourceAccounting::new(
+                retained_arc_key(&scene.vertex_buffer, 3),
+                scene.recovery_memory_bytes(),
+                scene
+                    .vertex_count
+                    .max(1)
+                    .saturating_mul(std::mem::size_of::<Vertex>()),
+                0,
+            )],
             work,
             FrameItem::Prepared {
                 scene,
@@ -806,12 +895,22 @@ impl<'frame> FrameComposer<'frame> {
             upload_bytes: std::mem::size_of::<CameraUniform>(),
             streaming_upload_bytes: 0,
             texture_bytes: 0,
-            retained_cpu_bytes: scene.recovery_memory_bytes(),
-            retained_buffer_bytes: scene.recovery_memory_bytes(),
+            retained_cpu_bytes: 0,
+            retained_buffer_bytes: 0,
             draw_calls: scene.scene.draw_batches.len(),
             source_counts: FrameSourceStatistics::single(FrameSourceKind::PreparedScene),
         };
-        self.push_item(
+        self.push_accounted_item(
+            &[RetainedResourceAccounting::new(
+                retained_arc_key(&scene.scene.vertex_buffer, 3),
+                scene.recovery_memory_bytes(),
+                scene
+                    .scene
+                    .vertex_count
+                    .max(1)
+                    .saturating_mul(std::mem::size_of::<Vertex>()),
+                0,
+            )],
             work,
             FrameItem::PreparedScreen {
                 scene,
@@ -842,14 +941,19 @@ impl<'frame> FrameComposer<'frame> {
             upload_bytes: std::mem::size_of::<CameraUniform>(),
             streaming_upload_bytes: 0,
             texture_bytes: 0,
-            retained_cpu_bytes: mesh.recovery_memory_bytes(),
-            retained_buffer_bytes: mesh
-                .vertex_capacity
-                .saturating_mul(std::mem::size_of::<DynamicGpu>()),
+            retained_cpu_bytes: 0,
+            retained_buffer_bytes: 0,
             draw_calls: usize::from(!mesh.vertices.is_empty()),
             source_counts: FrameSourceStatistics::single(FrameSourceKind::DynamicMesh),
         };
-        self.push_item(
+        self.push_accounted_item(
+            &[RetainedResourceAccounting::new(
+                retained_arc_key(&mesh.vertex_buffer, 4),
+                mesh.recovery_memory_bytes(),
+                mesh.vertex_capacity
+                    .saturating_mul(std::mem::size_of::<DynamicGpu>()),
+                0,
+            )],
             work,
             FrameItem::Dynamic {
                 mesh,
@@ -877,7 +981,13 @@ impl<'frame> FrameComposer<'frame> {
             .len()
             .min(field.budget.max_visibility_checks_per_frame)
             .min(field.budget.instance_limit());
-        self.push_item(
+        self.push_accounted_item(
+            &[RetainedResourceAccounting::new(
+                retained_arc_key(&field.instance_buffer, 5),
+                field.recovery_memory_bytes(),
+                field.gpu_allocation_bytes(),
+                0,
+            )],
             FrameStatistics {
                 pass_count: 1,
                 command_count: usize::from(!field.instances.is_empty()),
@@ -890,8 +1000,8 @@ impl<'frame> FrameComposer<'frame> {
                 streaming_upload_bytes: candidate_count
                     .saturating_mul(std::mem::size_of::<ParticleGpu>()),
                 texture_bytes: 0,
-                retained_cpu_bytes: field.recovery_memory_bytes(),
-                retained_buffer_bytes: field.gpu_allocation_bytes(),
+                retained_cpu_bytes: 0,
+                retained_buffer_bytes: 0,
                 draw_calls: usize::from(candidate_count > 0),
                 source_counts: FrameSourceStatistics::single(FrameSourceKind::ParticleField),
             },
@@ -925,7 +1035,13 @@ impl<'frame> FrameComposer<'frame> {
         let value_extent = scalar_value_range_extent(minimum, maximum)
             .ok_or(FrameComposerError::InvalidValueRange { minimum, maximum })?;
         let color_map_bytes = COLOR_MAP_LUT_SIZE as usize * 4;
-        self.push_item(
+        self.push_accounted_item(
+            &[RetainedResourceAccounting::new(
+                retained_key(&texture.texture, 6),
+                texture.recovery_memory_bytes(),
+                0,
+                texture.gpu_allocation_bytes(),
+            )],
             FrameStatistics {
                 pass_count: 1,
                 command_count: 1,
@@ -934,10 +1050,8 @@ impl<'frame> FrameComposer<'frame> {
                 reused_vertex_count: 0,
                 upload_bytes: std::mem::size_of::<HeatmapUniform>().saturating_add(color_map_bytes),
                 streaming_upload_bytes: 0,
-                texture_bytes: texture
-                    .gpu_allocation_bytes()
-                    .saturating_add(color_map_bytes),
-                retained_cpu_bytes: texture.recovery_memory_bytes(),
+                texture_bytes: color_map_bytes,
+                retained_cpu_bytes: 0,
                 retained_buffer_bytes: 0,
                 draw_calls: 1,
                 source_counts: FrameSourceStatistics::single(FrameSourceKind::ScalarField),
@@ -978,8 +1092,13 @@ impl<'frame> FrameComposer<'frame> {
         if !source.fits(image.width(), image.height()) {
             return Err(FrameComposerError::InvalidImageRegion);
         }
-        self.push_texture_item(
-            Arc::as_ptr(&image.resource_identity) as usize,
+        self.push_accounted_item(
+            &[RetainedResourceAccounting::new(
+                retained_arc_key(&image.resource_identity, 7),
+                image.recovery_memory_bytes(),
+                0,
+                image.gpu_allocation_bytes(),
+            )],
             FrameStatistics {
                 pass_count: 1,
                 command_count: 1,
@@ -988,8 +1107,8 @@ impl<'frame> FrameComposer<'frame> {
                 reused_vertex_count: 0,
                 upload_bytes: std::mem::size_of::<ImageUniform>(),
                 streaming_upload_bytes: 0,
-                texture_bytes: image.gpu_allocation_bytes(),
-                retained_cpu_bytes: image.recovery_memory_bytes(),
+                texture_bytes: 0,
+                retained_cpu_bytes: 0,
                 retained_buffer_bytes: 0,
                 draw_calls: 1,
                 source_counts: FrameSourceStatistics::single(FrameSourceKind::Image),
@@ -1046,8 +1165,13 @@ impl<'frame> FrameComposer<'frame> {
         {
             return Err(FrameComposerError::InvalidWorldImage);
         }
-        self.push_texture_item(
-            Arc::as_ptr(&image.resource_identity) as usize,
+        self.push_accounted_item(
+            &[RetainedResourceAccounting::new(
+                retained_arc_key(&image.resource_identity, 7),
+                image.recovery_memory_bytes(),
+                0,
+                image.gpu_allocation_bytes(),
+            )],
             FrameStatistics {
                 pass_count: 1,
                 command_count: 1,
@@ -1056,8 +1180,8 @@ impl<'frame> FrameComposer<'frame> {
                 reused_vertex_count: 0,
                 upload_bytes: std::mem::size_of::<ImageUniform>(),
                 streaming_upload_bytes: 0,
-                texture_bytes: image.gpu_allocation_bytes(),
-                retained_cpu_bytes: image.recovery_memory_bytes(),
+                texture_bytes: 0,
+                retained_cpu_bytes: 0,
                 retained_buffer_bytes: 0,
                 draw_calls: 1,
                 source_counts: FrameSourceStatistics::single(FrameSourceKind::Image),
@@ -1089,16 +1213,7 @@ impl<'frame> FrameComposer<'frame> {
                 source: FrameSourceKind::Image,
             });
         }
-        self.push_retained_image_batch(
-            image,
-            batch,
-            sampling,
-            options,
-            FrameSourceKind::Image,
-            image
-                .recovery_memory_bytes()
-                .saturating_add(batch.recovery_memory_bytes()),
-        )
+        self.push_retained_image_batch(image, batch, sampling, options, FrameSourceKind::Image)
     }
 
     /// Adds one host-shaped retained glyph run as one instanced draw call.
@@ -1118,15 +1233,53 @@ impl<'frame> FrameComposer<'frame> {
                 source: FrameSourceKind::Glyph,
             });
         }
-        self.push_retained_image_batch(
-            &atlas.image,
-            &run.batch,
-            sampling,
-            options,
-            FrameSourceKind::Glyph,
-            atlas
-                .recovery_memory_bytes()
-                .saturating_add(run.recovery_memory_bytes()),
+        let image = &atlas.image;
+        let batch = &run.batch;
+        let vertex_count = batch.sprite_count().saturating_mul(6);
+        self.push_accounted_item(
+            &[
+                RetainedResourceAccounting::new(
+                    retained_arc_key(&image.resource_identity, 7),
+                    image.recovery_memory_bytes(),
+                    0,
+                    image.gpu_allocation_bytes(),
+                ),
+                RetainedResourceAccounting::new(
+                    retained_key(atlas, 9),
+                    atlas
+                        .recovery_memory_bytes()
+                        .saturating_sub(image.recovery_memory_bytes()),
+                    0,
+                    0,
+                ),
+                RetainedResourceAccounting::new(
+                    retained_key(run, 10),
+                    run.recovery_memory_bytes(),
+                    run.gpu_allocation_bytes(),
+                    0,
+                ),
+            ],
+            FrameStatistics {
+                pass_count: 1,
+                command_count: usize::from(batch.sprite_count() > 0),
+                vertex_count,
+                streaming_vertex_count: 0,
+                reused_vertex_count: vertex_count,
+                upload_bytes: std::mem::size_of::<ImageUniform>(),
+                streaming_upload_bytes: 0,
+                texture_bytes: 0,
+                retained_cpu_bytes: 0,
+                retained_buffer_bytes: 0,
+                draw_calls: usize::from(batch.sprite_count() > 0),
+                source_counts: FrameSourceStatistics::single(FrameSourceKind::Glyph),
+            },
+            FrameItem::ImageBatch {
+                image,
+                batch,
+                sampling,
+                options,
+                insertion: self.next_insertion,
+            },
         )
     }
 
@@ -1137,11 +1290,23 @@ impl<'frame> FrameComposer<'frame> {
         sampling: ImageSampling,
         options: FramePassOptions,
         source: FrameSourceKind,
-        retained_cpu_bytes: usize,
     ) -> Result<(), FrameComposerError> {
         let vertex_count = batch.sprite_count().saturating_mul(6);
-        self.push_texture_item(
-            Arc::as_ptr(&image.resource_identity) as usize,
+        self.push_accounted_item(
+            &[
+                RetainedResourceAccounting::new(
+                    retained_arc_key(&image.resource_identity, 7),
+                    image.recovery_memory_bytes(),
+                    0,
+                    image.gpu_allocation_bytes(),
+                ),
+                RetainedResourceAccounting::new(
+                    retained_key(batch, 8),
+                    batch.recovery_memory_bytes(),
+                    batch.gpu_allocation_bytes(),
+                    0,
+                ),
+            ],
             FrameStatistics {
                 pass_count: 1,
                 command_count: usize::from(batch.sprite_count() > 0),
@@ -1150,9 +1315,9 @@ impl<'frame> FrameComposer<'frame> {
                 reused_vertex_count: vertex_count,
                 upload_bytes: std::mem::size_of::<ImageUniform>(),
                 streaming_upload_bytes: 0,
-                texture_bytes: image.gpu_allocation_bytes(),
-                retained_cpu_bytes,
-                retained_buffer_bytes: batch.gpu_allocation_bytes(),
+                texture_bytes: 0,
+                retained_cpu_bytes: 0,
+                retained_buffer_bytes: 0,
                 draw_calls: usize::from(batch.sprite_count() > 0),
                 source_counts: FrameSourceStatistics::single(source),
             },
@@ -1182,8 +1347,13 @@ impl<'frame> FrameComposer<'frame> {
         if !opacity.is_finite() || !(0.0..=1.0).contains(&opacity) {
             return Err(FrameComposerError::InvalidOpacity);
         }
-        self.push_texture_item(
-            Arc::as_ptr(&target.resource_identity) as usize,
+        self.push_accounted_item(
+            &[RetainedResourceAccounting::new(
+                retained_arc_key(&target.resource_identity, 11),
+                0,
+                0,
+                target.allocation_bytes,
+            )],
             FrameStatistics {
                 pass_count: 1,
                 command_count: 1,
@@ -1192,7 +1362,7 @@ impl<'frame> FrameComposer<'frame> {
                 reused_vertex_count: 0,
                 upload_bytes: std::mem::size_of::<CompositeUniform>(),
                 streaming_upload_bytes: 0,
-                texture_bytes: target.allocation_bytes,
+                texture_bytes: 0,
                 retained_cpu_bytes: 0,
                 retained_buffer_bytes: 0,
                 draw_calls: 1,
@@ -1236,25 +1406,25 @@ impl<'frame> FrameComposer<'frame> {
         Ok(())
     }
 
-    fn push_texture_item(
+    fn push_accounted_item(
         &mut self,
-        resource_identity: usize,
+        resources: &[RetainedResourceAccounting],
         mut work: FrameStatistics,
         item: FrameItem<'frame>,
     ) -> Result<(), FrameComposerError> {
-        let is_new = !self.texture_resources.contains(&resource_identity);
-        if !is_new {
-            work.texture_bytes = 0;
-        } else {
-            self.texture_resources.try_reserve(1).map_err(|_| {
-                FrameComposerError::AllocationFailed {
-                    requested_bytes: std::mem::size_of::<usize>(),
-                }
-            })?;
-        }
+        let (accounted_work, missing) =
+            account_new_retained_resources(&self.retained_resources, resources, work);
+        work = accounted_work;
+        self.retained_resources.try_reserve(missing).map_err(|_| {
+            FrameComposerError::AllocationFailed {
+                requested_bytes: missing.saturating_mul(std::mem::size_of::<RetainedResourceKey>()),
+            }
+        })?;
         self.push_item(work, item)?;
-        if is_new {
-            self.texture_resources.push(resource_identity);
+        for resource in resources {
+            if !self.retained_resources.contains(&resource.key) {
+                self.retained_resources.push(resource.key);
+            }
         }
         Ok(())
     }
@@ -1329,7 +1499,7 @@ fn present_frame(composer: FrameComposer<'_>) -> Result<FrameReport, FrameCompos
         background,
         budget,
         mut items,
-        texture_resources: _,
+        retained_resources: _,
         planned,
         next_insertion: _,
     } = composer;
@@ -2718,6 +2888,40 @@ mod tests {
             validate_frame_budget(FrameBudget::new(2, 0, 0, 0, 0, 0), combined),
             Ok(())
         );
+    }
+
+    #[test]
+    fn repeated_retained_references_count_each_allocation_once() {
+        let first = RetainedResourceKey {
+            address: 0x1000,
+            class: 3,
+        };
+        let second = RetainedResourceKey {
+            address: 0x2000,
+            class: 7,
+        };
+        let resources = [
+            RetainedResourceAccounting::new(first, 128, 256, 0),
+            RetainedResourceAccounting::new(first, 128, 256, 0),
+            RetainedResourceAccounting::new(second, 64, 0, 512),
+        ];
+
+        let (first_frame, missing) =
+            account_new_retained_resources(&[], &resources, FrameStatistics::default());
+        assert_eq!(missing, 2);
+        assert_eq!(first_frame.retained_cpu_bytes(), 192);
+        assert_eq!(first_frame.retained_buffer_bytes(), 256);
+        assert_eq!(first_frame.texture_bytes(), 512);
+
+        let (repeated, missing) = account_new_retained_resources(
+            &[first, second],
+            &resources,
+            FrameStatistics::default(),
+        );
+        assert_eq!(missing, 0);
+        assert_eq!(repeated.retained_cpu_bytes(), 0);
+        assert_eq!(repeated.retained_buffer_bytes(), 0);
+        assert_eq!(repeated.texture_bytes(), 0);
     }
 
     #[test]

@@ -13,7 +13,7 @@ use crate::{
 pub(crate) const CIRCLE_SEGMENTS: usize = 64;
 pub(crate) const ROUND_CAP_SEGMENTS: usize = 16;
 pub(crate) const CORNER_SEGMENTS: usize = 12;
-pub(crate) const TESSELLATED_VERTEX_BYTES: usize = 16 * size_of::<f32>();
+pub(crate) const TESSELLATED_VERTEX_BYTES: usize = 18 * size_of::<f32>();
 const MAX_DASH_ELEMENTS: usize = 8;
 const MAX_MITER_LIMIT: f32 = 1_000.0;
 /// Maximum visible dash pieces one command may request from tessellation.
@@ -1372,12 +1372,12 @@ fn estimate_stroke_vertices(points: &[Vec2], style: StrokeStyle2d) -> usize {
     };
     let join_vertices = match style.join {
         StrokeJoin2d::Bevel => join_count.saturating_mul(6),
-        StrokeJoin2d::Miter
-            if style.width_mode == StrokeWidthMode2d::LogicalPixels && style.dash.is_none() =>
-        {
-            0
-        }
         StrokeJoin2d::Miter => join_count.saturating_mul(12),
+        // Logical round joins carry one candidate fan for each possible screen
+        // orientation; the shader collapses the inactive fan to zero area.
+        StrokeJoin2d::Round if style.width_mode == StrokeWidthMode2d::LogicalPixels => {
+            join_count.saturating_mul(ROUND_CAP_SEGMENTS * 6)
+        }
         StrokeJoin2d::Round => join_count.saturating_mul(ROUND_CAP_SEGMENTS * 3),
     };
     let marker_vertices = (usize::from(style.start_marker.is_some())
@@ -1695,7 +1695,9 @@ impl StrokeDashPattern2d {
 /// Reusable arrow marker definition for a line endpoint.
 ///
 /// Marker dimensions are logical pixels even when the line body uses a world
-/// width, keeping scientific annotations readable under camera zoom.
+/// width, keeping scientific annotations readable under camera zoom. A marked
+/// endpoint ignores the ordinary cap: the body is trimmed to the marker base
+/// and shares only that boundary with the filled triangle.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct StrokeMarker2d {
     length: LogicalPixels,

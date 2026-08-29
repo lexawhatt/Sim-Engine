@@ -253,6 +253,7 @@ impl WgpuRenderer {
             })
             .await
             .map_err(RendererInitError::RequestAdapter)?;
+        let adapter_info = adapter.get_info();
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("sim-engine recovered device"),
@@ -305,6 +306,7 @@ impl WgpuRenderer {
             _queue: std::mem::replace(&mut self.queue, queue),
         };
         self.retired_devices.push(retired_device);
+        self.adapter_info = adapter_info;
         self.config = config;
         self.surface_present_mode = surface_present_mode;
         self.pipeline = pipeline;
