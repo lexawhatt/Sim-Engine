@@ -145,6 +145,8 @@ impl FramePassOptions {
 /// Renderer-owned source category used in structured composer errors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrameSourceKind {
+    /// Streaming world-space or fixed-screen scene tessellated for this frame.
+    StreamingScene,
     /// Immutable prepared world or screen geometry.
     PreparedScene,
     /// Mutable retained triangle geometry.
@@ -159,6 +161,110 @@ pub enum FrameSourceKind {
     Glyph,
     /// Offscreen color texture.
     RenderTarget,
+}
+
+/// Ordered frame inputs grouped by their renderer source path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FrameSourceStatistics {
+    streaming_scenes: usize,
+    prepared_scenes: usize,
+    dynamic_meshes: usize,
+    particle_fields: usize,
+    scalar_fields: usize,
+    images: usize,
+    glyph_runs: usize,
+    render_targets: usize,
+}
+
+impl FrameSourceStatistics {
+    /// Returns streaming world and fixed-screen scenes.
+    pub const fn streaming_scenes(self) -> usize {
+        self.streaming_scenes
+    }
+
+    /// Returns immutable prepared world and fixed-screen scenes.
+    pub const fn prepared_scenes(self) -> usize {
+        self.prepared_scenes
+    }
+
+    /// Returns retained dynamic triangle meshes.
+    pub const fn dynamic_meshes(self) -> usize {
+        self.dynamic_meshes
+    }
+
+    /// Returns retained particle fields.
+    pub const fn particle_fields(self) -> usize {
+        self.particle_fields
+    }
+
+    /// Returns retained scalar fields.
+    pub const fn scalar_fields(self) -> usize {
+        self.scalar_fields
+    }
+
+    /// Returns image, world-image, and atlas-batch sources.
+    pub const fn images(self) -> usize {
+        self.images
+    }
+
+    /// Returns host-shaped glyph runs.
+    pub const fn glyph_runs(self) -> usize {
+        self.glyph_runs
+    }
+
+    /// Returns composed 2D or retained-3D color targets.
+    pub const fn render_targets(self) -> usize {
+        self.render_targets
+    }
+
+    /// Returns all accepted frame sources.
+    pub const fn total(self) -> usize {
+        self.streaming_scenes
+            .saturating_add(self.prepared_scenes)
+            .saturating_add(self.dynamic_meshes)
+            .saturating_add(self.particle_fields)
+            .saturating_add(self.scalar_fields)
+            .saturating_add(self.images)
+            .saturating_add(self.glyph_runs)
+            .saturating_add(self.render_targets)
+    }
+
+    const fn single(source: FrameSourceKind) -> Self {
+        let mut counts = Self {
+            streaming_scenes: 0,
+            prepared_scenes: 0,
+            dynamic_meshes: 0,
+            particle_fields: 0,
+            scalar_fields: 0,
+            images: 0,
+            glyph_runs: 0,
+            render_targets: 0,
+        };
+        match source {
+            FrameSourceKind::StreamingScene => counts.streaming_scenes = 1,
+            FrameSourceKind::PreparedScene => counts.prepared_scenes = 1,
+            FrameSourceKind::DynamicMesh => counts.dynamic_meshes = 1,
+            FrameSourceKind::ParticleField => counts.particle_fields = 1,
+            FrameSourceKind::ScalarField => counts.scalar_fields = 1,
+            FrameSourceKind::Image => counts.images = 1,
+            FrameSourceKind::Glyph => counts.glyph_runs = 1,
+            FrameSourceKind::RenderTarget => counts.render_targets = 1,
+        }
+        counts
+    }
+
+    const fn adding(self, other: Self) -> Self {
+        Self {
+            streaming_scenes: self.streaming_scenes.saturating_add(other.streaming_scenes),
+            prepared_scenes: self.prepared_scenes.saturating_add(other.prepared_scenes),
+            dynamic_meshes: self.dynamic_meshes.saturating_add(other.dynamic_meshes),
+            particle_fields: self.particle_fields.saturating_add(other.particle_fields),
+            scalar_fields: self.scalar_fields.saturating_add(other.scalar_fields),
+            images: self.images.saturating_add(other.images),
+            glyph_runs: self.glyph_runs.saturating_add(other.glyph_runs),
+            render_targets: self.render_targets.saturating_add(other.render_targets),
+        }
+    }
 }
 
 /// Failure while constructing or presenting a heterogeneous frame.
@@ -256,7 +362,10 @@ pub struct FrameStatistics {
     upload_bytes: usize,
     streaming_upload_bytes: usize,
     texture_bytes: usize,
+    retained_cpu_bytes: usize,
+    retained_buffer_bytes: usize,
     draw_calls: usize,
+    source_counts: FrameSourceStatistics,
 }
 
 impl FrameStatistics {
@@ -303,9 +412,27 @@ impl FrameStatistics {
         self.texture_bytes
     }
 
+    /// Returns conservative CPU recovery or source bytes referenced by items.
+    ///
+    /// Unlike texture allocation bytes, repeated retained sources are counted
+    /// per item so the value remains cheap and conservative during building.
+    pub const fn retained_cpu_bytes(self) -> usize {
+        self.retained_cpu_bytes
+    }
+
+    /// Returns retained GPU vertex or instance-buffer bytes referenced by items.
+    pub const fn retained_buffer_bytes(self) -> usize {
+        self.retained_buffer_bytes
+    }
+
     /// Returns the conservative number of scheduled draw calls.
     pub const fn draw_calls(self) -> usize {
         self.draw_calls
+    }
+
+    /// Returns accepted ordered inputs grouped by renderer source path.
+    pub const fn source_counts(self) -> FrameSourceStatistics {
+        self.source_counts
     }
 
     fn adding(self, other: Self) -> Self {
@@ -324,7 +451,14 @@ impl FrameStatistics {
                 .streaming_upload_bytes
                 .saturating_add(other.streaming_upload_bytes),
             texture_bytes: self.texture_bytes.saturating_add(other.texture_bytes),
+            retained_cpu_bytes: self
+                .retained_cpu_bytes
+                .saturating_add(other.retained_cpu_bytes),
+            retained_buffer_bytes: self
+                .retained_buffer_bytes
+                .saturating_add(other.retained_buffer_bytes),
             draw_calls: self.draw_calls.saturating_add(other.draw_calls),
+            source_counts: self.source_counts.adding(other.source_counts),
         }
     }
 }
@@ -563,7 +697,10 @@ impl<'frame> FrameComposer<'frame> {
                 .saturating_add(std::mem::size_of::<CameraUniform>()),
             streaming_upload_bytes: statistics.estimated_upload_bytes(),
             texture_bytes: 0,
+            retained_cpu_bytes: statistics.retained_bytes(),
+            retained_buffer_bytes: 0,
             draw_calls: statistics.estimated_draw_batches(),
+            source_counts: FrameSourceStatistics::single(FrameSourceKind::StreamingScene),
         };
         self.push_item(
             work,
@@ -594,7 +731,10 @@ impl<'frame> FrameComposer<'frame> {
                 .saturating_add(std::mem::size_of::<CameraUniform>()),
             streaming_upload_bytes: statistics.estimated_upload_bytes(),
             texture_bytes: 0,
+            retained_cpu_bytes: statistics.retained_bytes(),
+            retained_buffer_bytes: 0,
             draw_calls: statistics.estimated_draw_batches(),
+            source_counts: FrameSourceStatistics::single(FrameSourceKind::StreamingScene),
         };
         self.push_item(
             work,
@@ -627,7 +767,10 @@ impl<'frame> FrameComposer<'frame> {
             upload_bytes: std::mem::size_of::<CameraUniform>(),
             streaming_upload_bytes: 0,
             texture_bytes: 0,
+            retained_cpu_bytes: scene.recovery_memory_bytes(),
+            retained_buffer_bytes: scene.recovery_memory_bytes(),
             draw_calls: scene.draw_batches.len(),
+            source_counts: FrameSourceStatistics::single(FrameSourceKind::PreparedScene),
         };
         self.push_item(
             work,
@@ -663,7 +806,10 @@ impl<'frame> FrameComposer<'frame> {
             upload_bytes: std::mem::size_of::<CameraUniform>(),
             streaming_upload_bytes: 0,
             texture_bytes: 0,
+            retained_cpu_bytes: scene.recovery_memory_bytes(),
+            retained_buffer_bytes: scene.recovery_memory_bytes(),
             draw_calls: scene.scene.draw_batches.len(),
+            source_counts: FrameSourceStatistics::single(FrameSourceKind::PreparedScene),
         };
         self.push_item(
             work,
@@ -696,7 +842,12 @@ impl<'frame> FrameComposer<'frame> {
             upload_bytes: std::mem::size_of::<CameraUniform>(),
             streaming_upload_bytes: 0,
             texture_bytes: 0,
+            retained_cpu_bytes: mesh.recovery_memory_bytes(),
+            retained_buffer_bytes: mesh
+                .vertex_capacity
+                .saturating_mul(std::mem::size_of::<DynamicGpu>()),
             draw_calls: usize::from(!mesh.vertices.is_empty()),
+            source_counts: FrameSourceStatistics::single(FrameSourceKind::DynamicMesh),
         };
         self.push_item(
             work,
@@ -739,7 +890,10 @@ impl<'frame> FrameComposer<'frame> {
                 streaming_upload_bytes: candidate_count
                     .saturating_mul(std::mem::size_of::<ParticleGpu>()),
                 texture_bytes: 0,
+                retained_cpu_bytes: field.recovery_memory_bytes(),
+                retained_buffer_bytes: field.gpu_allocation_bytes(),
                 draw_calls: usize::from(candidate_count > 0),
+                source_counts: FrameSourceStatistics::single(FrameSourceKind::ParticleField),
             },
             FrameItem::Particle {
                 field,
@@ -783,7 +937,10 @@ impl<'frame> FrameComposer<'frame> {
                 texture_bytes: texture
                     .gpu_allocation_bytes()
                     .saturating_add(color_map_bytes),
+                retained_cpu_bytes: texture.recovery_memory_bytes(),
+                retained_buffer_bytes: 0,
                 draw_calls: 1,
+                source_counts: FrameSourceStatistics::single(FrameSourceKind::ScalarField),
             },
             FrameItem::Scalar {
                 texture,
@@ -832,7 +989,10 @@ impl<'frame> FrameComposer<'frame> {
                 upload_bytes: std::mem::size_of::<ImageUniform>(),
                 streaming_upload_bytes: 0,
                 texture_bytes: image.gpu_allocation_bytes(),
+                retained_cpu_bytes: image.recovery_memory_bytes(),
+                retained_buffer_bytes: 0,
                 draw_calls: 1,
+                source_counts: FrameSourceStatistics::single(FrameSourceKind::Image),
             },
             FrameItem::Image {
                 image,
@@ -897,7 +1057,10 @@ impl<'frame> FrameComposer<'frame> {
                 upload_bytes: std::mem::size_of::<ImageUniform>(),
                 streaming_upload_bytes: 0,
                 texture_bytes: image.gpu_allocation_bytes(),
+                retained_cpu_bytes: image.recovery_memory_bytes(),
+                retained_buffer_bytes: 0,
                 draw_calls: 1,
+                source_counts: FrameSourceStatistics::single(FrameSourceKind::Image),
             },
             FrameItem::WorldImage {
                 image,
@@ -926,7 +1089,16 @@ impl<'frame> FrameComposer<'frame> {
                 source: FrameSourceKind::Image,
             });
         }
-        self.push_retained_image_batch(image, batch, sampling, options)
+        self.push_retained_image_batch(
+            image,
+            batch,
+            sampling,
+            options,
+            FrameSourceKind::Image,
+            image
+                .recovery_memory_bytes()
+                .saturating_add(batch.recovery_memory_bytes()),
+        )
     }
 
     /// Adds one host-shaped retained glyph run as one instanced draw call.
@@ -946,7 +1118,16 @@ impl<'frame> FrameComposer<'frame> {
                 source: FrameSourceKind::Glyph,
             });
         }
-        self.push_retained_image_batch(&atlas.image, &run.batch, sampling, options)
+        self.push_retained_image_batch(
+            &atlas.image,
+            &run.batch,
+            sampling,
+            options,
+            FrameSourceKind::Glyph,
+            atlas
+                .recovery_memory_bytes()
+                .saturating_add(run.recovery_memory_bytes()),
+        )
     }
 
     fn push_retained_image_batch(
@@ -955,6 +1136,8 @@ impl<'frame> FrameComposer<'frame> {
         batch: &'frame ImageBatch2d,
         sampling: ImageSampling,
         options: FramePassOptions,
+        source: FrameSourceKind,
+        retained_cpu_bytes: usize,
     ) -> Result<(), FrameComposerError> {
         let vertex_count = batch.sprite_count().saturating_mul(6);
         self.push_texture_item(
@@ -968,7 +1151,10 @@ impl<'frame> FrameComposer<'frame> {
                 upload_bytes: std::mem::size_of::<ImageUniform>(),
                 streaming_upload_bytes: 0,
                 texture_bytes: image.gpu_allocation_bytes(),
+                retained_cpu_bytes,
+                retained_buffer_bytes: batch.gpu_allocation_bytes(),
                 draw_calls: usize::from(batch.sprite_count() > 0),
+                source_counts: FrameSourceStatistics::single(source),
             },
             FrameItem::ImageBatch {
                 image,
@@ -1007,7 +1193,10 @@ impl<'frame> FrameComposer<'frame> {
                 upload_bytes: std::mem::size_of::<CompositeUniform>(),
                 streaming_upload_bytes: 0,
                 texture_bytes: target.allocation_bytes,
+                retained_cpu_bytes: 0,
+                retained_buffer_bytes: 0,
                 draw_calls: 1,
+                source_counts: FrameSourceStatistics::single(FrameSourceKind::RenderTarget),
             },
             FrameItem::Target {
                 target,
@@ -1325,7 +1514,10 @@ fn present_frame(composer: FrameComposer<'_>) -> Result<FrameReport, FrameCompos
                     texture_bytes: texture
                         .gpu_allocation_bytes()
                         .saturating_add(color_map_bytes),
+                    retained_cpu_bytes: 0,
+                    retained_buffer_bytes: 0,
                     draw_calls: 1,
+                    source_counts: FrameSourceStatistics::default(),
                 });
                 ready.push(ReadyItem::Scalar {
                     texture,
@@ -1375,7 +1567,10 @@ fn present_frame(composer: FrameComposer<'_>) -> Result<FrameReport, FrameCompos
                     upload_bytes: std::mem::size_of::<ImageUniform>(),
                     streaming_upload_bytes: 0,
                     texture_bytes: image.gpu_allocation_bytes(),
+                    retained_cpu_bytes: 0,
+                    retained_buffer_bytes: 0,
                     draw_calls: 1,
+                    source_counts: FrameSourceStatistics::default(),
                 });
                 ready.push(ReadyItem::Image {
                     image,
@@ -1462,7 +1657,10 @@ fn present_frame(composer: FrameComposer<'_>) -> Result<FrameReport, FrameCompos
                     upload_bytes: std::mem::size_of::<ImageUniform>(),
                     streaming_upload_bytes: 0,
                     texture_bytes: image.gpu_allocation_bytes(),
+                    retained_cpu_bytes: 0,
+                    retained_buffer_bytes: 0,
                     draw_calls: 1,
+                    source_counts: FrameSourceStatistics::default(),
                 });
                 ready.push(ReadyItem::Image {
                     image,
@@ -1502,7 +1700,10 @@ fn present_frame(composer: FrameComposer<'_>) -> Result<FrameReport, FrameCompos
                     upload_bytes: std::mem::size_of::<ImageUniform>(),
                     streaming_upload_bytes: 0,
                     texture_bytes: image.gpu_allocation_bytes(),
+                    retained_cpu_bytes: 0,
+                    retained_buffer_bytes: 0,
                     draw_calls: usize::from(batch.sprite_count() > 0),
+                    source_counts: FrameSourceStatistics::default(),
                 });
                 ready.push(ReadyItem::ImageBatch {
                     image,
@@ -1537,7 +1738,10 @@ fn present_frame(composer: FrameComposer<'_>) -> Result<FrameReport, FrameCompos
                     upload_bytes: std::mem::size_of::<CompositeUniform>(),
                     streaming_upload_bytes: 0,
                     texture_bytes: target.allocation_bytes,
+                    retained_cpu_bytes: 0,
+                    retained_buffer_bytes: 0,
                     draw_calls: 1,
+                    source_counts: FrameSourceStatistics::default(),
                 });
                 ready.push(ReadyItem::Target {
                     target,
@@ -1550,6 +1754,9 @@ fn present_frame(composer: FrameComposer<'_>) -> Result<FrameReport, FrameCompos
     }
     let tessellation = tessellation_started_at.elapsed();
     statistics.texture_bytes = planned.texture_bytes;
+    statistics.retained_cpu_bytes = planned.retained_cpu_bytes;
+    statistics.retained_buffer_bytes = planned.retained_buffer_bytes;
+    statistics.source_counts = planned.source_counts;
     validate_frame_budget(budget, statistics)?;
     renderer.ensure_vertex_capacity(streaming_vertices.len())?;
 
@@ -1838,7 +2045,10 @@ fn prepare_particle_item<'frame>(
             .saturating_add(std::mem::size_of::<CameraUniform>()),
         streaming_upload_bytes: selected_count.saturating_mul(std::mem::size_of::<ParticleGpu>()),
         texture_bytes: 0,
+        retained_cpu_bytes: 0,
+        retained_buffer_bytes: 0,
         draw_calls: usize::from(selected_count > 0),
+        source_counts: FrameSourceStatistics::default(),
     });
     ready.push(ReadyItem::Particle {
         field,
@@ -1935,7 +2145,10 @@ fn prepare_streaming_scene_resolved<'frame>(
             .saturating_add(std::mem::size_of::<CameraUniform>()),
         streaming_upload_bytes: stats.upload_bytes,
         texture_bytes: 0,
+        retained_cpu_bytes: 0,
+        retained_buffer_bytes: 0,
         draw_calls: batches.len(),
+        source_counts: FrameSourceStatistics::default(),
     });
     add_tessellation_stats(aggregate, stats);
     ready.push(ReadyItem::Geometry(ReadyGeometry {
@@ -1987,7 +2200,10 @@ fn prepare_retained_geometry<'frame>(
         upload_bytes: std::mem::size_of::<CameraUniform>(),
         streaming_upload_bytes: 0,
         texture_bytes: 0,
+        retained_cpu_bytes: 0,
+        retained_buffer_bytes: 0,
         draw_calls: owned_batches.len(),
+        source_counts: FrameSourceStatistics::default(),
     });
     add_tessellation_stats(aggregate, source_stats);
     ready.push(ReadyItem::Geometry(ReadyGeometry {
@@ -2393,6 +2609,9 @@ fn add_tessellation_stats(aggregate: &mut TessellationStats, source: Tessellatio
     aggregate.dropped_command_count = aggregate
         .dropped_command_count
         .saturating_add(source.dropped_command_count);
+    aggregate.command_counts = aggregate.command_counts.adding(source.command_counts);
+    aggregate.rendered_counts = aggregate.rendered_counts.adding(source.rendered_counts);
+    aggregate.dropped_counts = aggregate.dropped_counts.adding(source.dropped_counts);
     aggregate.vertex_count = aggregate.vertex_count.saturating_add(source.vertex_count);
     aggregate.draw_batch_count = aggregate
         .draw_batch_count
@@ -2449,7 +2668,10 @@ mod tests {
             upload_bytes: 4,
             streaming_upload_bytes: 0,
             texture_bytes: 5,
+            retained_cpu_bytes: 7,
+            retained_buffer_bytes: 8,
             draw_calls: 6,
+            source_counts: FrameSourceStatistics::single(FrameSourceKind::StreamingScene),
         };
         assert_eq!(validate_frame_budget(budget, exact), Ok(()));
         assert_eq!(
@@ -2465,6 +2687,36 @@ mod tests {
                 limit: 6,
                 actual: 7,
             })
+        );
+    }
+
+    #[test]
+    fn frame_statistics_group_sources_and_retained_memory_without_changing_budgets() {
+        let streaming = FrameStatistics {
+            pass_count: 1,
+            retained_cpu_bytes: 128,
+            source_counts: FrameSourceStatistics::single(FrameSourceKind::StreamingScene),
+            ..FrameStatistics::default()
+        };
+        let glyph = FrameStatistics {
+            pass_count: 1,
+            retained_cpu_bytes: 256,
+            retained_buffer_bytes: 512,
+            source_counts: FrameSourceStatistics::single(FrameSourceKind::Glyph),
+            ..FrameStatistics::default()
+        };
+
+        let combined = streaming.adding(glyph);
+
+        assert_eq!(combined.pass_count(), 2);
+        assert_eq!(combined.retained_cpu_bytes(), 384);
+        assert_eq!(combined.retained_buffer_bytes(), 512);
+        assert_eq!(combined.source_counts().streaming_scenes(), 1);
+        assert_eq!(combined.source_counts().glyph_runs(), 1);
+        assert_eq!(combined.source_counts().total(), 2);
+        assert_eq!(
+            validate_frame_budget(FrameBudget::new(2, 0, 0, 0, 0, 0), combined),
+            Ok(())
         );
     }
 

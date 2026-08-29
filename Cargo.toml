@@ -14,6 +14,7 @@ include = [
     "/src/**",
     "/examples/**",
     "/scripts/linux_release_gate.sh",
+    "/scripts/rendering_benchmark_matrix.sh",
     "/Cargo.toml",
     "/README.md",
     "/DOCUMENTATION.md",
@@ -58,6 +59,10 @@ name = "particle_cpu_benchmark"
 
 [[example]]
 name = "scene_construction_benchmark"
+
+[[example]]
+name = "rendering_benchmark_suite"
+required-features = ["wgpu"]
 
 [[example]]
 name = "star_remnant_stress"

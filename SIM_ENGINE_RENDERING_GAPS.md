@@ -5,7 +5,7 @@ Status: frozen pre-migration renderer-integration record for Sim;Engine
 actual updated API and Sim;X rendering path before deleting a workaround or
 marking a gap resolved.
 
-## Unreleased Engine Re-check - 2026-08-29
+## Sim;Engine 0.2.0 Re-check - 2026-08-29
 
 The post-0.1 engine branch now has a concrete API answer for every recorded
 integration gap. This does not authorize deleting a Sim;X workaround until its

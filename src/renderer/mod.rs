@@ -10,8 +10,8 @@ use std::{
 use crate::{
     Camera2d, Circle, Color, ColorMap, DrawCommand, Fill, Line, LogicalScreenPosition,
     LogicalViewport, LogicalViewportRegion, ParticleInstance2d, PhysicalPerLogical,
-    PhysicalScreenPosition, Polyline, Rect, ScalarField, Scene, SceneBudgetResource,
-    ScreenClipRect, ScreenScene, Shadow, ShapeStyle, Stroke, Vec2,
+    PhysicalScreenPosition, Polyline, PrimitiveCommandCounts, Rect, ScalarField, Scene,
+    SceneBudgetResource, ScreenClipRect, ScreenScene, Shadow, ShapeStyle, Stroke, Vec2,
     scene::{CIRCLE_SEGMENTS, CORNER_SEGMENTS, ROUND_CAP_SEGMENTS, TESSELLATED_VERTEX_BYTES},
     screen::screen_camera,
 };
@@ -30,6 +30,8 @@ struct Vertex {
     previous_direction: [f32; 2],
     next_direction: [f32; 2],
     normal_distance: f32,
+    tangent_distance: f32,
+    miter_limit: f32,
     color: [f32; 4],
 }
 
@@ -168,6 +170,8 @@ struct GeometryExtents {
     direction_max: Vec2,
     screen_offset_max_abs: Vec2,
     normal_distance_max_abs: f32,
+    tangent_distance_max_abs: f32,
+    miter_limit_max: f32,
     empty: bool,
 }
 
@@ -202,6 +206,9 @@ pub struct TessellationStats {
     command_count: usize,
     rendered_command_count: usize,
     dropped_command_count: usize,
+    command_counts: PrimitiveCommandCounts,
+    rendered_counts: PrimitiveCommandCounts,
+    dropped_counts: PrimitiveCommandCounts,
     vertex_count: usize,
     draw_batch_count: usize,
     upload_bytes: usize,
@@ -221,6 +228,21 @@ impl TessellationStats {
     /// Returns source commands discarded because tessellation emitted no valid geometry.
     pub fn dropped_command_count(self) -> usize {
         self.dropped_command_count
+    }
+
+    /// Returns accepted commands examined, grouped by primitive category.
+    pub const fn command_counts(self) -> PrimitiveCommandCounts {
+        self.command_counts
+    }
+
+    /// Returns commands that emitted geometry, grouped by primitive category.
+    pub const fn rendered_counts(self) -> PrimitiveCommandCounts {
+        self.rendered_counts
+    }
+
+    /// Returns commands that emitted no geometry, grouped by primitive category.
+    pub const fn dropped_counts(self) -> PrimitiveCommandCounts {
+        self.dropped_counts
     }
 
     /// Returns finite triangle-list vertices generated for this scene.
@@ -253,14 +275,16 @@ enum TessellationError {
 }
 
 impl Vertex {
-    const ATTRIBUTES: [wgpu::VertexAttribute; 7] = wgpu::vertex_attr_array![
+    const ATTRIBUTES: [wgpu::VertexAttribute; 9] = wgpu::vertex_attr_array![
         0 => Float32x2,
         1 => Float32,
         2 => Float32x2,
         3 => Float32x2,
         4 => Float32x2,
         5 => Float32,
-        6 => Float32x4
+        6 => Float32,
+        7 => Float32,
+        8 => Float32x4
     ];
 
     const LAYOUT: wgpu::VertexBufferLayout<'static> = wgpu::VertexBufferLayout {
@@ -279,6 +303,8 @@ impl Vertex {
                 .all(|value| value.is_finite())
             && self.next_direction.iter().all(|value| value.is_finite())
             && self.normal_distance.is_finite()
+            && self.tangent_distance.is_finite()
+            && self.miter_limit.is_finite()
             && self.color.iter().all(|value| value.is_finite())
     }
 }
@@ -472,6 +498,8 @@ impl GeometryExtents {
             direction_max: Vec2::splat(f32::NEG_INFINITY),
             screen_offset_max_abs: Vec2::ZERO,
             normal_distance_max_abs: 0.0,
+            tangent_distance_max_abs: 0.0,
+            miter_limit_max: 1.0,
             empty: is_empty,
         }
     }
@@ -503,6 +531,10 @@ impl GeometryExtents {
         self.normal_distance_max_abs = self
             .normal_distance_max_abs
             .max(vertex.normal_distance.abs());
+        self.tangent_distance_max_abs = self
+            .tangent_distance_max_abs
+            .max(vertex.tangent_distance.abs());
+        self.miter_limit_max = self.miter_limit_max.max(vertex.miter_limit);
     }
 
     fn include_dynamic(&mut self, vertex: DynamicGpu) {
@@ -566,12 +598,15 @@ impl GeometryExtents {
             self.direction_min,
             self.direction_max,
         );
-        let maximum_miter = self.normal_distance_max_abs as f64 * 1_000.0;
+        let maximum_miter = self.normal_distance_max_abs as f64 * self.miter_limit_max as f64;
         let horizontal_limit = interval_max_abs(world_horizontal)
             + self.screen_offset_max_abs.x as f64
-            + maximum_miter;
-        let vertical_limit =
-            interval_max_abs(world_vertical) + self.screen_offset_max_abs.y as f64 + maximum_miter;
+            + maximum_miter
+            + self.tangent_distance_max_abs as f64;
+        let vertical_limit = interval_max_abs(world_vertical)
+            + self.screen_offset_max_abs.y as f64
+            + maximum_miter
+            + self.tangent_distance_max_abs as f64;
 
         [
             world_horizontal.0,
@@ -5677,7 +5712,7 @@ use config::{
 pub use config::{RendererPresentMode, RendererSurfacePresentMode, WgpuRendererOptions};
 pub use frame::{
     FrameBudget, FrameBudgetResource, FrameComposer, FrameComposerError, FramePassOptions,
-    FrameReport, FrameSourceKind, FrameStatistics,
+    FrameReport, FrameSourceKind, FrameSourceStatistics, FrameStatistics,
 };
 pub use glyph::{
     GlyphAtlas2d, GlyphAtlasBudget, GlyphAtlasEntry, GlyphError, GlyphId, GlyphRun2d,

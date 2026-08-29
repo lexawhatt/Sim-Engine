@@ -44,7 +44,19 @@ composed frames, fixed-screen UI, retained images, and host-shaped text.
   missing-glyph outcomes, incremental uploads, and exact atlas/run recovery.
 - `DynamicMeshBudget` and `create_dynamic_mesh_with_budget` for bounded raw
   filled triangles in the common frame ordering path.
+- Reusable `StrokeStyle2d` with explicit logical-pixel or world-unit widths,
+  butt/square/round caps, bevel/round/bounded-miter joins, allocation-free dash
+  patterns with phase and expansion limits, and logical-pixel arrow markers.
+- Styled line/polyline entry points on `Scene`, `ScreenScene`, and
+  `DrawCommand`, while legacy methods preserve their existing presentation.
+- Primitive-grouped requested/accepted/rejected `SceneStatistics` and
+  rendered/dropped `TessellationStats`, plus source-grouped frame counts and
+  referenced CPU/GPU retained-memory diagnostics.
 - A core-only adversarial scene-construction benchmark.
+- A release-mode `rendering_benchmark_suite` and matrix runner covering the
+  named static-10k, 90/10 prepared/streaming, four-viewport, image-atlas,
+  scientific-text, mixed-layer, budget-rejection, HiDPI-resize, and retained-
+  resource recovery fixtures.
 - A retained scientific glyph-atlas probe in `ui_demo`, reused above all four
   world-camera workloads without steady-state atlas or instance upload.
 
@@ -54,7 +66,9 @@ composed frames, fixed-screen UI, retained images, and host-shaped text.
   vertex, upload-byte, and batch work against the originating scene budget
   before GPU submission.
 - `TessellationStats` now reports actual vertex count, upload bytes, and draw
-  batches in addition to command outcomes.
+  batches in addition to command outcomes and primitive categories.
+- Dash phase remains continuous through polyline vertices; a visible dash that
+  crosses a bend receives one configured join and no artificial internal caps.
 - Target and heatmap composition uniforms now carry an explicit logical
   destination, allowing offscreen resources to scale into bounded frame
   viewports without abusing scissor clipping.
@@ -73,6 +87,9 @@ composed frames, fixed-screen UI, retained images, and host-shaped text.
   glyph/measurement tests, second-device image/glyph recovery, and semantic GPU
   readback for screen/world image placement, sRGB alpha tint, atlas isolation,
   and instanced sprite drawing.
+- Added complete cap/join combinations, miter fallback, dash phase/continuity,
+  clipping, logical/world zoom behavior, finite-width overflow, bounded dash
+  expansion, deterministic topology, and real GPU dash/gap readback coverage.
 
 ## 0.1.0 - 2026-08-25
 

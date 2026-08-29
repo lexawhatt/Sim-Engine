@@ -20,9 +20,11 @@ pub(super) fn tessellate_scene(
     )?;
     let mut stats = TessellationStats {
         command_count: scene.command_count(),
+        command_counts: scene.statistics().accepted_by_primitive(),
         ..TessellationStats::default()
     };
     for scene_command in scene.commands() {
+        let primitive = scene_command.command().primitive();
         let screen_clip = scene_command.screen_clip();
         let vertex_start = vertices.len();
 
@@ -34,7 +36,7 @@ pub(super) fn tessellate_scene(
                 rectangle.style(),
                 vertices,
             )?,
-            DrawCommand::Line(line) => tessellate_line(line, vertices),
+            DrawCommand::Line(line) => tessellate_line(line, vertices)?,
             DrawCommand::Polyline(polyline) => {
                 tessellate_polyline(polyline, vertices)?;
             }
@@ -51,14 +53,17 @@ pub(super) fn tessellate_scene(
         {
             vertices.truncate(vertex_start);
             stats.dropped_command_count += 1;
+            stats.dropped_counts.increment(primitive);
             continue;
         }
         if vertex_end == vertex_start {
             stats.dropped_command_count += 1;
+            stats.dropped_counts.increment(primitive);
             continue;
         }
 
         stats.rendered_command_count += 1;
+        stats.rendered_counts.increment(primitive);
 
         let vertex_start =
             u32::try_from(vertex_start).map_err(|_| TessellationError::CapacityTooLarge)?;
@@ -330,15 +335,8 @@ fn tessellate_rect(
     Ok(())
 }
 
-fn tessellate_line(line: &Line, vertices: &mut Vec<Vertex>) {
-    push_round_line_world(
-        line.from(),
-        line.to(),
-        line.stroke().width(),
-        line.stroke().color(),
-        Vec2::ZERO,
-        vertices,
-    );
+fn tessellate_line(line: &Line, vertices: &mut Vec<Vertex>) -> Result<(), TessellationError> {
+    tessellate_open_stroke(&[line.from(), line.to()], line.stroke_style(), vertices)
 }
 
 fn tessellate_polyline(
@@ -355,81 +353,608 @@ fn tessellate_polyline(
     if points.len() < 2 {
         return Ok(());
     }
+    tessellate_open_stroke(&points, polyline.stroke_style(), vertices)
+}
 
-    let width = polyline.stroke().width();
-    let color = polyline.stroke().color();
-    let half_width = width * 0.5;
-    for index in 0..points.len() - 1 {
-        let from = points[index];
-        let to = points[index + 1];
-        let current_direction = to - from;
-        let previous_direction = index
-            .checked_sub(1)
-            .map_or(current_direction, |previous| from - points[previous]);
-        let next_direction = points
-            .get(index + 2)
-            .map_or(current_direction, |next| *next - to);
-
-        vertices.push(stroke_vertex(
-            from,
-            Vec2::ZERO,
-            previous_direction,
-            current_direction,
-            half_width,
-            color,
-        ));
-        vertices.push(stroke_vertex(
-            to,
-            Vec2::ZERO,
-            current_direction,
-            next_direction,
-            half_width,
-            color,
-        ));
-        vertices.push(stroke_vertex(
-            to,
-            Vec2::ZERO,
-            current_direction,
-            next_direction,
-            -half_width,
-            color,
-        ));
-        vertices.push(stroke_vertex(
-            from,
-            Vec2::ZERO,
-            previous_direction,
-            current_direction,
-            half_width,
-            color,
-        ));
-        vertices.push(stroke_vertex(
-            to,
-            Vec2::ZERO,
-            current_direction,
-            next_direction,
-            -half_width,
-            color,
-        ));
-        vertices.push(stroke_vertex(
-            from,
-            Vec2::ZERO,
-            previous_direction,
-            current_direction,
-            -half_width,
-            color,
-        ));
+fn tessellate_open_stroke(
+    points: &[Vec2],
+    style: crate::StrokeStyle2d,
+    vertices: &mut Vec<Vertex>,
+) -> Result<(), TessellationError> {
+    let width = style.stroke().width();
+    let color = style.stroke().color();
+    if let Some(dash) = style.dash_pattern() {
+        visit_dash_stroke(points, dash, |event| match event {
+            DashStrokeEvent::Segment {
+                from,
+                to,
+                start_cap,
+                end_cap,
+            } => push_stroke_segment(from, to, style, start_cap, end_cap, vertices),
+            DashStrokeEvent::Join {
+                previous,
+                center,
+                next,
+            } => push_stroke_join(previous, center, next, style, vertices),
+        });
+    } else if style.width_mode() == crate::StrokeWidthMode2d::LogicalPixels
+        && style.join() == crate::StrokeJoin2d::Miter
+    {
+        for (index, pair) in points.windows(2).enumerate() {
+            push_logical_miter_segment(points, index, pair[0], pair[1], style, vertices);
+        }
+    } else {
+        for (index, pair) in points.windows(2).enumerate() {
+            let from = pair[0];
+            let to = pair[1];
+            let start_cap = index == 0;
+            let end_cap = index + 2 == points.len();
+            push_stroke_segment(from, to, style, start_cap, end_cap, vertices);
+            if !end_cap {
+                push_stroke_join(from, to, points[index + 2], style, vertices);
+            }
+        }
     }
 
-    let radius = half_width;
-    push_circle_screen_at_world(points[0], radius, color, Vec2::ZERO, vertices);
-    push_circle_screen_at_world(
-        points[points.len() - 1],
-        radius,
-        color,
-        Vec2::ZERO,
-        vertices,
-    );
+    if let Some(marker) = style.start_marker() {
+        push_stroke_marker(
+            points[0],
+            points[1] - points[0],
+            true,
+            marker,
+            color,
+            vertices,
+        );
+    }
+    if let Some(marker) = style.end_marker() {
+        let last = points.len() - 1;
+        push_stroke_marker(
+            points[last],
+            points[last] - points[last - 1],
+            false,
+            marker,
+            color,
+            vertices,
+        );
+    }
+
+    debug_assert!(width.is_finite() && width > 0.0);
     Ok(())
+}
+
+fn push_logical_miter_segment(
+    points: &[Vec2],
+    index: usize,
+    from: Vec2,
+    to: Vec2,
+    style: crate::StrokeStyle2d,
+    vertices: &mut Vec<Vertex>,
+) {
+    let direction = to - from;
+    let previous = index
+        .checked_sub(1)
+        .map_or(direction, |previous| from - points[previous]);
+    let next = points.get(index + 2).map_or(direction, |next| *next - to);
+    let start_cap = index == 0;
+    let end_cap = index + 2 == points.len();
+    let half_width = style.stroke().width() * 0.5;
+    let start_tangent = if start_cap && style.cap() == crate::StrokeCap2d::Square {
+        -half_width
+    } else {
+        0.0
+    };
+    let end_tangent = if end_cap && style.cap() == crate::StrokeCap2d::Square {
+        half_width
+    } else {
+        0.0
+    };
+    let color = style.stroke().color();
+    let vertex = |world, previous_direction, next_direction, normal_distance, tangent_distance| {
+        stroke_vertex(
+            world,
+            Vec2::ZERO,
+            previous_direction,
+            next_direction,
+            normal_distance,
+            tangent_distance,
+            style.miter_limit(),
+            color,
+        )
+    };
+    let start_positive = vertex(from, previous, direction, half_width, start_tangent);
+    let end_positive = vertex(to, direction, next, half_width, end_tangent);
+    let end_negative = vertex(to, direction, next, -half_width, end_tangent);
+    let start_negative = vertex(from, previous, direction, -half_width, start_tangent);
+    vertices.extend_from_slice(&[
+        start_positive,
+        end_positive,
+        end_negative,
+        start_positive,
+        end_negative,
+        start_negative,
+    ]);
+    if style.cap() == crate::StrokeCap2d::Round {
+        if start_cap {
+            push_logical_round_cap(from, direction, half_width, true, color, vertices);
+        }
+        if end_cap {
+            push_logical_round_cap(to, direction, half_width, false, color, vertices);
+        }
+    }
+}
+
+fn push_stroke_segment(
+    from: Vec2,
+    to: Vec2,
+    style: crate::StrokeStyle2d,
+    start_cap: bool,
+    end_cap: bool,
+    vertices: &mut Vec<Vertex>,
+) {
+    let width = style.stroke().width();
+    let color = style.stroke().color();
+    let half_width = width * 0.5;
+    let direction = to - from;
+    match style.width_mode() {
+        crate::StrokeWidthMode2d::LogicalPixels => {
+            let start_tangent = if start_cap && style.cap() == crate::StrokeCap2d::Square {
+                -half_width
+            } else {
+                0.0
+            };
+            let end_tangent = if end_cap && style.cap() == crate::StrokeCap2d::Square {
+                half_width
+            } else {
+                0.0
+            };
+            push_logical_stroke_quad(
+                from,
+                to,
+                direction,
+                half_width,
+                start_tangent,
+                end_tangent,
+                color,
+                vertices,
+            );
+            if style.cap() == crate::StrokeCap2d::Round {
+                if start_cap {
+                    push_logical_round_cap(from, direction, half_width, true, color, vertices);
+                }
+                if end_cap {
+                    push_logical_round_cap(to, direction, half_width, false, color, vertices);
+                }
+            }
+        }
+        crate::StrokeWidthMode2d::WorldUnits => {
+            push_world_stroke_quad(
+                from,
+                to,
+                half_width,
+                start_cap && style.cap() == crate::StrokeCap2d::Square,
+                end_cap && style.cap() == crate::StrokeCap2d::Square,
+                color,
+                vertices,
+            );
+            if style.cap() == crate::StrokeCap2d::Round {
+                if start_cap {
+                    push_world_round_cap(from, direction, half_width, true, color, vertices);
+                }
+                if end_cap {
+                    push_world_round_cap(to, direction, half_width, false, color, vertices);
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum DashStrokeEvent {
+    Segment {
+        from: Vec2,
+        to: Vec2,
+        start_cap: bool,
+        end_cap: bool,
+    },
+    Join {
+        previous: Vec2,
+        center: Vec2,
+        next: Vec2,
+    },
+}
+
+fn visit_dash_stroke(
+    points: &[Vec2],
+    dash: crate::StrokeDashPattern2d,
+    mut visit: impl FnMut(DashStrokeEvent),
+) {
+    let lengths = dash.lengths();
+    let total: f64 = lengths.iter().map(|length| f64::from(*length)).sum();
+    let mut phase = f64::from(dash.phase()).rem_euclid(total);
+    let mut pattern_index = 0usize;
+    while phase >= f64::from(lengths[pattern_index]) {
+        phase -= f64::from(lengths[pattern_index]);
+        pattern_index = (pattern_index + 1) % lengths.len();
+    }
+    let mut pattern_remaining = f64::from(lengths[pattern_index]) - phase;
+    let mut visible_run_start = pattern_index.is_multiple_of(2);
+
+    for (segment_index, pair) in points.windows(2).enumerate() {
+        let from = pair[0];
+        let to = pair[1];
+        let delta = to - from;
+        let segment_length = f64::from(delta.x).hypot(f64::from(delta.y));
+        let mut segment_consumed = 0.0;
+        while segment_consumed < segment_length {
+            let segment_remaining = segment_length - segment_consumed;
+            let consumed = segment_remaining.min(pattern_remaining);
+            let finishes_segment = consumed >= segment_remaining;
+            let finishes_pattern = consumed >= pattern_remaining;
+            let finishes_path = finishes_segment && segment_index + 2 == points.len();
+            let visible = pattern_index.is_multiple_of(2);
+            if visible && consumed > 0.0 {
+                visit(DashStrokeEvent::Segment {
+                    from: segment_point(from, to, segment_consumed / segment_length),
+                    to: segment_point(from, to, (segment_consumed + consumed) / segment_length),
+                    start_cap: visible_run_start,
+                    end_cap: finishes_pattern || finishes_path,
+                });
+                visible_run_start = false;
+                if finishes_segment && !finishes_path && !finishes_pattern {
+                    visit(DashStrokeEvent::Join {
+                        previous: from,
+                        center: to,
+                        next: points[segment_index + 2],
+                    });
+                }
+            }
+            segment_consumed += consumed;
+            pattern_remaining -= consumed;
+            if pattern_remaining <= 0.0 {
+                pattern_index = (pattern_index + 1) % lengths.len();
+                pattern_remaining = f64::from(lengths[pattern_index]);
+                visible_run_start = pattern_index.is_multiple_of(2);
+            }
+        }
+    }
+}
+
+fn segment_point(from: Vec2, to: Vec2, amount: f64) -> Vec2 {
+    Vec2::new(
+        (f64::from(from.x) * (1.0 - amount) + f64::from(to.x) * amount) as f32,
+        (f64::from(from.y) * (1.0 - amount) + f64::from(to.y) * amount) as f32,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_logical_stroke_quad(
+    from: Vec2,
+    to: Vec2,
+    direction: Vec2,
+    half_width: f32,
+    start_tangent: f32,
+    end_tangent: f32,
+    color: Color,
+    vertices: &mut Vec<Vertex>,
+) {
+    let vertex = |world, normal_distance, tangent_distance| {
+        stroke_vertex(
+            world,
+            Vec2::ZERO,
+            direction,
+            direction,
+            normal_distance,
+            tangent_distance,
+            1.0,
+            color,
+        )
+    };
+    let start_positive = vertex(from, half_width, start_tangent);
+    let end_positive = vertex(to, half_width, end_tangent);
+    let end_negative = vertex(to, -half_width, end_tangent);
+    let start_negative = vertex(from, -half_width, start_tangent);
+    vertices.extend_from_slice(&[
+        start_positive,
+        end_positive,
+        end_negative,
+        start_positive,
+        end_negative,
+        start_negative,
+    ]);
+}
+
+fn push_world_stroke_quad(
+    from: Vec2,
+    to: Vec2,
+    half_width: f32,
+    extend_start: bool,
+    extend_end: bool,
+    color: Color,
+    vertices: &mut Vec<Vertex>,
+) {
+    let unit = precise_unit(to - from);
+    let normal = unit.perp() * half_width;
+    let start = from - unit * if extend_start { half_width } else { 0.0 };
+    let end = to + unit * if extend_end { half_width } else { 0.0 };
+    let start_positive = world_vertex(start + normal, Vec2::ZERO, color);
+    let end_positive = world_vertex(end + normal, Vec2::ZERO, color);
+    let end_negative = world_vertex(end - normal, Vec2::ZERO, color);
+    let start_negative = world_vertex(start - normal, Vec2::ZERO, color);
+    vertices.extend_from_slice(&[
+        start_positive,
+        end_positive,
+        end_negative,
+        start_positive,
+        end_negative,
+        start_negative,
+    ]);
+}
+
+fn precise_unit(direction: Vec2) -> Vec2 {
+    let length = f64::from(direction.x).hypot(f64::from(direction.y));
+    if length == 0.0 || !length.is_finite() {
+        Vec2::ZERO
+    } else {
+        Vec2::new(
+            (f64::from(direction.x) / length) as f32,
+            (f64::from(direction.y) / length) as f32,
+        )
+    }
+}
+
+fn push_logical_round_cap(
+    center: Vec2,
+    direction: Vec2,
+    radius: f32,
+    start: bool,
+    color: Color,
+    vertices: &mut Vec<Vertex>,
+) {
+    let start_angle = if start {
+        std::f32::consts::FRAC_PI_2
+    } else {
+        -std::f32::consts::FRAC_PI_2
+    };
+    let center_vertex = stroke_vertex(
+        center,
+        Vec2::ZERO,
+        direction,
+        direction,
+        0.0,
+        0.0,
+        1.0,
+        color,
+    );
+    for index in 0..ROUND_CAP_SEGMENTS {
+        let amount_start = index as f32 / ROUND_CAP_SEGMENTS as f32;
+        let amount_end = (index + 1) as f32 / ROUND_CAP_SEGMENTS as f32;
+        let angle_start = start_angle + amount_start * std::f32::consts::PI;
+        let angle_end = start_angle + amount_end * std::f32::consts::PI;
+        vertices.push(center_vertex);
+        for angle in [angle_start, angle_end] {
+            vertices.push(stroke_vertex(
+                center,
+                Vec2::ZERO,
+                direction,
+                direction,
+                angle.sin() * radius,
+                angle.cos() * radius,
+                1.0,
+                color,
+            ));
+        }
+    }
+}
+
+fn push_world_round_cap(
+    center: Vec2,
+    direction: Vec2,
+    radius: f32,
+    start: bool,
+    color: Color,
+    vertices: &mut Vec<Vertex>,
+) {
+    let tangent = precise_unit(direction);
+    let normal = tangent.perp();
+    let start_angle = if start {
+        std::f32::consts::FRAC_PI_2
+    } else {
+        -std::f32::consts::FRAC_PI_2
+    };
+    let center_vertex = world_vertex(center, Vec2::ZERO, color);
+    for index in 0..ROUND_CAP_SEGMENTS {
+        let amount_start = index as f32 / ROUND_CAP_SEGMENTS as f32;
+        let amount_end = (index + 1) as f32 / ROUND_CAP_SEGMENTS as f32;
+        let angle_start = start_angle + amount_start * std::f32::consts::PI;
+        let angle_end = start_angle + amount_end * std::f32::consts::PI;
+        vertices.push(center_vertex);
+        for angle in [angle_start, angle_end] {
+            let offset = tangent * (angle.cos() * radius) + normal * (angle.sin() * radius);
+            vertices.push(world_vertex(center + offset, Vec2::ZERO, color));
+        }
+    }
+}
+
+fn push_stroke_join(
+    previous: Vec2,
+    center: Vec2,
+    next: Vec2,
+    style: crate::StrokeStyle2d,
+    vertices: &mut Vec<Vertex>,
+) {
+    let incoming = center - previous;
+    let outgoing = next - center;
+    let half_width = style.stroke().width() * 0.5;
+    let color = style.stroke().color();
+    match style.width_mode() {
+        crate::StrokeWidthMode2d::LogicalPixels => match style.join() {
+            crate::StrokeJoin2d::Round => {
+                push_circle_screen_at_world(center, half_width, color, Vec2::ZERO, vertices);
+            }
+            crate::StrokeJoin2d::Bevel | crate::StrokeJoin2d::Miter => {
+                push_logical_join(center, incoming, outgoing, half_width, style, vertices);
+            }
+        },
+        crate::StrokeWidthMode2d::WorldUnits => match style.join() {
+            crate::StrokeJoin2d::Round => {
+                push_circle_fill_world(center, half_width, Fill::Solid(color), Vec2::ZERO, vertices)
+            }
+            crate::StrokeJoin2d::Bevel | crate::StrokeJoin2d::Miter => {
+                push_world_join(center, incoming, outgoing, half_width, style, vertices);
+            }
+        },
+    }
+}
+
+fn push_logical_join(
+    center: Vec2,
+    incoming: Vec2,
+    outgoing: Vec2,
+    half_width: f32,
+    style: crate::StrokeStyle2d,
+    vertices: &mut Vec<Vertex>,
+) {
+    let color = style.stroke().color();
+    let center_vertex = stroke_vertex(center, Vec2::ZERO, incoming, outgoing, 0.0, 0.0, 1.0, color);
+    for side in [-1.0, 1.0] {
+        let incoming_corner = stroke_vertex(
+            center,
+            Vec2::ZERO,
+            incoming,
+            incoming,
+            side * half_width,
+            0.0,
+            1.0,
+            color,
+        );
+        let outgoing_corner = stroke_vertex(
+            center,
+            Vec2::ZERO,
+            outgoing,
+            outgoing,
+            side * half_width,
+            0.0,
+            1.0,
+            color,
+        );
+        if style.join() == crate::StrokeJoin2d::Miter {
+            let miter = stroke_vertex(
+                center,
+                Vec2::ZERO,
+                incoming,
+                outgoing,
+                side * half_width,
+                0.0,
+                style.miter_limit(),
+                color,
+            );
+            vertices.extend_from_slice(&[
+                center_vertex,
+                incoming_corner,
+                miter,
+                center_vertex,
+                miter,
+                outgoing_corner,
+            ]);
+        } else {
+            vertices.extend_from_slice(&[center_vertex, incoming_corner, outgoing_corner]);
+        }
+    }
+}
+
+fn push_world_join(
+    center: Vec2,
+    incoming: Vec2,
+    outgoing: Vec2,
+    half_width: f32,
+    style: crate::StrokeStyle2d,
+    vertices: &mut Vec<Vertex>,
+) {
+    let incoming_normal = precise_unit(incoming).perp();
+    let outgoing_normal = precise_unit(outgoing).perp();
+    let color = style.stroke().color();
+    let center_vertex = world_vertex(center, Vec2::ZERO, color);
+    for side in [-1.0, 1.0] {
+        let incoming_corner = center + incoming_normal * (side * half_width);
+        let outgoing_corner = center + outgoing_normal * (side * half_width);
+        if style.join() == crate::StrokeJoin2d::Miter {
+            let combined = incoming_normal + outgoing_normal;
+            let miter_direction = precise_unit(combined);
+            let denominator = miter_direction.dot(outgoing_normal);
+            let multiple = if denominator.abs() > 0.001 {
+                (1.0 / denominator).abs()
+            } else {
+                f32::INFINITY
+            };
+            let miter = if multiple <= style.miter_limit() {
+                center + miter_direction * (side * half_width / denominator)
+            } else {
+                outgoing_corner
+            };
+            vertices.extend_from_slice(&[
+                center_vertex,
+                world_vertex(incoming_corner, Vec2::ZERO, color),
+                world_vertex(miter, Vec2::ZERO, color),
+                center_vertex,
+                world_vertex(miter, Vec2::ZERO, color),
+                world_vertex(outgoing_corner, Vec2::ZERO, color),
+            ]);
+        } else {
+            vertices.extend_from_slice(&[
+                center_vertex,
+                world_vertex(incoming_corner, Vec2::ZERO, color),
+                world_vertex(outgoing_corner, Vec2::ZERO, color),
+            ]);
+        }
+    }
+}
+
+fn push_stroke_marker(
+    center: Vec2,
+    direction: Vec2,
+    start: bool,
+    marker: crate::StrokeMarker2d,
+    color: Color,
+    vertices: &mut Vec<Vertex>,
+) {
+    let base_tangent = if start {
+        marker.length().get()
+    } else {
+        -marker.length().get()
+    };
+    let half_width = marker.width().get() * 0.5;
+    vertices.extend_from_slice(&[
+        stroke_vertex(
+            center,
+            Vec2::ZERO,
+            direction,
+            direction,
+            0.0,
+            0.0,
+            1.0,
+            color,
+        ),
+        stroke_vertex(
+            center,
+            Vec2::ZERO,
+            direction,
+            direction,
+            half_width,
+            base_tangent,
+            1.0,
+            color,
+        ),
+        stroke_vertex(
+            center,
+            Vec2::ZERO,
+            direction,
+            direction,
+            -half_width,
+            base_tangent,
+            1.0,
+            color,
+        ),
+    ]);
 }
 
 fn push_circle_screen_at_world(
@@ -594,21 +1119,6 @@ fn rounded_rect_points(rect: Rect, corner_radius: f32) -> Result<Vec<Vec2>, Tess
     Ok(points)
 }
 
-fn push_round_line_world(
-    from: Vec2,
-    to: Vec2,
-    width: f32,
-    color: Color,
-    screen_offset: Vec2,
-    vertices: &mut Vec<Vertex>,
-) {
-    if push_line_body_world(from, to, width, color, screen_offset, vertices) {
-        let radius = width * 0.5;
-        push_circle_screen_at_world(from, radius, color, screen_offset, vertices);
-        push_circle_screen_at_world(to, radius, color, screen_offset, vertices);
-    }
-}
-
 fn push_closed_polyline_world(
     points: &[Vec2],
     width: f32,
@@ -651,7 +1161,7 @@ fn push_closed_polyline_world(
         let current_next_direction = unique_points[next] - unique_points[index];
         let next_next_direction = unique_points[after_next] - unique_points[next];
 
-        vertices.push(stroke_vertex(
+        vertices.push(legacy_stroke_vertex(
             unique_points[index],
             screen_offset,
             current_previous_direction,
@@ -659,7 +1169,7 @@ fn push_closed_polyline_world(
             half_width,
             color,
         ));
-        vertices.push(stroke_vertex(
+        vertices.push(legacy_stroke_vertex(
             unique_points[next],
             screen_offset,
             current_next_direction,
@@ -667,7 +1177,7 @@ fn push_closed_polyline_world(
             half_width,
             color,
         ));
-        vertices.push(stroke_vertex(
+        vertices.push(legacy_stroke_vertex(
             unique_points[next],
             screen_offset,
             current_next_direction,
@@ -675,7 +1185,7 @@ fn push_closed_polyline_world(
             -half_width,
             color,
         ));
-        vertices.push(stroke_vertex(
+        vertices.push(legacy_stroke_vertex(
             unique_points[index],
             screen_offset,
             current_previous_direction,
@@ -683,7 +1193,7 @@ fn push_closed_polyline_world(
             half_width,
             color,
         ));
-        vertices.push(stroke_vertex(
+        vertices.push(legacy_stroke_vertex(
             unique_points[next],
             screen_offset,
             current_next_direction,
@@ -691,7 +1201,7 @@ fn push_closed_polyline_world(
             -half_width,
             color,
         ));
-        vertices.push(stroke_vertex(
+        vertices.push(legacy_stroke_vertex(
             unique_points[index],
             screen_offset,
             current_previous_direction,
@@ -703,75 +1213,6 @@ fn push_closed_polyline_world(
     Ok(())
 }
 
-fn push_line_body_world(
-    from: Vec2,
-    to: Vec2,
-    width: f32,
-    color: Color,
-    screen_offset: Vec2,
-    vertices: &mut Vec<Vertex>,
-) -> bool {
-    if width <= 0.0 {
-        return false;
-    }
-
-    let delta = to - from;
-    if !delta.is_finite() || (delta.x == 0.0 && delta.y == 0.0) {
-        return false;
-    }
-
-    let half_width = width * 0.5;
-    vertices.push(stroke_vertex(
-        from,
-        screen_offset,
-        delta,
-        delta,
-        half_width,
-        color,
-    ));
-    vertices.push(stroke_vertex(
-        to,
-        screen_offset,
-        delta,
-        delta,
-        half_width,
-        color,
-    ));
-    vertices.push(stroke_vertex(
-        to,
-        screen_offset,
-        delta,
-        delta,
-        -half_width,
-        color,
-    ));
-    vertices.push(stroke_vertex(
-        from,
-        screen_offset,
-        delta,
-        delta,
-        half_width,
-        color,
-    ));
-    vertices.push(stroke_vertex(
-        to,
-        screen_offset,
-        delta,
-        delta,
-        -half_width,
-        color,
-    ));
-    vertices.push(stroke_vertex(
-        from,
-        screen_offset,
-        delta,
-        delta,
-        -half_width,
-        color,
-    ));
-    true
-}
-
 pub(super) fn world_vertex(world: Vec2, screen_offset: Vec2, color: Color) -> Vertex {
     Vertex {
         world_position: [world.x, world.y],
@@ -780,11 +1221,13 @@ pub(super) fn world_vertex(world: Vec2, screen_offset: Vec2, color: Color) -> Ve
         previous_direction: [0.0; 2],
         next_direction: [0.0; 2],
         normal_distance: 0.0,
+        tangent_distance: 0.0,
+        miter_limit: 1.0,
         color: color.to_array(),
     }
 }
 
-fn stroke_vertex(
+fn legacy_stroke_vertex(
     world: Vec2,
     screen_offset: Vec2,
     previous_direction: Vec2,
@@ -792,6 +1235,31 @@ fn stroke_vertex(
     normal_distance: f32,
     color: Color,
 ) -> Vertex {
+    stroke_vertex(
+        world,
+        screen_offset,
+        previous_direction,
+        next_direction,
+        normal_distance,
+        0.0,
+        1_000.0,
+        color,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn stroke_vertex(
+    world: Vec2,
+    screen_offset: Vec2,
+    previous_direction: Vec2,
+    next_direction: Vec2,
+    normal_distance: f32,
+    tangent_distance: f32,
+    miter_limit: f32,
+    color: Color,
+) -> Vertex {
+    let previous_direction = precise_unit(previous_direction);
+    let next_direction = precise_unit(next_direction);
     Vertex {
         world_position: [world.x, world.y],
         depth: 0.0,
@@ -799,6 +1267,8 @@ fn stroke_vertex(
         previous_direction: [previous_direction.x, previous_direction.y],
         next_direction: [next_direction.x, next_direction.y],
         normal_distance,
+        tangent_distance,
+        miter_limit,
         color: color.to_array(),
     }
 }

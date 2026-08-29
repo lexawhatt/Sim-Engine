@@ -19,7 +19,8 @@ Rust version is 1.90.
 Version 0.2.0 adds the bounded Sim;X integration foundation: fixed-screen
 scenes, positioned 2D viewports, offscreen scene rendering, a heterogeneous
 single-present frame composer, retained RGBA images and atlas batches,
-host-shaped glyph runs, and explicitly budgeted dynamic triangles. See the
+host-shaped glyph runs, explicitly budgeted dynamic triangles, richer bounded
+2D strokes, and a named rendering benchmark matrix. See the
 [0.2.0 changelog](CHANGELOG.md#020---2026-08-29) for the complete delta from
 0.1.0.
 
@@ -38,7 +39,8 @@ host-shaped glyph runs, and explicitly budgeted dynamic triangles. See the
 
 - validated circles, rectangles, rounded rectangles, lines, and polylines;
 - solid, linear-gradient, and radial-gradient fills;
-- logical-pixel strokes, shadows, clipping, and stable layer ordering;
+- logical/world-width strokes with bounded caps, joins, dashes, markers,
+  clipping, and stable layer ordering;
 - 2D camera pan, rotation, zoom, fit, and picking;
 - fallible tweening and easing;
 - streaming, prepared, and dynamic triangle geometry;
@@ -52,7 +54,10 @@ host-shaped glyph runs, and explicitly budgeted dynamic triangles. See the
 - retained 3D meshes, independent transforms, hardware depth, and visible or
   dashed hidden mathematical edges;
 - atomic retained-3D scene recovery that preserves stable object IDs and visual
-  state across logical-device replacement.
+  state across logical-device replacement;
+- primitive/source-grouped diagnostics and repeatable release-mode workloads
+  for static UI, prepared/streaming UI, viewports, atlases, glyphs, mixed
+  layers, budget rejection, HiDPI resize, and recovery.
 
 Ordinary scenes support explicit construction, tessellation, and upload
 budgets, fixed logical-screen geometry, and independent positioned viewport or
@@ -151,9 +156,15 @@ cargo run --release --example ui_demo -- --uncapped
 cargo run --release --example star_remnant_stress -- --benchmark
 cargo run --release --no-default-features --example particle_cpu_benchmark
 cargo run --release --no-default-features --example scene_construction_benchmark
+cargo run --release --example rendering_benchmark_suite -- --fixture ui_90_10
 cargo run --release --example stereometry_3d -- --uncapped
 cargo run --release --example cylinder_derivation_3d -- --uncapped --benchmark
 ```
+
+Run the complete named performance/contract matrix on a Vulkan-capable Linux
+machine with `./scripts/rendering_benchmark_matrix.sh`. Absolute timings are
+comparable only when adapter, driver, backend, present mode, and workload are
+recorded together; deterministic command/vertex/upload counters are portable.
 
 `ui_demo` includes a retained host-rasterized scientific glyph probe above all
 four independently changing scene workloads. It demonstrates one-time atlas

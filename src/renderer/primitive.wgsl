@@ -15,7 +15,9 @@ struct VertexIn {
     @location(3) previous_direction: vec2<f32>,
     @location(4) next_direction: vec2<f32>,
     @location(5) normal_distance: f32,
-    @location(6) color: vec4<f32>,
+    @location(6) tangent_distance: f32,
+    @location(7) miter_limit: f32,
+    @location(8) color: vec4<f32>,
 };
 
 struct VertexOut {
@@ -25,12 +27,21 @@ struct VertexOut {
     @location(2) particle_mask: f32,
 };
 
-fn safe_normal(direction: vec2<f32>) -> vec2<f32> {
-    let length_squared = dot(direction, direction);
-    if length_squared <= 0.000001 {
+fn safe_unit(direction: vec2<f32>) -> vec2<f32> {
+    let scale = max(abs(direction.x), abs(direction.y));
+    if scale <= 0.0 {
         return vec2<f32>(0.0, 0.0);
     }
-    let normalized_direction = direction * inverseSqrt(length_squared);
+    let scaled = direction / scale;
+    let length_squared = dot(scaled, scaled);
+    if length_squared <= 0.0 {
+        return vec2<f32>(0.0, 0.0);
+    }
+    return scaled * inverseSqrt(length_squared);
+}
+
+fn safe_normal(direction: vec2<f32>) -> vec2<f32> {
+    let normalized_direction = safe_unit(direction);
     return vec2<f32>(-normalized_direction.y, normalized_direction.x);
 }
 
@@ -42,7 +53,7 @@ fn vs_main(input: VertexIn) -> VertexOut {
         dot(camera.world_to_screen_y.xyz, vec3<f32>(relative_world, input.depth)) + camera.world_to_screen_y.w,
     );
 
-    if abs(input.normal_distance) > 0.0 {
+    if abs(input.normal_distance) > 0.0 || abs(input.tangent_distance) > 0.0 {
         let previous_screen = vec2<f32>(
             dot(camera.world_to_screen_x.xy, input.previous_direction),
             dot(camera.world_to_screen_y.xy, input.previous_direction),
@@ -54,13 +65,18 @@ fn vs_main(input: VertexIn) -> VertexOut {
         let previous_normal = safe_normal(previous_screen);
         let next_normal = safe_normal(next_screen);
         let combined_normal = previous_normal + next_normal;
-        var extrusion = next_normal * input.normal_distance;
+        let next_tangent = safe_unit(next_screen);
+        var extrusion = next_normal * input.normal_distance + next_tangent * input.tangent_distance;
 
         if dot(combined_normal, combined_normal) > 0.000001 {
             let miter = normalize(combined_normal);
             let denominator = dot(miter, next_normal);
             if abs(denominator) > 0.001 {
-                extrusion = miter * (input.normal_distance / denominator);
+                let miter_multiple = abs(1.0 / denominator);
+                if miter_multiple <= input.miter_limit {
+                    extrusion = miter * (input.normal_distance / denominator)
+                        + next_tangent * input.tangent_distance;
+                }
             }
         }
         screen += extrusion;

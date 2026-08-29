@@ -181,7 +181,7 @@ fn vertex_screen_position(vertex: Vertex, camera: Camera2d, viewport: LogicalVie
     let world = Vec2::new(vertex.world_position[0], vertex.world_position[1]);
     let mut screen = uniform.world_to_screen(world, vertex.depth)
         + Vec2::new(vertex.screen_offset[0], vertex.screen_offset[1]);
-    if vertex.normal_distance.abs() > 0.0 {
+    if vertex.normal_distance.abs() > 0.0 || vertex.tangent_distance.abs() > 0.0 {
         let previous = uniform.direction_to_screen(Vec2::new(
             vertex.previous_direction[0],
             vertex.previous_direction[1],
@@ -193,12 +193,15 @@ fn vertex_screen_position(vertex: Vertex, camera: Camera2d, viewport: LogicalVie
         let previous_normal = previous.normalized().perp();
         let next_normal = next.normalized().perp();
         let combined_normal = previous_normal + next_normal;
-        let mut extrusion = next_normal * vertex.normal_distance;
+        let next_tangent = next.normalized();
+        let mut extrusion =
+            next_normal * vertex.normal_distance + next_tangent * vertex.tangent_distance;
         if combined_normal.length_squared() > 0.000001 {
             let miter = combined_normal.normalized();
             let denominator = miter.dot(next_normal);
-            if denominator.abs() > 0.001 {
-                extrusion = miter * (vertex.normal_distance / denominator);
+            if denominator.abs() > 0.001 && (1.0 / denominator).abs() <= vertex.miter_limit {
+                extrusion = miter * (vertex.normal_distance / denominator)
+                    + next_tangent * vertex.tangent_distance;
             }
         }
         screen += extrusion;
@@ -250,6 +253,217 @@ fn polyline_uses_joined_strip_and_only_two_round_caps() {
 
     assert_eq!(vertices.len(), 3 * 6 + ROUND_CAP_SEGMENTS * 6);
     assert!(vertices.iter().copied().all(Vertex::is_finite));
+}
+
+#[test]
+fn richer_strokes_have_deterministic_bounded_topology() {
+    let logical_width = crate::LogicalPixels::new(2.0).unwrap();
+    let marker = crate::StrokeMarker2d::arrow(
+        crate::LogicalPixels::new(5.0).unwrap(),
+        crate::LogicalPixels::new(4.0).unwrap(),
+    );
+    let points = vec![Vec2::ZERO, Vec2::X, Vec2::new(2.0, 1.0)];
+
+    let vertex_count = |style| {
+        let mut scene = Scene::new(Color::BLACK).unwrap();
+        scene.try_styled_polyline(points.clone(), style).unwrap();
+        tessellate_for_test(&scene).0.len()
+    };
+
+    let base = crate::StrokeStyle2d::logical(logical_width, Color::WHITE)
+        .with_cap(crate::StrokeCap2d::Butt);
+    assert_eq!(vertex_count(base.with_join(crate::StrokeJoin2d::Miter)), 12);
+    assert_eq!(vertex_count(base.with_join(crate::StrokeJoin2d::Bevel)), 18);
+    assert_eq!(
+        vertex_count(base.with_join(crate::StrokeJoin2d::Round)),
+        12 + ROUND_CAP_SEGMENTS * 3
+    );
+
+    let marked = base.with_start_marker(marker).with_end_marker(marker);
+    assert_eq!(vertex_count(marked), 18);
+
+    let dash = crate::StrokeDashPattern2d::new(&[2.0, 2.0], 0.0, 4).unwrap();
+    let mut dashed = Scene::new(Color::BLACK).unwrap();
+    dashed
+        .try_styled_line(
+            Vec2::ZERO,
+            Vec2::new(10.0, 0.0),
+            base.with_dash_pattern(dash),
+        )
+        .unwrap();
+    assert_eq!(tessellate_for_test(&dashed).0.len(), 3 * 6);
+}
+
+#[test]
+fn dash_run_crossing_a_polyline_vertex_uses_one_join_without_internal_caps() {
+    let dash = crate::StrokeDashPattern2d::new(&[6.0, 2.0], 0.0, 8).unwrap();
+    let style =
+        crate::StrokeStyle2d::logical(crate::LogicalPixels::new(2.0).unwrap(), Color::WHITE)
+            .with_cap(crate::StrokeCap2d::Round)
+            .with_join(crate::StrokeJoin2d::Round)
+            .with_dash_pattern(dash);
+    let mut scene = Scene::new(Color::BLACK).unwrap();
+    scene
+        .try_styled_polyline(
+            vec![Vec2::ZERO, Vec2::new(4.0, 0.0), Vec2::new(4.0, 4.0)],
+            style,
+        )
+        .unwrap();
+
+    let vertices = tessellate_for_test(&scene).0;
+
+    // Two quads form one visible dash, the bend receives one circular join,
+    // and only the two actual dash endpoints receive semicircular caps.
+    assert_eq!(
+        vertices.len(),
+        2 * 6 + ROUND_CAP_SEGMENTS * 3 + 2 * ROUND_CAP_SEGMENTS * 3
+    );
+    assert!(vertices.iter().copied().all(Vertex::is_finite));
+    assert!(scene.statistics().estimated_tessellated_vertices() >= vertices.len());
+}
+
+#[test]
+fn dash_phase_and_every_cap_join_combination_are_deterministic() {
+    let width = crate::LogicalPixels::new(2.0).unwrap();
+    let points = vec![Vec2::ZERO, Vec2::new(4.0, 0.0), Vec2::new(4.0, 4.0)];
+    for cap in [
+        crate::StrokeCap2d::Butt,
+        crate::StrokeCap2d::Square,
+        crate::StrokeCap2d::Round,
+    ] {
+        for join in [
+            crate::StrokeJoin2d::Bevel,
+            crate::StrokeJoin2d::Miter,
+            crate::StrokeJoin2d::Round,
+        ] {
+            let mut scene = Scene::new(Color::BLACK).unwrap();
+            scene
+                .try_styled_polyline(
+                    points.clone(),
+                    crate::StrokeStyle2d::logical(width, Color::WHITE)
+                        .with_cap(cap)
+                        .with_join(join),
+                )
+                .unwrap();
+            let vertices = tessellate_for_test(&scene).0;
+            assert!(vertices.iter().copied().all(Vertex::is_finite));
+            assert!(scene.statistics().estimated_tessellated_vertices() >= vertices.len());
+        }
+    }
+
+    let dash_count = |phase| {
+        let dash = crate::StrokeDashPattern2d::new(&[2.0, 2.0], phase, 8).unwrap();
+        let mut scene = Scene::new(Color::BLACK).unwrap();
+        scene
+            .try_styled_line(
+                Vec2::ZERO,
+                Vec2::new(10.0, 0.0),
+                crate::StrokeStyle2d::logical(width, Color::WHITE)
+                    .with_cap(crate::StrokeCap2d::Butt)
+                    .with_dash_pattern(dash),
+            )
+            .unwrap();
+        tessellate_for_test(&scene).0.len()
+    };
+    assert_eq!(dash_count(0.0), 18);
+    assert_eq!(dash_count(2.0), 12);
+}
+
+#[test]
+fn styled_strokes_preserve_clip_and_bound_miter_extrusion() {
+    let clip = ScreenClipRect::from_min_size(
+        LogicalScreenPosition::new(10.0, 12.0),
+        LogicalScreenVector::new(40.0, 30.0),
+    )
+    .unwrap();
+    let style =
+        crate::StrokeStyle2d::logical(crate::LogicalPixels::new(4.0).unwrap(), Color::WHITE)
+            .with_cap(crate::StrokeCap2d::Butt)
+            .with_join(crate::StrokeJoin2d::Miter)
+            .with_miter_limit(1.0)
+            .unwrap();
+    let mut scene = Scene::new(Color::BLACK).unwrap();
+    scene
+        .with_screen_clip(clip, |scene| {
+            scene
+                .try_styled_polyline(
+                    vec![Vec2::new(-10.0, 0.0), Vec2::ZERO, Vec2::new(-9.0, 1.0)],
+                    style,
+                )
+                .unwrap();
+        })
+        .unwrap();
+
+    let (vertices, batches) = tessellate_for_test(&scene);
+
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].screen_clip, Some(clip));
+    let camera = Camera2d::new(Vec2::ZERO, 1.0).unwrap();
+    let viewport = LogicalViewport::new(200.0, 120.0).unwrap();
+    let center = camera
+        .world_to_screen(Vec2::ZERO, viewport)
+        .unwrap()
+        .to_vec2();
+    for vertex in vertices
+        .iter()
+        .copied()
+        .filter(|vertex| vertex.world_position == [0.0, 0.0])
+    {
+        assert!((vertex_screen_position(vertex, camera, viewport) - center).length() <= 2.01);
+    }
+}
+
+#[test]
+fn stroke_caps_and_width_spaces_follow_their_contract() {
+    let logical_width = crate::LogicalPixels::new(2.0).unwrap();
+    let line_vertices = |style| {
+        let mut scene = Scene::new(Color::BLACK).unwrap();
+        scene
+            .try_styled_line(Vec2::new(-5.0, 0.0), Vec2::new(5.0, 0.0), style)
+            .unwrap();
+        tessellate_for_test(&scene).0
+    };
+    let base = crate::StrokeStyle2d::logical(logical_width, Color::WHITE);
+    assert_eq!(
+        line_vertices(base.with_cap(crate::StrokeCap2d::Butt)).len(),
+        6
+    );
+    assert_eq!(
+        line_vertices(base.with_cap(crate::StrokeCap2d::Square)).len(),
+        6
+    );
+    assert_eq!(
+        line_vertices(base.with_cap(crate::StrokeCap2d::Round)).len(),
+        6 + ROUND_CAP_SEGMENTS * 6
+    );
+
+    let viewport = LogicalViewport::new(200.0, 100.0).unwrap();
+    let logical = line_vertices(base.with_cap(crate::StrokeCap2d::Butt));
+    let world = line_vertices(
+        crate::StrokeStyle2d::world(crate::WorldLength::new(2.0).unwrap(), Color::WHITE)
+            .with_cap(crate::StrokeCap2d::Butt),
+    );
+    let height = |vertices: &[Vertex], camera| {
+        let projected: Vec<_> = vertices
+            .iter()
+            .copied()
+            .map(|vertex| vertex_screen_position(vertex, camera, viewport))
+            .collect();
+        projected
+            .iter()
+            .map(|point| point.y)
+            .fold(f32::NEG_INFINITY, f32::max)
+            - projected
+                .iter()
+                .map(|point| point.y)
+                .fold(f32::INFINITY, f32::min)
+    };
+    let zoom_one = Camera2d::new(Vec2::ZERO, 1.0).unwrap();
+    let zoom_four = Camera2d::new(Vec2::ZERO, 4.0).unwrap();
+    assert!((height(&logical, zoom_one) - 2.0).abs() < 0.01);
+    assert!((height(&logical, zoom_four) - 2.0).abs() < 0.01);
+    assert!((height(&world, zoom_one) - 2.0).abs() < 0.01);
+    assert!((height(&world, zoom_four) - 8.0).abs() < 0.01);
 }
 
 #[test]
@@ -406,6 +620,11 @@ fn scene_budget_estimate_bounds_actual_tessellation_and_upload() {
         stats.upload_bytes(),
         vertices.len() * std::mem::size_of::<Vertex>()
     );
+    assert_eq!(stats.command_counts().circles(), 1);
+    assert_eq!(stats.command_counts().rectangles(), 1);
+    assert_eq!(stats.command_counts().polylines(), 1);
+    assert_eq!(stats.rendered_counts(), stats.command_counts());
+    assert_eq!(stats.dropped_counts().total(), 0);
 }
 
 #[test]
@@ -508,6 +727,29 @@ fn gpu_extrusion_contract_keeps_line_width_in_screen_pixels() {
     let negative = vertex_screen_position(vertices[5], camera, viewport);
 
     assert!(((positive - negative).length() - 7.0).abs() < 0.001);
+}
+
+#[test]
+fn logical_stroke_direction_remains_normalized_for_extreme_finite_segments() {
+    let mut scene = Scene::new(Color::BLACK).unwrap();
+    scene
+        .try_styled_line(
+            Vec2::ZERO,
+            Vec2::new(f32::MAX, 0.0),
+            crate::StrokeStyle2d::logical(crate::LogicalPixels::new(2.0).unwrap(), Color::WHITE)
+                .with_cap(crate::StrokeCap2d::Butt),
+        )
+        .unwrap();
+    let (vertices, _) = tessellate_for_test(&scene);
+    let viewport = LogicalViewport::new(64.0, 64.0).unwrap();
+    let camera = Camera2d::new(Vec2::ZERO, 1.0).unwrap();
+
+    let direction = Vec2::new(vertices[0].next_direction[0], vertices[0].next_direction[1]);
+    let positive = vertex_screen_position(vertices[0], camera, viewport);
+    let negative = vertex_screen_position(vertices[5], camera, viewport);
+
+    assert!((direction.length() - 1.0).abs() < 0.000_001);
+    assert!(((positive - negative).length() - 2.0).abs() < 0.001);
 }
 
 #[test]
@@ -874,6 +1116,19 @@ fn offscreen_gpu_readback_verifies_camera_depth_and_clip_contract() {
                 })
                 .is_ok()
         );
+        let stroke_dash = crate::StrokeDashPattern2d::new(&[4.0, 4.0], 0.0, 8).unwrap();
+        scene
+            .try_styled_line(
+                Vec2::new(-20.0, 20.0),
+                Vec2::new(4.0, 20.0),
+                crate::StrokeStyle2d::logical(
+                    crate::LogicalPixels::new(4.0).unwrap(),
+                    Color::WHITE,
+                )
+                .with_cap(crate::StrokeCap2d::Butt)
+                .with_dash_pattern(stroke_dash),
+            )
+            .unwrap();
         let source_identity = Arc::new(());
         let prepared =
             prepare_scene_resources(&device, &queue, Arc::clone(&source_identity), &scene)
@@ -1389,10 +1644,16 @@ fn offscreen_gpu_readback_verifies_camera_depth_and_clip_contract() {
             pass.set_bind_group(0, &camera_bind_group, &[]);
             pass.set_vertex_buffer(0, restored.vertex_buffer.slice(..));
             for batch in &restored.draw_batches {
-                if let Some(clip) = batch.screen_clip {
-                    let scissor = screen_clip_to_scissor(clip, viewport, 1.0).unwrap();
-                    pass.set_scissor_rect(scissor.x, scissor.y, scissor.width, scissor.height);
-                }
+                let scissor = batch.screen_clip.map_or(
+                    ScissorRect {
+                        x: 0,
+                        y: 0,
+                        width: 64,
+                        height: 64,
+                    },
+                    |clip| screen_clip_to_scissor(clip, viewport, 1.0).unwrap(),
+                );
+                pass.set_scissor_rect(scissor.x, scissor.y, scissor.width, scissor.height);
                 pass.draw(batch.vertex_range.clone(), 0..1);
             }
         }
@@ -1491,6 +1752,9 @@ fn offscreen_gpu_readback_verifies_camera_depth_and_clip_contract() {
         let pixel = |x: usize, y: usize| &bytes[y * 256 + x * 4..y * 256 + x * 4 + 4];
         assert!(pixel(33, 29)[0] > 200, "camera/depth pixel was not drawn");
         assert!(pixel(33, 34)[0] < 10, "clip failed to remove outside pixel");
+        assert!(pixel(14, 14)[0] > 200, "styled dash body was not drawn");
+        assert!(pixel(18, 14)[0] < 10, "styled dash gap was not preserved");
+        assert!(pixel(22, 14)[0] > 200, "styled dash phase did not repeat");
         assert!(
             pixel(50, 48)[0] > 200,
             "instanced particle center was not drawn"

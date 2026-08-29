@@ -125,8 +125,8 @@ discarding invalid optional decoration is intentional.
 | --- | --- | --- |
 | Circle | `circle`, `try_circle`, and layer variants | fill, stroke, shadow |
 | Rectangle | `rect`, `try_rect`, and layer variants | rounded corners, fill, stroke, shadow |
-| Line | `line`, `try_line`, and layer variants | round caps, logical-pixel width |
-| Polyline | `polyline`, `try_polyline`, and layer variants | joined segments and round end caps |
+| Line | `line`, `try_line`, styled, and layer variants | bounded caps, dashes, markers, logical/world width |
+| Polyline | `polyline`, `try_polyline`, styled, and layer variants | bounded joins, continuous dashes, markers |
 
 Styles include solid, linear-gradient, and radial-gradient fills; strokes; and
 logical-screen shadows. Colors are straight linear RGBA internally.
@@ -134,6 +134,54 @@ logical-screen shadows. Colors are straight linear RGBA internally.
 `Color::rgb` and `Color::rgba` accept values already in linear space. Render
 boundaries require every channel in `0.0..=1.0`; animation may overshoot, but
 the host must call `Color::clamp` explicitly before inserting that value.
+
+#### Rich bounded strokes
+
+Legacy `line` and `polyline` methods retain their existing logical-pixel
+presentation. Use `StrokeStyle2d` when a diagram needs explicit styling:
+
+```rust
+use sim_engine::{
+    Color, LogicalPixels, Scene, StrokeCap2d, StrokeDashPattern2d, StrokeJoin2d,
+    StrokeMarker2d, StrokeStyle2d, Vec2,
+};
+
+let dash = StrokeDashPattern2d::new(&[8.0, 4.0], 2.0, 256)?;
+let arrow = StrokeMarker2d::arrow(
+    LogicalPixels::new(10.0)?,
+    LogicalPixels::new(8.0)?,
+);
+let style = StrokeStyle2d::logical(LogicalPixels::new(2.0)?, Color::WHITE)
+    .with_cap(StrokeCap2d::Butt)
+    .with_join(StrokeJoin2d::Miter)
+    .with_miter_limit(4.0)?
+    .with_dash_pattern(dash)
+    .with_end_marker(arrow);
+
+let mut scene = Scene::new(Color::BLACK)?;
+scene.try_styled_polyline(
+    vec![Vec2::ZERO, Vec2::new(20.0, 0.0), Vec2::new(30.0, 10.0)],
+    style,
+)?;
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+Dash/gap lengths and phase use source path-coordinate units: world-coordinate
+units for `Scene`, logical coordinate units for `ScreenScene`. A visible dash
+continues across polyline vertices and receives the configured join. Width is
+independent: `StrokeStyle2d::logical` stays constant under camera zoom, while
+`StrokeStyle2d::world` uses a validated `WorldLength` and scales with the
+camera. Endpoint markers always use logical pixels so annotations remain
+readable.
+
+Every dash pattern carries `max_subsegments` in `1..=1_000_000`. Scene insertion counts visible
+pieces before tessellation and returns
+`SceneError::StrokeExpansionLimitExceeded` atomically when the ceiling would
+be crossed. Dash boundaries that collapse at the path's `f32` coordinate scale
+return `UnrepresentableStrokePattern` instead of entering a non-progressing
+expansion loop. Miter length is bounded by `1.0..=1000.0`; geometry beyond the
+configured limit falls back to bevel presentation. Extreme finite widths whose
+derived extrusion would overflow are rejected as `InvalidStroke`.
 
 #### Bounded scenes
 
@@ -218,7 +266,7 @@ replace the retained 3D path.
 | `PhysicalPerLogical` | physical target texels per logical pixel |
 | `LogicalViewport` | finite logical viewport dimensions |
 | `LogicalViewportRegion` | positioned local viewport inside a logical target |
-| `WorldLength` | positive scalar distance in caller-defined 3D world units |
+| `WorldLength` | positive scalar distance in caller-defined 2D or 3D world units |
 | `RenderTarget2d` dimensions | physical texture pixels |
 
 Camera zoom is logical pixels per world unit. Stroke widths, screen shadows,
@@ -413,8 +461,19 @@ upload, surface acquisition, encode/submit/present dispatch, and total renderer
 work. It does not measure GPU completion or display scanout.
 
 `TessellationStats` distinguishes accepted commands, rendered commands, and
-dropped commands. Required visuals should use fallible scene APIs and hosts
-should surface a non-zero dropped count in diagnostics.
+dropped commands, and groups each by circle/rectangle/line/polyline category.
+`SceneStatistics` exposes the same primitive grouping for requested, accepted,
+and rejected construction work. Required visuals should use fallible scene
+APIs and hosts should surface a non-zero dropped count in diagnostics.
+
+For heterogeneous frames, `FrameStatistics::source_counts` separates
+streaming scenes, prepared scenes, dynamic meshes, particles, scalar fields,
+images, glyph runs, and targets. `retained_cpu_bytes` and
+`retained_buffer_bytes` complement deduplicated `texture_bytes`; the CPU value
+is intentionally conservative and counts repeated item references. This makes
+the prepared/static invariant directly observable: after warm-up,
+`streaming_vertex_count` and `streaming_upload_bytes` must include only sources
+that actually changed.
 
 Error-handling rules:
 
@@ -811,10 +870,28 @@ recovery returns `RecoveryLimitReached` before creating another device; inspect
 - Set hard particle memory, upload, visibility-check, and draw budgets.
 - Benchmark release builds without VSync and record the concrete present mode.
 - Report surface acquisition separately from renderer CPU time.
+- Compare primitive/source counts and retained/upload bytes before comparing
+  milliseconds, so workload drift is not mistaken for a renderer regression.
 
 A display-limited frame rate is not renderer throughput. Surface acquisition
 can wait for FIFO or compositor pacing while renderer CPU work remains small.
 The current public metrics do not include GPU timestamp queries.
+
+The named release-mode matrix is:
+
+```bash
+./scripts/rendering_benchmark_matrix.sh
+```
+
+It runs `ui_static_10k`, `ui_90_10`, `four_viewports`, `image_atlas`,
+`scientific_text`, `mixed_layers`, `budget_rejection`, `hidpi_resize`, and
+`recovery_frame`. Surface fixtures print p50/p95/p99 renderer CPU, observed
+wall throughput, construction time, source counts, vertices, uploads, retained
+memory, textures, and draw calls. `mixed_layers` remains core-only;
+`recovery_frame` is the mandatory Vulkan semantic fixture because it restores
+every retained source on a second logical device and verifies bytes/pixels.
+Record the adapter, driver, backend, and concrete present mode with results;
+do not apply one universal millisecond threshold across different GPUs.
 
 ### 17. Examples
 
@@ -831,6 +908,12 @@ cargo run --release --example star_remnant_stress -- --benchmark
 
 # CPU-only particle-state baseline
 cargo run --release --no-default-features --example particle_cpu_benchmark
+
+# Named surface benchmark (default fixture is ui_90_10)
+cargo run --release --example rendering_benchmark_suite -- --fixture ui_90_10
+
+# Complete named performance/contract matrix
+./scripts/rendering_benchmark_matrix.sh
 
 # Independently rotating cube and octahedron with hidden edges
 cargo run --release --example stereometry_3d -- --uncapped

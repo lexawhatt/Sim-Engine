@@ -21,11 +21,10 @@ impl LogicalPixels {
     }
 }
 
-/// Positive finite distance measured in caller-defined 3D world units.
+/// Positive finite distance measured in caller-defined world units.
 ///
-/// This type labels scalar distances such as camera near/far ranges. Positions
-/// and directions remain [`crate::Vec3`] because their three components have
-/// vector rather than scalar semantics.
+/// This type labels scalar distances such as 2D world-space stroke widths and
+/// 3D camera near/far ranges. Positions and directions remain vector types.
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
 pub struct WorldLength(f32);
 

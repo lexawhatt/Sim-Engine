@@ -5,7 +5,7 @@ milestone.
 
 Audience: Sim;Engine maintainers and Sim;X renderer-adapter maintainers.
 
-Implementation status on the unreleased post-0.1 main branch:
+Implementation status on the 0.2.0 release branch:
 
 - W-002: implemented, including atomic mixed-layer batch construction,
   fallible tessellation reservations, actual-work enforcement, metrics, and a
@@ -32,9 +32,12 @@ Implementation status on the unreleased post-0.1 main branch:
 - W-008: the allowed bounded raw-triangle option is implemented through
   `DynamicMeshBudget` plus the common frame path. Polygon/path tessellation is
   intentionally still host-owned.
-- W-009: aggregate frame/resource metrics and scene construction/GPU semantic
-  fixtures exist; the named workload benchmark matrix remains incomplete.
-- W-010 remains queued after the new consumer paths are migrated and measured.
+- W-009: implemented through primitive/source-grouped diagnostics, retained
+  CPU/GPU memory accounting, the release-mode surface benchmark suite, and the
+  complete named matrix runner. Optional hardware GPU timestamps remain a
+  capability-dependent later extension, not part of the CPU metrics contract.
+- W-010: implemented for logical/world widths, all bounded cap/join choices,
+  dash phase and continuity, expansion limits, and logical arrow markers.
 
 This document turns the confirmed rendering gaps in
 `SIM_ENGINE_RENDERING_GAPS.md` into a proposed delivery order. It is not a bug

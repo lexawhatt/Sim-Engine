@@ -40,7 +40,7 @@ fn run() -> Result<(), String> {
         0,
         vertices,
         command_count.saturating_mul(256),
-        vertices.saturating_mul(56),
+        vertices.saturating_mul(64),
         command_count,
     );
     let mut samples = Vec::with_capacity(iterations);

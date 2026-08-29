@@ -5,7 +5,7 @@ use crate::{Camera2d, LogicalViewport};
 use crate::{
     Color, Fill, Layer, LinearGradient, LogicalPixels, LogicalScreenPosition, LogicalScreenVector,
     RadialGradient, Rect, Scene, SceneBudget, SceneBudgetResource, SceneCommand, SceneError,
-    ScenePrimitive, SceneStatistics, ScreenClipRect, ShapeStyle, Vec2,
+    ScenePrimitive, SceneStatistics, ScreenClipRect, ShapeStyle, StrokeStyle2d, Vec2,
 };
 
 /// A bounded 2D scene whose geometry is expressed in logical screen pixels.
@@ -143,7 +143,7 @@ impl ScreenScene {
     ) -> Result<(), SceneError> {
         let max = min.to_vec2() + size.to_vec2();
         if !min.is_finite() || !size.is_finite() || !max.is_finite() {
-            self.scene.record_external_rejection();
+            self.scene.record_external_rejection(ScenePrimitive::Rect);
             return Err(SceneError::NonFiniteGeometry(ScenePrimitive::Rect));
         }
         self.scene.try_rect_on_layer(
@@ -186,6 +186,32 @@ impl ScreenScene {
         )
     }
 
+    /// Appends a logical-screen line with explicit bounded stroke styling.
+    pub fn try_styled_line(
+        &mut self,
+        from: LogicalScreenPosition,
+        to: LogicalScreenPosition,
+        style: StrokeStyle2d,
+    ) -> Result<(), SceneError> {
+        self.try_styled_line_on_layer(Layer::DEFAULT, from, to, style)
+    }
+
+    /// Appends an explicitly styled logical-screen line to a shared layer.
+    pub fn try_styled_line_on_layer(
+        &mut self,
+        layer: Layer,
+        from: LogicalScreenPosition,
+        to: LogicalScreenPosition,
+        style: StrokeStyle2d,
+    ) -> Result<(), SceneError> {
+        self.scene.try_styled_line_on_layer(
+            layer,
+            screen_to_internal(from),
+            screen_to_internal(to),
+            style,
+        )
+    }
+
     /// Appends a connected logical-screen line strip with fallible point copying.
     pub fn try_polyline(
         &mut self,
@@ -204,6 +230,25 @@ impl ScreenScene {
         width: LogicalPixels,
         color: Color,
     ) -> Result<(), SceneError> {
+        self.try_styled_polyline_on_layer(layer, points, StrokeStyle2d::logical(width, color))
+    }
+
+    /// Appends an explicitly styled logical-screen line strip.
+    pub fn try_styled_polyline(
+        &mut self,
+        points: &[LogicalScreenPosition],
+        style: StrokeStyle2d,
+    ) -> Result<(), SceneError> {
+        self.try_styled_polyline_on_layer(Layer::DEFAULT, points, style)
+    }
+
+    /// Appends an explicitly styled logical-screen line strip to a shared layer.
+    pub fn try_styled_polyline_on_layer(
+        &mut self,
+        layer: Layer,
+        points: &[LogicalScreenPosition],
+        style: StrokeStyle2d,
+    ) -> Result<(), SceneError> {
         if let Some(budget) = self.scene.budget() {
             let requested = self
                 .scene
@@ -211,7 +256,8 @@ impl ScreenScene {
                 .retained_points()
                 .saturating_add(points.len());
             if requested > budget.max_points() {
-                self.scene.record_external_rejection();
+                self.scene
+                    .record_external_rejection(ScenePrimitive::Polyline);
                 return Err(SceneError::BudgetExceeded {
                     resource: SceneBudgetResource::Points,
                     limit: budget.max_points(),
@@ -221,14 +267,15 @@ impl ScreenScene {
         }
         let mut internal = Vec::new();
         if internal.try_reserve(points.len()).is_err() {
-            self.scene.record_external_rejection();
+            self.scene
+                .record_external_rejection(ScenePrimitive::Polyline);
             return Err(SceneError::AllocationFailed {
                 requested_bytes: points.len().saturating_mul(size_of::<Vec2>()),
             });
         }
         internal.extend(points.iter().copied().map(screen_to_internal));
         self.scene
-            .try_polyline_on_layer(layer, internal, width.get(), color)
+            .try_styled_polyline_on_layer(layer, internal, style)
     }
 
     /// Creates a linear-gradient fill using typed logical-screen endpoints.

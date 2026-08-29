@@ -5,12 +5,19 @@ use std::{
     panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
 };
 
-use crate::{Color, Interpolate, LogicalScreenPosition, LogicalScreenVector, Rect, Vec2};
+use crate::{
+    Color, Interpolate, LogicalPixels, LogicalScreenPosition, LogicalScreenVector, Rect, Vec2,
+    WorldLength,
+};
 
 pub(crate) const CIRCLE_SEGMENTS: usize = 64;
 pub(crate) const ROUND_CAP_SEGMENTS: usize = 16;
 pub(crate) const CORNER_SEGMENTS: usize = 12;
-pub(crate) const TESSELLATED_VERTEX_BYTES: usize = 14 * size_of::<f32>();
+pub(crate) const TESSELLATED_VERTEX_BYTES: usize = 16 * size_of::<f32>();
+const MAX_DASH_ELEMENTS: usize = 8;
+const MAX_MITER_LIMIT: f32 = 1_000.0;
+/// Maximum visible dash pieces one command may request from tessellation.
+pub const MAX_STROKE_DASH_SUBSEGMENTS: usize = 1_000_000;
 
 /// Primitive category attached to structured scene validation errors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,6 +123,9 @@ pub struct SceneStatistics {
     requested_commands: usize,
     accepted_commands: usize,
     rejected_commands: usize,
+    requested_by_primitive: PrimitiveCommandCounts,
+    accepted_by_primitive: PrimitiveCommandCounts,
+    rejected_by_primitive: PrimitiveCommandCounts,
     retained_points: usize,
     estimated_tessellated_vertices: usize,
     retained_bytes: usize,
@@ -137,6 +147,21 @@ impl SceneStatistics {
     /// Returns insertion attempts rejected by validation, budget, or allocation.
     pub const fn rejected_commands(self) -> usize {
         self.rejected_commands
+    }
+
+    /// Returns insertion attempts grouped by primitive category.
+    pub const fn requested_by_primitive(self) -> PrimitiveCommandCounts {
+        self.requested_by_primitive
+    }
+
+    /// Returns currently retained commands grouped by primitive category.
+    pub const fn accepted_by_primitive(self) -> PrimitiveCommandCounts {
+        self.accepted_by_primitive
+    }
+
+    /// Returns rejected insertion attempts grouped by primitive category.
+    pub const fn rejected_by_primitive(self) -> PrimitiveCommandCounts {
+        self.rejected_by_primitive
     }
 
     /// Returns points retained by accepted polyline commands.
@@ -167,6 +192,7 @@ impl SceneStatistics {
     fn with_command(mut self, command: &DrawCommand) -> Self {
         let vertices = command.estimated_tessellated_vertices();
         self.accepted_commands = self.accepted_commands.saturating_add(1);
+        self.accepted_by_primitive.increment(command.primitive());
         self.retained_points = self
             .retained_points
             .saturating_add(command.retained_point_count());
@@ -177,6 +203,62 @@ impl SceneStatistics {
             .estimated_upload_bytes
             .saturating_add(vertices.saturating_mul(TESSELLATED_VERTEX_BYTES));
         self.estimated_draw_batches = self.estimated_draw_batches.saturating_add(1);
+        self
+    }
+}
+
+/// Command counters grouped by ordinary 2D primitive category.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PrimitiveCommandCounts {
+    circles: usize,
+    rectangles: usize,
+    lines: usize,
+    polylines: usize,
+}
+
+impl PrimitiveCommandCounts {
+    /// Returns circle command count.
+    pub const fn circles(self) -> usize {
+        self.circles
+    }
+
+    /// Returns rectangle command count.
+    pub const fn rectangles(self) -> usize {
+        self.rectangles
+    }
+
+    /// Returns single-line command count.
+    pub const fn lines(self) -> usize {
+        self.lines
+    }
+
+    /// Returns connected-polyline command count.
+    pub const fn polylines(self) -> usize {
+        self.polylines
+    }
+
+    /// Returns all primitive commands represented by these counters.
+    pub const fn total(self) -> usize {
+        self.circles
+            .saturating_add(self.rectangles)
+            .saturating_add(self.lines)
+            .saturating_add(self.polylines)
+    }
+
+    pub(crate) fn increment(&mut self, primitive: ScenePrimitive) {
+        match primitive {
+            ScenePrimitive::Circle => self.circles = self.circles.saturating_add(1),
+            ScenePrimitive::Rect => self.rectangles = self.rectangles.saturating_add(1),
+            ScenePrimitive::Line => self.lines = self.lines.saturating_add(1),
+            ScenePrimitive::Polyline => self.polylines = self.polylines.saturating_add(1),
+        }
+    }
+
+    pub(crate) fn adding(mut self, other: Self) -> Self {
+        self.circles = self.circles.saturating_add(other.circles);
+        self.rectangles = self.rectangles.saturating_add(other.rectangles);
+        self.lines = self.lines.saturating_add(other.lines);
+        self.polylines = self.polylines.saturating_add(other.polylines);
         self
     }
 }
@@ -198,6 +280,18 @@ pub enum SceneError {
     InvalidFill(ScenePrimitive),
     /// Stroke width or color is invalid.
     InvalidStroke(ScenePrimitive),
+    /// A dash pattern would expand into more retained triangle pieces than its
+    /// explicit per-command limit.
+    StrokeExpansionLimitExceeded {
+        /// Primitive whose stroke exceeded the limit.
+        primitive: ScenePrimitive,
+        /// Configured maximum number of emitted visible subsegments.
+        limit: usize,
+        /// Minimum visible-subsegment count that proved the limit was exceeded.
+        required: usize,
+    },
+    /// Dash/gap boundaries collapse at the source path's `f32` coordinate scale.
+    UnrepresentableStrokePattern(ScenePrimitive),
     /// Shadow offset, spread, or color is invalid.
     InvalidShadow(ScenePrimitive),
     /// Active logical screen clip is non-finite or empty.
@@ -441,10 +535,13 @@ impl Scene {
         layer: Layer,
         command: DrawCommand,
     ) -> Result<(), SceneError> {
+        let primitive = command.primitive();
         self.statistics.requested_commands = self.statistics.requested_commands.saturating_add(1);
+        self.statistics.requested_by_primitive.increment(primitive);
         let result = self.try_push_to_layer_inner(layer, command);
         if result.is_err() {
             self.statistics.rejected_commands = self.statistics.rejected_commands.saturating_add(1);
+            self.statistics.rejected_by_primitive.increment(primitive);
         }
         result
     }
@@ -463,20 +560,24 @@ impl Scene {
         let mut staged = Vec::new();
         let mut requested = self.statistics;
         let mut attempted = 0usize;
+        let mut attempted_by_primitive = PrimitiveCommandCounts::default();
         let mut next_order = self.next_order;
 
         for (layer, command) in commands {
+            let primitive = command.primitive();
             attempted = attempted.saturating_add(1);
+            attempted_by_primitive.increment(primitive);
             requested.requested_commands = requested.requested_commands.saturating_add(1);
+            requested.requested_by_primitive.increment(primitive);
             if let Err(error) = command.validate() {
-                self.record_batch_rejection(attempted);
+                self.record_batch_rejection(attempted, attempted_by_primitive);
                 return Err(error);
             }
             if self
                 .current_screen_clip
                 .is_some_and(|screen_clip| !screen_clip.is_valid())
             {
-                self.record_batch_rejection(attempted);
+                self.record_batch_rejection(attempted, attempted_by_primitive);
                 return Err(SceneError::InvalidScreenClip);
             }
 
@@ -484,11 +585,11 @@ impl Scene {
             if let Some(budget) = self.budget
                 && let Err(error) = validate_scene_budget(budget, requested)
             {
-                self.record_batch_rejection(attempted);
+                self.record_batch_rejection(attempted, attempted_by_primitive);
                 return Err(error);
             }
             if staged.try_reserve(1).is_err() {
-                self.record_batch_rejection(attempted);
+                self.record_batch_rejection(attempted, attempted_by_primitive);
                 return Err(SceneError::AllocationFailed {
                     requested_bytes: command.retained_bytes(),
                 });
@@ -509,7 +610,7 @@ impl Scene {
         let total = self.commands.len().saturating_add(staged.len());
         let mut merged = Vec::new();
         if merged.try_reserve(total).is_err() {
-            self.record_batch_rejection(attempted);
+            self.record_batch_rejection(attempted, attempted_by_primitive);
             return Err(SceneError::AllocationFailed {
                 requested_bytes: total.saturating_mul(size_of::<SceneCommand>()),
             });
@@ -523,7 +624,11 @@ impl Scene {
         Ok(())
     }
 
-    fn record_batch_rejection(&mut self, command_count: usize) {
+    fn record_batch_rejection(
+        &mut self,
+        command_count: usize,
+        by_primitive: PrimitiveCommandCounts,
+    ) {
         self.statistics.requested_commands = self
             .statistics
             .requested_commands
@@ -532,10 +637,16 @@ impl Scene {
             .statistics
             .rejected_commands
             .saturating_add(command_count);
+        self.statistics.requested_by_primitive =
+            self.statistics.requested_by_primitive.adding(by_primitive);
+        self.statistics.rejected_by_primitive =
+            self.statistics.rejected_by_primitive.adding(by_primitive);
     }
 
-    pub(crate) fn record_external_rejection(&mut self) {
-        self.record_batch_rejection(1);
+    pub(crate) fn record_external_rejection(&mut self, primitive: ScenePrimitive) {
+        let mut counts = PrimitiveCommandCounts::default();
+        counts.increment(primitive);
+        self.record_batch_rejection(1, counts);
     }
 
     fn try_push_to_layer_inner(
@@ -702,7 +813,7 @@ impl Scene {
         width: f32,
         color: Color,
     ) -> Result<(), SceneError> {
-        self.try_line_on_layer(Layer::DEFAULT, from, to, width, color)
+        self.try_styled_line(from, to, StrokeStyle2d::new(width, color))
     }
 
     /// Appends a stroked line between world-space points to a layer.
@@ -731,14 +842,45 @@ impl Scene {
         width: f32,
         color: Color,
     ) -> Result<(), SceneError> {
-        self.try_push_to_layer(
-            layer,
-            DrawCommand::Line(Line {
-                from,
-                to,
-                stroke: Stroke { width, color },
-            }),
-        )
+        self.try_styled_line_on_layer(layer, from, to, StrokeStyle2d::new(width, color))
+    }
+
+    /// Appends a line with explicit width units, caps, joins, dashes, and markers.
+    pub fn styled_line(&mut self, from: Vec2, to: Vec2, style: StrokeStyle2d) -> bool {
+        self.try_styled_line(from, to, style).is_ok()
+    }
+
+    /// Appends an explicitly styled line with structured rejection diagnostics.
+    pub fn try_styled_line(
+        &mut self,
+        from: Vec2,
+        to: Vec2,
+        style: StrokeStyle2d,
+    ) -> Result<(), SceneError> {
+        self.try_styled_line_on_layer(Layer::DEFAULT, from, to, style)
+    }
+
+    /// Appends an explicitly styled line to a shared draw layer.
+    pub fn styled_line_on_layer(
+        &mut self,
+        layer: Layer,
+        from: Vec2,
+        to: Vec2,
+        style: StrokeStyle2d,
+    ) -> bool {
+        self.try_styled_line_on_layer(layer, from, to, style)
+            .is_ok()
+    }
+
+    /// Appends an explicitly styled line to a layer with structured rejection.
+    pub fn try_styled_line_on_layer(
+        &mut self,
+        layer: Layer,
+        from: Vec2,
+        to: Vec2,
+        style: StrokeStyle2d,
+    ) -> Result<(), SceneError> {
+        self.try_push_to_layer(layer, DrawCommand::Line(Line { from, to, style }))
     }
 
     /// Appends connected stroked segments through world-space points.
@@ -756,7 +898,7 @@ impl Scene {
         width: f32,
         color: Color,
     ) -> Result<(), SceneError> {
-        self.try_polyline_on_layer(Layer::DEFAULT, points, width, color)
+        self.try_styled_polyline(points, StrokeStyle2d::new(width, color))
     }
 
     /// Appends connected stroked segments through world-space points to a layer.
@@ -782,13 +924,42 @@ impl Scene {
         width: f32,
         color: Color,
     ) -> Result<(), SceneError> {
-        self.try_push_to_layer(
-            layer,
-            DrawCommand::Polyline(Polyline {
-                points,
-                stroke: Stroke { width, color },
-            }),
-        )
+        self.try_styled_polyline_on_layer(layer, points, StrokeStyle2d::new(width, color))
+    }
+
+    /// Appends a connected path with explicit width, caps, joins, dashes, and markers.
+    pub fn styled_polyline(&mut self, points: Vec<Vec2>, style: StrokeStyle2d) -> bool {
+        self.try_styled_polyline(points, style).is_ok()
+    }
+
+    /// Appends an explicitly styled path with structured rejection diagnostics.
+    pub fn try_styled_polyline(
+        &mut self,
+        points: Vec<Vec2>,
+        style: StrokeStyle2d,
+    ) -> Result<(), SceneError> {
+        self.try_styled_polyline_on_layer(Layer::DEFAULT, points, style)
+    }
+
+    /// Appends an explicitly styled path to a shared draw layer.
+    pub fn styled_polyline_on_layer(
+        &mut self,
+        layer: Layer,
+        points: Vec<Vec2>,
+        style: StrokeStyle2d,
+    ) -> bool {
+        self.try_styled_polyline_on_layer(layer, points, style)
+            .is_ok()
+    }
+
+    /// Appends an explicitly styled path to a layer with structured rejection.
+    pub fn try_styled_polyline_on_layer(
+        &mut self,
+        layer: Layer,
+        points: Vec<Vec2>,
+        style: StrokeStyle2d,
+    ) -> Result<(), SceneError> {
+        self.try_push_to_layer(layer, DrawCommand::Polyline(Polyline { points, style }))
     }
 }
 
@@ -952,6 +1123,16 @@ pub enum DrawCommand {
 }
 
 impl DrawCommand {
+    /// Returns the primitive category used by diagnostics and budgets.
+    pub const fn primitive(&self) -> ScenePrimitive {
+        match self {
+            Self::Circle(_) => ScenePrimitive::Circle,
+            Self::Rect(_) => ScenePrimitive::Rect,
+            Self::Line(_) => ScenePrimitive::Line,
+            Self::Polyline(_) => ScenePrimitive::Polyline,
+        }
+    }
+
     /// Builds and validates a circle command for batch insertion.
     pub fn circle(center: Vec2, radius: f32, style: ShapeStyle) -> Result<Self, SceneError> {
         let command = Self::Circle(Circle {
@@ -976,21 +1157,24 @@ impl DrawCommand {
 
     /// Builds and validates a single line command for batch insertion.
     pub fn line(from: Vec2, to: Vec2, width: f32, color: Color) -> Result<Self, SceneError> {
-        let command = Self::Line(Line {
-            from,
-            to,
-            stroke: Stroke { width, color },
-        });
+        Self::styled_line(from, to, StrokeStyle2d::new(width, color))
+    }
+
+    /// Builds and validates an explicitly styled line command.
+    pub fn styled_line(from: Vec2, to: Vec2, style: StrokeStyle2d) -> Result<Self, SceneError> {
+        let command = Self::Line(Line { from, to, style });
         command.validate()?;
         Ok(command)
     }
 
     /// Builds and validates a connected polyline command for batch insertion.
     pub fn polyline(points: Vec<Vec2>, width: f32, color: Color) -> Result<Self, SceneError> {
-        let command = Self::Polyline(Polyline {
-            points,
-            stroke: Stroke { width, color },
-        });
+        Self::styled_polyline(points, StrokeStyle2d::new(width, color))
+    }
+
+    /// Builds and validates an explicitly styled polyline command.
+    pub fn styled_polyline(points: Vec<Vec2>, style: StrokeStyle2d) -> Result<Self, SceneError> {
+        let command = Self::Polyline(Polyline { points, style });
         command.validate()?;
         Ok(command)
     }
@@ -1040,9 +1224,10 @@ impl DrawCommand {
                 if !drawable_segment(line.from, line.to) {
                     return Err(SceneError::DegenerateGeometry(ScenePrimitive::Line));
                 }
-                if !line.stroke.is_valid() {
+                if !line.style.is_valid() {
                     return Err(SceneError::InvalidStroke(ScenePrimitive::Line));
                 }
+                validate_stroke_path(&[line.from, line.to], line.style, ScenePrimitive::Line)?;
                 Ok(())
             }
             Self::Polyline(polyline) => {
@@ -1064,9 +1249,10 @@ impl DrawCommand {
                 {
                     return Err(SceneError::DegenerateGeometry(ScenePrimitive::Polyline));
                 }
-                if !polyline.stroke.is_valid() {
+                if !polyline.style.is_valid() {
                     return Err(SceneError::InvalidStroke(ScenePrimitive::Polyline));
                 }
+                validate_stroke_path(&polyline.points, polyline.style, ScenePrimitive::Polyline)?;
                 Ok(())
             }
         }
@@ -1122,15 +1308,143 @@ impl DrawCommand {
                         fill_vertices + usize::from(shadow.spread > 0.0) * stroke_vertices
                     })
             }
-            Self::Line(_) => 6 + 2 * ROUND_CAP_SEGMENTS * 3,
-            Self::Polyline(polyline) => polyline
-                .points
-                .len()
-                .saturating_sub(1)
-                .saturating_mul(6)
-                .saturating_add(2 * ROUND_CAP_SEGMENTS * 3),
+            Self::Line(line) => estimate_stroke_vertices(&[line.from, line.to], line.style),
+            Self::Polyline(polyline) => estimate_stroke_vertices(&polyline.points, polyline.style),
         }
     }
+}
+
+fn validate_stroke_path(
+    points: &[Vec2],
+    style: StrokeStyle2d,
+    primitive: ScenePrimitive,
+) -> Result<(), SceneError> {
+    let maximum_offset = f64::from(style.stroke.width) * 0.5 * f64::from(style.miter_limit);
+    if !maximum_offset.is_finite() || maximum_offset > f64::from(f32::MAX) {
+        return Err(SceneError::InvalidStroke(primitive));
+    }
+    if style.width_mode == StrokeWidthMode2d::WorldUnits {
+        let extent = Vec2::splat(maximum_offset as f32);
+        if points
+            .iter()
+            .any(|point| !(*point + extent).is_finite() || !(*point - extent).is_finite())
+        {
+            return Err(SceneError::NonFiniteGeometry(primitive));
+        }
+    }
+    if let Some(dash) = style.dash {
+        let required = dash_subsegment_count(points, dash, Some(dash.max_subsegments))
+            .ok_or(SceneError::UnrepresentableStrokePattern(primitive))?;
+        if required > dash.max_subsegments {
+            return Err(SceneError::StrokeExpansionLimitExceeded {
+                primitive,
+                limit: dash.max_subsegments,
+                required,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn estimate_stroke_vertices(points: &[Vec2], style: StrokeStyle2d) -> usize {
+    let segment_count = points
+        .windows(2)
+        .filter(|pair| drawable_segment(pair[0], pair[1]))
+        .count();
+    if segment_count == 0 {
+        return 0;
+    }
+    let body_count = style.dash.map_or(segment_count, |dash| {
+        dash_subsegment_count(points, dash, None)
+            .expect("accepted dash paths have representable subsegments")
+    });
+    // A visible dash may continue across every geometric vertex. Counting all
+    // possible joins is conservative without expanding the pattern twice.
+    let join_count = segment_count.saturating_sub(1);
+    let cap_count = if style.dash.is_some() {
+        body_count.saturating_mul(2)
+    } else {
+        2
+    };
+    let cap_vertices = match style.cap {
+        StrokeCap2d::Round => cap_count.saturating_mul(ROUND_CAP_SEGMENTS * 3),
+        StrokeCap2d::Butt | StrokeCap2d::Square => 0,
+    };
+    let join_vertices = match style.join {
+        StrokeJoin2d::Bevel => join_count.saturating_mul(6),
+        StrokeJoin2d::Miter
+            if style.width_mode == StrokeWidthMode2d::LogicalPixels && style.dash.is_none() =>
+        {
+            0
+        }
+        StrokeJoin2d::Miter => join_count.saturating_mul(12),
+        StrokeJoin2d::Round => join_count.saturating_mul(ROUND_CAP_SEGMENTS * 3),
+    };
+    let marker_vertices = (usize::from(style.start_marker.is_some())
+        + usize::from(style.end_marker.is_some()))
+    .saturating_mul(3);
+    body_count
+        .saturating_mul(6)
+        .saturating_add(cap_vertices)
+        .saturating_add(join_vertices)
+        .saturating_add(marker_vertices)
+}
+
+fn dash_subsegment_count(
+    points: &[Vec2],
+    dash: StrokeDashPattern2d,
+    stop_after: Option<usize>,
+) -> Option<usize> {
+    let lengths = dash.lengths();
+    let total: f64 = lengths.iter().map(|length| f64::from(*length)).sum();
+    let mut phase = f64::from(dash.phase).rem_euclid(total);
+    let mut pattern_index = 0usize;
+    while phase >= f64::from(lengths[pattern_index]) {
+        phase -= f64::from(lengths[pattern_index]);
+        pattern_index = (pattern_index + 1) % lengths.len();
+    }
+    let mut pattern_remaining = f64::from(lengths[pattern_index]) - phase;
+    let mut count = 0usize;
+
+    for pair in points.windows(2) {
+        let delta = pair[1] - pair[0];
+        let segment_length = f64::from(delta.x).hypot(f64::from(delta.y));
+        let mut segment_remaining = segment_length;
+        while segment_remaining > 0.0 {
+            let consumed = segment_remaining.min(pattern_remaining);
+            if pattern_index.is_multiple_of(2) && consumed > 0.0 {
+                count = count.saturating_add(1);
+                if stop_after.is_some_and(|limit| count > limit) {
+                    return Some(count);
+                }
+            }
+            let next_remaining = segment_remaining - consumed;
+            if next_remaining >= segment_remaining {
+                return None;
+            }
+            let amount_start = 1.0 - segment_remaining / segment_length;
+            let amount_end = 1.0 - next_remaining / segment_length;
+            if dash_segment_point(pair[0], pair[1], amount_start)
+                == dash_segment_point(pair[0], pair[1], amount_end)
+            {
+                return None;
+            }
+            segment_remaining = next_remaining;
+            pattern_remaining -= consumed;
+            if pattern_remaining <= 0.0 {
+                pattern_index = (pattern_index + 1) % lengths.len();
+                pattern_remaining = f64::from(lengths[pattern_index]);
+            }
+        }
+    }
+    Some(count)
+}
+
+fn dash_segment_point(from: Vec2, to: Vec2, amount: f64) -> Vec2 {
+    Vec2::new(
+        (f64::from(from.x) * (1.0 - amount) + f64::from(to.x) * amount) as f32,
+        (f64::from(from.y) * (1.0 - amount) + f64::from(to.y) * amount) as f32,
+    )
 }
 
 fn validate_scene_budget(
@@ -1237,7 +1551,7 @@ impl RectShape {
 pub struct Line {
     from: Vec2,
     to: Vec2,
-    stroke: Stroke,
+    style: StrokeStyle2d,
 }
 
 impl Line {
@@ -1249,9 +1563,13 @@ impl Line {
     pub const fn to(&self) -> Vec2 {
         self.to
     }
-    /// Returns the logical-pixel stroke.
+    /// Returns color and scalar width; inspect [`Self::stroke_style`] for units.
     pub const fn stroke(&self) -> Stroke {
-        self.stroke
+        self.style.stroke
+    }
+    /// Returns the complete cap, join, dash, marker, and width-mode style.
+    pub const fn stroke_style(&self) -> StrokeStyle2d {
+        self.style
     }
 }
 
@@ -1259,7 +1577,7 @@ impl Line {
 #[derive(Debug, Clone)]
 pub struct Polyline {
     points: Vec<Vec2>,
-    stroke: Stroke,
+    style: StrokeStyle2d,
 }
 
 impl Polyline {
@@ -1267,11 +1585,288 @@ impl Polyline {
     pub fn points(&self) -> &[Vec2] {
         &self.points
     }
-    /// Returns the logical-pixel stroke.
+    /// Returns color and scalar width; inspect [`Self::stroke_style`] for units.
     pub const fn stroke(&self) -> Stroke {
-        self.stroke
+        self.style.stroke
+    }
+    /// Returns the complete cap, join, dash, marker, and width-mode style.
+    pub const fn stroke_style(&self) -> StrokeStyle2d {
+        self.style
     }
 }
+
+/// Coordinate space used by a line or polyline stroke width.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StrokeWidthMode2d {
+    /// Width remains constant in logical screen pixels while the camera zooms.
+    LogicalPixels,
+    /// Width is measured in the same world units as the path coordinates.
+    WorldUnits,
+}
+
+/// Presentation used at an open line or dash endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StrokeCap2d {
+    /// Stop exactly at the endpoint.
+    Butt,
+    /// Extend by half the stroke width beyond the endpoint.
+    Square,
+    /// Add a semicircular endpoint.
+    Round,
+}
+
+/// Presentation used where two visible polyline segments meet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StrokeJoin2d {
+    /// Connect the two segment corners directly.
+    Bevel,
+    /// Fill the corner with a circular join.
+    Round,
+    /// Extend corner edges to their intersection, bounded by the style's
+    /// miter limit and falling back to a bevel beyond it.
+    Miter,
+}
+
+/// Fixed-size, allocation-free dash pattern in source path-coordinate units.
+///
+/// Values alternate visible and hidden lengths, beginning with a visible
+/// length. The element count must be even and at most eight. `phase` advances
+/// into the repeating pattern in the same path units. `max_subsegments` is a
+/// hard limit on visible pieces generated for one command.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StrokeDashPattern2d {
+    lengths: [f32; MAX_DASH_ELEMENTS],
+    length_count: u8,
+    phase: f32,
+    max_subsegments: usize,
+}
+
+impl StrokeDashPattern2d {
+    /// Builds a bounded alternating visible/hidden dash pattern.
+    pub fn new(
+        lengths: &[f32],
+        phase: f32,
+        max_subsegments: usize,
+    ) -> Result<Self, StrokeStyleError> {
+        if lengths.len() < 2
+            || lengths.len() > MAX_DASH_ELEMENTS
+            || !lengths.len().is_multiple_of(2)
+        {
+            return Err(StrokeStyleError::InvalidDashElementCount);
+        }
+        if lengths
+            .iter()
+            .any(|length| !length.is_finite() || *length <= 0.0)
+        {
+            return Err(StrokeStyleError::InvalidDashLength);
+        }
+        if !phase.is_finite() {
+            return Err(StrokeStyleError::InvalidDashPhase);
+        }
+        if max_subsegments == 0 || max_subsegments > MAX_STROKE_DASH_SUBSEGMENTS {
+            return Err(StrokeStyleError::InvalidDashExpansionLimit);
+        }
+        let mut stored = [0.0; MAX_DASH_ELEMENTS];
+        stored[..lengths.len()].copy_from_slice(lengths);
+        Ok(Self {
+            lengths: stored,
+            length_count: lengths.len() as u8,
+            phase,
+            max_subsegments,
+        })
+    }
+
+    /// Returns the alternating visible/hidden lengths in path units.
+    pub fn lengths(&self) -> &[f32] {
+        &self.lengths[..usize::from(self.length_count)]
+    }
+
+    /// Returns the repeating-pattern phase in path units.
+    pub const fn phase(self) -> f32 {
+        self.phase
+    }
+
+    /// Returns the hard visible-subsegment expansion limit.
+    pub const fn max_subsegments(self) -> usize {
+        self.max_subsegments
+    }
+}
+
+/// Reusable arrow marker definition for a line endpoint.
+///
+/// Marker dimensions are logical pixels even when the line body uses a world
+/// width, keeping scientific annotations readable under camera zoom.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StrokeMarker2d {
+    length: LogicalPixels,
+    width: LogicalPixels,
+}
+
+impl StrokeMarker2d {
+    /// Builds a filled triangular arrow marker.
+    pub const fn arrow(length: LogicalPixels, width: LogicalPixels) -> Self {
+        Self { length, width }
+    }
+
+    /// Returns marker length along the endpoint tangent.
+    pub const fn length(self) -> LogicalPixels {
+        self.length
+    }
+
+    /// Returns full marker width perpendicular to the endpoint tangent.
+    pub const fn width(self) -> LogicalPixels {
+        self.width
+    }
+}
+
+/// Complete bounded styling for open 2D lines and polylines.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StrokeStyle2d {
+    stroke: Stroke,
+    width_mode: StrokeWidthMode2d,
+    cap: StrokeCap2d,
+    join: StrokeJoin2d,
+    miter_limit: f32,
+    dash: Option<StrokeDashPattern2d>,
+    start_marker: Option<StrokeMarker2d>,
+    end_marker: Option<StrokeMarker2d>,
+}
+
+impl StrokeStyle2d {
+    /// Builds the legacy logical-pixel round-cap joined-strip style.
+    pub const fn new(width: f32, color: Color) -> Self {
+        Self {
+            stroke: Stroke::new(width, color),
+            width_mode: StrokeWidthMode2d::LogicalPixels,
+            cap: StrokeCap2d::Round,
+            join: StrokeJoin2d::Miter,
+            miter_limit: MAX_MITER_LIMIT,
+            dash: None,
+            start_marker: None,
+            end_marker: None,
+        }
+    }
+
+    /// Builds a validated logical-pixel-width style.
+    pub const fn logical(width: LogicalPixels, color: Color) -> Self {
+        Self::new(width.get(), color)
+    }
+
+    /// Builds a validated world-unit-width style.
+    pub const fn world(width: WorldLength, color: Color) -> Self {
+        let mut style = Self::new(width.get(), color);
+        style.width_mode = StrokeWidthMode2d::WorldUnits;
+        style
+    }
+
+    /// Selects the open endpoint presentation.
+    pub const fn with_cap(mut self, cap: StrokeCap2d) -> Self {
+        self.cap = cap;
+        self
+    }
+
+    /// Selects the connected-segment presentation.
+    pub const fn with_join(mut self, join: StrokeJoin2d) -> Self {
+        self.join = join;
+        self
+    }
+
+    /// Sets the miter-length multiple in `1.0..=1000.0`.
+    pub fn with_miter_limit(mut self, limit: f32) -> Result<Self, StrokeStyleError> {
+        if !limit.is_finite() || !(1.0..=MAX_MITER_LIMIT).contains(&limit) {
+            return Err(StrokeStyleError::InvalidMiterLimit);
+        }
+        self.miter_limit = limit;
+        Ok(self)
+    }
+
+    /// Applies an allocation-free bounded dash pattern.
+    pub const fn with_dash_pattern(mut self, dash: StrokeDashPattern2d) -> Self {
+        self.dash = Some(dash);
+        self
+    }
+
+    /// Adds a reusable triangular marker at the first path point.
+    pub const fn with_start_marker(mut self, marker: StrokeMarker2d) -> Self {
+        self.start_marker = Some(marker);
+        self
+    }
+
+    /// Adds a reusable triangular marker at the last path point.
+    pub const fn with_end_marker(mut self, marker: StrokeMarker2d) -> Self {
+        self.end_marker = Some(marker);
+        self
+    }
+
+    /// Returns color and scalar width.
+    pub const fn stroke(self) -> Stroke {
+        self.stroke
+    }
+
+    /// Returns whether width is logical-screen or world-space.
+    pub const fn width_mode(self) -> StrokeWidthMode2d {
+        self.width_mode
+    }
+
+    /// Returns endpoint presentation.
+    pub const fn cap(self) -> StrokeCap2d {
+        self.cap
+    }
+
+    /// Returns connected-segment presentation.
+    pub const fn join(self) -> StrokeJoin2d {
+        self.join
+    }
+
+    /// Returns the bounded miter multiple.
+    pub const fn miter_limit(self) -> f32 {
+        self.miter_limit
+    }
+
+    /// Returns the optional bounded dash pattern.
+    pub const fn dash_pattern(self) -> Option<StrokeDashPattern2d> {
+        self.dash
+    }
+
+    /// Returns the optional first-endpoint marker.
+    pub const fn start_marker(self) -> Option<StrokeMarker2d> {
+        self.start_marker
+    }
+
+    /// Returns the optional last-endpoint marker.
+    pub const fn end_marker(self) -> Option<StrokeMarker2d> {
+        self.end_marker
+    }
+
+    fn is_valid(self) -> bool {
+        self.stroke.is_valid()
+            && self.miter_limit.is_finite()
+            && (1.0..=MAX_MITER_LIMIT).contains(&self.miter_limit)
+    }
+}
+
+/// Invalid bounded line-style configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StrokeStyleError {
+    /// Dash patterns require an even count from two through eight.
+    InvalidDashElementCount,
+    /// Every dash and gap length must be positive and finite.
+    InvalidDashLength,
+    /// Dash phase must be finite.
+    InvalidDashPhase,
+    /// Dash expansion limit must be in `1..=1_000_000`.
+    InvalidDashExpansionLimit,
+    /// Miter limit must be finite and in `1.0..=1000.0`.
+    InvalidMiterLimit,
+}
+
+impl fmt::Display for StrokeStyleError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "invalid bounded 2D stroke style: {self:?}")
+    }
+}
+
+impl Error for StrokeStyleError {}
 
 /// Fill, stroke, and shadow styling for solid primitives.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1585,11 +2180,14 @@ pub struct Stroke {
 }
 
 impl Stroke {
-    /// Builds a logical-pixel stroke.
+    /// Builds a stroke used by shape outlines and legacy logical-width lines.
+    ///
+    /// [`StrokeStyle2d::world`] reuses the same scalar/color value while making
+    /// the width's coordinate space explicit on the containing style.
     pub const fn new(width: f32, color: Color) -> Self {
         Self { width, color }
     }
-    /// Returns width in logical screen pixels.
+    /// Returns scalar width in the coordinate space selected by its owner.
     pub const fn width(self) -> f32 {
         self.width
     }
@@ -1646,11 +2244,14 @@ impl Shadow {
 mod tests {
     use std::panic::{AssertUnwindSafe, catch_unwind};
 
+    use super::MAX_STROKE_DASH_SUBSEGMENTS;
     use crate::{
         Color, DrawCommand, Fill, Layer, LinearGradient, LogicalScreenPosition,
         LogicalScreenVector, RadialGradient, Rect, Scene, SceneBudget, SceneBudgetResource,
-        SceneError, ScenePrimitive, ScreenClipRect, ShapeStyle, Vec2,
+        SceneError, ScenePrimitive, ScreenClipRect, ShapeStyle, StrokeCap2d, StrokeDashPattern2d,
+        StrokeJoin2d, StrokeMarker2d, StrokeStyle2d, StrokeStyleError, Vec2,
     };
+    use crate::{LogicalPixels, WorldLength};
 
     const UNLIMITED: usize = usize::MAX;
 
@@ -2032,6 +2633,127 @@ mod tests {
 
         assert!(scene.circle(Vec2::ZERO, 1.0, ShapeStyle::filled(Color::WHITE)));
         assert_eq!(scene.commands()[0].order(), 0);
+    }
+
+    #[test]
+    fn bounded_stroke_configuration_rejects_invalid_patterns_and_miters() {
+        assert_eq!(
+            StrokeDashPattern2d::new(&[1.0], 0.0, 4),
+            Err(StrokeStyleError::InvalidDashElementCount)
+        );
+        assert_eq!(
+            StrokeDashPattern2d::new(&[1.0, 0.0], 0.0, 4),
+            Err(StrokeStyleError::InvalidDashLength)
+        );
+        assert_eq!(
+            StrokeDashPattern2d::new(&[1.0, 1.0], f32::NAN, 4),
+            Err(StrokeStyleError::InvalidDashPhase)
+        );
+        assert_eq!(
+            StrokeDashPattern2d::new(&[1.0, 1.0], 0.0, 0),
+            Err(StrokeStyleError::InvalidDashExpansionLimit)
+        );
+        assert_eq!(
+            StrokeDashPattern2d::new(&[1.0, 1.0], 0.0, MAX_STROKE_DASH_SUBSEGMENTS + 1,),
+            Err(StrokeStyleError::InvalidDashExpansionLimit)
+        );
+        assert_eq!(
+            StrokeStyle2d::logical(LogicalPixels::new(2.0).unwrap(), Color::WHITE)
+                .with_miter_limit(0.5),
+            Err(StrokeStyleError::InvalidMiterLimit)
+        );
+    }
+
+    #[test]
+    fn dash_boundaries_must_be_representable_at_the_source_coordinate_scale() {
+        let dash =
+            StrokeDashPattern2d::new(&[f32::MIN_POSITIVE, f32::MIN_POSITIVE], 0.0, 8).unwrap();
+        let style = StrokeStyle2d::logical(LogicalPixels::new(1.0).unwrap(), Color::WHITE)
+            .with_dash_pattern(dash);
+
+        assert!(matches!(
+            DrawCommand::styled_line(Vec2::ZERO, Vec2::new(f32::MAX, 0.0), style),
+            Err(SceneError::UnrepresentableStrokePattern(
+                ScenePrimitive::Line,
+            ))
+        ));
+    }
+
+    #[test]
+    fn dash_expansion_is_rejected_atomically_at_the_scene_boundary() {
+        let dash = StrokeDashPattern2d::new(&[2.0, 2.0], 0.0, 2).unwrap();
+        let style = StrokeStyle2d::logical(LogicalPixels::new(2.0).unwrap(), Color::WHITE)
+            .with_cap(StrokeCap2d::Butt)
+            .with_dash_pattern(dash);
+        let mut scene = Scene::new(Color::BLACK).unwrap();
+
+        assert_eq!(
+            scene.try_styled_line(Vec2::ZERO, Vec2::new(10.0, 0.0), style),
+            Err(SceneError::StrokeExpansionLimitExceeded {
+                primitive: ScenePrimitive::Line,
+                limit: 2,
+                required: 3,
+            })
+        );
+        assert_eq!(scene.command_count(), 0);
+        assert_eq!(scene.statistics().requested_commands(), 1);
+        assert_eq!(scene.statistics().rejected_commands(), 1);
+    }
+
+    #[test]
+    fn scene_statistics_group_requested_accepted_and_rejected_primitives() {
+        let mut scene = Scene::new(Color::BLACK).unwrap();
+        scene
+            .try_circle(Vec2::ZERO, 1.0, ShapeStyle::filled(Color::WHITE))
+            .unwrap();
+        assert_eq!(
+            scene.try_line(Vec2::ZERO, Vec2::ZERO, 1.0, Color::WHITE),
+            Err(SceneError::DegenerateGeometry(ScenePrimitive::Line))
+        );
+        scene
+            .try_polyline(vec![Vec2::ZERO, Vec2::X], 1.0, Color::WHITE)
+            .unwrap();
+
+        let statistics = scene.statistics();
+        assert_eq!(statistics.requested_by_primitive().circles(), 1);
+        assert_eq!(statistics.requested_by_primitive().lines(), 1);
+        assert_eq!(statistics.requested_by_primitive().polylines(), 1);
+        assert_eq!(statistics.requested_by_primitive().total(), 3);
+        assert_eq!(statistics.accepted_by_primitive().circles(), 1);
+        assert_eq!(statistics.accepted_by_primitive().polylines(), 1);
+        assert_eq!(statistics.accepted_by_primitive().total(), 2);
+        assert_eq!(statistics.rejected_by_primitive().lines(), 1);
+        assert_eq!(statistics.rejected_by_primitive().total(), 1);
+    }
+
+    #[test]
+    fn rich_stroke_values_are_reusable_and_world_overflow_is_rejected() {
+        let marker = StrokeMarker2d::arrow(
+            LogicalPixels::new(8.0).unwrap(),
+            LogicalPixels::new(6.0).unwrap(),
+        );
+        let style = StrokeStyle2d::logical(LogicalPixels::new(2.0).unwrap(), Color::WHITE)
+            .with_cap(StrokeCap2d::Square)
+            .with_join(StrokeJoin2d::Bevel)
+            .with_start_marker(marker)
+            .with_end_marker(marker);
+        let command =
+            DrawCommand::styled_polyline(vec![Vec2::ZERO, Vec2::X, Vec2::new(2.0, 1.0)], style)
+                .unwrap();
+        assert_eq!(command.estimated_tessellated_vertices(), 24);
+
+        let unsafe_world = StrokeStyle2d::world(WorldLength::new(f32::MAX).unwrap(), Color::WHITE);
+        assert!(matches!(
+            DrawCommand::styled_line(Vec2::ZERO, Vec2::X, unsafe_world),
+            Err(SceneError::InvalidStroke(ScenePrimitive::Line))
+        ));
+
+        let unsafe_logical =
+            StrokeStyle2d::logical(LogicalPixels::new(f32::MAX).unwrap(), Color::WHITE);
+        assert!(matches!(
+            DrawCommand::styled_line(Vec2::ZERO, Vec2::X, unsafe_logical),
+            Err(SceneError::InvalidStroke(ScenePrimitive::Line))
+        ));
     }
 
     #[test]
