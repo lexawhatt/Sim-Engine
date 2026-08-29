@@ -8,6 +8,72 @@ public API reaches 1.0.
 
 No unreleased changes.
 
+## 0.2.0 - 2026-08-29
+
+Second official Linux release. This release turns the Sim;X integration
+foundation developed after 0.1.0 into supported, bounded APIs for complete
+composed frames, fixed-screen UI, retained images, and host-shaped text.
+
+### Added
+
+- Explicit `SceneBudget` limits and `SceneStatistics` for commands, retained
+  points/bytes, conservative and actual tessellated vertices, upload bytes,
+  and draw batches.
+- Atomic `Scene::try_extend_to_layers` for high-volume mixed-layer construction
+  with one `O(N log N)` ordering pass, plus validated `DrawCommand` builders.
+- `ScreenScene` and `PreparedScreenScene` for fixed top-left logical-pixel
+  geometry that cannot accidentally receive a world camera.
+- Positioned `LogicalViewportRegion` rendering for ordinary scenes and an
+  explicit ordinary-scene-to-`RenderTarget2d` path with independent
+  `PhysicalPerLogical` scale and `RenderTargetLoad` behavior.
+- `FrameComposer`, `FrameBudget`, per-item ordering/viewports/clips, and
+  `FrameReport` for one bounded surface frame containing streaming or prepared
+  world/screen scenes, dynamic meshes, particles, scalar fields, and composable
+  2D or retained-3D color targets.
+- Frame diagnostics for total, streaming, and reused vertices, streaming and
+  total upload bytes, referenced texture bytes, passes, commands, and draw
+  calls.
+- Actual encoder, render-pass, queue-submission, and surface-present counts on
+  `FrameReport`, including zeroes for skipped surface frames.
+- Bounded retained `Image2d` resources, partial region upload, atlas source
+  rectangles, nearest/linear sampling, logical sprite batches, world-space
+  image quads, exact pixels for recovery, and image composition in
+  `FrameComposer`.
+- Low-level host-shaped text through `GlyphAtlas2d`, opaque `GlyphId` metadata,
+  bounded `GlyphRun2d` instancing, deterministic logical bounds, structured
+  missing-glyph outcomes, incremental uploads, and exact atlas/run recovery.
+- `DynamicMeshBudget` and `create_dynamic_mesh_with_budget` for bounded raw
+  filled triangles in the common frame ordering path.
+- A core-only adversarial scene-construction benchmark.
+- A retained scientific glyph-atlas probe in `ui_demo`, reused above all four
+  world-camera workloads without steady-state atlas or instance upload.
+
+### Changed
+
+- Ordinary tessellation now uses fallible CPU reservations and rechecks actual
+  vertex, upload-byte, and batch work against the originating scene budget
+  before GPU submission.
+- `TessellationStats` now reports actual vertex count, upload bytes, and draw
+  batches in addition to command outcomes.
+- Target and heatmap composition uniforms now carry an explicit logical
+  destination, allowing offscreen resources to scale into bounded frame
+  viewports without abusing scissor clipping.
+- Dynamic-mesh creation, replacement, and restoration now reserve CPU recovery
+  storage fallibly; full replacement commits retained state only after all
+  validation, reservation, and replacement-buffer creation succeeds.
+
+### Testing
+
+- Added exact-limit/one-over budget tests, atomic batch rejection tests,
+  conservative-estimate checks against actual tessellation, positioned
+  viewport/DPI math coverage, logical-screen coordinate regressions, frame
+  budget/order/clip tests, and semantic GPU readback of positioned target
+  composition.
+- Added image dimension/row-pitch/atlas-boundary tests, glyph metadata/missing
+  glyph/measurement tests, second-device image/glyph recovery, and semantic GPU
+  readback for screen/world image placement, sRGB alpha tint, atlas isolation,
+  and instanced sprite drawing.
+
 ## 0.1.0 - 2026-08-25
 
 First official Linux release of the validated 2D scene, scientific

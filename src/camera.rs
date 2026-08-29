@@ -115,6 +115,39 @@ pub struct LogicalViewport {
     height: f32,
 }
 
+/// A logical viewport positioned inside a larger presentation target.
+///
+/// The origin uses top-left logical screen coordinates. Scene-local camera
+/// projection and clips use the region's own `0..width`, `0..height` space.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LogicalViewportRegion {
+    origin: LogicalScreenPosition,
+    viewport: LogicalViewport,
+}
+
+impl LogicalViewportRegion {
+    /// Builds a finite positioned logical viewport.
+    pub fn new(
+        origin: LogicalScreenPosition,
+        viewport: LogicalViewport,
+    ) -> Result<Self, LogicalViewportError> {
+        if !origin.is_finite() {
+            return Err(LogicalViewportError::InvalidOrigin { origin });
+        }
+        Ok(Self { origin, viewport })
+    }
+
+    /// Returns the top-left origin in target logical pixels.
+    pub const fn origin(self) -> LogicalScreenPosition {
+        self.origin
+    }
+
+    /// Returns the local camera viewport dimensions.
+    pub const fn viewport(self) -> LogicalViewport {
+        self.viewport
+    }
+}
+
 impl LogicalViewport {
     /// Builds a viewport from logical pixel dimensions.
     ///
@@ -158,6 +191,11 @@ pub enum LogicalViewportError {
         /// Rejected height in logical screen pixels.
         height: f32,
     },
+    /// A positioned viewport origin must be finite.
+    InvalidOrigin {
+        /// Rejected logical target position.
+        origin: LogicalScreenPosition,
+    },
 }
 
 impl fmt::Display for LogicalViewportError {
@@ -167,6 +205,9 @@ impl fmt::Display for LogicalViewportError {
                 formatter,
                 "viewport dimensions must be finite and positive, got {width}x{height}"
             ),
+            Self::InvalidOrigin { origin } => {
+                write!(formatter, "viewport origin must be finite, got {origin:?}")
+            }
         }
     }
 }

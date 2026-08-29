@@ -275,8 +275,9 @@ impl WgpuRenderer {
         );
         config.present_mode = surface_present_mode.to_wgpu();
         let sample_count = preferred_sample_count(&adapter, config.format);
-        let (
+        let PipelineResources {
             pipeline,
+            target_pipeline,
             dynamic_pipeline,
             particle_pipeline,
             target_particle_pipeline,
@@ -286,12 +287,14 @@ impl WgpuRenderer {
             target_composition_pipelines,
             camera_uniform_buffer,
             camera_bind_group,
+            camera_bind_group_layout,
             heatmap_uniform_buffer,
             heatmap_bind_group_layout,
-        ) = create_pipeline(&device, config.format, sample_count);
+        } = create_pipeline(&device, config.format, sample_count);
         let vertex_buffer = Arc::new(create_vertex_buffer(&device, INITIAL_VERTEX_CAPACITY));
         let particle_unit_buffer = create_particle_unit_buffer(&device, &queue);
         let multisample_target = create_multisample_target(&device, &config, sample_count);
+        let image_renderer = ImageRenderer::new(&device, config.format, sample_count);
         let mesh3d_renderer = Mesh3dRenderer::new(&device, config.format);
         self.surface.configure(&device, &config);
 
@@ -305,6 +308,7 @@ impl WgpuRenderer {
         self.config = config;
         self.surface_present_mode = surface_present_mode;
         self.pipeline = pipeline;
+        self.target_pipeline = target_pipeline;
         self.dynamic_pipeline = dynamic_pipeline;
         self.particle_pipeline = particle_pipeline;
         self.target_particle_pipeline = target_particle_pipeline;
@@ -312,9 +316,11 @@ impl WgpuRenderer {
         self.target_heatmap_pipeline = target_heatmap_pipeline;
         self.composition_pipelines = composition_pipelines;
         self.target_composition_pipelines = target_composition_pipelines;
+        self.image_renderer = image_renderer;
         self.mesh3d_renderer = mesh3d_renderer;
         self.camera_uniform_buffer = camera_uniform_buffer;
         self.camera_bind_group = camera_bind_group;
+        self.camera_bind_group_layout = camera_bind_group_layout;
         self.heatmap_uniform_buffer = heatmap_uniform_buffer;
         self.heatmap_bind_group_layout = heatmap_bind_group_layout;
         self.color_map_cache = None;

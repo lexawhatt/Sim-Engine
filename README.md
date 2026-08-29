@@ -10,11 +10,18 @@ clipping, interpolation, GPU resources, composition, recovery, and rendering
 diagnostics. Physics, simulation stepping, domain entities, UI navigation, and
 plugins remain in the host application.
 
-Version **0.1.0** is the first official Sim;Engine release. The crate remains
+Version **0.2.0** is the current official Sim;Engine release. The crate remains
 pre-1.0, and its supported release target is Linux with Vulkan. A concrete
 adapter/driver is supported when the mandatory semantic fixture passes on it;
 untested drivers are not inferred from Mesa evidence. The minimum supported
 Rust version is 1.90.
+
+Version 0.2.0 adds the bounded Sim;X integration foundation: fixed-screen
+scenes, positioned 2D viewports, offscreen scene rendering, a heterogeneous
+single-present frame composer, retained RGBA images and atlas batches,
+host-shaped glyph runs, and explicitly budgeted dynamic triangles. See the
+[0.2.0 changelog](CHANGELOG.md#020---2026-08-29) for the complete delta from
+0.1.0.
 
 ## Documentation
 
@@ -35,6 +42,8 @@ Rust version is 1.90.
 - 2D camera pan, rotation, zoom, fit, and picking;
 - fallible tweening and easing;
 - streaming, prepared, and dynamic triangle geometry;
+- retained sRGB RGBA images, atlas sprite batches, and world-space image quads;
+- host-shaped, bounded glyph atlas runs with deterministic logical bounds;
 - budgeted instanced particle rendering;
 - scalar-field textures, color maps, partial updates, and heatmaps;
 - offscreen targets, composition, and bounded trails;
@@ -45,8 +54,16 @@ Rust version is 1.90.
 - atomic retained-3D scene recovery that preserves stable object IDs and visual
   state across logical-device replacement.
 
+Ordinary scenes support explicit construction, tessellation, and upload
+budgets, fixed logical-screen geometry, and independent positioned viewport or
+offscreen-target rendering. `FrameComposer` orders streaming and prepared
+scenes, dynamic meshes, particles, scalar fields, images, glyph runs, and 2D/3D
+color targets under one frame budget and one surface presentation.
+`DynamicMeshBudget` limits caller-provided filled triangles and makes full
+updates allocation-fallible and atomic.
+
 Translucent section materials, hatching, projected 3D anchors, and 3D picking
-are not part of v0.1.0.
+are not part of v0.2.0.
 
 ## Installation
 
@@ -54,14 +71,14 @@ The default feature set includes the `wgpu` renderer:
 
 ```toml
 [dependencies]
-sim-engine = "0.1"
+sim-engine = "0.2"
 ```
 
 Use core visual-state APIs without GPU dependencies:
 
 ```toml
 [dependencies]
-sim-engine = { version = "0.1", default-features = false }
+sim-engine = { version = "0.2", default-features = false }
 ```
 
 ## Quick Start
@@ -106,7 +123,9 @@ let mut renderer = WgpuRenderer::new_with_options(
     options,
 ).await?;
 
-let report = renderer.render_with_metrics(&scene, &camera)?;
+let mut frame = renderer.begin_frame(scene.background(), FrameBudget::default())?;
+frame.draw_scene(&scene, camera, FramePassOptions::default())?;
+let report = frame.present()?;
 ```
 
 ## Choose A Rendering Path
@@ -116,8 +135,11 @@ let report = renderer.render_with_metrics(&scene, &camera)?;
 | Small changing scene | `Scene` |
 | Static geometry with a moving camera | `PreparedScene` |
 | Frequently changing triangles | `DynamicMesh2d` |
+| Images and atlas sprites | `Image2d` plus `ImageBatch2d` |
+| Host-shaped scientific text | `GlyphAtlas2d` plus `GlyphRun2d` |
 | Large point or circle population | `ParticleField2d` |
 | Dense scalar grid | `ScalarFieldTexture` |
+| Mixed UI, viewports, fields, and targets | `FrameComposer` |
 | Bounded gas plus particle overlay | `render_layered_visualization` |
 | Stereometry solids and hidden edges | `Mesh3d` plus `Scene3d` |
 
@@ -128,13 +150,19 @@ cargo run --release --example demo
 cargo run --release --example ui_demo -- --uncapped
 cargo run --release --example star_remnant_stress -- --benchmark
 cargo run --release --no-default-features --example particle_cpu_benchmark
+cargo run --release --no-default-features --example scene_construction_benchmark
 cargo run --release --example stereometry_3d -- --uncapped
 cargo run --release --example cylinder_derivation_3d -- --uncapped --benchmark
 ```
 
+`ui_demo` includes a retained host-rasterized scientific glyph probe above all
+four independently changing scene workloads. It demonstrates one-time atlas
+and run creation without making the engine responsible for font selection or
+text shaping.
+
 ## Verification
 
-The v0.1.0 Linux release gate checks the declared Rust 1.90 MSRV, all targets with
+The v0.2.0 Linux release gate checks the declared Rust 1.90 MSRV, all targets with
 and without the renderer, strict clippy, rustdoc, Vulkan semantic GPU readback
 with a backend assertion, and the publishable package boundary:
 

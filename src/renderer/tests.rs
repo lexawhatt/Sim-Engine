@@ -7,7 +7,8 @@ use crate::LogicalScreenVector;
 fn tessellate_for_test(scene: &Scene) -> (Vec<Vertex>, Vec<PreparedDrawBatch>) {
     let mut vertices = Vec::new();
     let mut draw_batches = Vec::new();
-    let _ = tessellate_scene(scene, &mut vertices, &mut draw_batches);
+    tessellate_scene(scene, &mut vertices, &mut draw_batches)
+        .expect("validated test scene should tessellate within its budget");
     (vertices, draw_batches)
 }
 
@@ -32,6 +33,22 @@ fn dynamic_mesh_vertices_require_complete_finite_triangles() {
     assert_eq!(dynamic_vertex_capacity(3), Some(4));
     assert_eq!(dynamic_vertex_capacity(usize::MAX), None);
     assert_eq!(buffer_allocation_bytes::<Vertex>(usize::MAX), None);
+
+    let triangle_bytes = 3 * std::mem::size_of::<DynamicGpu>();
+    assert_eq!(
+        DynamicMeshBudget::new(2, triangle_bytes, triangle_bytes),
+        Err(DynamicMeshError::InvalidBudget)
+    );
+    let budget = DynamicMeshBudget::new(3, triangle_bytes, triangle_bytes).unwrap();
+    assert_eq!(validate_dynamic_mesh_budget(budget, 3), Ok(()));
+    assert_eq!(
+        validate_dynamic_mesh_budget(budget, 6),
+        Err(DynamicMeshError::BudgetExceeded {
+            resource: DynamicMeshBudgetResource::Vertices,
+            limit: 3,
+            actual: 6,
+        })
+    );
 }
 
 #[test]
@@ -320,7 +337,8 @@ fn projected_circle_follows_camera_tilt() {
     let mut vertices = Vec::new();
     let mut draw_batches = Vec::new();
 
-    tessellate_scene(&scene, &mut vertices, &mut draw_batches);
+    tessellate_scene(&scene, &mut vertices, &mut draw_batches)
+        .expect("validated circle should tessellate");
 
     let positions: Vec<_> = vertices
         .iter()
@@ -346,6 +364,48 @@ fn projected_circle_follows_camera_tilt() {
 
     assert!((width - 40.0).abs() < 0.01);
     assert!((height - 40.0 * 0.8_f32.cos()).abs() < 0.05);
+}
+
+#[test]
+fn scene_budget_estimate_bounds_actual_tessellation_and_upload() {
+    let budget = crate::SceneBudget::new(4, 4, 2_000, 16_000, 120_000, 4);
+    let mut scene = Scene::with_budget(Color::BLACK, budget).unwrap();
+    scene
+        .try_circle(
+            Vec2::ZERO,
+            8.0,
+            ShapeStyle::fill_stroke(Color::WHITE, 2.0, Color::BLACK),
+        )
+        .unwrap();
+    scene
+        .try_rect(
+            Rect::from_center_size(Vec2::new(20.0, 0.0), Vec2::new(8.0, 12.0)),
+            2.0,
+            ShapeStyle::fill_stroke(Color::WHITE, 1.0, Color::BLACK),
+        )
+        .unwrap();
+    scene
+        .try_polyline(
+            vec![Vec2::ZERO, Vec2::X, Vec2::X, Vec2::new(2.0, 1.0)],
+            1.0,
+            Color::WHITE,
+        )
+        .unwrap();
+
+    let mut vertices = Vec::new();
+    let mut batches = Vec::new();
+    let stats = tessellate_scene(&scene, &mut vertices, &mut batches).unwrap();
+    let estimate = scene.statistics();
+
+    assert!(stats.vertex_count() <= estimate.estimated_tessellated_vertices());
+    assert!(stats.upload_bytes() <= estimate.estimated_upload_bytes());
+    assert!(stats.draw_batch_count() <= estimate.estimated_draw_batches());
+    assert_eq!(stats.vertex_count(), vertices.len());
+    assert_eq!(stats.draw_batch_count(), batches.len());
+    assert_eq!(
+        stats.upload_bytes(),
+        vertices.len() * std::mem::size_of::<Vertex>()
+    );
 }
 
 #[test]
@@ -596,6 +656,34 @@ fn logical_clip_converts_to_hidpi_physical_scissor() {
 }
 
 #[test]
+fn positioned_viewport_camera_and_scissor_share_one_logical_origin() {
+    let target = LogicalViewport::new(800.0, 600.0).unwrap();
+    let local = LogicalViewport::new(320.0, 180.0).unwrap();
+    let origin = Vec2::new(40.0, 70.0);
+    let camera = Camera2d::new(Vec2::ZERO, 2.0).unwrap();
+    let uniform = CameraUniform::new_in_region(camera, local, origin, target).unwrap();
+
+    assert_eq!(
+        uniform.world_to_screen(Vec2::ZERO, 0.0),
+        Vec2::new(200.0, 160.0)
+    );
+    for scale in [1.0, 1.25, 1.5, 2.0, 3.0] {
+        let scissor = logical_viewport_scissor(
+            origin,
+            local,
+            scale,
+            (target.width() * scale) as u32,
+            (target.height() * scale) as u32,
+        )
+        .unwrap();
+        assert_eq!(scissor.x, (origin.x * scale).floor() as u32);
+        assert_eq!(scissor.y, (origin.y * scale).floor() as u32);
+        assert!(scissor.width as f32 / scale >= local.width());
+        assert!(scissor.height as f32 / scale >= local.height());
+    }
+}
+
+#[test]
 fn renderer_screen_position_conversion_is_explicit_at_hidpi() {
     let physical = PhysicalScreenPosition::new(800.0, 600.0);
 
@@ -731,20 +819,23 @@ fn offscreen_gpu_readback_verifies_camera_depth_and_clip_contract() {
             ));
         }
         let format = wgpu::TextureFormat::Rgba8UnormSrgb;
-        let (
+        let PipelineResources {
             pipeline,
-            _dynamic_pipeline,
-            _particle_pipeline,
+            target_pipeline: _,
+            dynamic_pipeline: _,
+            particle_pipeline: _,
             target_particle_pipeline,
             heatmap_pipeline,
             target_heatmap_pipeline,
-            _composition_pipelines,
+            composition_pipelines: _,
             target_composition_pipelines,
             camera_uniform_buffer,
             camera_bind_group,
+            camera_bind_group_layout: _,
             heatmap_uniform_buffer,
             heatmap_bind_group_layout,
-        ) = create_pipeline(&device, format, 1);
+        } = create_pipeline(&device, format, 1);
+        let image_renderer = ImageRenderer::new(&device, format, 1);
         let target = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("sim-engine offscreen test target"),
             size: wgpu::Extent3d {
@@ -836,18 +927,40 @@ fn offscreen_gpu_readback_verifies_camera_depth_and_clip_contract() {
 
         let dynamic_vertex = DynamicVertex2d::new(Vec2::ZERO, 0.0, Color::WHITE).unwrap();
         let dynamic_vertices = dynamic_vertices_to_gpu(&[dynamic_vertex; 3]).unwrap();
-        let dynamic_source = DynamicMesh2d {
+        let triangle_bytes = 3 * std::mem::size_of::<DynamicGpu>();
+        let mut dynamic_source = DynamicMesh2d {
             renderer_identity: Arc::clone(&source_identity),
             vertex_buffer: Arc::new(create_dynamic_vertex_buffer(&device, 8)),
             geometry_extents: GeometryExtents::from_dynamic_vertices(&dynamic_vertices),
             vertices: dynamic_vertices,
             vertex_capacity: 8,
+            budget: Some(DynamicMeshBudget::new(3, triangle_bytes, triangle_bytes).unwrap()),
         };
         queue.write_buffer(
             &dynamic_source.vertex_buffer,
             0,
             bytemuck::cast_slice(dynamic_source.vertices.as_slice()),
         );
+        let original_dynamic_buffer = Arc::clone(&dynamic_source.vertex_buffer);
+        let original_dynamic_vertices = dynamic_source.vertices.clone();
+        assert_eq!(
+            replace_dynamic_mesh_resources(
+                &device,
+                &queue,
+                &mut dynamic_source,
+                &[dynamic_vertex; 6],
+            ),
+            Err(DynamicMeshError::BudgetExceeded {
+                resource: DynamicMeshBudgetResource::Vertices,
+                limit: 3,
+                actual: 6,
+            })
+        );
+        assert!(Arc::ptr_eq(
+            &dynamic_source.vertex_buffer,
+            &original_dynamic_buffer
+        ));
+        assert_eq!(dynamic_source.vertices, original_dynamic_vertices);
         let restored_dynamic = restore_dynamic_mesh_resources(
             &device,
             &queue,
@@ -926,10 +1039,7 @@ fn offscreen_gpu_readback_verifies_camera_depth_and_clip_contract() {
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
         let heatmap_lut_view = &heatmap_lut.view;
-        let heatmap_uniform = HeatmapUniform {
-            value_range: [0.0, 1.0, 0.0, 0.0],
-            dimensions: [2, 2, 0, 0],
-        };
+        let heatmap_uniform = HeatmapUniform::new(0.0, 1.0, 2, 2, ScalarFieldSampling::Nearest);
         queue.write_buffer(
             &heatmap_uniform_buffer,
             0,
@@ -1042,6 +1152,129 @@ fn offscreen_gpu_readback_verifies_camera_depth_and_clip_contract() {
             particle_statistics(2, 2, 0),
             "recovery must not preserve stale culling or draw statistics"
         );
+
+        let image_pixels = vec![255, 0, 0, 255, 0, 255, 0, 128];
+        let image_source = image::create_image_resources(
+            &device,
+            &queue,
+            Arc::clone(&source_identity),
+            2,
+            1,
+            image_pixels,
+            ImageBudget::new(2, 1, 8).unwrap(),
+        )
+        .expect("bounded image should upload");
+        let sprite_region = LogicalViewportRegion::new(
+            LogicalScreenPosition::new(3.0, 4.0),
+            LogicalViewport::new(8.0, 6.0).unwrap(),
+        )
+        .unwrap();
+        let image_sprites = vec![
+            ImageSprite2d::new(
+                ImageTexelRect::new(0, 0, 1, 1).unwrap(),
+                sprite_region,
+                Color::WHITE,
+            )
+            .unwrap(),
+        ];
+        let image_batch = image::create_image_batch_resources(
+            &device,
+            &queue,
+            Arc::clone(&source_identity),
+            &image_source,
+            image_sprites.clone(),
+            ImageBatchBudget::new(2, 1024).unwrap(),
+        )
+        .expect("bounded image batch should upload");
+        let recovered_image = image::create_image_resources(
+            &recovery_device,
+            &recovery_queue,
+            Arc::clone(&recovery_identity),
+            image_source.width(),
+            image_source.height(),
+            image_source.pixels().to_vec(),
+            image_source.budget(),
+        )
+        .expect("image should migrate to a second device");
+        let recovered_image_batch = image::create_image_batch_resources(
+            &recovery_device,
+            &recovery_queue,
+            Arc::clone(&recovery_identity),
+            &recovered_image,
+            image_sprites,
+            image_batch.budget(),
+        )
+        .expect("image batch should migrate to a second device");
+        assert_eq!(recovered_image.pixels(), image_source.pixels());
+        assert_eq!(recovered_image_batch.sprites(), image_batch.sprites());
+
+        let atlas_entries = vec![
+            GlyphAtlasEntry::new(
+                GlyphId::new('μ' as u32),
+                ImageTexelRect::new(0, 0, 1, 1).unwrap(),
+            ),
+            GlyphAtlasEntry::new(
+                GlyphId::new('Δ' as u32),
+                ImageTexelRect::new(1, 0, 1, 1).unwrap(),
+            ),
+        ];
+        let glyph_atlas = glyph::create_glyph_atlas_resources(
+            &device,
+            &queue,
+            Arc::clone(&source_identity),
+            2,
+            1,
+            image_source.pixels().to_vec(),
+            atlas_entries.clone(),
+            GlyphAtlasBudget::new(ImageBudget::new(2, 1, 8).unwrap(), 4, 1024).unwrap(),
+        )
+        .expect("glyph atlas should upload");
+        let glyphs = vec![
+            PositionedGlyph2d::new(GlyphId::new('μ' as u32), sprite_region, Color::WHITE).unwrap(),
+            PositionedGlyph2d::new(
+                GlyphId::new('Δ' as u32),
+                LogicalViewportRegion::new(
+                    LogicalScreenPosition::new(11.0, 4.0),
+                    LogicalViewport::new(8.0, 6.0).unwrap(),
+                )
+                .unwrap(),
+                Color::WHITE,
+            )
+            .unwrap(),
+        ];
+        let glyph_run = glyph::create_glyph_run_resources(
+            &device,
+            &queue,
+            Arc::clone(&source_identity),
+            &glyph_atlas,
+            glyphs.clone(),
+            GlyphRunBudget::new(4, 4096).unwrap(),
+        )
+        .expect("glyph run should upload");
+        let recovered_atlas = glyph::create_glyph_atlas_resources(
+            &recovery_device,
+            &recovery_queue,
+            Arc::clone(&recovery_identity),
+            2,
+            1,
+            glyph_atlas.image.pixels().to_vec(),
+            atlas_entries,
+            glyph_atlas.budget(),
+        )
+        .expect("glyph atlas should migrate to a second device");
+        let recovered_glyph_run = glyph::create_glyph_run_resources(
+            &recovery_device,
+            &recovery_queue,
+            Arc::clone(&recovery_identity),
+            &recovered_atlas,
+            glyphs,
+            glyph_run.budget(),
+        )
+        .expect("glyph run should migrate to a second device");
+        assert_eq!(recovered_atlas.entries(), glyph_atlas.entries());
+        assert_eq!(recovered_glyph_run.glyphs(), glyph_run.glyphs());
+        assert_eq!(recovered_glyph_run.statistics().rendered_quads(), 2);
+
         let recovery_vertex_bytes = bytemuck::cast_slice(prepared.vertices.as_ref());
         let recovery_readback = recovery_device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("sim-engine recovery vertex readback"),
@@ -1371,9 +1604,7 @@ fn offscreen_gpu_readback_verifies_camera_depth_and_clip_contract() {
         queue.write_buffer(
             &composition_uniform,
             0,
-            bytemuck::bytes_of(&CompositeUniform {
-                opacity: [1.0, 0.0, 0.0, 0.0],
-            }),
+            bytemuck::bytes_of(&CompositeUniform::full_surface(1.0)),
         );
         let composition_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("sim-engine offscreen composition bind group"),
@@ -1467,19 +1698,99 @@ fn offscreen_gpu_readback_verifies_camera_depth_and_clip_contract() {
         drop(composition_bytes);
         composition_readback.unmap();
 
+        let composition_region = LogicalViewportRegion::new(
+            LogicalScreenPosition::new(0.0, 0.0),
+            LogicalViewport::new(1.0, 1.0).unwrap(),
+        )
+        .unwrap();
+        let region_uniform = CompositeUniform::in_region(
+            1.0,
+            composition_region,
+            LogicalViewport::new(2.0, 2.0).unwrap(),
+        )
+        .unwrap();
+        queue.write_buffer(&composition_uniform, 0, bytemuck::bytes_of(&region_uniform));
+        let mut region_encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("sim-engine offscreen region composition encoder"),
+        });
+        {
+            let mut pass = region_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("sim-engine offscreen region composition pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &composition_target_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(Color::BLACK.to_wgpu()),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&target_composition_pipelines.alpha);
+            pass.set_bind_group(0, &composition_bind_group, &[]);
+            pass.draw(0..6, 0..1);
+        }
+        region_encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &composition_target,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &composition_readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(256),
+                    rows_per_image: Some(2),
+                },
+            },
+            wgpu::Extent3d {
+                width: 2,
+                height: 2,
+                depth_or_array_layers: 1,
+            },
+        );
+        queue.submit([region_encoder.finish()]);
+        let region_slice = composition_readback.slice(..);
+        let (region_sender, region_receiver) = mpsc::channel();
+        region_slice.map_async(wgpu::MapMode::Read, move |result| {
+            region_sender.send(result).unwrap()
+        });
+        device
+            .poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: Some(Duration::from_secs(5)),
+            })
+            .expect("offscreen region composition should complete");
+        region_receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("offscreen region composition callback")
+            .expect("offscreen region composition should map");
+        let region_bytes = region_slice
+            .get_mapped_range()
+            .expect("offscreen region composition bytes");
+        assert!(region_bytes[0] > 180, "region top-left pixel was not drawn");
+        assert!(
+            region_bytes[4] < 8 && region_bytes[256] < 8,
+            "region composition escaped its logical destination"
+        );
+        drop(region_bytes);
+        composition_readback.unmap();
+
         queue.write_buffer(
             &target_composition_pipelines.secondary_uniform_buffer,
             0,
-            bytemuck::bytes_of(&CompositeUniform {
-                opacity: [0.5, 0.0, 0.0, 0.0],
-            }),
+            bytemuck::bytes_of(&CompositeUniform::full_surface(0.5)),
         );
         queue.write_buffer(
             &target_composition_pipelines.uniform_buffer,
             0,
-            bytemuck::bytes_of(&CompositeUniform {
-                opacity: [0.5, 0.0, 0.0, 0.0],
-            }),
+            bytemuck::bytes_of(&CompositeUniform::full_surface(0.5)),
         );
         let trail_history_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("sim-engine offscreen trail history bind group"),
@@ -1614,10 +1925,13 @@ fn offscreen_gpu_readback_verifies_camera_depth_and_clip_contract() {
         queue.write_buffer(
             &linear_uniform_buffer,
             0,
-            bytemuck::bytes_of(&HeatmapUniform {
-                value_range: [0.0, 1.0, 0.0, 0.0],
-                dimensions: [2, 2, ScalarFieldSampling::Linear.shader_value(), 0],
-            }),
+            bytemuck::bytes_of(&HeatmapUniform::new(
+                0.0,
+                1.0,
+                2,
+                2,
+                ScalarFieldSampling::Linear,
+            )),
         );
         let linear_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("sim-engine offscreen linear heatmap bind group"),
@@ -1738,6 +2052,356 @@ fn offscreen_gpu_readback_verifies_camera_depth_and_clip_contract() {
         );
         drop(linear_bytes);
         linear_readback.unmap();
+
+        let image_scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let image_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("sim-engine offscreen atlas image"),
+            size: wgpu::Extent3d {
+                width: 2,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &image_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &[255, 0, 0, 255, 0, 255, 0, 255],
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(8),
+                rows_per_image: Some(1),
+            },
+            wgpu::Extent3d {
+                width: 2,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+        );
+        let image_view = image_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let image_uniform = ImageUniform {
+            destination: [0.5, 1.0, -0.5, 0.0],
+            uv_rect: [0.25, 0.5, 0.25, 0.5],
+            tint: [1.0, 1.0, 1.0, 0.5],
+            world_clip_x: [0.0; 4],
+            world_clip_y: [0.0; 4],
+            world_mode: [0.0; 4],
+        };
+        let image_uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("sim-engine offscreen image uniform"),
+            size: std::mem::size_of::<ImageUniform>() as wgpu::BufferAddress,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&image_uniform_buffer, 0, bytemuck::bytes_of(&image_uniform));
+        let image_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("sim-engine offscreen image bind group"),
+            layout: &image_renderer.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&image_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(
+                        image_renderer.sampler(ImageSampling::Linear),
+                    ),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: image_uniform_buffer.as_entire_binding(),
+                },
+            ],
+        });
+        let world_image_uniform = ImageUniform {
+            destination: [0.0; 4],
+            uv_rect: [0.75, 0.5, 0.75, 0.5],
+            tint: [1.0, 1.0, 1.0, 0.5],
+            world_clip_x: [0.0, 1.0, 0.0, 1.0],
+            world_clip_y: [1.0, 1.0, -1.0, -1.0],
+            world_mode: [1.0, 0.0, 0.0, 0.0],
+        };
+        let world_image_uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("sim-engine offscreen world image uniform"),
+            size: std::mem::size_of::<ImageUniform>() as wgpu::BufferAddress,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(
+            &world_image_uniform_buffer,
+            0,
+            bytemuck::bytes_of(&world_image_uniform),
+        );
+        let world_image_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("sim-engine offscreen world image bind group"),
+            layout: &image_renderer.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&image_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(
+                        image_renderer.sampler(ImageSampling::Linear),
+                    ),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: world_image_uniform_buffer.as_entire_binding(),
+                },
+            ],
+        });
+        let image_target = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("sim-engine offscreen image target"),
+            size: wgpu::Extent3d {
+                width: 2,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let image_target_view = image_target.create_view(&wgpu::TextureViewDescriptor::default());
+        let image_readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("sim-engine offscreen image readback"),
+            size: 256,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut image_encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("sim-engine offscreen image encoder"),
+        });
+        {
+            let mut pass = image_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("sim-engine offscreen image pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &image_target_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(Color::BLACK.to_wgpu()),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&image_renderer.pipeline);
+            pass.set_bind_group(0, &image_bind_group, &[]);
+            pass.draw(0..6, 0..1);
+            pass.set_bind_group(0, &world_image_bind_group, &[]);
+            pass.draw(0..6, 0..1);
+        }
+        image_encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &image_target,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &image_readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(256),
+                    rows_per_image: Some(1),
+                },
+            },
+            wgpu::Extent3d {
+                width: 2,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+        );
+        queue.submit([image_encoder.finish()]);
+        let image_slice = image_readback.slice(..);
+        let (image_sender, image_receiver) = mpsc::channel();
+        image_slice.map_async(wgpu::MapMode::Read, move |result| {
+            image_sender.send(result).unwrap()
+        });
+        device
+            .poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: Some(Duration::from_secs(5)),
+            })
+            .expect("offscreen image readback should complete");
+        image_receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("offscreen image callback")
+            .expect("offscreen image should map");
+        if let Some(error) = image_scope.pop().await {
+            panic!("offscreen image validation failed: {error}");
+        }
+        let image_bytes = image_slice
+            .get_mapped_range()
+            .expect("offscreen image bytes");
+        assert!(image_bytes[0] > 180 && image_bytes[0] < 195);
+        assert!(
+            image_bytes[1] < 8,
+            "screen image atlas sampling bled into the next texel"
+        );
+        assert!(
+            image_bytes[4] < 8,
+            "world image atlas sampling bled into the previous texel"
+        );
+        assert!(image_bytes[5] > 180 && image_bytes[5] < 195);
+        drop(image_bytes);
+        image_readback.unmap();
+
+        let image_batch_scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let image_batch_uniform = ImageUniform {
+            destination: [1.0, -2.0, -1.0, 1.0],
+            uv_rect: [0.0, 0.0, 0.0, 0.0],
+            tint: Color::WHITE.to_array(),
+            world_clip_x: [0.0; 4],
+            world_clip_y: [0.0; 4],
+            world_mode: [0.0; 4],
+        };
+        let image_batch_uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("sim-engine offscreen image batch uniform"),
+            size: std::mem::size_of::<ImageUniform>() as wgpu::BufferAddress,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(
+            &image_batch_uniform_buffer,
+            0,
+            bytemuck::bytes_of(&image_batch_uniform),
+        );
+        let image_batch_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("sim-engine offscreen image batch bind group"),
+            layout: &image_renderer.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&image_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(
+                        image_renderer.sampler(ImageSampling::Linear),
+                    ),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: image_batch_uniform_buffer.as_entire_binding(),
+                },
+            ],
+        });
+        let image_instances = [
+            image::ImageInstance {
+                destination: [0.0, 0.0, 1.0, 1.0],
+                uv_rect: [0.25, 0.5, 0.25, 0.5],
+                tint: Color::WHITE.to_array(),
+            },
+            image::ImageInstance {
+                destination: [1.0, 0.0, 1.0, 1.0],
+                uv_rect: [0.75, 0.5, 0.75, 0.5],
+                tint: Color::WHITE.with_alpha(0.5).to_array(),
+            },
+        ];
+        let image_instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("sim-engine offscreen image batch instances"),
+            size: std::mem::size_of_val(&image_instances) as wgpu::BufferAddress,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(
+            &image_instance_buffer,
+            0,
+            bytemuck::cast_slice(&image_instances),
+        );
+        let mut image_batch_encoder =
+            device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("sim-engine offscreen image batch encoder"),
+            });
+        {
+            let mut pass = image_batch_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("sim-engine offscreen image batch pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &image_target_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(Color::BLACK.to_wgpu()),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&image_renderer.batch_pipeline);
+            pass.set_bind_group(0, &image_batch_bind_group, &[]);
+            pass.set_vertex_buffer(0, image_instance_buffer.slice(..));
+            pass.draw(0..6, 0..2);
+        }
+        image_batch_encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &image_target,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &image_readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(256),
+                    rows_per_image: Some(1),
+                },
+            },
+            wgpu::Extent3d {
+                width: 2,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+        );
+        queue.submit([image_batch_encoder.finish()]);
+        let image_batch_slice = image_readback.slice(..);
+        let (image_batch_sender, image_batch_receiver) = mpsc::channel();
+        image_batch_slice.map_async(wgpu::MapMode::Read, move |result| {
+            image_batch_sender.send(result).unwrap()
+        });
+        device
+            .poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: Some(Duration::from_secs(5)),
+            })
+            .expect("offscreen image batch readback should complete");
+        image_batch_receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("offscreen image batch callback")
+            .expect("offscreen image batch should map");
+        if let Some(error) = image_batch_scope.pop().await {
+            panic!("offscreen image batch validation failed: {error}");
+        }
+        let image_batch_bytes = image_batch_slice
+            .get_mapped_range()
+            .expect("offscreen image batch bytes");
+        assert!(image_batch_bytes[0] > 247 && image_batch_bytes[1] < 8);
+        assert!(image_batch_bytes[4] < 8);
+        assert!(image_batch_bytes[5] > 180 && image_batch_bytes[5] < 195);
+        drop(image_batch_bytes);
+        image_readback.unmap();
     });
 }
 

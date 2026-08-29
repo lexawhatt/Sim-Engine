@@ -1,10 +1,16 @@
 use std::{
     error::Error,
     fmt,
+    mem::size_of,
     panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
 };
 
 use crate::{Color, Interpolate, LogicalScreenPosition, LogicalScreenVector, Rect, Vec2};
+
+pub(crate) const CIRCLE_SEGMENTS: usize = 64;
+pub(crate) const ROUND_CAP_SEGMENTS: usize = 16;
+pub(crate) const CORNER_SEGMENTS: usize = 12;
+pub(crate) const TESSELLATED_VERTEX_BYTES: usize = 14 * size_of::<f32>();
 
 /// Primitive category attached to structured scene validation errors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -17,6 +23,162 @@ pub enum ScenePrimitive {
     Line,
     /// Connected polyline geometry or stroke.
     Polyline,
+}
+
+/// Work category constrained by a [`SceneBudget`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SceneBudgetResource {
+    /// Accepted scene commands.
+    Commands,
+    /// Points retained by polyline commands.
+    Points,
+    /// Conservative upper bound for generated triangle-list vertices.
+    TessellatedVertices,
+    /// Command payload bytes retained by the scene.
+    RetainedBytes,
+    /// Bytes uploaded for generated scene vertices.
+    UploadBytes,
+    /// Draw batches caused by ordering and clip changes.
+    DrawBatches,
+}
+
+/// Explicit upper bounds for engine-owned ordinary-scene work.
+///
+/// Limits may be zero to construct a background-only scene. Retained bytes
+/// count command values and owned polyline storage, excluding allocator
+/// bookkeeping. Vertex and upload limits use the renderer's conservative
+/// triangle-list estimate, which is checked again after tessellation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SceneBudget {
+    max_commands: usize,
+    max_points: usize,
+    max_tessellated_vertices: usize,
+    max_retained_bytes: usize,
+    max_upload_bytes: usize,
+    max_draw_batches: usize,
+}
+
+impl SceneBudget {
+    /// Builds a complete budget for ordinary scene construction and rendering.
+    pub const fn new(
+        max_commands: usize,
+        max_points: usize,
+        max_tessellated_vertices: usize,
+        max_retained_bytes: usize,
+        max_upload_bytes: usize,
+        max_draw_batches: usize,
+    ) -> Self {
+        Self {
+            max_commands,
+            max_points,
+            max_tessellated_vertices,
+            max_retained_bytes,
+            max_upload_bytes,
+            max_draw_batches,
+        }
+    }
+
+    /// Returns the maximum accepted command count.
+    pub const fn max_commands(self) -> usize {
+        self.max_commands
+    }
+
+    /// Returns the maximum retained polyline point count.
+    pub const fn max_points(self) -> usize {
+        self.max_points
+    }
+
+    /// Returns the maximum conservatively estimated vertex count.
+    pub const fn max_tessellated_vertices(self) -> usize {
+        self.max_tessellated_vertices
+    }
+
+    /// Returns the maximum retained command payload bytes.
+    pub const fn max_retained_bytes(self) -> usize {
+        self.max_retained_bytes
+    }
+
+    /// Returns the maximum generated vertex upload bytes.
+    pub const fn max_upload_bytes(self) -> usize {
+        self.max_upload_bytes
+    }
+
+    /// Returns the maximum draw-batch count.
+    pub const fn max_draw_batches(self) -> usize {
+        self.max_draw_batches
+    }
+}
+
+/// Construction and conservative rendering work accumulated by a scene.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SceneStatistics {
+    requested_commands: usize,
+    accepted_commands: usize,
+    rejected_commands: usize,
+    retained_points: usize,
+    estimated_tessellated_vertices: usize,
+    retained_bytes: usize,
+    estimated_upload_bytes: usize,
+    estimated_draw_batches: usize,
+}
+
+impl SceneStatistics {
+    /// Returns all insertion attempts, including invalid and over-budget work.
+    pub const fn requested_commands(self) -> usize {
+        self.requested_commands
+    }
+
+    /// Returns commands currently retained by the scene.
+    pub const fn accepted_commands(self) -> usize {
+        self.accepted_commands
+    }
+
+    /// Returns insertion attempts rejected by validation, budget, or allocation.
+    pub const fn rejected_commands(self) -> usize {
+        self.rejected_commands
+    }
+
+    /// Returns points retained by accepted polyline commands.
+    pub const fn retained_points(self) -> usize {
+        self.retained_points
+    }
+
+    /// Returns the conservative upper bound for tessellated vertices.
+    pub const fn estimated_tessellated_vertices(self) -> usize {
+        self.estimated_tessellated_vertices
+    }
+
+    /// Returns tracked command and owned polyline payload bytes.
+    pub const fn retained_bytes(self) -> usize {
+        self.retained_bytes
+    }
+
+    /// Returns estimated bytes uploaded for generated vertices.
+    pub const fn estimated_upload_bytes(self) -> usize {
+        self.estimated_upload_bytes
+    }
+
+    /// Returns the conservative draw-batch upper bound.
+    pub const fn estimated_draw_batches(self) -> usize {
+        self.estimated_draw_batches
+    }
+
+    fn with_command(mut self, command: &DrawCommand) -> Self {
+        let vertices = command.estimated_tessellated_vertices();
+        self.accepted_commands = self.accepted_commands.saturating_add(1);
+        self.retained_points = self
+            .retained_points
+            .saturating_add(command.retained_point_count());
+        self.estimated_tessellated_vertices =
+            self.estimated_tessellated_vertices.saturating_add(vertices);
+        self.retained_bytes = self.retained_bytes.saturating_add(command.retained_bytes());
+        self.estimated_upload_bytes = self
+            .estimated_upload_bytes
+            .saturating_add(vertices.saturating_mul(TESSELLATED_VERTEX_BYTES));
+        self.estimated_draw_batches = self.estimated_draw_batches.saturating_add(1);
+        self
+    }
 }
 
 /// Reason a command or temporary scene state was rejected.
@@ -42,6 +204,20 @@ pub enum SceneError {
     InvalidScreenClip,
     /// Pseudo-depth must be finite.
     NonFiniteDepth,
+    /// An accepted command would exceed an explicit scene work limit.
+    BudgetExceeded {
+        /// Work category whose limit was exceeded.
+        resource: SceneBudgetResource,
+        /// Configured maximum for the category.
+        limit: usize,
+        /// Total category usage that the command requested.
+        requested: usize,
+    },
+    /// Engine-owned command storage could not be reserved without mutation.
+    AllocationFailed {
+        /// Minimum additional payload bytes associated with the insertion.
+        requested_bytes: usize,
+    },
 }
 
 impl fmt::Display for SceneError {
@@ -64,11 +240,26 @@ pub struct Scene {
     next_order: u64,
     current_screen_clip: Option<ScreenClipRect>,
     current_depth: f32,
+    budget: Option<SceneBudget>,
+    statistics: SceneStatistics,
 }
 
 impl Scene {
     /// Creates an empty scene with a normalized linear-RGBA background color.
+    ///
+    /// This compatibility constructor is intentionally unbounded. Production
+    /// hosts handling externally sized visual state should prefer
+    /// [`Scene::with_budget`].
     pub fn new(background: Color) -> Result<Self, SceneError> {
+        Self::create(background, None)
+    }
+
+    /// Creates an empty scene with explicit construction and rendering limits.
+    pub fn with_budget(background: Color, budget: SceneBudget) -> Result<Self, SceneError> {
+        Self::create(background, Some(budget))
+    }
+
+    fn create(background: Color, budget: Option<SceneBudget>) -> Result<Self, SceneError> {
         if !background.is_normalized() {
             return Err(SceneError::InvalidBackground);
         }
@@ -78,6 +269,8 @@ impl Scene {
             next_order: 0,
             current_screen_clip: None,
             current_depth: 0.0,
+            budget,
+            statistics: SceneStatistics::default(),
         })
     }
 
@@ -101,6 +294,7 @@ impl Scene {
         self.next_order = 0;
         self.current_screen_clip = None;
         self.current_depth = 0.0;
+        self.statistics = SceneStatistics::default();
     }
 
     /// Returns accepted commands in stable layer and insertion order.
@@ -111,6 +305,20 @@ impl Scene {
     /// Returns the number of accepted render commands.
     pub fn command_count(&self) -> usize {
         self.commands.len()
+    }
+
+    /// Returns the explicit work budget, or `None` for an unbounded scene.
+    pub const fn budget(&self) -> Option<SceneBudget> {
+        self.budget
+    }
+
+    /// Returns requested, accepted, rejected, and estimated scene work.
+    pub const fn statistics(&self) -> SceneStatistics {
+        self.statistics
+    }
+
+    pub(crate) const fn current_screen_clip(&self) -> Option<ScreenClipRect> {
+        self.current_screen_clip
     }
 
     /// Replaces the screen-space clipping rectangle captured by new commands.
@@ -233,6 +441,108 @@ impl Scene {
         layer: Layer,
         command: DrawCommand,
     ) -> Result<(), SceneError> {
+        self.statistics.requested_commands = self.statistics.requested_commands.saturating_add(1);
+        let result = self.try_push_to_layer_inner(layer, command);
+        if result.is_err() {
+            self.statistics.rejected_commands = self.statistics.rejected_commands.saturating_add(1);
+        }
+        result
+    }
+
+    /// Atomically appends many commands and orders the combined scene once.
+    ///
+    /// This is the bounded high-volume construction path for adversarial or
+    /// frequently alternating layers. Validation and budget accounting happen
+    /// before the existing command list is changed. On failure, no command from
+    /// the batch is retained; request and rejection diagnostics still advance.
+    /// The resulting order is stable by layer and by batch insertion order.
+    pub fn try_extend_to_layers(
+        &mut self,
+        commands: impl IntoIterator<Item = (Layer, DrawCommand)>,
+    ) -> Result<(), SceneError> {
+        let mut staged = Vec::new();
+        let mut requested = self.statistics;
+        let mut attempted = 0usize;
+        let mut next_order = self.next_order;
+
+        for (layer, command) in commands {
+            attempted = attempted.saturating_add(1);
+            requested.requested_commands = requested.requested_commands.saturating_add(1);
+            if let Err(error) = command.validate() {
+                self.record_batch_rejection(attempted);
+                return Err(error);
+            }
+            if self
+                .current_screen_clip
+                .is_some_and(|screen_clip| !screen_clip.is_valid())
+            {
+                self.record_batch_rejection(attempted);
+                return Err(SceneError::InvalidScreenClip);
+            }
+
+            requested = requested.with_command(&command);
+            if let Some(budget) = self.budget
+                && let Err(error) = validate_scene_budget(budget, requested)
+            {
+                self.record_batch_rejection(attempted);
+                return Err(error);
+            }
+            if staged.try_reserve(1).is_err() {
+                self.record_batch_rejection(attempted);
+                return Err(SceneError::AllocationFailed {
+                    requested_bytes: command.retained_bytes(),
+                });
+            }
+            staged.push(SceneCommand {
+                layer,
+                order: next_order,
+                depth: self.current_depth,
+                screen_clip: self.current_screen_clip,
+                command,
+            });
+            next_order = next_order.saturating_add(1);
+        }
+
+        if staged.is_empty() {
+            return Ok(());
+        }
+        let total = self.commands.len().saturating_add(staged.len());
+        let mut merged = Vec::new();
+        if merged.try_reserve(total).is_err() {
+            self.record_batch_rejection(attempted);
+            return Err(SceneError::AllocationFailed {
+                requested_bytes: total.saturating_mul(size_of::<SceneCommand>()),
+            });
+        }
+        merged.append(&mut self.commands);
+        merged.append(&mut staged);
+        merged.sort_unstable_by_key(|command| (command.layer, command.order));
+        self.commands = merged;
+        self.next_order = next_order;
+        self.statistics = requested;
+        Ok(())
+    }
+
+    fn record_batch_rejection(&mut self, command_count: usize) {
+        self.statistics.requested_commands = self
+            .statistics
+            .requested_commands
+            .saturating_add(command_count);
+        self.statistics.rejected_commands = self
+            .statistics
+            .rejected_commands
+            .saturating_add(command_count);
+    }
+
+    pub(crate) fn record_external_rejection(&mut self) {
+        self.record_batch_rejection(1);
+    }
+
+    fn try_push_to_layer_inner(
+        &mut self,
+        layer: Layer,
+        command: DrawCommand,
+    ) -> Result<(), SceneError> {
         command.validate()?;
         if self
             .current_screen_clip
@@ -241,8 +551,19 @@ impl Scene {
             return Err(SceneError::InvalidScreenClip);
         }
 
+        let command_retained_bytes = command.retained_bytes();
+        let requested = self.statistics.with_command(&command);
+        if let Some(budget) = self.budget {
+            validate_scene_budget(budget, requested)?;
+        }
+
+        self.commands
+            .try_reserve(1)
+            .map_err(|_| SceneError::AllocationFailed {
+                requested_bytes: command_retained_bytes,
+            })?;
+
         let order = self.next_order;
-        self.next_order = self.next_order.saturating_add(1);
         let scene_command = SceneCommand {
             layer,
             order,
@@ -255,6 +576,8 @@ impl Scene {
                 || (existing.layer == scene_command.layer && existing.order <= scene_command.order)
         });
         self.commands.insert(position, scene_command);
+        self.next_order = self.next_order.saturating_add(1);
+        self.statistics = requested;
         Ok(())
     }
 
@@ -629,6 +952,49 @@ pub enum DrawCommand {
 }
 
 impl DrawCommand {
+    /// Builds and validates a circle command for batch insertion.
+    pub fn circle(center: Vec2, radius: f32, style: ShapeStyle) -> Result<Self, SceneError> {
+        let command = Self::Circle(Circle {
+            center,
+            radius,
+            style,
+        });
+        command.validate()?;
+        Ok(command)
+    }
+
+    /// Builds and validates a rectangle command for batch insertion.
+    pub fn rect(rect: Rect, corner_radius: f32, style: ShapeStyle) -> Result<Self, SceneError> {
+        let command = Self::Rect(RectShape {
+            rect,
+            corner_radius,
+            style,
+        });
+        command.validate()?;
+        Ok(command)
+    }
+
+    /// Builds and validates a single line command for batch insertion.
+    pub fn line(from: Vec2, to: Vec2, width: f32, color: Color) -> Result<Self, SceneError> {
+        let command = Self::Line(Line {
+            from,
+            to,
+            stroke: Stroke { width, color },
+        });
+        command.validate()?;
+        Ok(command)
+    }
+
+    /// Builds and validates a connected polyline command for batch insertion.
+    pub fn polyline(points: Vec<Vec2>, width: f32, color: Color) -> Result<Self, SceneError> {
+        let command = Self::Polyline(Polyline {
+            points,
+            stroke: Stroke { width, color },
+        });
+        command.validate()?;
+        Ok(command)
+    }
+
     fn validate(&self) -> Result<(), SceneError> {
         match self {
             Self::Circle(circle) => {
@@ -705,6 +1071,114 @@ impl DrawCommand {
             }
         }
     }
+
+    fn retained_point_count(&self) -> usize {
+        match self {
+            Self::Polyline(polyline) => polyline.points.len(),
+            Self::Circle(_) | Self::Rect(_) | Self::Line(_) => 0,
+        }
+    }
+
+    fn retained_bytes(&self) -> usize {
+        let point_bytes = match self {
+            Self::Polyline(polyline) => {
+                polyline.points.capacity().saturating_mul(size_of::<Vec2>())
+            }
+            Self::Circle(_) | Self::Rect(_) | Self::Line(_) => 0,
+        };
+        size_of::<SceneCommand>().saturating_add(point_bytes)
+    }
+
+    fn estimated_tessellated_vertices(&self) -> usize {
+        match self {
+            Self::Circle(circle) => {
+                let fill_vertices = CIRCLE_SEGMENTS * 3;
+                let stroke_vertices = CIRCLE_SEGMENTS * 6;
+                let style = circle.style;
+                usize::from(style.fill.is_some()) * fill_vertices
+                    + usize::from(style.stroke.is_some()) * stroke_vertices
+                    + style.shadow.map_or(0, |shadow| {
+                        fill_vertices + usize::from(shadow.spread > 0.0) * stroke_vertices
+                    })
+            }
+            Self::Rect(rectangle) => {
+                let rect = rectangle.rect.normalized();
+                let radius = rectangle
+                    .corner_radius
+                    .max(0.0)
+                    .min(rect.width().abs() * 0.5)
+                    .min(rect.height().abs() * 0.5);
+                let boundary_segments = if radius <= f32::EPSILON {
+                    4
+                } else {
+                    4 * (CORNER_SEGMENTS + 1)
+                };
+                let fill_vertices = boundary_segments * 3;
+                let stroke_vertices = boundary_segments * 6;
+                let style = rectangle.style;
+                usize::from(style.fill.is_some()) * fill_vertices
+                    + usize::from(style.stroke.is_some()) * stroke_vertices
+                    + style.shadow.map_or(0, |shadow| {
+                        fill_vertices + usize::from(shadow.spread > 0.0) * stroke_vertices
+                    })
+            }
+            Self::Line(_) => 6 + 2 * ROUND_CAP_SEGMENTS * 3,
+            Self::Polyline(polyline) => polyline
+                .points
+                .len()
+                .saturating_sub(1)
+                .saturating_mul(6)
+                .saturating_add(2 * ROUND_CAP_SEGMENTS * 3),
+        }
+    }
+}
+
+fn validate_scene_budget(
+    budget: SceneBudget,
+    requested: SceneStatistics,
+) -> Result<(), SceneError> {
+    let limits = [
+        (
+            SceneBudgetResource::Commands,
+            budget.max_commands,
+            requested.accepted_commands,
+        ),
+        (
+            SceneBudgetResource::Points,
+            budget.max_points,
+            requested.retained_points,
+        ),
+        (
+            SceneBudgetResource::TessellatedVertices,
+            budget.max_tessellated_vertices,
+            requested.estimated_tessellated_vertices,
+        ),
+        (
+            SceneBudgetResource::RetainedBytes,
+            budget.max_retained_bytes,
+            requested.retained_bytes,
+        ),
+        (
+            SceneBudgetResource::UploadBytes,
+            budget.max_upload_bytes,
+            requested.estimated_upload_bytes,
+        ),
+        (
+            SceneBudgetResource::DrawBatches,
+            budget.max_draw_batches,
+            requested.estimated_draw_batches,
+        ),
+    ];
+    for (resource, limit, requested) in limits {
+        if requested > limit {
+            return Err(SceneError::BudgetExceeded {
+                resource,
+                limit,
+                requested,
+            });
+        }
+    }
+    Ok(())
 }
 
 fn drawable_segment(from: Vec2, to: Vec2) -> bool {
@@ -1174,9 +1648,29 @@ mod tests {
 
     use crate::{
         Color, DrawCommand, Fill, Layer, LinearGradient, LogicalScreenPosition,
-        LogicalScreenVector, RadialGradient, Rect, Scene, SceneError, ScenePrimitive,
-        ScreenClipRect, ShapeStyle, Vec2,
+        LogicalScreenVector, RadialGradient, Rect, Scene, SceneBudget, SceneBudgetResource,
+        SceneError, ScenePrimitive, ScreenClipRect, ShapeStyle, Vec2,
     };
+
+    const UNLIMITED: usize = usize::MAX;
+
+    const fn budget_for(
+        commands: usize,
+        points: usize,
+        vertices: usize,
+        retained_bytes: usize,
+        upload_bytes: usize,
+        batches: usize,
+    ) -> SceneBudget {
+        SceneBudget::new(
+            commands,
+            points,
+            vertices,
+            retained_bytes,
+            upload_bytes,
+            batches,
+        )
+    }
 
     #[test]
     fn scene_collects_visual_commands_only() {
@@ -1199,6 +1693,207 @@ mod tests {
 
         assert!(matches!(scene.commands[0].command, DrawCommand::Line(_)));
         assert!(matches!(scene.commands[1].command, DrawCommand::Circle(_)));
+    }
+
+    #[test]
+    fn scene_budget_rejection_is_atomic_and_counted() {
+        let budget = budget_for(1, UNLIMITED, UNLIMITED, UNLIMITED, UNLIMITED, UNLIMITED);
+        let mut scene = Scene::with_budget(Color::BLACK, budget).unwrap();
+        scene
+            .try_circle(Vec2::new(1.0, 2.0), 3.0, ShapeStyle::filled(Color::WHITE))
+            .unwrap();
+
+        let before_order = scene.commands()[0].order();
+        let result = scene.try_circle(Vec2::new(4.0, 5.0), 6.0, ShapeStyle::filled(Color::WHITE));
+
+        assert_eq!(
+            result,
+            Err(SceneError::BudgetExceeded {
+                resource: SceneBudgetResource::Commands,
+                limit: 1,
+                requested: 2,
+            })
+        );
+        assert_eq!(scene.command_count(), 1);
+        assert_eq!(scene.commands()[0].order(), before_order);
+        assert_eq!(scene.statistics().requested_commands(), 2);
+        assert_eq!(scene.statistics().accepted_commands(), 1);
+        assert_eq!(scene.statistics().rejected_commands(), 1);
+    }
+
+    #[test]
+    fn scene_budget_enforces_every_resource_at_insertion() {
+        let mut reference = Scene::new(Color::BLACK).unwrap();
+        reference
+            .try_polyline(
+                vec![Vec2::ZERO, Vec2::X, Vec2::new(1.0, 1.0)],
+                2.0,
+                Color::WHITE,
+            )
+            .unwrap();
+        let usage = reference.statistics();
+        let cases = [
+            (
+                SceneBudgetResource::Points,
+                budget_for(
+                    UNLIMITED,
+                    usage.retained_points() - 1,
+                    UNLIMITED,
+                    UNLIMITED,
+                    UNLIMITED,
+                    UNLIMITED,
+                ),
+                usage.retained_points(),
+            ),
+            (
+                SceneBudgetResource::TessellatedVertices,
+                budget_for(
+                    UNLIMITED,
+                    UNLIMITED,
+                    usage.estimated_tessellated_vertices() - 1,
+                    UNLIMITED,
+                    UNLIMITED,
+                    UNLIMITED,
+                ),
+                usage.estimated_tessellated_vertices(),
+            ),
+            (
+                SceneBudgetResource::RetainedBytes,
+                budget_for(
+                    UNLIMITED,
+                    UNLIMITED,
+                    UNLIMITED,
+                    usage.retained_bytes() - 1,
+                    UNLIMITED,
+                    UNLIMITED,
+                ),
+                usage.retained_bytes(),
+            ),
+            (
+                SceneBudgetResource::UploadBytes,
+                budget_for(
+                    UNLIMITED,
+                    UNLIMITED,
+                    UNLIMITED,
+                    UNLIMITED,
+                    usage.estimated_upload_bytes() - 1,
+                    UNLIMITED,
+                ),
+                usage.estimated_upload_bytes(),
+            ),
+            (
+                SceneBudgetResource::DrawBatches,
+                budget_for(
+                    UNLIMITED,
+                    UNLIMITED,
+                    UNLIMITED,
+                    UNLIMITED,
+                    UNLIMITED,
+                    usage.estimated_draw_batches() - 1,
+                ),
+                usage.estimated_draw_batches(),
+            ),
+        ];
+
+        for (resource, budget, requested) in cases {
+            let mut scene = Scene::with_budget(Color::BLACK, budget).unwrap();
+            let result = scene.try_polyline(
+                vec![Vec2::ZERO, Vec2::X, Vec2::new(1.0, 1.0)],
+                2.0,
+                Color::WHITE,
+            );
+            assert_eq!(
+                result,
+                Err(SceneError::BudgetExceeded {
+                    resource,
+                    limit: requested - 1,
+                    requested,
+                })
+            );
+            assert_eq!(scene.command_count(), 0);
+            assert_eq!(scene.statistics().accepted_commands(), 0);
+            assert_eq!(scene.statistics().rejected_commands(), 1);
+        }
+    }
+
+    #[test]
+    fn exact_scene_budget_is_accepted_and_clear_preserves_limits() {
+        let mut reference = Scene::new(Color::BLACK).unwrap();
+        reference
+            .try_line(Vec2::ZERO, Vec2::X, 2.0, Color::WHITE)
+            .unwrap();
+        let usage = reference.statistics();
+        let budget = budget_for(
+            usage.accepted_commands(),
+            usage.retained_points(),
+            usage.estimated_tessellated_vertices(),
+            usage.retained_bytes(),
+            usage.estimated_upload_bytes(),
+            usage.estimated_draw_batches(),
+        );
+        let mut scene = Scene::with_budget(Color::BLACK, budget).unwrap();
+
+        scene
+            .try_line(Vec2::ZERO, Vec2::X, 2.0, Color::WHITE)
+            .unwrap();
+        assert_eq!(scene.statistics(), usage);
+        scene.clear();
+
+        assert_eq!(scene.budget(), Some(budget));
+        assert_eq!(scene.statistics(), Default::default());
+        assert_eq!(scene.command_count(), 0);
+    }
+
+    #[test]
+    fn batch_insertion_sorts_once_and_is_atomic_on_budget_failure() {
+        let budget = budget_for(4, UNLIMITED, UNLIMITED, UNLIMITED, UNLIMITED, UNLIMITED);
+        let mut scene = Scene::with_budget(Color::BLACK, budget).unwrap();
+        scene
+            .try_extend_to_layers([
+                (
+                    Layer::FOREGROUND,
+                    DrawCommand::circle(Vec2::new(1.0, 0.0), 1.0, ShapeStyle::filled(Color::WHITE))
+                        .unwrap(),
+                ),
+                (
+                    Layer::BACKGROUND,
+                    DrawCommand::line(Vec2::ZERO, Vec2::X, 1.0, Color::WHITE).unwrap(),
+                ),
+                (
+                    Layer::FOREGROUND,
+                    DrawCommand::circle(Vec2::new(2.0, 0.0), 1.0, ShapeStyle::filled(Color::WHITE))
+                        .unwrap(),
+                ),
+            ])
+            .unwrap();
+
+        assert_eq!(scene.command_count(), 3);
+        assert_eq!(scene.commands()[0].layer(), Layer::BACKGROUND);
+        assert_eq!(scene.commands()[1].order(), 0);
+        assert_eq!(scene.commands()[2].order(), 2);
+
+        let result = scene.try_extend_to_layers([
+            (
+                Layer::DEFAULT,
+                DrawCommand::circle(Vec2::ZERO, 1.0, ShapeStyle::filled(Color::WHITE)).unwrap(),
+            ),
+            (
+                Layer::DEFAULT,
+                DrawCommand::circle(Vec2::X, 1.0, ShapeStyle::filled(Color::WHITE)).unwrap(),
+            ),
+        ]);
+        assert_eq!(
+            result,
+            Err(SceneError::BudgetExceeded {
+                resource: SceneBudgetResource::Commands,
+                limit: 4,
+                requested: 5,
+            })
+        );
+        assert_eq!(scene.command_count(), 3);
+        assert_eq!(scene.statistics().requested_commands(), 5);
+        assert_eq!(scene.statistics().accepted_commands(), 3);
+        assert_eq!(scene.statistics().rejected_commands(), 2);
     }
 
     #[test]

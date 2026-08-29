@@ -1,7 +1,7 @@
-# Sim;Engine v0.1.0 Documentation
+# Sim;Engine v0.2.0 Documentation
 
 This document is the public guide and engineering reference for the official
-Sim;Engine v0.1.0 release. It is divided into two parts:
+Sim;Engine v0.2.0 release. It is divided into two parts:
 
 - [Integration Handbook](#part-i-integration-handbook) - how to add the crate,
   construct visual state, choose a rendering path, recover resources, and
@@ -16,7 +16,7 @@ For exact signatures and error variants, generate the Rust API reference:
 cargo doc --all-features --no-deps --open
 ```
 
-Sim;Engine v0.1.0 is the first official release and remains pre-1.0. Linux with
+Sim;Engine v0.2.0 remains pre-1.0. Linux with
 Vulkan is its supported release target, and Rust 1.90 is the minimum supported
 Rust version.
 
@@ -31,7 +31,7 @@ policy. The engine owns:
 - validated 2D commands and visual styles;
 - camera transforms, typed coordinate conversion, clipping, and pseudo-depth;
 - visual interpolation;
-- prepared, dynamic, particle, and scalar-field GPU resources;
+- prepared, dynamic, image, glyph, particle, and scalar-field GPU resources;
 - offscreen targets, composition, and bounded trails;
 - retained stereometry meshes, depth, and visible or hidden display edges;
 - renderer diagnostics, ownership checks, and resource recovery.
@@ -49,14 +49,14 @@ The default feature set includes the `wgpu` backend:
 
 ```toml
 [dependencies]
-sim-engine = "0.1"
+sim-engine = "0.2"
 ```
 
 Use the CPU-side visual-state APIs without GPU dependencies:
 
 ```toml
 [dependencies]
-sim-engine = { version = "0.1", default-features = false }
+sim-engine = { version = "0.2", default-features = false }
 ```
 
 | Configuration | Provides |
@@ -135,6 +135,41 @@ logical-screen shadows. Colors are straight linear RGBA internally.
 boundaries require every channel in `0.0..=1.0`; animation may overshoot, but
 the host must call `Color::clamp` explicitly before inserting that value.
 
+#### Bounded scenes
+
+Production adapters that translate externally sized visual state should use
+`Scene::with_budget`. All six limits are hard upper bounds; zero is valid for a
+background-only scene. Rejection is structured and leaves retained commands
+unchanged.
+
+```rust
+use sim_engine::{Color, DrawCommand, Layer, Scene, SceneBudget, ShapeStyle, Vec2};
+
+let budget = SceneBudget::new(
+    20_000,
+    100_000,
+    2_000_000,
+    16 * 1024 * 1024,
+    64 * 1024 * 1024,
+    20_000,
+);
+let mut scene = Scene::with_budget(Color::BLACK, budget)?;
+let circle = DrawCommand::circle(
+    Vec2::ZERO,
+    4.0,
+    ShapeStyle::filled(Color::WHITE),
+)?;
+scene.try_extend_to_layers([(Layer::DEFAULT, circle)])?;
+assert_eq!(scene.statistics().accepted_commands(), 1);
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+Use `try_extend_to_layers` for large alternating/mixed-layer batches. It
+validates the transaction before replacing the ordered command store, then
+performs one `O(N log N)` sort using unique insertion order as the stable
+tie-breaker. The core-only `scene_construction_benchmark` measures this path.
+The compatibility constructor `Scene::new` remains explicitly unbounded.
+
 ### 5. Ordering, clipping, and pseudo-depth
 
 2D commands are ordered by `Layer`, then insertion order. Pseudo-depth affects
@@ -182,6 +217,7 @@ replace the retained 3D path.
 | `PhysicalScreenPosition` | surface pixels, top-left origin |
 | `PhysicalPerLogical` | physical target texels per logical pixel |
 | `LogicalViewport` | finite logical viewport dimensions |
+| `LogicalViewportRegion` | positioned local viewport inside a logical target |
 | `WorldLength` | positive scalar distance in caller-defined 3D world units |
 | `RenderTarget2d` dimensions | physical texture pixels |
 
@@ -214,6 +250,88 @@ renderer.resize_with_scale_factor(width, height, window.scale_factor())?;
 Zero physical dimensions are ignored because a minimized surface cannot be
 configured at zero size. Scale factors that cannot produce a finite logical
 viewport are rejected.
+
+#### Fixed UI and viewports
+
+`ScreenScene` accepts typed `LogicalScreenPosition`, `LogicalScreenVector`, and
+`LogicalPixels` geometry. Its top-left origin and downward y axis match UI hit
+coordinates. `WgpuRenderer::render_screen_scene` derives the fixed camera
+internally, while `PreparedScreenScene` prevents a world camera from being
+supplied to prepared UI geometry.
+
+```rust,ignore
+let mut ui = ScreenScene::with_budget(Color::BLACK, ui_budget)?;
+ui.try_rect(
+    LogicalScreenPosition::new(16.0, 16.0),
+    LogicalScreenVector::new(240.0, 80.0),
+    LogicalPixels::new(8.0)?,
+    ShapeStyle::filled(Color::rgb8(24, 31, 44)),
+)?;
+renderer.render_screen_scene(&ui)?;
+```
+
+`LogicalViewportRegion` positions a camera-local logical viewport on the
+surface. `render_scene_in_viewport` always clips the scene to that region;
+scene-local clips are relative to the region and intersect at physical scissor
+conversion.
+
+For offscreen rendering, `render_scene_to_target` requires an explicit
+`PhysicalPerLogical`, optional local viewport, and `RenderTargetLoad`. Target
+dimensions remain physical texels and never inherit window DPI. The scene
+background is not an implicit target clear; pass
+`RenderTargetLoad::Clear(scene.background())` when that is intended.
+
+#### One composed frame
+
+`FrameComposer` is the preferred surface path when UI, scientific viewports,
+prepared geometry, particles, scalar fields, or offscreen targets must share a
+defined order. It validates the complete frame before surface acquisition and
+uses one clear, encoder, submission, and present.
+
+```rust,ignore
+let mut frame = renderer.begin_frame(Color::BLACK, FrameBudget::default())?;
+frame.draw_prepared_screen_scene(
+    &static_ui,
+    FramePassOptions::new(0),
+)?;
+frame.draw_scene(
+    &physics,
+    physics_camera,
+    FramePassOptions::new(10).with_viewport(canvas_region),
+)?;
+frame.draw_particle_field(
+    &mut particles,
+    physics_camera,
+    FramePassOptions::new(20).with_viewport(canvas_region),
+)?;
+frame.draw_glyph_run(
+    &font_atlas,
+    &inspector_labels,
+    ImageSampling::Linear,
+    FramePassOptions::new(30),
+)?;
+let report = frame.present()?;
+```
+
+Items with equal `order` retain insertion order. Scene-local clips remain local
+to that item's viewport and intersect the optional item clip. Prepared and
+dynamic resources are rejected immediately when they belong to another
+renderer generation. A retained 3D result participates through
+`RenderTarget3d::color_target()`.
+
+`FrameBudget` limits passes, referenced commands, vertices, uniform/streaming
+uploads, referenced texture bytes, and conservative draw calls. Additions are
+atomic, and actual post-tessellation work is checked again before GPU upload or
+surface acquisition. `FrameStatistics` separates streaming vertices/uploads
+from retained vertices reused without a per-frame geometry upload.
+`FrameReport` also exposes actual command-encoder, render-pass, queue-submission,
+and surface-present counts: each is one for `Drawn` and zero for a skipped
+surface frame.
+
+Images and glyph runs use the same ordering rule and clip/viewport
+intersection as geometry. Referencing the same atlas several times counts its
+texture allocation once toward the frame texture budget. Atlas pixels and
+retained instances are not uploaded again merely because the frame draws them.
 
 ### 7. Cameras and motion
 
@@ -314,6 +432,8 @@ Error-handling rules:
 | Small changing scene | `Scene` + `render_with_metrics` | validate, tessellate, upload every frame |
 | Static shapes, moving camera | `PreparedScene` | prepare once, update camera per frame |
 | Frequently changing triangles | `DynamicMesh2d` | upload ready triangle data |
+| Images or atlas sprites | `Image2d` + `ImageBatch2d` | retain pixels and instances; update dirty regions |
+| Host-shaped text | `GlyphAtlas2d` + `GlyphRun2d` | retain atlas/run; one quad per glyph |
 | Many circles or points | `ParticleField2d` | cull, budget, compact, instanced draw |
 | Dense scalar grid | `ScalarFieldTexture` | texture update and heatmap shader |
 | Field plus particle overlay | `render_layered_visualization` | one encoder and one queue submission |
@@ -338,6 +458,127 @@ by three. Full updates replace the list; triangle-aligned range updates reuse
 the existing allocation. Update reports expose upload time and reallocation.
 
 Use this path for ready visual triangles, not as a new simulation data model.
+
+Externally sized triangle input should use an explicit `DynamicMeshBudget`:
+
+```rust,ignore
+let budget = DynamicMeshBudget::new(
+    30_000,          // triangle-list vertices
+    2 * 1024 * 1024, // exact CPU recovery bytes
+    2 * 1024 * 1024, // bytes in one full upload
+)?;
+let mesh = renderer.create_dynamic_mesh_with_budget(&vertices, budget)?;
+frame.draw_dynamic_mesh(
+    &mesh,
+    camera,
+    FramePassOptions::new(15).with_viewport(canvas_region),
+)?;
+```
+
+This is the bounded raw-filled-triangle path for host-tessellated vector art
+and scientific diagrams. Vertex counts must be divisible by three. Sim;Engine
+does not infer a polygon fill rule because the host supplies the final triangle
+list. Full updates allocate and validate a replacement CPU snapshot and any
+required larger GPU buffer before committing retained state. Triangle-aligned
+range updates remain in-place and enforce the retained upload budget.
+
+#### Retained images and atlas sprites
+
+`Image2d` owns one straight-alpha, top-to-bottom, row-major sRGB RGBA8 image.
+RGB is decoded to linear light by the GPU texture; alpha remains linear.
+`ImageBudget` constrains source dimensions and bytes before texture creation.
+The owned constructor consumes a `Vec<u8>` without first making another
+full-image copy; the slice constructor performs one fallible recovery copy.
+
+```rust,ignore
+let image_budget = ImageBudget::new(1024, 1024, 4 * 1024 * 1024)?;
+let atlas = renderer.create_image_rgba8(
+    atlas_width,
+    atlas_height,
+    rgba_pixels,
+    image_budget,
+)?;
+
+let sprite = ImageSprite2d::new(
+    ImageTexelRect::new(0, 0, 32, 32)?,
+    icon_destination,
+    Color::WHITE,
+)?;
+let batch = renderer.create_image_batch(
+    &atlas,
+    vec![sprite],
+    ImageBatchBudget::new(256, 64 * 1024)?,
+)?;
+
+frame.draw_image_batch(
+    &atlas,
+    &batch,
+    ImageSampling::Linear,
+    FramePassOptions::new(20),
+)?;
+```
+
+Sprite destinations are local logical pixels with a top-left origin. A frame
+viewport positions the entire retained batch without rebuilding its instance
+buffer. `draw_image` scales one full image or atlas rectangle into the item
+viewport. `draw_world_image` instead maps an atlas rectangle onto an
+axis-aligned world `Rect` at one pseudo-depth; the resulting quad follows that
+item's camera zoom, rotation, projection, viewport, and clip.
+
+Nearest filtering preserves masks and pixel art. Linear filtering samples only
+between the selected sub-rectangle's first and last texel centers, so adjacent
+atlas entries do not bleed at their own texel centers. Use padding when a
+scaled asset intentionally filters near an outer edge.
+
+`update_image_region` validates the exact row pitch, byte count, checked extent,
+and atlas bounds before updating both GPU pixels and the CPU recovery snapshot.
+`replace_image_rgba8` is atomic and creates a new resource identity, so batches
+against the previous packing must be rebuilt. No implicit atlas eviction
+occurs.
+
+#### Host-shaped glyph runs
+
+The text layer deliberately starts below font selection and shaping. The host
+chooses fonts, fallback, localization, bidi behavior, baselines, advances, and
+line breaks. It gives Sim;Engine opaque `GlyphId` values, atlas rectangles, and
+already-positioned logical quads:
+
+```rust,ignore
+let entries = vec![
+    GlyphAtlasEntry::new(mu_id, ImageTexelRect::new(0, 0, 18, 24)?),
+    GlyphAtlasEntry::new(delta_id, ImageTexelRect::new(18, 0, 20, 24)?),
+];
+let atlas = renderer.create_glyph_atlas(
+    width,
+    height,
+    atlas_pixels,
+    entries,
+    GlyphAtlasBudget::default(),
+)?;
+let glyphs = vec![
+    PositionedGlyph2d::new(mu_id, mu_destination, Color::WHITE)?,
+    PositionedGlyph2d::new(delta_id, delta_destination, Color::WHITE)?,
+];
+let run = renderer.create_glyph_run(
+    &atlas,
+    glyphs,
+    GlyphRunBudget::default(),
+)?;
+let logical_bounds = run.bounds().region();
+```
+
+One successful run becomes one instanced draw and one retained quad per glyph.
+Missing glyphs return `GlyphError::MissingGlyph` with identity and run index;
+they are never silently replaced. `upload_glyph` can fill a bounded atlas
+region and register new sorted metadata. Reusing an identity with a different
+rectangle is rejected so old retained runs cannot begin sampling unrelated
+pixels.
+
+A run references one atlas. Mixed fallback fonts are explicit multiple runs at
+the same frame order; stable insertion order preserves the host's chosen
+overlap. `GlyphRunStatistics` exposes submitted glyphs, rendered quads, misses,
+and retained bytes. Successful retained runs have zero misses and cause no
+texture upload after warm-up.
 
 ### 11. Particles and hard budgets
 
@@ -522,6 +763,10 @@ resources from the previous identity are rejected until restored.
 | --- | --- | --- |
 | `PreparedScene` | `restore_prepared_scene` | exact retained geometry |
 | `DynamicMesh2d` | `restore_dynamic_mesh` | exact retained vertices/capacity |
+| `Image2d` | `restore_image` | exact sRGB RGBA pixels and limits |
+| `ImageBatch2d` | `restore_image_batch` | exact sprite instances against the restored image |
+| `GlyphAtlas2d` | `restore_glyph_atlas` | exact pixels, IDs, rectangles, and limits |
+| `GlyphRun2d` | `restore_glyph_run` | exact positioned glyphs against the restored atlas |
 | `ParticleField2d` | `restore_particle_field` | exact instances and budget |
 | `ScalarFieldTexture` | `restore_scalar_field_texture` | exact scalar grid |
 | `RenderTarget2d` | `restore_render_target` | empty target; redraw required |
@@ -557,6 +802,7 @@ recovery returns `RecoveryLimitReached` before creating another device; inspect
 
 - Prepare static scenes once.
 - Use dynamic meshes for ready changing triangles.
+- Batch unchanged icons and glyphs in retained atlas instance buffers.
 - Use particle instancing for large point/circle populations.
 - Put dense scalar fields in textures and update dirty regions only.
 - Render expensive fields below surface resolution when quality permits.
@@ -577,6 +823,7 @@ The current public metrics do not include GPU timestamp queries.
 cargo run --release --example demo
 
 # Menu with Fluid, Gas, Wave, and edge-case workloads
+# plus a retained host-shaped scientific glyph atlas probe
 cargo run --release --example ui_demo -- --uncapped
 
 # Bounded star-remnant gas/particle workload
@@ -737,8 +984,18 @@ snapshot for recovery. Rendering reuses geometry and only updates camera state.
 #### Dynamic meshes
 
 The resource retains a CPU copy and capacity-managed triangle buffer. Full
-updates grow amortized capacity; aligned range updates reuse it. Geometry
-extents are recomputed after mutation.
+updates grow amortized capacity; aligned range updates reuse it. Bounded meshes
+preflight vertex/retained/upload work, use fallible staging reservation, and
+commit a full update only after replacement resources exist. Geometry extents
+are recomputed after mutation.
+
+#### Images and glyph runs
+
+Images use an `Rgba8UnormSrgb` sampled texture and exact retained source bytes.
+Single logical or world images draw one shader-generated quad. Atlas and glyph
+batches store logical destination, UV-center bounds, and straight-linear tint
+in one retained instance buffer and issue one instanced draw. Glyph metadata is
+kept sorted for deterministic allocation-free lookup while runs are built.
 
 #### Particle fields
 
@@ -829,12 +1086,14 @@ automation are repeatable.
 ### 28. Known boundaries
 
 - Linux with Vulkan is the only release-gated platform/backend contract.
-- A Vulkan adapter is supported for 0.1 only when the mandatory semantic
+- A Vulkan adapter is supported for 0.2 only when the mandatory semantic
   fixture passes on that concrete adapter/driver. CI records Mesa software
-  evidence and the v0.1.0 release evidence records Intel Mesa; untested
+  evidence and the release evidence records the exact tested adapter; untested
   AMD/NVIDIA drivers are not silently certified by those results.
 - The crate is pre-1.0.
-- Text shaping and glyph caching are not implemented.
+- Font loading, text shaping, fallback selection, line breaking, and automatic
+  atlas eviction are not implemented. The low-level API renders
+  host-shaped glyph runs and retains their atlas/cache resources.
 - Retained 3D supports opaque surfaces and depth-classified edges, not section
   materials, projected anchors, labels, or picking.
 - Renderer timing is CPU-side; public GPU timestamps are not available.

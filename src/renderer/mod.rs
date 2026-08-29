@@ -9,16 +9,17 @@ use std::{
 
 use crate::{
     Camera2d, Circle, Color, ColorMap, DrawCommand, Fill, Line, LogicalScreenPosition,
-    LogicalViewport, ParticleInstance2d, PhysicalScreenPosition, Polyline, Rect, ScalarField,
-    Scene, ScreenClipRect, Shadow, ShapeStyle, Stroke, Vec2,
+    LogicalViewport, LogicalViewportRegion, ParticleInstance2d, PhysicalPerLogical,
+    PhysicalScreenPosition, Polyline, Rect, ScalarField, Scene, SceneBudgetResource,
+    ScreenClipRect, ScreenScene, Shadow, ShapeStyle, Stroke, Vec2,
+    scene::{CIRCLE_SEGMENTS, CORNER_SEGMENTS, ROUND_CAP_SEGMENTS, TESSELLATED_VERTEX_BYTES},
+    screen::screen_camera,
 };
 use config::select_surface_present_mode;
 
 const INITIAL_VERTEX_CAPACITY: usize = 4096;
-const CIRCLE_SEGMENTS: usize = 64;
-const ROUND_CAP_SEGMENTS: usize = 16;
-const CORNER_SEGMENTS: usize = 12;
 const PREFERRED_SAMPLE_COUNT: u32 = 4;
+const COLOR_MAP_LUT_SIZE: u32 = 256;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
@@ -32,8 +33,10 @@ struct Vertex {
     color: [f32; 4],
 }
 
+const _: () = assert!(std::mem::size_of::<Vertex>() == TESSELLATED_VERTEX_BYTES);
+
 #[repr(C)]
-#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+#[derive(Clone, Copy, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 struct DynamicGpu {
     world_position: [f32; 2],
     depth: f32,
@@ -54,12 +57,65 @@ struct CameraUniform {
 struct HeatmapUniform {
     value_range: [f32; 4],
     dimensions: [u32; 4],
+    destination: [f32; 4],
+}
+
+impl HeatmapUniform {
+    fn new(
+        minimum: f32,
+        value_extent: f32,
+        width: usize,
+        height: usize,
+        sampling: ScalarFieldSampling,
+    ) -> Self {
+        Self {
+            value_range: [minimum, value_extent, 0.0, 0.0],
+            dimensions: [width as u32, height as u32, sampling.shader_value(), 0],
+            destination: [1.0, 1.0, 0.0, 0.0],
+        }
+    }
+
+    fn in_region(mut self, region: LogicalViewportRegion, target: LogicalViewport) -> Option<Self> {
+        let destination = CompositeUniform::in_region(1.0, region, target)?.destination;
+        self.destination = destination;
+        Some(self)
+    }
 }
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 struct CompositeUniform {
     opacity: [f32; 4],
+    destination: [f32; 4],
+}
+
+impl CompositeUniform {
+    const fn full_surface(opacity: f32) -> Self {
+        Self {
+            opacity: [opacity, 0.0, 0.0, 0.0],
+            destination: [1.0, 1.0, 0.0, 0.0],
+        }
+    }
+
+    fn in_region(
+        opacity: f32,
+        region: LogicalViewportRegion,
+        target: LogicalViewport,
+    ) -> Option<Self> {
+        let origin = region.origin().to_vec2();
+        let viewport = region.viewport();
+        let scale_x = viewport.width() / target.width();
+        let scale_y = viewport.height() / target.height();
+        let offset_x = (origin.x.mul_add(2.0, viewport.width())) / target.width() - 1.0;
+        let offset_y = 1.0 - (origin.y.mul_add(2.0, viewport.height())) / target.height();
+        [scale_x, scale_y, offset_x, offset_y]
+            .into_iter()
+            .all(f32::is_finite)
+            .then_some(Self {
+                opacity: [opacity, 0.0, 0.0, 0.0],
+                destination: [scale_x, scale_y, offset_x, offset_y],
+            })
+    }
 }
 
 /// Scalar-field sampling mode used by heatmap rendering.
@@ -146,6 +202,9 @@ pub struct TessellationStats {
     command_count: usize,
     rendered_command_count: usize,
     dropped_command_count: usize,
+    vertex_count: usize,
+    draw_batch_count: usize,
+    upload_bytes: usize,
 }
 
 impl TessellationStats {
@@ -163,6 +222,34 @@ impl TessellationStats {
     pub fn dropped_command_count(self) -> usize {
         self.dropped_command_count
     }
+
+    /// Returns finite triangle-list vertices generated for this scene.
+    pub fn vertex_count(self) -> usize {
+        self.vertex_count
+    }
+
+    /// Returns draw batches generated after compatible adjacent commands merge.
+    pub fn draw_batch_count(self) -> usize {
+        self.draw_batch_count
+    }
+
+    /// Returns bytes required to upload the generated vertices.
+    pub fn upload_bytes(self) -> usize {
+        self.upload_bytes
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TessellationError {
+    AllocationFailed {
+        requested_bytes: usize,
+    },
+    CapacityTooLarge,
+    BudgetExceeded {
+        resource: SceneBudgetResource,
+        limit: usize,
+        actual: usize,
+    },
 }
 
 impl Vertex {
@@ -292,6 +379,15 @@ impl ParticleGpu {
 
 impl CameraUniform {
     fn new(camera: Camera2d, viewport: LogicalViewport) -> Option<Self> {
+        Self::new_in_region(camera, viewport, Vec2::ZERO, viewport)
+    }
+
+    fn new_in_region(
+        camera: Camera2d,
+        viewport: LogicalViewport,
+        target_origin: Vec2,
+        target_viewport: LogicalViewport,
+    ) -> Option<Self> {
         let projection_cosine = camera.projection().tilt().cos();
         let rotation_cosine = camera.rotation().cos();
         let rotation_sine = camera.rotation().sin();
@@ -315,15 +411,20 @@ impl CameraUniform {
                 horizontal_x,
                 horizontal_y,
                 horizontal_depth,
-                viewport.width() * 0.5,
+                target_origin.x + viewport.width() * 0.5,
             ],
             world_to_screen_y: [
                 vertical_x,
                 vertical_y,
                 vertical_depth,
-                viewport.height() * 0.5,
+                target_origin.y + viewport.height() * 0.5,
             ],
-            screen_to_clip: [2.0 / viewport.width(), -2.0 / viewport.height(), -1.0, 1.0],
+            screen_to_clip: [
+                2.0 / target_viewport.width(),
+                -2.0 / target_viewport.height(),
+                -1.0,
+                1.0,
+            ],
         };
         uniform.is_finite().then_some(uniform)
     }
@@ -337,7 +438,6 @@ impl CameraUniform {
             .all(|value| value.is_finite())
     }
 
-    #[cfg(test)]
     fn world_to_screen(self, world: Vec2, depth: f32) -> Vec2 {
         let relative = world - Vec2::new(self.camera_center[0], self.camera_center[1]);
         Vec2::new(
@@ -646,8 +746,24 @@ pub enum RendererFrameError {
     Surface(RendererSurfaceStatus),
     /// Camera and geometry are finite separately but overflow when transformed together.
     InvalidGeometryTransform,
+    /// A logical viewport is outside the active surface or render target.
+    InvalidViewport,
     /// Tessellated geometry exceeds the active device's vertex-buffer limit.
     GeometryCapacityTooLarge,
+    /// CPU storage for scene tessellation could not be reserved.
+    SceneAllocationFailed {
+        /// Minimum additional bytes requested by the failed reservation.
+        requested_bytes: usize,
+    },
+    /// Actual renderer work exceeded a scene's explicit limit.
+    SceneBudgetExceeded {
+        /// Work category whose post-tessellation limit was exceeded.
+        resource: SceneBudgetResource,
+        /// Configured maximum for the category.
+        limit: usize,
+        /// Actual renderer work observed.
+        actual: usize,
+    },
 }
 
 impl fmt::Display for RendererFrameError {
@@ -657,9 +773,27 @@ impl fmt::Display for RendererFrameError {
             Self::InvalidGeometryTransform => {
                 write!(formatter, "camera and geometry overflow the GPU transform")
             }
+            Self::InvalidViewport => {
+                write!(
+                    formatter,
+                    "logical viewport lies outside the active render target"
+                )
+            }
             Self::GeometryCapacityTooLarge => {
                 write!(formatter, "geometry exceeds the GPU vertex-buffer limit")
             }
+            Self::SceneAllocationFailed { requested_bytes } => write!(
+                formatter,
+                "could not reserve {requested_bytes} additional bytes for scene tessellation"
+            ),
+            Self::SceneBudgetExceeded {
+                resource,
+                limit,
+                actual,
+            } => write!(
+                formatter,
+                "scene {resource:?} work exceeded its limit {limit} after tessellation: {actual}"
+            ),
         }
     }
 }
@@ -756,6 +890,20 @@ impl Error for RendererCoordinateError {}
 pub enum PreparedSceneError {
     /// Tessellated geometry exceeds the active device's vertex-buffer limit.
     CapacityTooLarge,
+    /// CPU storage for scene tessellation could not be reserved.
+    AllocationFailed {
+        /// Minimum additional bytes requested by the failed reservation.
+        requested_bytes: usize,
+    },
+    /// Actual prepared-scene work exceeded an explicit scene limit.
+    BudgetExceeded {
+        /// Work category whose post-tessellation limit was exceeded.
+        resource: SceneBudgetResource,
+        /// Configured maximum for the category.
+        limit: usize,
+        /// Actual renderer work observed.
+        actual: usize,
+    },
 }
 
 impl fmt::Display for PreparedSceneError {
@@ -767,6 +915,58 @@ impl fmt::Display for PreparedSceneError {
                     "prepared scene exceeds the GPU vertex-buffer limit"
                 )
             }
+            Self::AllocationFailed { requested_bytes } => write!(
+                formatter,
+                "could not reserve {requested_bytes} additional bytes for prepared-scene tessellation"
+            ),
+            Self::BudgetExceeded {
+                resource,
+                limit,
+                actual,
+            } => write!(
+                formatter,
+                "prepared scene {resource:?} work exceeded its limit {limit}: {actual}"
+            ),
+        }
+    }
+}
+
+impl From<TessellationError> for RendererFrameError {
+    fn from(error: TessellationError) -> Self {
+        match error {
+            TessellationError::AllocationFailed { requested_bytes } => {
+                Self::SceneAllocationFailed { requested_bytes }
+            }
+            TessellationError::CapacityTooLarge => Self::GeometryCapacityTooLarge,
+            TessellationError::BudgetExceeded {
+                resource,
+                limit,
+                actual,
+            } => Self::SceneBudgetExceeded {
+                resource,
+                limit,
+                actual,
+            },
+        }
+    }
+}
+
+impl From<TessellationError> for PreparedSceneError {
+    fn from(error: TessellationError) -> Self {
+        match error {
+            TessellationError::AllocationFailed { requested_bytes } => {
+                Self::AllocationFailed { requested_bytes }
+            }
+            TessellationError::CapacityTooLarge => Self::CapacityTooLarge,
+            TessellationError::BudgetExceeded {
+                resource,
+                limit,
+                actual,
+            } => Self::BudgetExceeded {
+                resource,
+                limit,
+                actual,
+            },
         }
     }
 }
@@ -813,6 +1013,14 @@ pub struct PreparedScene {
     geometry_extents: GeometryExtents,
     draw_batches: Vec<PreparedDrawBatch>,
     tessellation: TessellationStats,
+}
+
+/// Immutable prepared geometry whose positions are logical screen pixels.
+///
+/// This distinct wrapper prevents a world camera from being supplied to fixed
+/// UI geometry. It is created by [`WgpuRenderer::prepare_screen_scene`].
+pub struct PreparedScreenScene {
+    scene: PreparedScene,
 }
 
 /// One world-space vertex in a dynamic triangle-list mesh.
@@ -868,6 +1076,22 @@ pub enum DynamicMeshError {
     RendererMismatch,
     /// The mesh capacity exceeds the current device's vertex-buffer limit.
     CapacityTooLarge,
+    /// At least one complete triangle must fit in every configured limit.
+    InvalidBudget,
+    /// A bounded mesh operation exceeded a host-selected limit.
+    BudgetExceeded {
+        /// Work category that exceeded its ceiling.
+        resource: DynamicMeshBudgetResource,
+        /// Configured upper bound.
+        limit: usize,
+        /// Required work for the requested mesh state.
+        actual: usize,
+    },
+    /// CPU recovery storage could not be reserved without changing the mesh.
+    AllocationFailed {
+        /// Bytes requested by the failed reservation.
+        requested_bytes: usize,
+    },
 }
 
 impl fmt::Display for DynamicMeshError {
@@ -894,11 +1118,90 @@ impl fmt::Display for DynamicMeshError {
                     "dynamic mesh exceeds the GPU vertex-buffer limit"
                 )
             }
+            Self::InvalidBudget => write!(formatter, "dynamic mesh budget must fit one triangle"),
+            Self::BudgetExceeded {
+                resource,
+                limit,
+                actual,
+            } => write!(
+                formatter,
+                "dynamic mesh {resource:?} work {actual} exceeds limit {limit}"
+            ),
+            Self::AllocationFailed { requested_bytes } => write!(
+                formatter,
+                "could not reserve {requested_bytes} bytes for dynamic mesh recovery data"
+            ),
         }
     }
 }
 
 impl Error for DynamicMeshError {}
+
+/// Host-selected work category constrained by [`DynamicMeshBudget`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DynamicMeshBudgetResource {
+    /// Triangle-list vertex count.
+    Vertices,
+    /// CPU bytes retained for exact recovery.
+    RetainedBytes,
+    /// GPU bytes uploaded by a full replacement.
+    UploadBytes,
+}
+
+/// Explicit retained and upload limits for caller-provided colored triangles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DynamicMeshBudget {
+    max_vertices: usize,
+    max_retained_bytes: usize,
+    max_upload_bytes: usize,
+}
+
+impl DynamicMeshBudget {
+    /// Creates limits large enough for at least one complete triangle.
+    pub fn new(
+        max_vertices: usize,
+        max_retained_bytes: usize,
+        max_upload_bytes: usize,
+    ) -> Result<Self, DynamicMeshError> {
+        let triangle_bytes = 3 * std::mem::size_of::<DynamicGpu>();
+        if max_vertices < 3
+            || max_retained_bytes < triangle_bytes
+            || max_upload_bytes < triangle_bytes
+        {
+            return Err(DynamicMeshError::InvalidBudget);
+        }
+        Ok(Self {
+            max_vertices,
+            max_retained_bytes,
+            max_upload_bytes,
+        })
+    }
+
+    /// Returns the maximum retained triangle-list vertex count.
+    pub const fn max_vertices(self) -> usize {
+        self.max_vertices
+    }
+
+    /// Returns the maximum exact CPU recovery bytes.
+    pub const fn max_retained_bytes(self) -> usize {
+        self.max_retained_bytes
+    }
+
+    /// Returns the maximum bytes uploaded by one complete replacement.
+    pub const fn max_upload_bytes(self) -> usize {
+        self.max_upload_bytes
+    }
+}
+
+impl Default for DynamicMeshBudget {
+    fn default() -> Self {
+        Self {
+            max_vertices: 1_000_000,
+            max_retained_bytes: 64 * 1024 * 1024,
+            max_upload_bytes: 64 * 1024 * 1024,
+        }
+    }
+}
 
 /// Mutable GPU triangle-list geometry for high-frequency simulation visuals.
 ///
@@ -911,6 +1214,7 @@ pub struct DynamicMesh2d {
     vertices: Vec<DynamicGpu>,
     vertex_capacity: usize,
     geometry_extents: GeometryExtents,
+    budget: Option<DynamicMeshBudget>,
 }
 
 impl DynamicMesh2d {
@@ -927,6 +1231,11 @@ impl DynamicMesh2d {
     /// Returns retained CPU memory used for validation and future updates.
     pub fn recovery_memory_bytes(&self) -> usize {
         self.vertices.len() * std::mem::size_of::<DynamicGpu>()
+    }
+
+    /// Returns explicit limits, or `None` for the compatibility constructor.
+    pub const fn budget(&self) -> Option<DynamicMeshBudget> {
+        self.budget
     }
 }
 
@@ -1578,6 +1887,33 @@ impl PreparedScene {
     }
 }
 
+impl PreparedScreenScene {
+    /// Returns the number of accepted source screen commands.
+    pub fn command_count(&self) -> usize {
+        self.scene.command_count()
+    }
+
+    /// Returns the retained triangle-list vertex count.
+    pub fn vertex_count(&self) -> usize {
+        self.scene.vertex_count()
+    }
+
+    /// Returns the number of clip-compatible draw batches.
+    pub fn draw_batch_count(&self) -> usize {
+        self.scene.draw_batch_count()
+    }
+
+    /// Returns retained CPU bytes available for device-loss recovery.
+    pub fn recovery_memory_bytes(&self) -> usize {
+        self.scene.recovery_memory_bytes()
+    }
+
+    /// Returns preparation-time tessellation statistics.
+    pub fn tessellation_stats(&self) -> TessellationStats {
+        self.scene.tessellation_stats()
+    }
+}
+
 /// `wgpu` backend that renders [`Scene`] commands into a presentation surface.
 ///
 /// The renderer owns the GPU device, queue, surface, pipeline, and transient
@@ -1595,6 +1931,7 @@ pub struct WgpuRenderer {
     surface_present_mode: RendererSurfacePresentMode,
     scale_factor: f64,
     pipeline: wgpu::RenderPipeline,
+    target_pipeline: wgpu::RenderPipeline,
     dynamic_pipeline: wgpu::RenderPipeline,
     particle_pipeline: wgpu::RenderPipeline,
     target_particle_pipeline: wgpu::RenderPipeline,
@@ -1602,9 +1939,11 @@ pub struct WgpuRenderer {
     target_heatmap_pipeline: wgpu::RenderPipeline,
     composition_pipelines: CompositionPipelines,
     target_composition_pipelines: CompositionPipelines,
+    image_renderer: ImageRenderer,
     mesh3d_renderer: Mesh3dRenderer,
     camera_uniform_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
+    camera_bind_group_layout: wgpu::BindGroupLayout,
     heatmap_uniform_buffer: wgpu::Buffer,
     heatmap_bind_group_layout: wgpu::BindGroupLayout,
     color_map_cache: Option<CachedColorMap>,
@@ -1696,8 +2035,9 @@ impl WgpuRenderer {
         surface.configure(&device, &config);
 
         let sample_count = preferred_sample_count(&adapter, config.format);
-        let (
+        let PipelineResources {
             pipeline,
+            target_pipeline,
             dynamic_pipeline,
             particle_pipeline,
             target_particle_pipeline,
@@ -1707,12 +2047,14 @@ impl WgpuRenderer {
             target_composition_pipelines,
             camera_uniform_buffer,
             camera_bind_group,
+            camera_bind_group_layout,
             heatmap_uniform_buffer,
             heatmap_bind_group_layout,
-        ) = create_pipeline(&device, config.format, sample_count);
+        } = create_pipeline(&device, config.format, sample_count);
         let vertex_buffer = Arc::new(create_vertex_buffer(&device, INITIAL_VERTEX_CAPACITY));
         let particle_unit_buffer = create_particle_unit_buffer(&device, &queue);
         let multisample_target = create_multisample_target(&device, &config, sample_count);
+        let image_renderer = ImageRenderer::new(&device, config.format, sample_count);
         let mesh3d_renderer = Mesh3dRenderer::new(&device, config.format);
 
         Ok(Self {
@@ -1727,6 +2069,7 @@ impl WgpuRenderer {
             surface_present_mode,
             scale_factor: options.scale_factor(),
             pipeline,
+            target_pipeline,
             dynamic_pipeline,
             particle_pipeline,
             target_particle_pipeline,
@@ -1734,9 +2077,11 @@ impl WgpuRenderer {
             target_heatmap_pipeline,
             composition_pipelines,
             target_composition_pipelines,
+            image_renderer,
             mesh3d_renderer,
             camera_uniform_buffer,
             camera_bind_group,
+            camera_bind_group_layout,
             heatmap_uniform_buffer,
             heatmap_bind_group_layout,
             color_map_cache: None,
@@ -1893,6 +2238,27 @@ impl WgpuRenderer {
             .map(RenderReport::status)
     }
 
+    /// Draws fixed logical-screen geometry independently of any world camera.
+    pub fn render_screen_scene(
+        &mut self,
+        scene: &ScreenScene,
+    ) -> Result<RenderStatus, RendererFrameError> {
+        self.render_screen_scene_with_metrics(scene)
+            .map(RenderReport::status)
+    }
+
+    /// Draws fixed logical-screen geometry and returns CPU-side stage timings.
+    pub fn render_screen_scene_with_metrics(
+        &mut self,
+        scene: &ScreenScene,
+    ) -> Result<RenderReport, RendererFrameError> {
+        let viewport = LogicalViewport::new(self.logical_size().0, self.logical_size().1)
+            .map_err(|_| RendererFrameError::InvalidGeometryTransform)?;
+        let camera =
+            screen_camera(viewport).map_err(|_| RendererFrameError::InvalidGeometryTransform)?;
+        self.render_with_metrics(scene.as_scene(), &camera)
+    }
+
     /// Draws a scene and returns a CPU-side timing breakdown.
     ///
     /// Metrics separate tessellation, buffer upload, surface acquisition, and
@@ -1904,12 +2270,205 @@ impl WgpuRenderer {
         scene: &Scene,
         camera: &Camera2d,
     ) -> Result<RenderReport, RendererFrameError> {
+        self.render_with_metrics_in_region(scene, camera, None)
+    }
+
+    /// Draws a world scene through a camera into one bounded logical viewport.
+    ///
+    /// Scene-local clips are interpreted relative to the viewport and are
+    /// intersected with its physical bounds. The surface outside the viewport
+    /// is cleared but receives no scene geometry.
+    pub fn render_scene_in_viewport(
+        &mut self,
+        scene: &Scene,
+        camera: &Camera2d,
+        viewport: LogicalViewportRegion,
+    ) -> Result<RenderStatus, RendererFrameError> {
+        self.render_scene_in_viewport_with_metrics(scene, camera, viewport)
+            .map(RenderReport::status)
+    }
+
+    /// Draws one bounded scene viewport and returns CPU-side stage timings.
+    pub fn render_scene_in_viewport_with_metrics(
+        &mut self,
+        scene: &Scene,
+        camera: &Camera2d,
+        viewport: LogicalViewportRegion,
+    ) -> Result<RenderReport, RendererFrameError> {
+        self.render_with_metrics_in_region(scene, camera, Some(viewport))
+    }
+
+    /// Renders an ordinary world scene into an offscreen target.
+    ///
+    /// Target dimensions are physical texels. `pixel_scale` defines their
+    /// logical viewport density independently of window DPI. Scene-local clips
+    /// are relative to `viewport`, or to the complete logical target when no
+    /// region is supplied. `load` explicitly controls preservation or clearing.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_scene_to_target(
+        &mut self,
+        target: &RenderTarget2d,
+        scene: &Scene,
+        camera: &Camera2d,
+        pixel_scale: PhysicalPerLogical,
+        viewport: Option<LogicalViewportRegion>,
+        load: RenderTargetLoad,
+    ) -> Result<RenderReport, RenderTargetError> {
+        self.validate_render_target(target)?;
+        if let RenderTargetLoad::Clear(color) = load
+            && !color.is_normalized()
+        {
+            return Err(RenderTargetError::InvalidBackground);
+        }
+
         let frame_started_at = Instant::now();
         let tessellation_started_at = Instant::now();
         self.vertices.clear();
         self.draw_batches.clear();
         let tessellation_stats =
-            tessellate_scene(scene, &mut self.vertices, &mut self.draw_batches);
+            tessellate_scene(scene, &mut self.vertices, &mut self.draw_batches)
+                .map_err(RendererFrameError::from)
+                .map_err(RenderTargetError::Frame)?;
+        self.ensure_vertex_capacity(self.vertices.len())
+            .map_err(RenderTargetError::Frame)?;
+        let tessellation = tessellation_started_at.elapsed();
+
+        let upload_started_at = Instant::now();
+        if !self.vertices.is_empty() {
+            self.queue
+                .write_buffer(&self.vertex_buffer, 0, bytemuck::cast_slice(&self.vertices));
+        }
+        let upload = upload_started_at.elapsed();
+
+        let scale = pixel_scale.get();
+        let target_viewport = LogicalViewport::new(
+            target.width() as f32 / scale,
+            target.height() as f32 / scale,
+        )
+        .map_err(|_| RenderTargetError::Frame(RendererFrameError::InvalidViewport))?;
+        let (local_viewport, origin) = match viewport {
+            Some(region) => (region.viewport(), region.origin().to_vec2()),
+            None => (target_viewport, Vec2::ZERO),
+        };
+        let max = origin + local_viewport.size();
+        if !max.is_finite()
+            || origin.x < 0.0
+            || origin.y < 0.0
+            || max.x > target_viewport.width()
+            || max.y > target_viewport.height()
+        {
+            return Err(RenderTargetError::Frame(
+                RendererFrameError::InvalidViewport,
+            ));
+        }
+        let target_scissor = logical_viewport_scissor(
+            origin,
+            local_viewport,
+            scale,
+            target.width(),
+            target.height(),
+        )
+        .ok_or(RenderTargetError::Frame(
+            RendererFrameError::InvalidViewport,
+        ))?;
+        let camera_uniform =
+            CameraUniform::new_in_region(*camera, local_viewport, origin, target_viewport).ok_or(
+                RenderTargetError::Frame(RendererFrameError::InvalidGeometryTransform),
+            )?;
+        let extents = GeometryExtents::from_vertices(&self.vertices);
+        if !extents.is_safe_for(camera_uniform) {
+            return Err(RenderTargetError::Frame(
+                RendererFrameError::InvalidGeometryTransform,
+            ));
+        }
+        let uniform_started_at = Instant::now();
+        self.queue.write_buffer(
+            &self.camera_uniform_buffer,
+            0,
+            bytemuck::bytes_of(&camera_uniform),
+        );
+        let camera_uniform_upload = uniform_started_at.elapsed();
+
+        let encode_started_at = Instant::now();
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("sim-engine scene target encoder"),
+            });
+        {
+            let load = match load {
+                RenderTargetLoad::Load => wgpu::LoadOp::Load,
+                RenderTargetLoad::Clear(color) => wgpu::LoadOp::Clear(color.to_wgpu()),
+            };
+            let color_attachment = wgpu::RenderPassColorAttachment {
+                view: &target.view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load,
+                    store: wgpu::StoreOp::Store,
+                },
+            };
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("sim-engine scene target pass"),
+                color_attachments: &[Some(color_attachment)],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            if !self.vertices.is_empty() {
+                pass.set_pipeline(&self.target_pipeline);
+                pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+                for batch in &self.draw_batches {
+                    let scissor = match batch.screen_clip {
+                        Some(clip) => {
+                            let Some(local) = screen_clip_to_scissor(clip, local_viewport, scale)
+                            else {
+                                continue;
+                            };
+                            let Some(scissor) = offset_scissor(local, target_scissor) else {
+                                continue;
+                            };
+                            scissor
+                        }
+                        None => target_scissor,
+                    };
+                    pass.set_scissor_rect(scissor.x, scissor.y, scissor.width, scissor.height);
+                    pass.draw(batch.vertex_range.clone(), 0..1);
+                }
+            }
+        }
+        self.queue.submit([encoder.finish()]);
+        let encode = encode_started_at.elapsed();
+
+        Ok(render_report(
+            RenderStatus::Drawn,
+            tessellation,
+            upload,
+            camera_uniform_upload,
+            Duration::ZERO,
+            encode,
+            frame_started_at.elapsed(),
+            false,
+            true,
+            tessellation_stats,
+        ))
+    }
+
+    fn render_with_metrics_in_region(
+        &mut self,
+        scene: &Scene,
+        camera: &Camera2d,
+        viewport: Option<LogicalViewportRegion>,
+    ) -> Result<RenderReport, RendererFrameError> {
+        let frame_started_at = Instant::now();
+        let tessellation_started_at = Instant::now();
+        self.vertices.clear();
+        self.draw_batches.clear();
+        let tessellation_stats =
+            tessellate_scene(scene, &mut self.vertices, &mut self.draw_batches)?;
         self.ensure_vertex_capacity(self.vertices.len())?;
         let tessellation = tessellation_started_at.elapsed();
 
@@ -1936,6 +2495,7 @@ impl WgpuRenderer {
             false,
             tessellation_stats,
             frame_started_at,
+            viewport,
         );
         self.draw_batches = draw_batches;
         result
@@ -1953,6 +2513,24 @@ impl WgpuRenderer {
             Arc::clone(&self.renderer_identity),
             scene,
         )
+    }
+
+    /// Tessellates fixed logical-screen geometry once for repeated composition.
+    pub fn prepare_screen_scene(
+        &self,
+        scene: &ScreenScene,
+    ) -> Result<PreparedScreenScene, PreparedSceneError> {
+        self.prepare_scene(scene.as_scene())
+            .map(|scene| PreparedScreenScene { scene })
+    }
+
+    /// Restores prepared logical-screen geometry on a recreated renderer.
+    pub fn restore_prepared_screen_scene(
+        &self,
+        source: &PreparedScreenScene,
+    ) -> Result<PreparedScreenScene, PreparedSceneError> {
+        self.restore_prepared_scene(&source.scene)
+            .map(|scene| PreparedScreenScene { scene })
     }
 
     /// Recreates prepared GPU resources on this renderer from a retained CPU snapshot.
@@ -1996,6 +2574,29 @@ impl WgpuRenderer {
         &self,
         vertices: &[DynamicVertex2d],
     ) -> Result<DynamicMesh2d, DynamicMeshError> {
+        self.create_dynamic_mesh_inner(vertices, None)
+    }
+
+    /// Creates bounded mutable colored triangles for composition in a frame.
+    ///
+    /// Validation and CPU reservation complete before any GPU allocation. The
+    /// retained budget is also enforced by every later full or partial update.
+    pub fn create_dynamic_mesh_with_budget(
+        &self,
+        vertices: &[DynamicVertex2d],
+        budget: DynamicMeshBudget,
+    ) -> Result<DynamicMesh2d, DynamicMeshError> {
+        self.create_dynamic_mesh_inner(vertices, Some(budget))
+    }
+
+    fn create_dynamic_mesh_inner(
+        &self,
+        vertices: &[DynamicVertex2d],
+        budget: Option<DynamicMeshBudget>,
+    ) -> Result<DynamicMesh2d, DynamicMeshError> {
+        if let Some(budget) = budget {
+            validate_dynamic_mesh_budget(budget, vertices.len())?;
+        }
         let vertices = dynamic_vertices_to_gpu(vertices)?;
         let vertex_capacity = dynamic_vertex_capacity(vertices.len())
             .filter(|capacity| buffer_capacity_fits::<DynamicGpu>(&self.device, *capacity))
@@ -2011,6 +2612,7 @@ impl WgpuRenderer {
             vertex_buffer,
             vertices,
             vertex_capacity,
+            budget,
         })
     }
 
@@ -2030,37 +2632,8 @@ impl WgpuRenderer {
         mesh: &mut DynamicMesh2d,
         vertices: &[DynamicVertex2d],
     ) -> Result<DynamicMeshUpdateReport, DynamicMeshError> {
-        let update_started_at = Instant::now();
         self.validate_dynamic_mesh(mesh)?;
-        validate_dynamic_vertices(vertices)?;
-        let reallocated = vertices.len() > mesh.vertex_capacity;
-        if reallocated {
-            mesh.vertex_capacity = dynamic_vertex_capacity(vertices.len())
-                .filter(|capacity| buffer_capacity_fits::<DynamicGpu>(&self.device, *capacity))
-                .ok_or(DynamicMeshError::CapacityTooLarge)?;
-            mesh.vertex_buffer = Arc::new(create_dynamic_vertex_buffer(
-                &self.device,
-                mesh.vertex_capacity,
-            ));
-        }
-        mesh.vertices.clear();
-        mesh.vertices.reserve(vertices.len());
-        let mut geometry_extents = GeometryExtents::empty(vertices.is_empty());
-        for vertex in vertices.iter().copied() {
-            let vertex = dynamic_vertex_to_gpu(vertex);
-            geometry_extents.include_dynamic(vertex);
-            mesh.vertices.push(vertex);
-        }
-        if !mesh.vertices.is_empty() {
-            self.queue
-                .write_buffer(&mesh.vertex_buffer, 0, bytemuck::cast_slice(&mesh.vertices));
-        }
-        mesh.geometry_extents = geometry_extents;
-        Ok(DynamicMeshUpdateReport {
-            vertex_count: mesh.vertices.len(),
-            upload: update_started_at.elapsed(),
-            reallocated,
-        })
+        replace_dynamic_mesh_resources(&self.device, &self.queue, mesh, vertices)
     }
 
     /// Replaces a contiguous vertex range without reallocating the mesh buffer.
@@ -2094,6 +2667,17 @@ impl WgpuRenderer {
             || end > mesh.vertices.len()
         {
             return Err(DynamicMeshError::UpdateRangeOutOfBounds);
+        }
+        if let Some(budget) = mesh.budget {
+            validate_dynamic_mesh_budget(budget, mesh.vertices.len())?;
+            let upload_bytes = dynamic_mesh_bytes(vertices.len())?;
+            if upload_bytes > budget.max_upload_bytes {
+                return Err(DynamicMeshError::BudgetExceeded {
+                    resource: DynamicMeshBudgetResource::UploadBytes,
+                    limit: budget.max_upload_bytes,
+                    actual: upload_bytes,
+                });
+            }
         }
         let vertices = dynamic_vertices_to_gpu(vertices)?;
         if !vertices.is_empty() {
@@ -2150,6 +2734,7 @@ impl WgpuRenderer {
             true,
             TessellationStats::default(),
             Instant::now(),
+            None,
         )
         .map_err(DynamicMeshRenderError::Frame)
     }
@@ -2735,6 +3320,25 @@ impl WgpuRenderer {
             .map(RenderReport::status)
     }
 
+    /// Draws prepared logical-screen geometry independently of a world camera.
+    ///
+    /// The prepared resource must have been built from a [`ScreenScene`]. The
+    /// renderer cannot infer the original coordinate space from raw prepared
+    /// vertices, so passing world-space geometry is a caller contract error.
+    pub fn render_prepared_screen_scene(
+        &mut self,
+        scene: &PreparedScreenScene,
+    ) -> Result<RenderStatus, PreparedSceneRenderError> {
+        let (width, height) = self.logical_size();
+        let viewport = LogicalViewport::new(width, height).map_err(|_| {
+            PreparedSceneRenderError::Frame(RendererFrameError::InvalidGeometryTransform)
+        })?;
+        let camera = screen_camera(viewport).map_err(|_| {
+            PreparedSceneRenderError::Frame(RendererFrameError::InvalidGeometryTransform)
+        })?;
+        self.render_prepared(&scene.scene, &camera)
+    }
+
     /// Draws prepared geometry and reports per-frame CPU timing.
     ///
     /// Tessellation and geometry upload durations are zero because both happened
@@ -2762,6 +3366,7 @@ impl WgpuRenderer {
             false,
             scene.tessellation,
             Instant::now(),
+            None,
         )
         .map_err(PreparedSceneRenderError::Frame)
     }
@@ -2781,12 +3386,37 @@ impl WgpuRenderer {
         geometry_streamed: bool,
         tessellation_stats: TessellationStats,
         frame_started_at: Instant,
+        viewport_region: Option<LogicalViewportRegion>,
     ) -> Result<RenderReport, RendererFrameError> {
         let (logical_width, logical_height) = self.logical_size();
-        let viewport = LogicalViewport::new(logical_width, logical_height)
+        let target_viewport = LogicalViewport::new(logical_width, logical_height)
             .map_err(|_| RendererFrameError::InvalidGeometryTransform)?;
+        let (viewport, viewport_origin) = match viewport_region {
+            Some(region) => (region.viewport(), region.origin().to_vec2()),
+            None => (target_viewport, Vec2::ZERO),
+        };
+        let viewport_max = viewport_origin + viewport.size();
+        if !viewport_origin.is_finite()
+            || !viewport_max.is_finite()
+            || viewport_origin.x < 0.0
+            || viewport_origin.y < 0.0
+            || viewport_max.x > target_viewport.width()
+            || viewport_max.y > target_viewport.height()
+        {
+            return Err(RendererFrameError::InvalidViewport);
+        }
+        let viewport_scissor = logical_viewport_scissor(
+            viewport_origin,
+            viewport,
+            self.scale_factor as f32,
+            self.config.width,
+            self.config.height,
+        )
+        .ok_or(RendererFrameError::InvalidViewport)?;
         let camera_uniform_upload_started_at = Instant::now();
-        let Some(camera_uniform) = CameraUniform::new(camera, viewport) else {
+        let Some(camera_uniform) =
+            CameraUniform::new_in_region(camera, viewport, viewport_origin, target_viewport)
+        else {
             return Err(RendererFrameError::InvalidGeometryTransform);
         };
         if !geometry_extents.is_safe_for(camera_uniform) {
@@ -2903,21 +3533,20 @@ impl WgpuRenderer {
                 for batch in draw_batches {
                     let scissor = match batch.screen_clip {
                         Some(screen_clip) => {
-                            let Some(scissor) = screen_clip_to_scissor(
+                            let Some(local_scissor) = screen_clip_to_scissor(
                                 screen_clip,
                                 viewport,
                                 self.scale_factor as f32,
                             ) else {
                                 continue;
                             };
+                            let Some(scissor) = offset_scissor(local_scissor, viewport_scissor)
+                            else {
+                                continue;
+                            };
                             scissor
                         }
-                        None => ScissorRect {
-                            x: 0,
-                            y: 0,
-                            width: self.config.width,
-                            height: self.config.height,
-                        },
+                        None => viewport_scissor,
                     };
                     pass.set_scissor_rect(scissor.x, scissor.y, scissor.width, scissor.height);
                     pass.draw(batch.vertex_range.clone(), 0..1);
@@ -2959,15 +3588,13 @@ impl WgpuRenderer {
         let scalar_view = texture
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
-        let uniform = HeatmapUniform {
-            value_range: [minimum, value_extent, 0.0, 0.0],
-            dimensions: [
-                texture.width() as u32,
-                texture.height() as u32,
-                sampling.shader_value(),
-                0,
-            ],
-        };
+        let uniform = HeatmapUniform::new(
+            minimum,
+            value_extent,
+            texture.width(),
+            texture.height(),
+            sampling,
+        );
         self.queue.write_buffer(
             &self.heatmap_uniform_buffer,
             0,
@@ -3119,15 +3746,13 @@ impl WgpuRenderer {
         self.queue.write_buffer(
             &self.heatmap_uniform_buffer,
             0,
-            bytemuck::bytes_of(&HeatmapUniform {
-                value_range: [minimum, value_extent, 0.0, 0.0],
-                dimensions: [
-                    texture.width() as u32,
-                    texture.height() as u32,
-                    sampling.shader_value(),
-                    0,
-                ],
-            }),
+            bytemuck::bytes_of(&HeatmapUniform::new(
+                minimum,
+                value_extent,
+                texture.width(),
+                texture.height(),
+                sampling,
+            )),
         );
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("sim-engine target heatmap bind group"),
@@ -3202,9 +3827,7 @@ impl WgpuRenderer {
         self.queue.write_buffer(
             &self.composition_pipelines.uniform_buffer,
             0,
-            bytemuck::bytes_of(&CompositeUniform {
-                opacity: [opacity, 0.0, 0.0, 0.0],
-            }),
+            bytemuck::bytes_of(&CompositeUniform::full_surface(opacity)),
         );
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("sim-engine composition bind group"),
@@ -3345,16 +3968,12 @@ impl WgpuRenderer {
         self.queue.write_buffer(
             &self.target_composition_pipelines.secondary_uniform_buffer,
             0,
-            bytemuck::bytes_of(&CompositeUniform {
-                opacity: [retention, 0.0, 0.0, 0.0],
-            }),
+            bytemuck::bytes_of(&CompositeUniform::full_surface(retention)),
         );
         self.queue.write_buffer(
             &self.target_composition_pipelines.uniform_buffer,
             0,
-            bytemuck::bytes_of(&CompositeUniform {
-                opacity: [source_opacity, 0.0, 0.0, 0.0],
-            }),
+            bytemuck::bytes_of(&CompositeUniform::full_surface(source_opacity)),
         );
         let history_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("sim-engine trail history bind group"),
@@ -3883,11 +4502,93 @@ fn dynamic_vertices_to_gpu(
     vertices: &[DynamicVertex2d],
 ) -> Result<Vec<DynamicGpu>, DynamicMeshError> {
     validate_dynamic_vertices(vertices)?;
-    Ok(vertices
-        .iter()
-        .copied()
-        .map(dynamic_vertex_to_gpu)
-        .collect())
+    let requested_bytes = dynamic_mesh_bytes(vertices.len())?;
+    let mut converted = Vec::new();
+    converted
+        .try_reserve_exact(vertices.len())
+        .map_err(|_| DynamicMeshError::AllocationFailed { requested_bytes })?;
+    converted.extend(vertices.iter().copied().map(dynamic_vertex_to_gpu));
+    Ok(converted)
+}
+
+fn replace_dynamic_mesh_resources(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    mesh: &mut DynamicMesh2d,
+    vertices: &[DynamicVertex2d],
+) -> Result<DynamicMeshUpdateReport, DynamicMeshError> {
+    let update_started_at = Instant::now();
+    validate_dynamic_vertices(vertices)?;
+    if let Some(budget) = mesh.budget {
+        validate_dynamic_mesh_budget(budget, vertices.len())?;
+    }
+    let replacement_vertices = dynamic_vertices_to_gpu(vertices)?;
+    let reallocated = vertices.len() > mesh.vertex_capacity;
+    let replacement = if reallocated {
+        let capacity = dynamic_vertex_capacity(vertices.len())
+            .filter(|capacity| buffer_capacity_fits::<DynamicGpu>(device, *capacity))
+            .ok_or(DynamicMeshError::CapacityTooLarge)?;
+        let buffer = Arc::new(create_dynamic_vertex_buffer(device, capacity));
+        Some((buffer, capacity))
+    } else {
+        None
+    };
+    let upload_buffer = replacement
+        .as_ref()
+        .map_or(mesh.vertex_buffer.as_ref(), |(buffer, _)| buffer.as_ref());
+    if !replacement_vertices.is_empty() {
+        queue.write_buffer(
+            upload_buffer,
+            0,
+            bytemuck::cast_slice(&replacement_vertices),
+        );
+    }
+    if let Some((buffer, capacity)) = replacement {
+        mesh.vertex_buffer = buffer;
+        mesh.vertex_capacity = capacity;
+    }
+    mesh.geometry_extents = GeometryExtents::from_dynamic_vertices(&replacement_vertices);
+    mesh.vertices = replacement_vertices;
+    Ok(DynamicMeshUpdateReport {
+        vertex_count: mesh.vertices.len(),
+        upload: update_started_at.elapsed(),
+        reallocated,
+    })
+}
+
+fn dynamic_mesh_bytes(vertex_count: usize) -> Result<usize, DynamicMeshError> {
+    vertex_count
+        .checked_mul(std::mem::size_of::<DynamicGpu>())
+        .ok_or(DynamicMeshError::CapacityTooLarge)
+}
+
+fn validate_dynamic_mesh_budget(
+    budget: DynamicMeshBudget,
+    vertex_count: usize,
+) -> Result<(), DynamicMeshError> {
+    if vertex_count > budget.max_vertices {
+        return Err(DynamicMeshError::BudgetExceeded {
+            resource: DynamicMeshBudgetResource::Vertices,
+            limit: budget.max_vertices,
+            actual: vertex_count,
+        });
+    }
+    let bytes = dynamic_mesh_bytes(vertex_count)?;
+    if bytes > budget.max_retained_bytes {
+        return Err(DynamicMeshError::BudgetExceeded {
+            resource: DynamicMeshBudgetResource::RetainedBytes,
+            limit: budget.max_retained_bytes,
+            actual: bytes,
+        });
+    }
+    if bytes > budget.max_upload_bytes {
+        return Err(DynamicMeshError::BudgetExceeded {
+            resource: DynamicMeshBudgetResource::UploadBytes,
+            limit: budget.max_upload_bytes,
+            actual: bytes,
+        });
+    }
+    Ok(())
 }
 
 fn validate_dynamic_vertices(vertices: &[DynamicVertex2d]) -> Result<(), DynamicMeshError> {
@@ -4067,7 +4768,7 @@ fn prepare_scene_resources(
 ) -> Result<PreparedScene, PreparedSceneError> {
     let mut vertices = Vec::new();
     let mut draw_batches = Vec::new();
-    let tessellation = tessellate_scene(scene, &mut vertices, &mut draw_batches);
+    let tessellation = tessellate_scene(scene, &mut vertices, &mut draw_batches)?;
     let geometry_extents = GeometryExtents::from_vertices(&vertices);
     if !buffer_capacity_fits::<Vertex>(device, vertices.len().max(1)) {
         return Err(PreparedSceneError::CapacityTooLarge);
@@ -4132,20 +4833,26 @@ fn restore_dynamic_mesh_resources(
     if !buffer_capacity_fits::<DynamicGpu>(device, source.vertex_capacity) {
         return Err(DynamicMeshError::CapacityTooLarge);
     }
+    if let Some(budget) = source.budget {
+        validate_dynamic_mesh_budget(budget, source.vertices.len())?;
+    }
+    let requested_bytes = dynamic_mesh_bytes(source.vertices.len())?;
+    let mut vertices = Vec::new();
+    vertices
+        .try_reserve_exact(source.vertices.len())
+        .map_err(|_| DynamicMeshError::AllocationFailed { requested_bytes })?;
+    vertices.extend_from_slice(&source.vertices);
     let vertex_buffer = Arc::new(create_dynamic_vertex_buffer(device, source.vertex_capacity));
-    if !source.vertices.is_empty() {
-        queue.write_buffer(
-            &vertex_buffer,
-            0,
-            bytemuck::cast_slice(source.vertices.as_slice()),
-        );
+    if !vertices.is_empty() {
+        queue.write_buffer(&vertex_buffer, 0, bytemuck::cast_slice(vertices.as_slice()));
     }
     Ok(DynamicMesh2d {
         renderer_identity,
         vertex_buffer,
-        vertices: source.vertices.clone(),
+        vertices,
         vertex_capacity: source.vertex_capacity,
         geometry_extents: source.geometry_extents,
+        budget: source.budget,
     })
 }
 
@@ -4202,24 +4909,28 @@ fn render_report(
     }
 }
 
+struct PipelineResources {
+    pipeline: wgpu::RenderPipeline,
+    target_pipeline: wgpu::RenderPipeline,
+    dynamic_pipeline: wgpu::RenderPipeline,
+    particle_pipeline: wgpu::RenderPipeline,
+    target_particle_pipeline: wgpu::RenderPipeline,
+    heatmap_pipeline: wgpu::RenderPipeline,
+    target_heatmap_pipeline: wgpu::RenderPipeline,
+    composition_pipelines: CompositionPipelines,
+    target_composition_pipelines: CompositionPipelines,
+    camera_uniform_buffer: wgpu::Buffer,
+    camera_bind_group: wgpu::BindGroup,
+    camera_bind_group_layout: wgpu::BindGroupLayout,
+    heatmap_uniform_buffer: wgpu::Buffer,
+    heatmap_bind_group_layout: wgpu::BindGroupLayout,
+}
+
 fn create_pipeline(
     device: &wgpu::Device,
     format: wgpu::TextureFormat,
     sample_count: u32,
-) -> (
-    wgpu::RenderPipeline,
-    wgpu::RenderPipeline,
-    wgpu::RenderPipeline,
-    wgpu::RenderPipeline,
-    wgpu::RenderPipeline,
-    wgpu::RenderPipeline,
-    CompositionPipelines,
-    CompositionPipelines,
-    wgpu::Buffer,
-    wgpu::BindGroup,
-    wgpu::Buffer,
-    wgpu::BindGroupLayout,
-) {
+) -> PipelineResources {
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("sim-engine flat color shader"),
         source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("primitive.wgsl"))),
@@ -4275,6 +4986,35 @@ fn create_pipeline(
             count: sample_count,
             ..Default::default()
         },
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format,
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        multiview_mask: None,
+        cache: None,
+    });
+
+    let target_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("sim-engine target shape pipeline"),
+        layout: Some(&pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            buffers: &[Some(Vertex::LAYOUT)],
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            ..Default::default()
+        },
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
         fragment: Some(wgpu::FragmentState {
             module: &shader,
             entry_point: Some("fs_main"),
@@ -4417,7 +5157,7 @@ fn create_pipeline(
                 },
                 wgpu::BindGroupLayoutEntry {
                     binding: 2,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
@@ -4521,7 +5261,7 @@ fn create_pipeline(
                 },
                 wgpu::BindGroupLayoutEntry {
                     binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
@@ -4595,7 +5335,7 @@ fn create_pipeline(
                 },
                 wgpu::BindGroupLayoutEntry {
                     binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
@@ -4641,8 +5381,9 @@ fn create_pipeline(
         bind_group_layout: target_composition_bind_group_layout,
     };
 
-    (
+    PipelineResources {
         pipeline,
+        target_pipeline,
         dynamic_pipeline,
         particle_pipeline,
         target_particle_pipeline,
@@ -4652,9 +5393,10 @@ fn create_pipeline(
         target_composition_pipelines,
         camera_uniform_buffer,
         camera_bind_group,
+        camera_bind_group_layout,
         heatmap_uniform_buffer,
         heatmap_bind_group_layout,
-    )
+    }
 }
 
 fn preferred_sample_count(adapter: &wgpu::Adapter, format: wgpu::TextureFormat) -> u32 {
@@ -4831,7 +5573,6 @@ fn create_cached_color_map(
     queue: &wgpu::Queue,
     color_map: &ColorMap,
 ) -> CachedColorMap {
-    const COLOR_MAP_LUT_SIZE: u32 = 256;
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("sim-engine color map texture"),
         size: wgpu::Extent3d {
@@ -4923,6 +5664,9 @@ fn create_particle_instance_buffer(device: &wgpu::Device, capacity: usize) -> wg
 }
 
 mod config;
+mod frame;
+mod glyph;
+mod image;
 mod mesh3d;
 mod tessellation;
 mod visualization;
@@ -4931,12 +5675,27 @@ use config::{
     physical_to_logical_screen, validate_scale_factor,
 };
 pub use config::{RendererPresentMode, RendererSurfacePresentMode, WgpuRendererOptions};
+pub use frame::{
+    FrameBudget, FrameBudgetResource, FrameComposer, FrameComposerError, FramePassOptions,
+    FrameReport, FrameSourceKind, FrameStatistics,
+};
+pub use glyph::{
+    GlyphAtlas2d, GlyphAtlasBudget, GlyphAtlasEntry, GlyphError, GlyphId, GlyphRun2d,
+    GlyphRunBounds, GlyphRunBudget, GlyphRunStatistics, GlyphUploadReport, PositionedGlyph2d,
+};
+pub use image::{
+    Image2d, ImageBatch2d, ImageBatchBudget, ImageBudget, ImageError, ImageSampling, ImageSprite2d,
+    ImageTexelRect, ImageUploadReport,
+};
+use image::{ImageRenderer, ImageUniform};
 use mesh3d::Mesh3dRenderer;
 pub use mesh3d::{
     Mesh3dInstance, Mesh3dRenderError, Mesh3dRenderReport, Mesh3dResourceError, Object3dId,
     RenderTarget3d, RetainedMesh3d, Scene3d, Scene3dError, Scene3dRestoreReport,
 };
-use tessellation::{screen_clip_to_scissor, tessellate_scene};
+use tessellation::{
+    logical_viewport_scissor, offset_scissor, screen_clip_to_scissor, tessellate_scene,
+};
 use visualization::{CachedColorMap, CompositionPipelines, create_composition_pipeline};
 pub use visualization::{LayeredVisualizationError, LayeredVisualizationOptions};
 

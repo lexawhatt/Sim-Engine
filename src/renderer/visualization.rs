@@ -68,7 +68,7 @@ pub(super) fn create_composition_pipeline(
         layout: Some(layout),
         vertex: wgpu::VertexState {
             module: shader,
-            entry_point: Some("heatmap_vs_main"),
+            entry_point: Some("composite_vs_main"),
             compilation_options: wgpu::PipelineCompilationOptions::default(),
             buffers: &[],
         },
@@ -257,15 +257,13 @@ impl WgpuRenderer {
         self.queue.write_buffer(
             &self.heatmap_uniform_buffer,
             0,
-            bytemuck::bytes_of(&HeatmapUniform {
-                value_range: [options.minimum, options.value_extent, 0.0, 0.0],
-                dimensions: [
-                    scalar.width() as u32,
-                    scalar.height() as u32,
-                    options.sampling.shader_value(),
-                    0,
-                ],
-            }),
+            bytemuck::bytes_of(&HeatmapUniform::new(
+                options.minimum,
+                options.value_extent,
+                scalar.width(),
+                scalar.height(),
+                options.sampling,
+            )),
         );
         let heatmap_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("sim-engine layered heatmap bind group"),
@@ -288,9 +286,7 @@ impl WgpuRenderer {
         self.queue.write_buffer(
             &self.composition_pipelines.uniform_buffer,
             0,
-            bytemuck::bytes_of(&CompositeUniform {
-                opacity: [options.opacity, 0.0, 0.0, 0.0],
-            }),
+            bytemuck::bytes_of(&CompositeUniform::full_surface(options.opacity)),
         );
         let composition_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("sim-engine layered composition bind group"),

@@ -5,9 +5,12 @@ use std::{
 };
 
 use sim_engine::{
-    Camera2d, Color, Fill, LinearGradient, LogicalScreenPosition, LogicalScreenVector,
-    PhysicalScreenPosition, Projection2d, Rect, RendererFrameMetrics, Scene, ScreenClipRect,
-    ShapeStyle, Vec2, WgpuRenderer, WgpuRendererOptions,
+    Camera2d, Color, Fill, FrameBudget, FramePassOptions, GlyphAtlas2d, GlyphAtlasBudget,
+    GlyphAtlasEntry, GlyphId, GlyphRun2d, GlyphRunBudget, ImageBudget, ImageSampling,
+    ImageTexelRect, LinearGradient, LogicalScreenPosition, LogicalScreenVector, LogicalViewport,
+    LogicalViewportRegion, PhysicalScreenPosition, PositionedGlyph2d, Projection2d, Rect,
+    RendererFrameMetrics, Scene, ScreenClipRect, ShapeStyle, Vec2, WgpuRenderer,
+    WgpuRendererOptions,
 };
 use winit::{
     application::ApplicationHandler,
@@ -174,6 +177,8 @@ impl ShowcaseFrameMetrics {
 struct UiDemoApplication {
     window: Option<Arc<Window>>,
     renderer: Option<WgpuRenderer>,
+    glyph_probe_atlas: Option<GlyphAtlas2d>,
+    glyph_probe_run: Option<GlyphRun2d>,
     camera: Camera2d,
     screen: DemoScreen,
     uncapped: bool,
@@ -204,6 +209,8 @@ impl UiDemoApplication {
         Self {
             window: None,
             renderer: None,
+            glyph_probe_atlas: None,
+            glyph_probe_run: None,
             camera: Camera2d::new(Vec2::ZERO, 1.0).expect("UI demo camera is valid"),
             screen,
             uncapped,
@@ -400,10 +407,14 @@ impl ApplicationHandler for UiDemoApplication {
             renderer_options,
         ))
         .expect("create UI renderer");
+        let (glyph_probe_atlas, glyph_probe_run) =
+            create_scientific_glyph_probe(&renderer).expect("create retained glyph probe");
 
         window.request_redraw();
         self.window = Some(window);
         self.renderer = Some(renderer);
+        self.glyph_probe_atlas = Some(glyph_probe_atlas);
+        self.glyph_probe_run = Some(glyph_probe_run);
         let now = Instant::now();
         self.previous_frame = now;
         self.next_frame_at = now;
@@ -545,8 +556,24 @@ impl ApplicationHandler for UiDemoApplication {
                 if !self.uncapped {
                     window.pre_present_notify();
                 }
-                if let Some(renderer) = self.renderer.as_mut() {
-                    match renderer.render_with_metrics(&scene, &camera) {
+                if let (Some(renderer), Some(glyph_atlas), Some(glyph_run)) = (
+                    self.renderer.as_mut(),
+                    self.glyph_probe_atlas.as_ref(),
+                    self.glyph_probe_run.as_ref(),
+                ) {
+                    let report = renderer
+                        .begin_frame(scene.background(), FrameBudget::default())
+                        .and_then(|mut frame| {
+                            frame.draw_scene(&scene, camera, FramePassOptions::default())?;
+                            frame.draw_glyph_run(
+                                glyph_atlas,
+                                glyph_run,
+                                ImageSampling::Nearest,
+                                FramePassOptions::new(10_000),
+                            )?;
+                            frame.present()
+                        });
+                    match report {
                         Ok(report) => {
                             if let Some(title) = self.frame_metrics.record(
                                 frame_started_at,
@@ -1921,6 +1948,69 @@ fn draw_edge_centered_text(
         pixel_size,
         color,
     );
+}
+
+fn create_scientific_glyph_probe(
+    renderer: &WgpuRenderer,
+) -> Result<(GlyphAtlas2d, GlyphRun2d), Box<dyn Error>> {
+    let glyphs = [
+        ('μ', [0b000, 0b000, 0b101, 0b101, 0b111]),
+        ('Δ', [0b010, 0b101, 0b101, 0b111, 0b000]),
+        ('∫', [0b011, 0b010, 0b010, 0b010, 0b110]),
+        ('Σ', [0b111, 0b100, 0b010, 0b100, 0b111]),
+        ('Ж', [0b101, 0b111, 0b010, 0b111, 0b101]),
+    ];
+    let width = glyphs.len() as u32 * 3;
+    let height = 5;
+    let mut pixels = vec![0_u8; width as usize * height as usize * 4];
+    let mut entries = Vec::with_capacity(glyphs.len());
+    for (glyph_index, (character, pattern)) in glyphs.into_iter().enumerate() {
+        let source_x = glyph_index as u32 * 3;
+        entries.push(GlyphAtlasEntry::new(
+            GlyphId::new(character as u32),
+            ImageTexelRect::new(source_x, 0, 3, height)?,
+        ));
+        for (row, bits) in pattern.into_iter().enumerate() {
+            for column in 0..3 {
+                if bits & (1 << (2 - column)) == 0 {
+                    continue;
+                }
+                let x = source_x as usize + column;
+                let offset = (row * width as usize + x) * 4;
+                pixels[offset..offset + 4].copy_from_slice(&[255, 255, 255, 255]);
+            }
+        }
+    }
+    let pixel_bytes = pixels.len();
+    let image_budget = ImageBudget::new(width, height, pixel_bytes)?;
+    let atlas_budget = GlyphAtlasBudget::new(
+        image_budget,
+        glyphs.len(),
+        glyphs.len() * std::mem::size_of::<GlyphAtlasEntry>(),
+    )?;
+    let atlas = renderer.create_glyph_atlas(width, height, pixels, entries, atlas_budget)?;
+    let colors = [
+        WAVE_COLORS[0],
+        WAVE_COLORS[1],
+        WAVE_COLORS[2],
+        WAVE_COLORS[3],
+        Color::WHITE,
+    ];
+    let mut positioned = Vec::with_capacity(glyphs.len());
+    for (index, ((character, _), color)) in glyphs.into_iter().zip(colors).enumerate() {
+        let destination = LogicalViewportRegion::new(
+            LogicalScreenPosition::new(18.0 + index as f32 * 16.0, 18.0),
+            LogicalViewport::new(12.0, 20.0)?,
+        )?;
+        positioned.push(PositionedGlyph2d::new(
+            GlyphId::new(character as u32),
+            destination,
+            color,
+        )?);
+    }
+    let run =
+        renderer.create_glyph_run(&atlas, positioned, GlyphRunBudget::new(glyphs.len(), 4096)?)?;
+    Ok((atlas, run))
 }
 
 fn glyph_pattern(character: char) -> [u8; 5] {

@@ -143,6 +143,7 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
 struct HeatmapUniform {
     value_range: vec4<f32>,
     dimensions: vec4<u32>,
+    destination: vec4<f32>,
 };
 
 @group(0) @binding(0) var scalar_field: texture_2d<f32>;
@@ -162,7 +163,11 @@ fn heatmap_vs_main(@builtin(vertex_index) index: u32) -> HeatmapOut {
     );
     let position = positions[index];
     var output: HeatmapOut;
-    output.position = vec4<f32>(position, 0.0, 1.0);
+    output.position = vec4<f32>(
+        position * heatmap.destination.xy + heatmap.destination.zw,
+        0.0,
+        1.0,
+    );
     output.uv = vec2<f32>((position.x + 1.0) * 0.5, (1.0 - position.y) * 0.5);
     return output;
 }
@@ -189,10 +194,28 @@ fn heatmap_fs_main(input: HeatmapOut) -> @location(0) vec4<f32> {
 
 struct CompositeUniform {
     opacity: vec4<f32>,
+    destination: vec4<f32>,
 };
 
 @group(0) @binding(0) var composition_source: texture_2d<f32>;
 @group(0) @binding(1) var<uniform> composition: CompositeUniform;
+
+@vertex
+fn composite_vs_main(@builtin(vertex_index) index: u32) -> HeatmapOut {
+    var positions = array<vec2<f32>, 6>(
+        vec2<f32>(-1.0, -1.0), vec2<f32>(1.0, -1.0), vec2<f32>(1.0, 1.0),
+        vec2<f32>(-1.0, -1.0), vec2<f32>(1.0, 1.0), vec2<f32>(-1.0, 1.0),
+    );
+    let position = positions[index];
+    var output: HeatmapOut;
+    output.position = vec4<f32>(
+        position * composition.destination.xy + composition.destination.zw,
+        0.0,
+        1.0,
+    );
+    output.uv = vec2<f32>((position.x + 1.0) * 0.5, (1.0 - position.y) * 0.5);
+    return output;
+}
 
 @fragment
 fn composite_fs_main(input: HeatmapOut) -> @location(0) vec4<f32> {

@@ -1,6 +1,6 @@
 [package]
 name = "sim-engine"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.90"
 license = "MIT OR Apache-2.0"
@@ -55,6 +55,9 @@ required-features = ["wgpu"]
 
 [[example]]
 name = "particle_cpu_benchmark"
+
+[[example]]
+name = "scene_construction_benchmark"
 
 [[example]]
 name = "star_remnant_stress"

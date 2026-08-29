@@ -4,7 +4,20 @@ pub(super) fn tessellate_scene(
     scene: &Scene,
     vertices: &mut Vec<Vertex>,
     draw_batches: &mut Vec<PreparedDrawBatch>,
-) -> TessellationStats {
+) -> Result<TessellationStats, TessellationError> {
+    let estimate = scene.statistics();
+    reserve_items(
+        vertices,
+        estimate
+            .estimated_tessellated_vertices()
+            .saturating_sub(vertices.len()),
+    )?;
+    reserve_items(
+        draw_batches,
+        estimate
+            .estimated_draw_batches()
+            .saturating_sub(draw_batches.len()),
+    )?;
     let mut stats = TessellationStats {
         command_count: scene.command_count(),
         ..TessellationStats::default()
@@ -14,16 +27,16 @@ pub(super) fn tessellate_scene(
         let vertex_start = vertices.len();
 
         match scene_command.command() {
-            DrawCommand::Circle(circle) => tessellate_circle(circle, vertices),
+            DrawCommand::Circle(circle) => tessellate_circle(circle, vertices)?,
             DrawCommand::Rect(rectangle) => tessellate_rect(
                 rectangle.rect(),
                 rectangle.corner_radius(),
                 rectangle.style(),
                 vertices,
-            ),
+            )?,
             DrawCommand::Line(line) => tessellate_line(line, vertices),
             DrawCommand::Polyline(polyline) => {
-                tessellate_polyline(polyline, vertices);
+                tessellate_polyline(polyline, vertices)?;
             }
         }
 
@@ -47,8 +60,10 @@ pub(super) fn tessellate_scene(
 
         stats.rendered_command_count += 1;
 
-        let vertex_start = vertex_start as u32;
-        let vertex_end = vertex_end as u32;
+        let vertex_start =
+            u32::try_from(vertex_start).map_err(|_| TessellationError::CapacityTooLarge)?;
+        let vertex_end =
+            u32::try_from(vertex_end).map_err(|_| TessellationError::CapacityTooLarge)?;
         match draw_batches.last_mut() {
             Some(batch)
                 if batch.screen_clip == screen_clip && batch.vertex_range.end == vertex_start =>
@@ -61,7 +76,55 @@ pub(super) fn tessellate_scene(
             }),
         }
     }
-    stats
+    stats.vertex_count = vertices.len();
+    stats.draw_batch_count = draw_batches.len();
+    stats.upload_bytes = vertices.len().saturating_mul(std::mem::size_of::<Vertex>());
+    validate_tessellated_budget(scene, stats)?;
+    Ok(stats)
+}
+
+fn reserve_items<T>(items: &mut Vec<T>, additional: usize) -> Result<(), TessellationError> {
+    items
+        .try_reserve(additional)
+        .map_err(|_| TessellationError::AllocationFailed {
+            requested_bytes: additional.saturating_mul(std::mem::size_of::<T>()),
+        })
+}
+
+fn validate_tessellated_budget(
+    scene: &Scene,
+    stats: TessellationStats,
+) -> Result<(), TessellationError> {
+    let Some(budget) = scene.budget() else {
+        return Ok(());
+    };
+    let actual = [
+        (
+            SceneBudgetResource::TessellatedVertices,
+            budget.max_tessellated_vertices(),
+            stats.vertex_count,
+        ),
+        (
+            SceneBudgetResource::UploadBytes,
+            budget.max_upload_bytes(),
+            stats.upload_bytes,
+        ),
+        (
+            SceneBudgetResource::DrawBatches,
+            budget.max_draw_batches(),
+            stats.draw_batch_count,
+        ),
+    ];
+    for (resource, limit, actual) in actual {
+        if actual > limit {
+            return Err(TessellationError::BudgetExceeded {
+                resource,
+                limit,
+                actual,
+            });
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn screen_clip_to_scissor(
@@ -105,13 +168,65 @@ pub(super) fn screen_clip_to_scissor(
     })
 }
 
-fn tessellate_circle(circle: &Circle, vertices: &mut Vec<Vertex>) {
+pub(super) fn logical_viewport_scissor(
+    origin: Vec2,
+    viewport: LogicalViewport,
+    scale_factor: f32,
+    target_width: u32,
+    target_height: u32,
+) -> Option<ScissorRect> {
+    if !origin.is_finite() || !scale_factor.is_finite() || scale_factor <= 0.0 {
+        return None;
+    }
+    let max = origin + viewport.size();
+    if !max.is_finite() {
+        return None;
+    }
+    let min_x = (origin.x * scale_factor)
+        .floor()
+        .clamp(0.0, target_width as f32);
+    let min_y = (origin.y * scale_factor)
+        .floor()
+        .clamp(0.0, target_height as f32);
+    let max_x = (max.x * scale_factor)
+        .ceil()
+        .clamp(0.0, target_width as f32);
+    let max_y = (max.y * scale_factor)
+        .ceil()
+        .clamp(0.0, target_height as f32);
+    if max_x <= min_x || max_y <= min_y {
+        return None;
+    }
+    Some(ScissorRect {
+        x: min_x as u32,
+        y: min_y as u32,
+        width: (max_x - min_x) as u32,
+        height: (max_y - min_y) as u32,
+    })
+}
+
+pub(super) fn offset_scissor(local: ScissorRect, viewport: ScissorRect) -> Option<ScissorRect> {
+    let x = viewport.x.saturating_add(local.x);
+    let y = viewport.y.saturating_add(local.y);
+    let viewport_max_x = viewport.x.saturating_add(viewport.width);
+    let viewport_max_y = viewport.y.saturating_add(viewport.height);
+    let max_x = x.saturating_add(local.width).min(viewport_max_x);
+    let max_y = y.saturating_add(local.height).min(viewport_max_y);
+    (max_x > x && max_y > y).then_some(ScissorRect {
+        x,
+        y,
+        width: max_x - x,
+        height: max_y - y,
+    })
+}
+
+fn tessellate_circle(circle: &Circle, vertices: &mut Vec<Vertex>) -> Result<(), TessellationError> {
     if circle.radius() <= 0.0 {
-        return;
+        return Ok(());
     }
 
     if let Some(shadow) = circle.style().shadow() {
-        push_circle_shadow_world(circle.center(), circle.radius(), shadow, vertices);
+        push_circle_shadow_world(circle.center(), circle.radius(), shadow, vertices)?;
     }
 
     if let Some(fill) = circle.style().fill() {
@@ -119,8 +234,9 @@ fn tessellate_circle(circle: &Circle, vertices: &mut Vec<Vertex>) {
     }
 
     if let Some(stroke) = circle.style().stroke() {
-        push_circle_stroke_world(circle.center(), circle.radius(), stroke, vertices);
+        push_circle_stroke_world(circle.center(), circle.radius(), stroke, vertices)?;
     }
+    Ok(())
 }
 
 fn push_circle_shadow_world(
@@ -128,7 +244,7 @@ fn push_circle_shadow_world(
     radius_world: f32,
     shadow: Shadow,
     vertices: &mut Vec<Vertex>,
-) {
+) -> Result<(), TessellationError> {
     push_circle_fill_world(
         center_world,
         radius_world,
@@ -138,15 +254,16 @@ fn push_circle_shadow_world(
     );
 
     if shadow.spread() > 0.0 {
-        let points = circle_world_points(center_world, radius_world);
+        let points = circle_world_points(center_world, radius_world)?;
         push_closed_polyline_world(
             &points,
             shadow.spread() * 2.0,
             shadow.color(),
             shadow.offset().to_vec2(),
             vertices,
-        );
+        )?;
     }
+    Ok(())
 }
 
 fn push_circle_stroke_world(
@@ -154,21 +271,26 @@ fn push_circle_stroke_world(
     radius_world: f32,
     stroke: Stroke,
     vertices: &mut Vec<Vertex>,
-) {
-    let points = circle_world_points(center_world, radius_world);
+) -> Result<(), TessellationError> {
+    let points = circle_world_points(center_world, radius_world)?;
     push_closed_polyline_world(
         &points,
         stroke.width(),
         stroke.color(),
         Vec2::ZERO,
         vertices,
-    );
+    )
 }
 
-fn tessellate_rect(rect: Rect, corner_radius: f32, style: ShapeStyle, vertices: &mut Vec<Vertex>) {
+fn tessellate_rect(
+    rect: Rect,
+    corner_radius: f32,
+    style: ShapeStyle,
+    vertices: &mut Vec<Vertex>,
+) -> Result<(), TessellationError> {
     let rect = rect.normalized();
     if rect.width() <= 0.0 || rect.height() <= 0.0 {
-        return;
+        return Ok(());
     }
 
     if let Some(shadow) = style.shadow() {
@@ -178,33 +300,34 @@ fn tessellate_rect(rect: Rect, corner_radius: f32, style: ShapeStyle, vertices: 
             Fill::Solid(shadow.color()),
             shadow.offset().to_vec2(),
             vertices,
-        );
+        )?;
         if shadow.spread() > 0.0 {
-            let points = rounded_rect_points(rect, corner_radius);
+            let points = rounded_rect_points(rect, corner_radius)?;
             push_closed_polyline_world(
                 &points,
                 shadow.spread() * 2.0,
                 shadow.color(),
                 shadow.offset().to_vec2(),
                 vertices,
-            );
+            )?;
         }
     }
 
     if let Some(fill) = style.fill() {
-        push_rect_world(rect, corner_radius, fill, Vec2::ZERO, vertices);
+        push_rect_world(rect, corner_radius, fill, Vec2::ZERO, vertices)?;
     }
 
     if let Some(stroke) = style.stroke() {
-        let points = rounded_rect_points(rect, corner_radius);
+        let points = rounded_rect_points(rect, corner_radius)?;
         push_closed_polyline_world(
             &points,
             stroke.width(),
             stroke.color(),
             Vec2::ZERO,
             vertices,
-        );
+        )?;
     }
+    Ok(())
 }
 
 fn tessellate_line(line: &Line, vertices: &mut Vec<Vertex>) {
@@ -218,15 +341,19 @@ fn tessellate_line(line: &Line, vertices: &mut Vec<Vertex>) {
     );
 }
 
-fn tessellate_polyline(polyline: &Polyline, vertices: &mut Vec<Vertex>) {
-    let mut points = Vec::with_capacity(polyline.points().len());
+fn tessellate_polyline(
+    polyline: &Polyline,
+    vertices: &mut Vec<Vertex>,
+) -> Result<(), TessellationError> {
+    let mut points = Vec::new();
+    reserve_items(&mut points, polyline.points().len())?;
     for point in polyline.points() {
         if points.last().is_none_or(|previous| *previous != *point) {
             points.push(*point);
         }
     }
     if points.len() < 2 {
-        return;
+        return Ok(());
     }
 
     let width = polyline.stroke().width();
@@ -302,6 +429,7 @@ fn tessellate_polyline(polyline: &Polyline, vertices: &mut Vec<Vertex>) {
         Vec2::ZERO,
         vertices,
     );
+    Ok(())
 }
 
 fn push_circle_screen_at_world(
@@ -367,13 +495,17 @@ fn push_circle_fill_world(
     }
 }
 
-fn circle_world_points(center_world: Vec2, radius_world: f32) -> Vec<Vec2> {
-    let mut points = Vec::with_capacity(CIRCLE_SEGMENTS + 1);
+fn circle_world_points(
+    center_world: Vec2,
+    radius_world: f32,
+) -> Result<Vec<Vec2>, TessellationError> {
+    let mut points = Vec::new();
+    reserve_items(&mut points, CIRCLE_SEGMENTS + 1)?;
     for index in 0..=CIRCLE_SEGMENTS {
         let angle = index as f32 / CIRCLE_SEGMENTS as f32 * std::f32::consts::TAU;
         points.push(center_world + Vec2::new(angle.cos(), angle.sin()) * radius_world);
     }
-    points
+    Ok(points)
 }
 
 fn push_rect_world(
@@ -382,10 +514,10 @@ fn push_rect_world(
     fill: Fill,
     screen_offset: Vec2,
     vertices: &mut Vec<Vertex>,
-) {
-    let points = rounded_rect_points(rect, corner_radius);
+) -> Result<(), TessellationError> {
+    let points = rounded_rect_points(rect, corner_radius)?;
     if points.len() < 3 {
-        return;
+        return Ok(());
     }
 
     let center = rect.center();
@@ -406,22 +538,23 @@ fn push_rect_world(
             fill.color_at(points[index + 1]),
         ));
     }
+    Ok(())
 }
 
-fn rounded_rect_points(rect: Rect, corner_radius: f32) -> Vec<Vec2> {
+fn rounded_rect_points(rect: Rect, corner_radius: f32) -> Result<Vec<Vec2>, TessellationError> {
     let radius = corner_radius
         .max(0.0)
         .min(rect.width().abs() * 0.5)
         .min(rect.height().abs() * 0.5);
 
     if radius <= f32::EPSILON {
-        return vec![
+        return Ok(vec![
             Vec2::new(rect.max.x, rect.min.y),
             Vec2::new(rect.max.x, rect.max.y),
             Vec2::new(rect.min.x, rect.max.y),
             Vec2::new(rect.min.x, rect.min.y),
             Vec2::new(rect.max.x, rect.min.y),
-        ];
+        ]);
     }
 
     let corners = [
@@ -447,7 +580,8 @@ fn rounded_rect_points(rect: Rect, corner_radius: f32) -> Vec<Vec2> {
         ),
     ];
 
-    let mut points = Vec::with_capacity(CORNER_SEGMENTS * 4 + 1);
+    let mut points = Vec::new();
+    reserve_items(&mut points, CORNER_SEGMENTS * 4 + 1)?;
     for (center, start_angle, end_angle) in corners {
         for step in 0..=CORNER_SEGMENTS {
             let amount = step as f32 / CORNER_SEGMENTS as f32;
@@ -457,7 +591,7 @@ fn rounded_rect_points(rect: Rect, corner_radius: f32) -> Vec<Vec2> {
     }
     points.push(points[0]);
 
-    points
+    Ok(points)
 }
 
 fn push_round_line_world(
@@ -481,12 +615,13 @@ fn push_closed_polyline_world(
     color: Color,
     screen_offset: Vec2,
     vertices: &mut Vec<Vertex>,
-) {
+) -> Result<(), TessellationError> {
     if points.len() < 4 || width <= 0.0 || !width.is_finite() {
-        return;
+        return Ok(());
     }
 
-    let mut unique_points = Vec::with_capacity(points.len() - 1);
+    let mut unique_points = Vec::new();
+    reserve_items(&mut unique_points, points.len() - 1)?;
     for point in &points[..points.len() - 1] {
         if unique_points
             .last()
@@ -503,7 +638,7 @@ fn push_closed_polyline_world(
         }
     }
     if unique_points.len() < 3 {
-        return;
+        return Ok(());
     }
 
     let point_count = unique_points.len();
@@ -565,6 +700,7 @@ fn push_closed_polyline_world(
             color,
         ));
     }
+    Ok(())
 }
 
 fn push_line_body_world(
