@@ -12,8 +12,8 @@ use sim_engine::{
     GlyphId, GlyphRunBudget, ImageBatchBudget, ImageBudget, ImageSampling, ImageSprite2d,
     ImageTexelRect, Layer, LogicalPixels, LogicalScreenPosition, LogicalScreenVector,
     LogicalViewport, LogicalViewportRegion, PositionedGlyph2d, PreparedScreenScene, Rect,
-    RendererSurfacePresentMode, Scene, SceneBudget, ScreenScene, ShapeStyle, Vec2, WgpuRenderer,
-    WgpuRendererOptions,
+    RenderStatus, RendererSurfacePresentMode, Scene, SceneBudget, ScreenScene, ShapeStyle, Vec2,
+    WgpuRenderer, WgpuRendererOptions,
 };
 use winit::{
     application::ApplicationHandler,
@@ -26,6 +26,8 @@ use winit::{
 
 const WARMUP_FRAMES: usize = 20;
 const MEASURED_FRAMES: usize = 120;
+const GATE_TRIALS: usize = 3;
+const MAX_OUTPUT_CONFIRMATION_REDRAWS: usize = 120;
 const STATIC_COMMANDS: usize = 9_000;
 const STREAMING_COMMANDS: usize = 1_000;
 
@@ -94,7 +96,7 @@ fn parse_configuration() -> Result<BenchmarkConfiguration, Box<dyn Error>> {
             "--vsync" => vsync = true,
             "--help" | "-h" => {
                 println!(
-                    "Usage: rendering_benchmark_suite [--fixture ui_static_10k|ui_90_10|four_viewports|image_atlas|scientific_text|dpi_reconfigure|hidpi_transition] [--gate] [--vsync]"
+                    "Usage: rendering_benchmark_suite [--fixture adapter_probe|ui_static_10k|ui_90_10|four_viewports|image_atlas|scientific_text|dpi_reconfigure|hidpi_transition] [--gate] [--vsync]"
                 );
                 std::process::exit(0);
             }
@@ -114,7 +116,16 @@ struct BenchmarkApplication {
     vsync: bool,
     started: bool,
     failure: Option<String>,
+    benchmark: Option<BenchmarkRunState>,
     hidpi: Option<HidpiTransitionState>,
+}
+
+struct BenchmarkRunState {
+    window: Arc<Window>,
+    renderer: WgpuRenderer,
+    physical_width: u32,
+    physical_height: u32,
+    output_confirmation_redraws: usize,
 }
 
 struct HidpiTransitionState {
@@ -206,6 +217,7 @@ impl BenchmarkApplication {
             vsync: configuration.vsync,
             started: false,
             failure: None,
+            benchmark: None,
             hidpi: None,
         }
     }
@@ -232,33 +244,29 @@ impl ApplicationHandler for BenchmarkApplication {
                 sim_engine::RendererPresentMode::NoVsync
             };
             let options = WgpuRendererOptions::new(requested_present_mode, window.scale_factor())?;
-            let mut renderer = pollster::block_on(WgpuRenderer::new_with_options(
+            let renderer = pollster::block_on(WgpuRenderer::new_with_options(
                 Arc::clone(&window),
                 size.width.max(1),
                 size.height.max(1),
                 options,
             ))?;
-            let gate_context = BenchmarkGateContext {
-                enabled: self.gate,
-                display_refresh_hz: window
-                    .current_monitor()
-                    .or_else(|| window.primary_monitor())
-                    .or_else(|| window.available_monitors().next())
-                    .and_then(|monitor| monitor.refresh_rate_millihertz())
-                    .map(|millihertz| f64::from(millihertz) / 1_000.0),
-            };
             let require_adapter_identity =
                 std::env::var("SIM_ENGINE_REQUIRE_ADAPTER_IDENTITY").as_deref() == Ok("1");
             validate_renderer_adapter(&renderer, require_adapter_identity)
                 .map_err(|error| -> Box<dyn Error> { error.into() })?;
             match self.fixture.as_str() {
-                "ui_static_10k" => benchmark_static_ui(&mut renderer, gate_context),
-                "ui_90_10" => benchmark_ui_90_10(&mut renderer, gate_context),
-                "four_viewports" => benchmark_four_viewports(&mut renderer, gate_context),
-                "image_atlas" => benchmark_image_atlas(&mut renderer, gate_context),
-                "scientific_text" => benchmark_scientific_text(&mut renderer, gate_context),
-                "dpi_reconfigure" => {
-                    benchmark_dpi_reconfigure(&mut renderer, size.width, size.height, gate_context)
+                "adapter_probe" => write_surface_probe_evidence(&renderer),
+                "ui_static_10k" | "ui_90_10" | "four_viewports" | "image_atlas"
+                | "scientific_text" | "dpi_reconfigure" => {
+                    window.request_redraw();
+                    self.benchmark = Some(BenchmarkRunState {
+                        window,
+                        renderer,
+                        physical_width: size.width.max(1),
+                        physical_height: size.height.max(1),
+                        output_confirmation_redraws: 0,
+                    });
+                    Ok(())
                 }
                 "hidpi_transition" => {
                     let scene = build_screen_scene(2_500, 0)?;
@@ -285,7 +293,7 @@ impl ApplicationHandler for BenchmarkApplication {
         if let Err(error) = result {
             self.failure = Some(error.to_string());
         }
-        if self.hidpi.is_none() || self.failure.is_some() {
+        if (self.benchmark.is_none() && self.hidpi.is_none()) || self.failure.is_some() {
             event_loop.exit();
         }
     }
@@ -296,6 +304,125 @@ impl ApplicationHandler for BenchmarkApplication {
         window_id: WindowId,
         event: WindowEvent,
     ) {
+        if self
+            .benchmark
+            .as_ref()
+            .is_some_and(|state| state.window.id() == window_id)
+        {
+            match event {
+                WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                    let state = self.benchmark.as_mut().expect("benchmark state exists");
+                    let size = state.window.inner_size();
+                    state.physical_width = size.width.max(1);
+                    state.physical_height = size.height.max(1);
+                    if let Err(error) = state.renderer.resize_with_scale_factor(
+                        state.physical_width,
+                        state.physical_height,
+                        scale_factor,
+                    ) {
+                        self.failure = Some(error.to_string());
+                        event_loop.exit();
+                    } else {
+                        state.window.request_redraw();
+                    }
+                }
+                WindowEvent::Resized(size) => {
+                    let state = self.benchmark.as_mut().expect("benchmark state exists");
+                    state.physical_width = size.width.max(1);
+                    state.physical_height = size.height.max(1);
+                    if let Err(error) = state.renderer.resize_with_scale_factor(
+                        state.physical_width,
+                        state.physical_height,
+                        state.window.scale_factor(),
+                    ) {
+                        self.failure = Some(error.to_string());
+                        event_loop.exit();
+                    } else {
+                        state.window.request_redraw();
+                    }
+                }
+                WindowEvent::RedrawRequested => {
+                    let state = self.benchmark.as_mut().expect("benchmark state exists");
+                    if self.gate
+                        && state
+                            .window
+                            .current_monitor()
+                            .and_then(|monitor| monitor.refresh_rate_millihertz())
+                            .is_none()
+                    {
+                        let confirmation = (|| -> Result<(), Box<dyn Error>> {
+                            let frame = state
+                                .renderer
+                                .begin_frame(Color::BLACK, FrameBudget::default())?;
+                            let report = frame.present()?;
+                            require_drawn_frame(
+                                &self.fixture,
+                                "output-confirmation",
+                                state.output_confirmation_redraws,
+                                report.status(),
+                            )?;
+                            Ok(())
+                        })();
+                        if let Err(error) = confirmation {
+                            self.failure = Some(error.to_string());
+                            event_loop.exit();
+                            return;
+                        }
+                        state.output_confirmation_redraws =
+                            state.output_confirmation_redraws.saturating_add(1);
+                        if state.output_confirmation_redraws >= MAX_OUTPUT_CONFIRMATION_REDRAWS {
+                            self.failure = Some(
+                                "gated surface measurement could not confirm the current output and refresh rate"
+                                    .to_owned(),
+                            );
+                            event_loop.exit();
+                        } else {
+                            state.window.request_redraw();
+                        }
+                        return;
+                    }
+                    let mut state = self.benchmark.take().expect("benchmark state exists");
+                    let result = (|| -> Result<(), Box<dyn Error>> {
+                        let gate_context = benchmark_gate_context(&state.window, self.gate)?;
+                        match self.fixture.as_str() {
+                            "ui_static_10k" => {
+                                benchmark_static_ui(&mut state.renderer, gate_context)
+                            }
+                            "ui_90_10" => benchmark_ui_90_10(&mut state.renderer, gate_context),
+                            "four_viewports" => {
+                                benchmark_four_viewports(&mut state.renderer, gate_context)
+                            }
+                            "image_atlas" => {
+                                benchmark_image_atlas(&mut state.renderer, gate_context)
+                            }
+                            "scientific_text" => {
+                                benchmark_scientific_text(&mut state.renderer, gate_context)
+                            }
+                            "dpi_reconfigure" => benchmark_dpi_reconfigure(
+                                &mut state.renderer,
+                                state.physical_width,
+                                state.physical_height,
+                                gate_context,
+                            ),
+                            fixture => Err(format!("unknown benchmark fixture: {fixture}").into()),
+                        }
+                    })();
+                    if let Err(error) = result {
+                        self.failure = Some(error.to_string());
+                    }
+                    event_loop.exit();
+                }
+                WindowEvent::CloseRequested => {
+                    self.failure = Some(
+                        "benchmark window closed before the confirmed-output measurement"
+                            .to_owned(),
+                    );
+                    event_loop.exit();
+                }
+                _ => {}
+            }
+            return;
+        }
         let Some(state) = self.hidpi.as_mut() else {
             return;
         };
@@ -428,6 +555,49 @@ fn validate_hidpi_evidence(evidence: &HidpiEvidenceTracker) -> Result<(), &'stat
     Ok(())
 }
 
+fn benchmark_gate_context(
+    window: &Window,
+    enabled: bool,
+) -> Result<BenchmarkGateContext, Box<dyn Error>> {
+    let current_monitor = window.current_monitor();
+    if enabled && current_monitor.is_none() {
+        return Err(
+            "gated surface measurement requires a current monitor after the first redraw".into(),
+        );
+    }
+    let display_refresh_hz = current_monitor
+        .and_then(|monitor| monitor.refresh_rate_millihertz())
+        .map(|millihertz| f64::from(millihertz) / 1_000.0);
+    if enabled && display_refresh_hz.is_none() {
+        return Err("gated surface measurement requires current-monitor refresh metadata".into());
+    }
+    Ok(BenchmarkGateContext {
+        enabled,
+        display_refresh_hz,
+    })
+}
+
+fn write_surface_probe_evidence(renderer: &WgpuRenderer) -> Result<(), Box<dyn Error>> {
+    let path = required_environment("SIM_ENGINE_SURFACE_EVIDENCE_PATH")?;
+    let revision = required_environment("SIM_ENGINE_RELEASE_SHA")?;
+    let clean = |value: &str| value.replace(['\n', '\r', '='], " ");
+    let body = format!(
+        "format_version=1\nvcs_sha={}\nbackend={}\nname={}\nvendor={:#06x}\ndevice={:#06x}\npci_bus_id={}\ndriver={}\ndriver_info={}\nsurface_format={:?}\nsample_count={}\n",
+        clean(&revision),
+        renderer.adapter_backend(),
+        clean(renderer.adapter_name()),
+        renderer.adapter_vendor_id(),
+        renderer.adapter_device_id(),
+        clean(renderer.adapter_pci_bus_id()),
+        clean(renderer.adapter_driver()),
+        clean(renderer.adapter_driver_info()),
+        renderer.surface_format(),
+        renderer.surface_sample_count(),
+    );
+    std::fs::write(Path::new(&path), body)?;
+    Ok(())
+}
+
 fn write_hidpi_evidence(
     state: &HidpiTransitionState,
     completed: PendingHidpiTransition,
@@ -435,13 +605,16 @@ fn write_hidpi_evidence(
     let Ok(path) = std::env::var("SIM_ENGINE_HIDPI_EVIDENCE_PATH") else {
         return Ok(());
     };
-    let revision = std::env::var("SIM_ENGINE_RELEASE_SHA").unwrap_or_else(|_| "unknown".into());
+    let revision = required_environment("SIM_ENGINE_RELEASE_SHA")?;
     let body = format!(
-        "format_version=1\nvcs_sha={revision}\nbackend={}\nadapter={}\nvendor={:#06x}\ndevice={:#06x}\ntransition_serial={}\nscale_factor={:.3}\nphysical_width={}\nphysical_height={}\nscale_events={}\nresize_events={}\npaired_transitions={}\ncompleted_transitions={}\n",
+        "format_version=1\nvcs_sha={revision}\nbackend={}\nadapter={}\nvendor={:#06x}\ndevice={:#06x}\npci_bus_id={}\nsurface_format={:?}\nsample_count={}\ntransition_serial={}\nscale_factor={:.3}\nphysical_width={}\nphysical_height={}\nscale_events={}\nresize_events={}\npaired_transitions={}\ncompleted_transitions={}\n",
         state.renderer.adapter_backend(),
         state.renderer.adapter_name(),
         state.renderer.adapter_vendor_id(),
         state.renderer.adapter_device_id(),
+        state.renderer.adapter_pci_bus_id(),
+        state.renderer.surface_format(),
+        state.renderer.surface_sample_count(),
         completed.serial,
         completed.scale_factor,
         completed.physical_width,
@@ -461,6 +634,9 @@ struct RequiredAdapterIdentity {
     name: String,
     vendor: u32,
     device: u32,
+    pci_bus_id: String,
+    surface_format: String,
+    sample_count: u32,
 }
 
 fn validate_renderer_adapter(renderer: &WgpuRenderer, required: bool) -> Result<(), String> {
@@ -472,14 +648,22 @@ fn validate_renderer_adapter(renderer: &WgpuRenderer, required: bool) -> Result<
         name: required_environment("SIM_ENGINE_REQUIRED_ADAPTER_NAME")?,
         vendor: required_hex_environment("SIM_ENGINE_REQUIRED_ADAPTER_VENDOR")?,
         device: required_hex_environment("SIM_ENGINE_REQUIRED_ADAPTER_DEVICE")?,
+        pci_bus_id: required_environment("SIM_ENGINE_REQUIRED_ADAPTER_PCI_BUS_ID")?,
+        surface_format: required_environment("SIM_ENGINE_GPU_SURFACE_FORMAT")?,
+        sample_count: required_environment("SIM_ENGINE_GPU_SURFACE_SAMPLE_COUNT")?
+            .parse::<u32>()
+            .map_err(|_| "SIM_ENGINE_GPU_SURFACE_SAMPLE_COUNT is not a u32".to_owned())?,
     };
-    validate_adapter_identity(
-        renderer.adapter_backend(),
-        renderer.adapter_name(),
-        renderer.adapter_vendor_id(),
-        renderer.adapter_device_id(),
-        &expected,
-    )
+    let actual = RequiredAdapterIdentity {
+        backend: renderer.adapter_backend().to_owned(),
+        name: renderer.adapter_name().to_owned(),
+        vendor: renderer.adapter_vendor_id(),
+        device: renderer.adapter_device_id(),
+        pci_bus_id: renderer.adapter_pci_bus_id().to_owned(),
+        surface_format: format!("{:?}", renderer.surface_format()),
+        sample_count: renderer.surface_sample_count(),
+    };
+    validate_adapter_identity(&actual, &expected)
 }
 
 fn required_environment(name: &str) -> Result<String, String> {
@@ -493,22 +677,14 @@ fn required_hex_environment(name: &str) -> Result<u32, String> {
 }
 
 fn validate_adapter_identity(
-    backend: &str,
-    name: &str,
-    vendor: u32,
-    device: u32,
+    actual: &RequiredAdapterIdentity,
     expected: &RequiredAdapterIdentity,
 ) -> Result<(), String> {
-    if backend == expected.backend
-        && name == expected.name
-        && vendor == expected.vendor
-        && device == expected.device
-    {
+    if actual == expected {
         return Ok(());
     }
     Err(format!(
-        "adapter identity mismatch: expected {:?}, selected backend={backend:?} name={name:?} vendor={vendor:#06x} device={device:#06x}",
-        expected
+        "adapter/surface identity mismatch: expected {expected:?}, selected {actual:?}"
     ))
 }
 
@@ -549,6 +725,23 @@ mod tests {
         assert_eq!(retained.maximum_renderer_work_p95_ms, 5.0);
         assert_eq!(streaming.maximum_renderer_work_p95_ms, 25.0);
         assert!(gate_thresholds("unknown").is_none());
+    }
+
+    #[test]
+    fn skipped_frames_cannot_enter_throughput_samples() {
+        assert_eq!(
+            require_drawn_frame("fixture", "measurement", 0, RenderStatus::Drawn),
+            Ok(())
+        );
+        let error = require_drawn_frame(
+            "fixture",
+            "measurement",
+            7,
+            RenderStatus::Skipped(sim_engine::RendererSurfaceStatus::Timeout),
+        )
+        .unwrap_err();
+        assert!(error.contains("skipped without submission/present"));
+        assert!(error.contains("frame 7"));
     }
 
     #[test]
@@ -619,27 +812,92 @@ mod tests {
     }
 
     #[test]
-    fn adapter_identity_requires_backend_name_vendor_and_device() {
+    fn adapter_identity_requires_physical_pci_instance() {
         let expected = RequiredAdapterIdentity {
             backend: "vulkan".to_owned(),
             name: "adapter-a".to_owned(),
             vendor: 0x10de,
             device: 0x1234,
+            pci_bus_id: "0000:01:00.0".to_owned(),
+            surface_format: "Bgra8UnormSrgb".to_owned(),
+            sample_count: 4,
         };
-        assert_eq!(
-            validate_adapter_identity("vulkan", "adapter-a", 0x10de, 0x1234, &expected),
-            Ok(())
-        );
+        assert_eq!(validate_adapter_identity(&expected, &expected), Ok(()));
         for actual in [
-            ("gl", "adapter-a", 0x10de, 0x1234),
-            ("vulkan", "adapter-b", 0x10de, 0x1234),
-            ("vulkan", "adapter-a", 0x8086, 0x1234),
-            ("vulkan", "adapter-a", 0x10de, 0x4321),
+            (
+                "gl",
+                "adapter-a",
+                0x10de,
+                0x1234,
+                "0000:01:00.0",
+                "Bgra8UnormSrgb",
+                4,
+            ),
+            (
+                "vulkan",
+                "adapter-b",
+                0x10de,
+                0x1234,
+                "0000:01:00.0",
+                "Bgra8UnormSrgb",
+                4,
+            ),
+            (
+                "vulkan",
+                "adapter-a",
+                0x8086,
+                0x1234,
+                "0000:01:00.0",
+                "Bgra8UnormSrgb",
+                4,
+            ),
+            (
+                "vulkan",
+                "adapter-a",
+                0x10de,
+                0x4321,
+                "0000:01:00.0",
+                "Bgra8UnormSrgb",
+                4,
+            ),
+            (
+                "vulkan",
+                "adapter-a",
+                0x10de,
+                0x1234,
+                "0000:02:00.0",
+                "Bgra8UnormSrgb",
+                4,
+            ),
+            (
+                "vulkan",
+                "adapter-a",
+                0x10de,
+                0x1234,
+                "0000:01:00.0",
+                "Rgba8UnormSrgb",
+                4,
+            ),
+            (
+                "vulkan",
+                "adapter-a",
+                0x10de,
+                0x1234,
+                "0000:01:00.0",
+                "Bgra8UnormSrgb",
+                1,
+            ),
         ] {
-            assert!(
-                validate_adapter_identity(actual.0, actual.1, actual.2, actual.3, &expected)
-                    .is_err()
-            );
+            let actual = RequiredAdapterIdentity {
+                backend: actual.0.to_owned(),
+                name: actual.1.to_owned(),
+                vendor: actual.2,
+                device: actual.3,
+                pci_bus_id: actual.4.to_owned(),
+                surface_format: actual.5.to_owned(),
+                sample_count: actual.6,
+            };
+            assert!(validate_adapter_identity(&actual, &expected).is_err());
         }
     }
 }
@@ -935,31 +1193,39 @@ fn measure_frames(
     mut render: impl FnMut(&mut WgpuRenderer, usize) -> Result<FrameReport, Box<dyn Error>>,
 ) -> Result<(), Box<dyn Error>> {
     for frame in 0..WARMUP_FRAMES {
-        let _ = render(renderer, frame)?;
+        let report = render(renderer, frame)?;
+        require_drawn_frame(name, "warmup", frame, report.status())?;
     }
-    renderer.wait_for_gpu_idle()?;
-
-    let wall_started = Instant::now();
-    let mut renderer_work_samples = Vec::with_capacity(MEASURED_FRAMES);
-    let mut acquire_samples = Vec::with_capacity(MEASURED_FRAMES);
+    let trial_count = if gate.enabled { GATE_TRIALS } else { 1 };
+    let measured_attempts = MEASURED_FRAMES * trial_count;
+    let mut renderer_work_samples = Vec::with_capacity(measured_attempts);
+    let mut acquire_samples = Vec::with_capacity(measured_attempts);
+    let mut trial_fps = Vec::with_capacity(trial_count);
     let mut last = None;
-    for frame in 0..MEASURED_FRAMES {
-        let report = render(renderer, frame + WARMUP_FRAMES)?;
-        let metrics = report.metrics();
-        renderer_work_samples.push(
-            metrics
-                .total_cpu()
-                .saturating_sub(metrics.surface_acquire())
-                .as_secs_f64()
-                * 1_000.0,
-        );
-        acquire_samples.push(metrics.surface_acquire().as_secs_f64() * 1_000.0);
-        last = Some(report);
+    for trial in 0..trial_count {
+        renderer.wait_for_gpu_idle()?;
+        let trial_started = Instant::now();
+        for frame in 0..MEASURED_FRAMES {
+            let absolute_frame = WARMUP_FRAMES + trial * MEASURED_FRAMES + frame;
+            let report = render(renderer, absolute_frame)?;
+            require_drawn_frame(name, "measurement", absolute_frame, report.status())?;
+            let metrics = report.metrics();
+            renderer_work_samples.push(
+                metrics
+                    .total_cpu()
+                    .saturating_sub(metrics.surface_acquire())
+                    .as_secs_f64()
+                    * 1_000.0,
+            );
+            acquire_samples.push(metrics.surface_acquire().as_secs_f64() * 1_000.0);
+            last = Some(report);
+        }
+        renderer.wait_for_gpu_idle()?;
+        trial_fps.push(MEASURED_FRAMES as f64 / trial_started.elapsed().as_secs_f64());
     }
-    renderer.wait_for_gpu_idle()?;
-    let wall = wall_started.elapsed();
     renderer_work_samples.sort_by(f64::total_cmp);
     acquire_samples.sort_by(f64::total_cmp);
+    trial_fps.sort_by(f64::total_cmp);
     let percentile = |samples: &[f64], fraction: f64| {
         let index = ((samples.len() - 1) as f64 * fraction).round() as usize;
         samples[index]
@@ -968,20 +1234,27 @@ fn measure_frames(
     let statistics = report.statistics();
     validate_fixture_contract(name, statistics)?;
     let sources = statistics.source_counts();
-    let wall_fps = MEASURED_FRAMES as f64 / wall.as_secs_f64();
+    let wall_fps = trial_fps[trial_fps.len() / 2];
     let work_p95 = percentile(&renderer_work_samples, 0.95);
     println!(
-        "fixture={name} adapter={:?} vendor={:#06x} device={:#06x} backend={} driver={:?} driver_info={:?} present_mode={} display_refresh_hz={:?} measured_frames={} wall_fps={:.1} renderer_work_excluding_acquire_ms[p50={:.3},p95={:.3},p99={:.3}] surface_acquire_ms[p50={:.3},p95={:.3},p99={:.3}] construction_ms={:.3}",
+        "fixture={name} adapter={:?} vendor={:#06x} device={:#06x} pci_bus_id={:?} backend={} driver={:?} driver_info={:?} surface_format={:?} sample_count={} present_mode={} display_refresh_hz={:?} trials={} frames_per_trial={} attempted_frames={} drawn_frames={} median_trial_wall_fps={:.1} trial_wall_fps={:?} renderer_work_excluding_acquire_ms[p50={:.3},p95={:.3},p99={:.3}] surface_acquire_ms[p50={:.3},p95={:.3},p99={:.3}] construction_ms={:.3}",
         renderer.adapter_name(),
         renderer.adapter_vendor_id(),
         renderer.adapter_device_id(),
+        renderer.adapter_pci_bus_id(),
         renderer.adapter_backend(),
         renderer.adapter_driver(),
         renderer.adapter_driver_info(),
+        renderer.surface_format(),
+        renderer.surface_sample_count(),
         renderer.surface_present_mode(),
         gate.display_refresh_hz,
+        trial_count,
         MEASURED_FRAMES,
+        measured_attempts,
+        measured_attempts,
         wall_fps,
+        trial_fps,
         percentile(&renderer_work_samples, 0.50),
         percentile(&renderer_work_samples, 0.95),
         percentile(&renderer_work_samples, 0.99),
@@ -1033,6 +1306,20 @@ fn measure_frames(
         }
     }
     Ok(())
+}
+
+fn require_drawn_frame(
+    fixture: &str,
+    phase: &str,
+    index: usize,
+    status: RenderStatus,
+) -> Result<(), String> {
+    match status {
+        RenderStatus::Drawn => Ok(()),
+        RenderStatus::Skipped(reason) => Err(format!(
+            "{fixture} {phase} frame {index} was skipped without submission/present: {reason:?}"
+        )),
+    }
 }
 
 fn validate_performance_gate(

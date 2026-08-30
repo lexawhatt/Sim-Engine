@@ -438,9 +438,13 @@ advertised non-VSync mode and may fall back to FIFO. Query
 or FIFO-relaxed configuration chosen by the surface. This does not guarantee
 that a desktop compositor will scan out above the monitor refresh rate.
 `adapter_name()`, `adapter_backend()`, `adapter_vendor_id()`,
-`adapter_device_id()`, `adapter_driver()`, and `adapter_driver_info()` expose
-the exact adapter/API evidence that must travel with benchmark results;
-recovery updates every value to the replacement logical device.
+`adapter_device_id()`, `adapter_pci_bus_id()`, `adapter_driver()`, and
+`adapter_driver_info()` expose the adapter/API evidence that must travel with
+benchmark results. The PCI bus address distinguishes physical instances of the
+same GPU model when Vulkan exposes `VK_EXT_pci_bus_info`; an empty address is
+not sufficient for release identity. `surface_format()` and
+`surface_sample_count()` expose the matching production raster contract.
+Recovery updates every value to the replacement logical device.
 
 On Wayland, `Window::pre_present_notify()` installs compositor pacing. Call it
 for ordinary VSync presentation. An explicit uncapped diagnostic loop may omit
@@ -468,7 +472,13 @@ match renderer.render_with_metrics(&scene, &camera) {
 ```
 
 `RenderStatus::Skipped` is not a drawn frame. A timeout, occlusion, outdated
-surface, or zero-sized surface can be transient. `RendererFrameMetrics`
+surface, or zero-sized surface can be transient, but a throughput fixture must
+reject that attempt or exclude it from both its numerator and timing samples.
+The release matrix fails on any skipped warmup or measured report.
+Gated workloads run three independent 120-frame measurement trials. Wall
+throughput uses the median trial, while renderer-work/acquire percentiles use
+all 360 drawn samples.
+`RendererFrameMetrics`
 contains CPU wall-clock durations for tessellation, upload, camera-uniform
 upload, surface acquisition, encode/submit/present dispatch, and total call
 time. `total_cpu()` includes `surface_acquire()`; subtract it when comparing
@@ -911,20 +921,27 @@ It runs `ui_static_10k`, `ui_90_10`, `four_viewports`, `image_atlas`,
 scenes and four distinct cameras. Surface fixtures print p50/p95/p99 renderer
 work excluding acquire, separate acquire percentiles, observed wall
 throughput, construction time, source counts, vertices, uploads, unique
-retained memory, textures, and draw calls. The semantic oracle first selects
-the high-performance Vulkan adapter; backend, name, PCI vendor, and device must
-then match in every surface and HiDPI process. Renderer-work p95 is capped at 5
-ms for retained UI, four-camera,
+retained memory, textures, and draw calls. A production-surface probe first
+selects the high-performance Vulkan adapter and records its PCI bus address,
+format, and MSAA count. The semantic oracle must use that exact physical GPU,
+surface format, and sample count; backend, name, vendor/model IDs, and PCI bus
+address must then match in every surface and HiDPI process. Renderer-work p95
+is capped at 5 ms for retained UI, four-camera,
 image, and glyph workloads, 10 ms for repeated DPI reconfiguration, and 25 ms
 for `ui_90_10`, which deliberately rebuilds and tessellates one thousand
 commands per frame. These fixture-specific ceilings keep a streaming baseline
 from weakening the retained-path oracle. If the selected surface mode is
 Immediate, the gate additionally requires at least 60 observed FPS. Mailbox
-and FIFO must sustain 95% of the monitor's reported refresh rate after clamping
-that release reference to 30-60 Hz. Surface-acquire percentiles remain visible
-diagnostics in every mode, but a scheduler-sensitive p95 from one 120-frame run
-is not an independent release threshold. The matrix includes an explicit FIFO
-surface run so the refresh-normalized branch is exercised. `mixed_layers`
+and FIFO must sustain 95% of the confirmed current monitor's reported refresh
+rate after clamping that release reference to 30-60 Hz. Before measuring, the
+fixture presents an unmeasured frame so Wayland can associate the surface with
+an output; it never substitutes the primary or first enumerated monitor.
+Every warmup and measured frame must report `Drawn`. Surface-acquire
+percentiles remain visible diagnostics in every mode, but a scheduler-sensitive
+p95 from one trial is not an independent release threshold. Each gated fixture
+uses three 120-frame trials, median wall throughput, and combined 360-frame
+work percentiles. The matrix includes an explicit FIFO surface run so the
+refresh-normalized branch is exercised. `mixed_layers`
 remains core-only;
 `recovery_frame` is the mandatory Vulkan semantic fixture because it restores
 every retained source on a second logical device and verifies bytes/pixels.
@@ -1255,14 +1272,18 @@ It checks formatting, Rust 1.90 compatibility, all targets with and without
 default features, strict clippy, doctests, warning-free rustdoc, a mandatory
 Vulkan semantic GPU readback fixture with backend assertion, the Vulkan-pinned
 performance matrix, a real nested-KWin HiDPI transition, `git diff --check`,
-and the offline package boundary. The GPU step writes
-`target/linux-vulkan-adapter.txt`; CI publishes the same manifest as the
-`linux-vulkan-adapter` artifact. The manifest names backend, adapter type,
-vendor/device IDs, driver, and driver version for the exact semantic run.
+and the offline package boundary. The surface probe writes
+`target/linux-vulkan-surface.txt`; the GPU step writes
+`target/linux-vulkan-adapter.txt`; CI publishes the latter manifest as the
+`linux-vulkan-adapter` artifact. The manifest names the exact VCS SHA, backend,
+adapter type, vendor/model IDs, PCI bus address when available, driver, oracle
+format, and sample count for the semantic run. CI supplies `github.sha` and
+asserts that the artifact does not contain `vcs_sha=unknown`.
 The HiDPI step writes `target/linux-hidpi-transition.txt` with the exact VCS
 revision, Vulkan backend, scale, physical size, and transactional event counts.
 
 The gate must run from a clean worktree. Hardware performance or recovery
-claims must additionally name the Linux adapter, PCI vendor/device, backend,
-driver, workload, present mode, display refresh where applicable, and
-measurement method.
+claims must additionally name the Linux adapter, PCI vendor/device and bus
+address, backend, driver, surface format/sample count, workload, present mode,
+confirmed current-monitor refresh where applicable, drawn/attempted counts,
+and measurement method.

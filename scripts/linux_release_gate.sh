@@ -31,8 +31,29 @@ RUSTDOCFLAGS="-D warnings" cargo doc --all-features --no-deps
 echo "[8/11] strict Linux Vulkan semantics"
 release_sha=$(git rev-parse HEAD)
 WGPU_BACKEND=vulkan \
+SIM_ENGINE_SURFACE_EVIDENCE_PATH=target/linux-vulkan-surface.txt \
+SIM_ENGINE_RELEASE_SHA="$release_sha" \
+SIM_ENGINE_REQUIRE_ADAPTER_IDENTITY=0 \
+cargo run --release --example rendering_benchmark_suite -- --fixture adapter_probe
+required_adapter_name=$(sed -n 's/^name=//p' target/linux-vulkan-surface.txt)
+required_adapter_vendor=$(sed -n 's/^vendor=//p' target/linux-vulkan-surface.txt)
+required_adapter_device=$(sed -n 's/^device=//p' target/linux-vulkan-surface.txt)
+required_adapter_pci_bus_id=$(sed -n 's/^pci_bus_id=//p' target/linux-vulkan-surface.txt)
+required_surface_format=$(sed -n 's/^surface_format=//p' target/linux-vulkan-surface.txt)
+required_surface_sample_count=$(sed -n 's/^sample_count=//p' target/linux-vulkan-surface.txt)
+test -n "$required_adapter_pci_bus_id"
+WGPU_BACKEND=vulkan \
 SIM_ENGINE_REQUIRE_GPU_TESTS=1 \
 SIM_ENGINE_REQUIRE_VULKAN=1 \
+SIM_ENGINE_REQUIRE_ADAPTER_IDENTITY=1 \
+SIM_ENGINE_REQUIRED_ADAPTER_BACKEND=vulkan \
+SIM_ENGINE_REQUIRED_ADAPTER_NAME="$required_adapter_name" \
+SIM_ENGINE_REQUIRED_ADAPTER_VENDOR="$required_adapter_vendor" \
+SIM_ENGINE_REQUIRED_ADAPTER_DEVICE="$required_adapter_device" \
+SIM_ENGINE_REQUIRED_ADAPTER_PCI_BUS_ID="$required_adapter_pci_bus_id" \
+SIM_ENGINE_REQUIRE_PRODUCTION_SURFACE_FORMAT=1 \
+SIM_ENGINE_GPU_SURFACE_FORMAT="$required_surface_format" \
+SIM_ENGINE_GPU_SURFACE_SAMPLE_COUNT="$required_surface_sample_count" \
 SIM_ENGINE_GPU_EVIDENCE_PATH=target/linux-vulkan-adapter.txt \
 SIM_ENGINE_RELEASE_SHA="$release_sha" \
 cargo test --all-features \
@@ -40,6 +61,9 @@ cargo test --all-features \
   -- --nocapture
 grep -Fxq 'backend=Vulkan' target/linux-vulkan-adapter.txt
 grep -Fxq "vcs_sha=$release_sha" target/linux-vulkan-adapter.txt
+grep -Fxq "pci_bus_id=$required_adapter_pci_bus_id" target/linux-vulkan-adapter.txt
+grep -Fxq "oracle_format=$required_surface_format" target/linux-vulkan-adapter.txt
+grep -Fxq "oracle_sample_count=$required_surface_sample_count" target/linux-vulkan-adapter.txt
 echo "GPU evidence: target/linux-vulkan-adapter.txt"
 
 echo "[9/11] named rendering performance matrix"

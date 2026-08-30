@@ -167,17 +167,27 @@ Run the complete named performance/contract matrix on a Vulkan-capable Linux
 machine with `./scripts/rendering_benchmark_matrix.sh`. Absolute timings are
 comparable only when adapter, driver, backend, present mode, and workload are
 recorded together; deterministic command/vertex/upload counters are portable.
-The matrix first runs the semantic oracle on the high-performance Vulkan
-adapter and pins its backend, name, PCI vendor, and device identity for every
-surface and HiDPI process. It always enforces fixture-specific p95 ceilings for
-renderer work excluding surface acquisition. Immediate additionally requires
-60 observed FPS. Mailbox/FIFO wall throughput must reach 95% of the reported
-display refresh, bounded to a 30-60 Hz release floor, so both a correct 50 Hz
-compositor and a pathologically slow GPU are distinguished. Acquire
-percentiles remain reported but do not independently flip the verdict from one
-scheduler-sensitive sample. The matrix also drives a nested KWin compositor
-through a real scale 1.00-to-1.25 transition and records the paired event and
-successful redraw for the exact revision on that same adapter.
+The matrix first probes the real production surface. It pins the selected
+high-performance Vulkan adapter by PCI bus address as well as backend, name,
+vendor, and model, then requires the offscreen semantic oracle and every
+surface/HiDPI process to use that same physical GPU. The oracle uses the
+production surface format and its selected MSAA count. Every warmup and
+measured report must be `Drawn`; a timeout, occlusion, or outdated surface
+fails the fixture instead of inflating throughput with skipped attempts.
+Gated workloads use three independent 120-frame trials, compare median trial
+throughput, and calculate renderer-work percentiles across all 360 drawn
+frames, so one scheduler/cold-run outlier cannot decide the release.
+
+The matrix always enforces fixture-specific p95 ceilings for renderer work
+excluding surface acquisition. Immediate additionally requires 60 presented
+FPS. Mailbox/FIFO wall throughput must reach 95% of the confirmed current
+monitor refresh, bounded to a 30-60 Hz release floor. The window is mapped by
+an unmeasured drawn frame before querying `current_monitor()`; primary/first
+monitor fallbacks are never accepted. Acquire percentiles remain reported but
+do not independently flip the verdict from one scheduler-sensitive sample.
+The matrix also drives a nested KWin compositor through a real scale
+1.00-to-1.25 transition and records the paired event and successful redraw for
+the exact revision on that same physical adapter.
 The automatic transition requires `dbus-run-session`, `kwin_wayland`, and
 `kscreen-doctor`; a missing executable fails the matrix instead of silently
 skipping HiDPI evidence.
@@ -205,8 +215,9 @@ publishable package boundary:
 ./scripts/linux_release_gate.sh
 ```
 
-The gate records exact adapter/backend/driver evidence in
-`target/linux-vulkan-adapter.txt` and compositor-transition evidence in
+The gate records production-surface selection in
+`target/linux-vulkan-surface.txt`, matching semantic adapter/oracle evidence in
+`target/linux-vulkan-adapter.txt`, and compositor-transition evidence in
 `target/linux-hidpi-transition.txt`.
 
 ## License

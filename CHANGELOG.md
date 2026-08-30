@@ -88,9 +88,10 @@ composed frames, fixed-screen UI, retained images, and host-shaped text.
 - Dynamic-mesh creation, replacement, and restoration now reserve CPU recovery
   storage fallibly; full replacement commits retained state only after all
   validation, reservation, and replacement-buffer creation succeeds.
-- Adapter diagnostics now expose PCI vendor/device IDs, and release evidence
-  rejects any semantic, performance, or compositor process that selects a
-  different adapter identity.
+- Adapter diagnostics now expose PCI vendor/device IDs, physical PCI bus
+  address, surface format, and sample count. Release evidence rejects any
+  semantic, performance, or compositor process that selects a different
+  physical adapter instance.
 - `SceneError::DegenerateGeometry` documentation now matches validation: one
   non-drawable consecutive segment is sufficient to reject a polyline.
 
@@ -121,11 +122,18 @@ composed frames, fixed-screen UI, retained images, and host-shaped text.
 - The named matrix now uses four independent prepared world scenes and four
   independent cameras, reports renderer work separately from surface acquire,
   prints the actual adapter/backend/driver and present mode, validates fixture
-  source/count contracts, pins semantic/performance/HiDPI evidence to one
-  Vulkan adapter identity, and enforces per-fixture renderer-work p95
+  source/count contracts, and pins semantic/performance/HiDPI evidence to one
+  physical Vulkan adapter through its PCI bus address. A real surface probe
+  also makes the semantic oracle use the production surface format and selected
+  MSAA count. The matrix enforces per-fixture renderer-work p95
   thresholds. Immediate requires 60 FPS; Mailbox/FIFO require 95% of the
-  reported refresh within a 30-60 Hz release reference. Acquire percentiles are
-  diagnostics rather than a scheduler-sensitive one-run verdict.
+  confirmed current-monitor refresh within a 30-60 Hz release reference. It
+  never substitutes another enumerated monitor, and every warmup/measured frame
+  must be `Drawn`. Gated fixtures use the median throughput of three independent
+  120-frame trials and combined 360-frame work percentiles. Acquire percentiles
+  are diagnostics rather than a scheduler-sensitive one-run verdict.
+- CI semantic evidence records and asserts the exact GitHub revision instead
+  of permitting `vcs_sha=unknown`.
 - Added the interactive `stroke_gallery` visual oracle with four pages for all
   v0.2 stroke styles, alpha contracts, markers, dashes, camera motion, and short
   accepted geometry.

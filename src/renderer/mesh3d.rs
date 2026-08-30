@@ -2132,19 +2132,24 @@ pub(super) fn assert_gpu_depth_contract(
         .expect("3D depth test callback should run")
         .expect("3D depth readback should map");
     let bytes = slice.get_mapped_range().expect("3D depth bytes");
+    let [red, green, blue] = match format {
+        wgpu::TextureFormat::Rgba8Unorm | wgpu::TextureFormat::Rgba8UnormSrgb => [0, 1, 2],
+        wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb => [2, 1, 0],
+        _ => panic!("unsupported 3D byte-channel oracle format: {format:?}"),
+    };
     let center_offset = 32 * 256 + 32 * 4;
     assert!(
-        bytes[center_offset + 1] > 200,
+        bytes[center_offset + green] > 200,
         "near green surface must win depth testing"
     );
     assert!(
-        bytes[center_offset] < 20,
+        bytes[center_offset + red] < 20,
         "far red surface must remain occluded"
     );
     for x in 20..44 {
         let offset = 48 * 256 + x * 4;
         assert!(
-            bytes[offset + 2] > 180 && bytes[offset] < 80,
+            bytes[offset + blue] > 180 && bytes[offset + red] < 80,
             "coplanar near edge must remain solid visible blue at x={x}"
         );
     }
@@ -2164,7 +2169,7 @@ pub(super) fn assert_gpu_depth_contract(
     );
     let near_clipped_yellow_pixels = bytes
         .chunks_exact(4)
-        .filter(|pixel| pixel[0] > 180 && pixel[1] > 180 && pixel[2] < 80)
+        .filter(|pixel| pixel[red] > 180 && pixel[green] > 180 && pixel[blue] < 80)
         .count();
     assert!(
         near_clipped_yellow_pixels >= 4,
@@ -2172,7 +2177,7 @@ pub(super) fn assert_gpu_depth_contract(
     );
     let different_object_coplanar_pixels = bytes
         .chunks_exact(4)
-        .filter(|pixel| pixel[0] < 80 && pixel[1] > 180 && pixel[2] > 180)
+        .filter(|pixel| pixel[red] < 80 && pixel[green] > 180 && pixel[blue] > 180)
         .count();
     assert!(
         different_object_coplanar_pixels >= 4,
@@ -2180,7 +2185,7 @@ pub(super) fn assert_gpu_depth_contract(
     );
     let sub_depth_resolution_pixels = bytes
         .chunks_exact(4)
-        .filter(|pixel| pixel[0] > 180 && pixel[1] > 100 && pixel[2] < 80)
+        .filter(|pixel| pixel[red] > 180 && pixel[green] > 100 && pixel[blue] < 80)
         .count();
     assert!(
         sub_depth_resolution_pixels >= 4,

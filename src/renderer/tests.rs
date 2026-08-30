@@ -1359,34 +1359,131 @@ async fn assert_gpu_stroke_pixel_matrix(
     );
 }
 
+fn parse_gpu_oracle_surface_format(name: &str) -> Option<wgpu::TextureFormat> {
+    match name {
+        "Rgba8Unorm" => Some(wgpu::TextureFormat::Rgba8Unorm),
+        "Rgba8UnormSrgb" => Some(wgpu::TextureFormat::Rgba8UnormSrgb),
+        "Bgra8Unorm" => Some(wgpu::TextureFormat::Bgra8Unorm),
+        "Bgra8UnormSrgb" => Some(wgpu::TextureFormat::Bgra8UnormSrgb),
+        _ => None,
+    }
+}
+
+fn gpu_oracle_channel_indices(format: wgpu::TextureFormat) -> [usize; 4] {
+    match format {
+        wgpu::TextureFormat::Rgba8Unorm | wgpu::TextureFormat::Rgba8UnormSrgb => [0, 1, 2, 3],
+        wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb => [2, 1, 0, 3],
+        _ => panic!("unsupported byte-channel oracle format: {format:?}"),
+    }
+}
+
+#[test]
+fn gpu_oracle_surface_format_preserves_production_channel_order() {
+    assert_eq!(
+        parse_gpu_oracle_surface_format("Rgba8UnormSrgb"),
+        Some(wgpu::TextureFormat::Rgba8UnormSrgb)
+    );
+    assert_eq!(
+        parse_gpu_oracle_surface_format("Bgra8UnormSrgb"),
+        Some(wgpu::TextureFormat::Bgra8UnormSrgb)
+    );
+    assert_eq!(
+        gpu_oracle_channel_indices(wgpu::TextureFormat::Rgba8UnormSrgb),
+        [0, 1, 2, 3]
+    );
+    assert_eq!(
+        gpu_oracle_channel_indices(wgpu::TextureFormat::Bgra8UnormSrgb),
+        [2, 1, 0, 3]
+    );
+    assert_eq!(parse_gpu_oracle_surface_format("Rgba16Float"), None);
+}
+
 #[test]
 fn offscreen_gpu_readback_verifies_camera_depth_and_clip_contract() {
     pollster::block_on(async {
         let instance =
             wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
-        let Ok(adapter) = instance
-            .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
-                force_fallback_adapter: false,
-                compatible_surface: None,
-                apply_limit_buckets: false,
-            })
-            .await
-        else {
+        let adapter = if let Ok(required_pci_bus_id) =
+            std::env::var("SIM_ENGINE_REQUIRED_ADAPTER_PCI_BUS_ID")
+        {
+            instance
+                .enumerate_adapters(wgpu::Backends::all())
+                .await
+                .into_iter()
+                .find(|candidate| candidate.get_info().device_pci_bus_id == required_pci_bus_id)
+        } else {
+            instance
+                .request_adapter(&wgpu::RequestAdapterOptions {
+                    power_preference: wgpu::PowerPreference::HighPerformance,
+                    force_fallback_adapter: false,
+                    compatible_surface: None,
+                    apply_limit_buckets: false,
+                })
+                .await
+                .ok()
+        };
+        let Some(adapter) = adapter else {
             assert_ne!(
                 std::env::var("SIM_ENGINE_REQUIRE_GPU_TESTS").as_deref(),
                 Ok("1"),
-                "a GPU adapter is required by SIM_ENGINE_REQUIRE_GPU_TESTS=1"
+                "the required physical GPU adapter is unavailable"
             );
             return;
         };
         let adapter_info = adapter.get_info();
+        let required_surface_format = std::env::var("SIM_ENGINE_GPU_SURFACE_FORMAT").ok();
+        assert!(
+            required_surface_format.is_some()
+                || std::env::var("SIM_ENGINE_REQUIRE_PRODUCTION_SURFACE_FORMAT").as_deref()
+                    != Ok("1"),
+            "SIM_ENGINE_REQUIRE_PRODUCTION_SURFACE_FORMAT=1 requires SIM_ENGINE_GPU_SURFACE_FORMAT"
+        );
+        let format = required_surface_format
+            .as_deref()
+            .map(|name| {
+                parse_gpu_oracle_surface_format(name)
+                    .unwrap_or_else(|| panic!("unsupported production surface format: {name}"))
+            })
+            .unwrap_or(wgpu::TextureFormat::Rgba8UnormSrgb);
+        let sample_count = preferred_sample_count(&adapter, format);
+        if let Ok(expected) = std::env::var("SIM_ENGINE_GPU_SURFACE_SAMPLE_COUNT") {
+            assert_eq!(
+                sample_count,
+                expected
+                    .parse::<u32>()
+                    .expect("SIM_ENGINE_GPU_SURFACE_SAMPLE_COUNT must be a u32"),
+                "offscreen oracle MSAA differs from the production surface selection"
+            );
+        }
+        if std::env::var("SIM_ENGINE_REQUIRE_ADAPTER_IDENTITY").as_deref() == Ok("1") {
+            assert_eq!(
+                adapter_info.backend.to_str(),
+                std::env::var("SIM_ENGINE_REQUIRED_ADAPTER_BACKEND").unwrap(),
+            );
+            assert_eq!(
+                adapter_info.name,
+                std::env::var("SIM_ENGINE_REQUIRED_ADAPTER_NAME").unwrap(),
+            );
+            assert_eq!(
+                format!("{:#06x}", adapter_info.vendor),
+                std::env::var("SIM_ENGINE_REQUIRED_ADAPTER_VENDOR").unwrap(),
+            );
+            assert_eq!(
+                format!("{:#06x}", adapter_info.device),
+                std::env::var("SIM_ENGINE_REQUIRED_ADAPTER_DEVICE").unwrap(),
+            );
+            assert_eq!(
+                adapter_info.device_pci_bus_id,
+                std::env::var("SIM_ENGINE_REQUIRED_ADAPTER_PCI_BUS_ID").unwrap(),
+                "semantic oracle selected a different physical adapter instance"
+            );
+        }
         if let Ok(path) = std::env::var("SIM_ENGINE_GPU_EVIDENCE_PATH") {
             let clean = |value: &str| value.replace(['\n', '\r', '='], " ");
-            let revision =
-                std::env::var("SIM_ENGINE_RELEASE_SHA").unwrap_or_else(|_| "unknown".to_owned());
+            let revision = std::env::var("SIM_ENGINE_RELEASE_SHA")
+                .expect("GPU evidence requires SIM_ENGINE_RELEASE_SHA");
             let evidence = format!(
-                "format_version=1\nvcs_sha={}\ncrate_version={}\nbackend={:?}\nname={}\ndevice_type={:?}\ndriver={}\ndriver_info={}\nvendor={:#06x}\ndevice={:#06x}\n",
+                "format_version=1\nvcs_sha={}\ncrate_version={}\nbackend={:?}\nname={}\ndevice_type={:?}\ndriver={}\ndriver_info={}\nvendor={:#06x}\ndevice={:#06x}\npci_bus_id={}\noracle_format={:?}\noracle_sample_count={}\n",
                 clean(&revision),
                 env!("CARGO_PKG_VERSION"),
                 adapter_info.backend,
@@ -1396,13 +1493,16 @@ fn offscreen_gpu_readback_verifies_camera_depth_and_clip_contract() {
                 clean(&adapter_info.driver_info),
                 adapter_info.vendor,
                 adapter_info.device,
+                clean(&adapter_info.device_pci_bus_id),
+                format,
+                sample_count,
             );
             std::fs::write(&path, evidence)
                 .unwrap_or_else(|error| panic!("write GPU evidence to {path}: {error}"));
         }
         if std::env::var("SIM_ENGINE_REQUIRE_GPU_TESTS").as_deref() == Ok("1") {
             eprintln!(
-                "sim-engine GPU evidence: name={:?}, type={:?}, backend={:?}, driver={:?}, driver_info={:?}, vendor={:#06x}, device={:#06x}",
+                "sim-engine GPU evidence: name={:?}, type={:?}, backend={:?}, driver={:?}, driver_info={:?}, vendor={:#06x}, device={:#06x}, pci_bus_id={:?}, surface_format={:?}, sample_count={}",
                 adapter_info.name,
                 adapter_info.device_type,
                 adapter_info.backend,
@@ -1410,6 +1510,9 @@ fn offscreen_gpu_readback_verifies_camera_depth_and_clip_contract() {
                 adapter_info.driver_info,
                 adapter_info.vendor,
                 adapter_info.device,
+                adapter_info.device_pci_bus_id,
+                format,
+                sample_count,
             );
             if std::env::var("SIM_ENGINE_REQUIRE_VULKAN").as_deref() == Ok("1") {
                 assert_eq!(
@@ -1449,14 +1552,8 @@ fn offscreen_gpu_readback_verifies_camera_depth_and_clip_contract() {
         let validation_scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
         let recovery_validation_scope =
             recovery_device.push_error_scope(wgpu::ErrorFilter::Validation);
-        assert_gpu_stroke_pixel_matrix(
-            &adapter,
-            &device,
-            &queue,
-            wgpu::TextureFormat::Rgba8UnormSrgb,
-        )
-        .await;
-        mesh3d::assert_gpu_depth_contract(&device, &queue, wgpu::TextureFormat::Rgba8UnormSrgb);
+        assert_gpu_stroke_pixel_matrix(&adapter, &device, &queue, format).await;
+        mesh3d::assert_gpu_depth_contract(&device, &queue, format);
         mesh3d::assert_gpu_scene_recovery_contract(
             &device,
             &queue,
@@ -1470,7 +1567,6 @@ fn offscreen_gpu_readback_verifies_camera_depth_and_clip_contract() {
                 first_invalid_capacity
             ));
         }
-        let format = wgpu::TextureFormat::Rgba8UnormSrgb;
         let PipelineResources {
             pipeline,
             target_pipeline: _,
@@ -2227,6 +2323,7 @@ fn offscreen_gpu_readback_verifies_camera_depth_and_clip_contract() {
             .expect("offscreen readback should map");
         let bytes = slice.get_mapped_range().expect("offscreen mapped bytes");
         let pixel = |x: usize, y: usize| &bytes[y * 256 + x * 4..y * 256 + x * 4 + 4];
+        let [red, green, blue, _alpha] = gpu_oracle_channel_indices(format);
         assert!(pixel(33, 29)[0] > 200, "camera/depth pixel was not drawn");
         assert!(pixel(33, 34)[0] < 10, "clip failed to remove outside pixel");
         assert!(pixel(14, 14)[0] > 200, "styled dash body was not drawn");
@@ -2242,31 +2339,31 @@ fn offscreen_gpu_readback_verifies_camera_depth_and_clip_contract() {
                 "{name} detail was alpha-blended more than once: body={body:?}, detail={detail:?}"
             );
         };
-        assert_uniform_translucency(pixel(10, 37), pixel(14, 32), 0, "round join");
-        assert_uniform_translucency(pixel(38, 37), pixel(42, 32), 1, "bevel join");
-        assert_uniform_translucency(pixel(46, 25), pixel(50, 20), 0, "miter fallback");
+        assert_uniform_translucency(pixel(10, 37), pixel(14, 32), red, "round join");
+        assert_uniform_translucency(pixel(38, 37), pixel(42, 32), green, "bevel join");
+        assert_uniform_translucency(pixel(46, 25), pixel(50, 20), red, "miter fallback");
         assert!(
-            pixel(50, 17)[0] < 10 && pixel(50, 17)[1] < 10,
+            pixel(50, 17)[red] < 10 && pixel(50, 17)[green] < 10,
             "over-limit miter spike was not replaced by bevel geometry: {:?}",
             pixel(50, 17)
         );
-        assert_uniform_translucency(pixel(20, 53), pixel(42, 53), 2, "arrow marker");
-        assert_uniform_translucency(pixel(20, 53), pixel(6, 53), 2, "round cap");
+        assert_uniform_translucency(pixel(20, 53), pixel(42, 53), blue, "arrow marker");
+        assert_uniform_translucency(pixel(20, 53), pixel(6, 53), blue, "round cap");
         assert!(
-            pixel(48, 53)[2] < 10,
+            pixel(48, 53)[blue] < 10,
             "the endpoint cap protruded beyond the arrow tip: {:?}",
             pixel(48, 53)
         );
         assert!(
-            pixel(50, 48)[0] > 200,
+            pixel(50, 48)[red] > 200,
             "instanced particle center was not drawn"
         );
         assert!(
-            pixel(50, 48)[1] < 10,
+            pixel(50, 48)[green] < 10,
             "instanced particle color was not applied"
         );
         assert!(
-            pixel(56, 54)[0] < 10,
+            pixel(56, 54)[red] < 10,
             "particle circle mask did not discard its corner"
         );
         drop(bytes);
@@ -2830,7 +2927,7 @@ fn offscreen_gpu_readback_verifies_camera_depth_and_clip_contract() {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
@@ -3018,16 +3115,16 @@ fn offscreen_gpu_readback_verifies_camera_depth_and_clip_contract() {
         let image_bytes = image_slice
             .get_mapped_range()
             .expect("offscreen image bytes");
-        assert!(image_bytes[0] > 180 && image_bytes[0] < 195);
+        assert!(image_bytes[red] > 180 && image_bytes[red] < 195);
         assert!(
-            image_bytes[1] < 8,
+            image_bytes[green] < 8,
             "screen image atlas sampling bled into the next texel"
         );
         assert!(
-            image_bytes[4] < 8,
+            image_bytes[4 + red] < 8,
             "world image atlas sampling bled into the previous texel"
         );
-        assert!(image_bytes[5] > 180 && image_bytes[5] < 195);
+        assert!(image_bytes[4 + green] > 180 && image_bytes[4 + green] < 195);
         drop(image_bytes);
         image_readback.unmap();
 
@@ -3163,9 +3260,9 @@ fn offscreen_gpu_readback_verifies_camera_depth_and_clip_contract() {
         let image_batch_bytes = image_batch_slice
             .get_mapped_range()
             .expect("offscreen image batch bytes");
-        assert!(image_batch_bytes[0] > 247 && image_batch_bytes[1] < 8);
-        assert!(image_batch_bytes[4] < 8);
-        assert!(image_batch_bytes[5] > 180 && image_batch_bytes[5] < 195);
+        assert!(image_batch_bytes[red] > 247 && image_batch_bytes[green] < 8);
+        assert!(image_batch_bytes[4 + red] < 8);
+        assert!(image_batch_bytes[4 + green] > 180 && image_batch_bytes[4 + green] < 195);
         drop(image_batch_bytes);
         image_readback.unmap();
     });

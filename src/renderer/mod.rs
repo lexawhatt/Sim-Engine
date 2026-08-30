@@ -2215,6 +2215,26 @@ impl WgpuRenderer {
         self.adapter_info.device
     }
 
+    /// Returns the backend-reported PCI bus address for the active adapter.
+    ///
+    /// Vulkan adapters expose this as `domain:bus:device.function` when the
+    /// driver supports `VK_EXT_pci_bus_info`. An empty string means that the
+    /// backend cannot identify a physical adapter instance; release evidence
+    /// must not treat model identifiers alone as instance identity.
+    pub fn adapter_pci_bus_id(&self) -> &str {
+        &self.adapter_info.device_pci_bus_id
+    }
+
+    /// Returns the texture format selected for the active presentation surface.
+    pub fn surface_format(&self) -> wgpu::TextureFormat {
+        self.config.format
+    }
+
+    /// Returns the raster sample count selected for the active surface format.
+    pub fn surface_sample_count(&self) -> u32 {
+        self.sample_count
+    }
+
     /// Returns the driver name reported by the active graphics adapter.
     pub fn adapter_driver(&self) -> &str {
         &self.adapter_info.driver
