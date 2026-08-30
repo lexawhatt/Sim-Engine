@@ -272,7 +272,7 @@ pub enum SceneError {
     NonFiniteGeometry(ScenePrimitive),
     /// Radius, size, corner radius, or stroke width is outside its valid range.
     InvalidDimension(ScenePrimitive),
-    /// Line or polyline has no drawable segment.
+    /// A line segment, or at least one consecutive polyline segment, is not drawable.
     DegenerateGeometry(ScenePrimitive),
     /// Consecutive polyline segments reverse exactly through the same vertex.
     ///

@@ -167,14 +167,17 @@ Run the complete named performance/contract matrix on a Vulkan-capable Linux
 machine with `./scripts/rendering_benchmark_matrix.sh`. Absolute timings are
 comparable only when adapter, driver, backend, present mode, and workload are
 recorded together; deterministic command/vertex/upload counters are portable.
-The matrix requires Vulkan and always enforces fixture-specific p95 ceilings
-for renderer work excluding surface acquisition. When the surface actually
-selects Immediate, it also enforces at least 60 observed FPS and a separate
-acquire p95 ceiling. Mailbox/FIFO results keep wall FPS and acquire wait as
-refresh-pacing diagnostics, so a correct 50/59.94 Hz compositor is not treated
-as a renderer regression. The matrix also drives a nested KWin compositor
+The matrix first runs the semantic oracle on the high-performance Vulkan
+adapter and pins its backend, name, PCI vendor, and device identity for every
+surface and HiDPI process. It always enforces fixture-specific p95 ceilings for
+renderer work excluding surface acquisition. Immediate additionally requires
+60 observed FPS. Mailbox/FIFO wall throughput must reach 95% of the reported
+display refresh, bounded to a 30-60 Hz release floor, so both a correct 50 Hz
+compositor and a pathologically slow GPU are distinguished. Acquire
+percentiles remain reported but do not independently flip the verdict from one
+scheduler-sensitive sample. The matrix also drives a nested KWin compositor
 through a real scale 1.00-to-1.25 transition and records the paired event and
-successful redraw for the exact revision.
+successful redraw for the exact revision on that same adapter.
 The automatic transition requires `dbus-run-session`, `kwin_wayland`, and
 `kscreen-doctor`; a missing executable fails the matrix instead of silently
 skipping HiDPI evidence.

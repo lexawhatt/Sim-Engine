@@ -2205,6 +2205,16 @@ impl WgpuRenderer {
         self.adapter_info.backend.to_str()
     }
 
+    /// Returns the PCI vendor identifier reported for the active adapter.
+    pub fn adapter_vendor_id(&self) -> u32 {
+        self.adapter_info.vendor
+    }
+
+    /// Returns the device identifier reported for the active adapter.
+    pub fn adapter_device_id(&self) -> u32 {
+        self.adapter_info.device
+    }
+
     /// Returns the driver name reported by the active graphics adapter.
     pub fn adapter_driver(&self) -> &str {
         &self.adapter_info.driver

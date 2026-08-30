@@ -1074,8 +1074,8 @@ async fn assert_gpu_stroke_pixel_matrix(
     queue: &wgpu::Queue,
     format: wgpu::TextureFormat,
 ) {
-    const WIDTH: u32 = 256;
-    const HEIGHT: u32 = 216;
+    const WIDTH: u32 = 512;
+    const HEIGHT: u32 = 248;
     const ROW_BYTES: u32 = WIDTH * 4;
     let sample_count = preferred_sample_count(adapter, format);
     let PipelineResources {
@@ -1138,33 +1138,56 @@ async fn assert_gpu_stroke_pixel_matrix(
         crate::StrokeJoin2d::Round,
     ];
     let mut scene = Scene::new(Color::BLACK).unwrap();
+    let screen_to_world =
+        |x: f32, y: f32| Vec2::new(x - WIDTH as f32 * 0.5, HEIGHT as f32 * 0.5 - y);
     for width_mode in 0..2 {
-        for (cap_index, cap) in caps.iter().copied().enumerate() {
-            for (join_index, join) in joins.iter().copied().enumerate() {
-                let row = cap_index * joins.len() + join_index;
-                let center_x = if width_mode == 0 { 64.0 } else { 192.0 };
-                let center_y = 12.0 + row as f32 * 24.0;
-                let screen_to_world =
-                    |x: f32, y: f32| Vec2::new(x - WIDTH as f32 * 0.5, HEIGHT as f32 * 0.5 - y);
-                let points = vec![
-                    screen_to_world(center_x - 14.0, center_y + 6.0),
-                    screen_to_world(center_x, center_y - 6.0),
-                    screen_to_world(center_x + 14.0, center_y + 6.0),
-                ];
-                let color = Color::rgba(1.0, 1.0, 1.0, 0.5);
-                let style = if width_mode == 0 {
-                    crate::StrokeStyle2d::logical(crate::LogicalPixels::new(10.0).unwrap(), color)
-                } else {
-                    crate::StrokeStyle2d::world(crate::WorldLength::new(10.0).unwrap(), color)
+        for turn_direction in 0..2 {
+            for (cap_index, cap) in caps.iter().copied().enumerate() {
+                for (join_index, join) in joins.iter().copied().enumerate() {
+                    let row = cap_index * joins.len() + join_index;
+                    let center_x = 64.0 + (width_mode * 2 + turn_direction) as f32 * 128.0;
+                    let center_y = 12.0 + row as f32 * 24.0;
+                    let vertical = if turn_direction == 0 { 6.0 } else { -6.0 };
+                    let points = vec![
+                        screen_to_world(center_x - 14.0, center_y + vertical),
+                        screen_to_world(center_x, center_y - vertical),
+                        screen_to_world(center_x + 14.0, center_y + vertical),
+                    ];
+                    let color = Color::rgba(1.0, 1.0, 1.0, 0.5);
+                    let style = if width_mode == 0 {
+                        crate::StrokeStyle2d::logical(
+                            crate::LogicalPixels::new(10.0).unwrap(),
+                            color,
+                        )
+                    } else {
+                        crate::StrokeStyle2d::world(crate::WorldLength::new(10.0).unwrap(), color)
+                    }
+                    .with_cap(cap)
+                    .with_join(join)
+                    .with_miter_limit(4.0)
+                    .unwrap();
+                    scene.try_styled_polyline(points, style).unwrap();
                 }
-                .with_cap(cap)
-                .with_join(join)
-                .with_miter_limit(4.0)
-                .unwrap();
-                scene.try_styled_polyline(points, style).unwrap();
             }
         }
     }
+    let marker = crate::StrokeMarker2d::arrow(
+        crate::LogicalPixels::new(10.0).unwrap(),
+        crate::LogicalPixels::new(12.0).unwrap(),
+    );
+    scene
+        .try_styled_line(
+            screen_to_world(254.0, 235.0),
+            screen_to_world(258.0, 235.0),
+            crate::StrokeStyle2d::logical(
+                crate::LogicalPixels::new(10.0).unwrap(),
+                Color::rgba(1.0, 1.0, 1.0, 0.5),
+            )
+            .with_cap(crate::StrokeCap2d::Round)
+            .with_start_marker(marker)
+            .with_end_marker(marker),
+        )
+        .unwrap();
     let identity = Arc::new(());
     let prepared = prepare_scene_resources(device, queue, identity, &scene)
         .expect("stroke pixel matrix should prepare");
@@ -1253,58 +1276,87 @@ async fn assert_gpu_stroke_pixel_matrix(
         .get_mapped_range()
         .expect("stroke pixel-matrix mapped bytes");
     let pixel = |x: usize, y: usize| &bytes[y * ROW_BYTES as usize + x * 4..][..4];
-    let mut covered = [[0usize; 9]; 2];
-    for (width_mode, counts) in covered.iter_mut().enumerate() {
-        let center_x = if width_mode == 0 { 64usize } else { 192usize };
-        for (row, count) in counts.iter_mut().enumerate() {
-            let center_y = 12usize + row * 24;
-            let mut maximum = 0u8;
-            for y in center_y.saturating_sub(11)..=(center_y + 11).min(HEIGHT as usize - 1) {
-                for x in center_x - 22..=center_x + 22 {
-                    let value = pixel(x, y)[0];
-                    maximum = maximum.max(value);
-                    *count += usize::from(value > 32);
+    let mut covered = [[[0usize; 9]; 2]; 2];
+    for (width_mode, turns) in covered.iter_mut().enumerate() {
+        for (turn_direction, counts) in turns.iter_mut().enumerate() {
+            let center_x = 64usize + (width_mode * 2 + turn_direction) * 128;
+            for (row, count) in counts.iter_mut().enumerate() {
+                let center_y = 12usize + row * 24;
+                let mut maximum = 0u8;
+                for y in center_y.saturating_sub(11)..=(center_y + 11).min(HEIGHT as usize - 1) {
+                    for x in center_x - 22..=center_x + 22 {
+                        let value = pixel(x, y)[0];
+                        maximum = maximum.max(value);
+                        *count += usize::from(value > 32);
+                    }
                 }
+                assert!(
+                    (175..=210).contains(&maximum),
+                    "stroke matrix width_mode={width_mode} turn={turn_direction} row={row} has missing or multiply blended pixels: maximum={maximum}, samples={sample_count}"
+                );
+                assert!(
+                    *count > 100,
+                    "stroke matrix width_mode={width_mode} turn={turn_direction} row={row} did not rasterize enough pixels: {count}"
+                );
             }
-            assert!(
-                (175..=210).contains(&maximum),
-                "stroke matrix width_mode={width_mode} row={row} has missing or multiply blended pixels: maximum={maximum}, samples={sample_count}"
-            );
-            assert!(
-                *count > 100,
-                "stroke matrix width_mode={width_mode} row={row} did not rasterize enough pixels: {count}"
-            );
-        }
-        for join in 0..3 {
-            assert!(counts[3 + join] > counts[join]);
-            assert!(counts[6 + join] > counts[join]);
-        }
-        for cap in 0..3 {
-            assert!(
-                counts[cap * 3 + 1] > counts[cap * 3],
-                "miter/bevel coverage did not differ for cap {cap}: {counts:?}"
-            );
-            assert!(
-                counts[cap * 3 + 2] > counts[cap * 3],
-                "round/bevel coverage did not differ for cap {cap}: {counts:?}"
-            );
+            for join in 0..3 {
+                assert!(counts[3 + join] > counts[join]);
+                assert!(counts[6 + join] > counts[join]);
+            }
+            for cap in 0..3 {
+                assert!(
+                    counts[cap * 3 + 1] > counts[cap * 3],
+                    "miter/bevel coverage did not differ for width={width_mode} turn={turn_direction} cap={cap}: {counts:?}"
+                );
+                assert!(
+                    counts[cap * 3 + 2] > counts[cap * 3],
+                    "round/bevel coverage did not differ for width={width_mode} turn={turn_direction} cap={cap}: {counts:?}"
+                );
+            }
         }
     }
-    for (row, (logical, world)) in covered[0]
-        .iter()
-        .copied()
-        .zip(covered[1].iter().copied())
-        .enumerate()
+    for (turn_direction, (logical_rows, world_rows)) in
+        covered[0].iter().zip(covered[1].iter()).enumerate()
     {
-        assert!(
-            logical.abs_diff(world) <= 24,
-            "logical/world stroke matrix diverged in row {row}: {:?}",
-            [logical, world]
-        );
+        for (row, (logical, world)) in logical_rows
+            .iter()
+            .copied()
+            .zip(world_rows.iter().copied())
+            .enumerate()
+        {
+            assert!(
+                logical.abs_diff(world) <= 24,
+                "logical/world stroke matrix diverged for turn={turn_direction} row={row}: {:?}",
+                [logical, world]
+            );
+        }
     }
+    for (width_mode, turns) in covered.iter().enumerate() {
+        for (row, (clockwise, counterclockwise)) in turns[0]
+            .iter()
+            .copied()
+            .zip(turns[1].iter().copied())
+            .enumerate()
+        {
+            assert!(
+                clockwise.abs_diff(counterclockwise) <= 24,
+                "mirrored stroke matrix diverged for width={width_mode} row={row}: {:?}",
+                [clockwise, counterclockwise]
+            );
+        }
+    }
+    let short_body = pixel(256, 235)[0];
+    let short_start_marker = pixel(248, 235)[0];
+    let short_end_marker = pixel(264, 235)[0];
+    assert!((175..=210).contains(&short_body));
+    assert!(short_body.abs_diff(short_start_marker) <= 8);
+    assert!(short_body.abs_diff(short_end_marker) <= 8);
+    assert!(pixel(241, 235)[0] < 10 && pixel(271, 235)[0] < 10);
     drop(bytes);
     readback.unmap();
-    eprintln!("sim-engine stroke pixel matrix: sample_count={sample_count}");
+    eprintln!(
+        "sim-engine stroke pixel matrix: 36 mirrored cap/join/width cells + short dual markers, sample_count={sample_count}"
+    );
 }
 
 #[test]
@@ -1314,7 +1366,7 @@ fn offscreen_gpu_readback_verifies_camera_depth_and_clip_contract() {
             wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
         let Ok(adapter) = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::LowPower,
+                power_preference: wgpu::PowerPreference::HighPerformance,
                 force_fallback_adapter: false,
                 compatible_surface: None,
                 apply_limit_buckets: false,
@@ -1331,8 +1383,11 @@ fn offscreen_gpu_readback_verifies_camera_depth_and_clip_contract() {
         let adapter_info = adapter.get_info();
         if let Ok(path) = std::env::var("SIM_ENGINE_GPU_EVIDENCE_PATH") {
             let clean = |value: &str| value.replace(['\n', '\r', '='], " ");
+            let revision =
+                std::env::var("SIM_ENGINE_RELEASE_SHA").unwrap_or_else(|_| "unknown".to_owned());
             let evidence = format!(
-                "format_version=1\ncrate_version={}\nbackend={:?}\nname={}\ndevice_type={:?}\ndriver={}\ndriver_info={}\nvendor={:#06x}\ndevice={:#06x}\n",
+                "format_version=1\nvcs_sha={}\ncrate_version={}\nbackend={:?}\nname={}\ndevice_type={:?}\ndriver={}\ndriver_info={}\nvendor={:#06x}\ndevice={:#06x}\n",
+                clean(&revision),
                 env!("CARGO_PKG_VERSION"),
                 adapter_info.backend,
                 clean(&adapter_info.name),

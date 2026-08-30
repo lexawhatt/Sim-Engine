@@ -46,6 +46,11 @@ dbus-run-session -- env \
 
 grep -Fxq "vcs_sha=$release_sha" "$SIM_ENGINE_HIDPI_EVIDENCE_PATH"
 grep -Fxq 'backend=vulkan' "$SIM_ENGINE_HIDPI_EVIDENCE_PATH"
+if [[ "${SIM_ENGINE_REQUIRE_ADAPTER_IDENTITY:-0}" == 1 ]]; then
+    grep -Fxq "adapter=$SIM_ENGINE_REQUIRED_ADAPTER_NAME" "$SIM_ENGINE_HIDPI_EVIDENCE_PATH"
+    grep -Fxq "vendor=$SIM_ENGINE_REQUIRED_ADAPTER_VENDOR" "$SIM_ENGINE_HIDPI_EVIDENCE_PATH"
+    grep -Fxq "device=$SIM_ENGINE_REQUIRED_ADAPTER_DEVICE" "$SIM_ENGINE_HIDPI_EVIDENCE_PATH"
+fi
 grep -Fxq 'scale_factor=1.250' "$SIM_ENGINE_HIDPI_EVIDENCE_PATH"
 grep -Fxq 'paired_transitions=1' "$SIM_ENGINE_HIDPI_EVIDENCE_PATH"
 grep -Fxq 'completed_transitions=1' "$SIM_ENGINE_HIDPI_EVIDENCE_PATH"

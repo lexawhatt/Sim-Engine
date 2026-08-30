@@ -88,6 +88,11 @@ composed frames, fixed-screen UI, retained images, and host-shaped text.
 - Dynamic-mesh creation, replacement, and restoration now reserve CPU recovery
   storage fallibly; full replacement commits retained state only after all
   validation, reservation, and replacement-buffer creation succeeds.
+- Adapter diagnostics now expose PCI vendor/device IDs, and release evidence
+  rejects any semantic, performance, or compositor process that selects a
+  different adapter identity.
+- `SceneError::DegenerateGeometry` documentation now matches validation: one
+  non-drawable consecutive segment is sufficient to reject a polyline.
 
 ### Testing
 
@@ -104,9 +109,10 @@ composed frames, fixed-screen UI, retained images, and host-shaped text.
   clipping, logical/world zoom behavior, finite-width overflow, bounded dash
   expansion, deterministic topology, and real GPU dash/gap readback coverage.
 - Extended the mandatory GPU oracle with half-alpha pixel comparisons for all
-  18 cap/join/width-mode combinations at the production-selected MSAA count,
-  plus arrow-marker and miter-to-bevel probes. It rejects repeated alpha
-  blending and any cap protruding through a marker boundary.
+  36 cap/join/width-mode/turn-direction combinations at the production-selected
+  MSAA count, plus a four-pixel body with short start-and-end arrow markers and
+  miter-to-bevel probes. It rejects repeated alpha blending, asymmetric CW/CCW
+  shader behavior, and any cap protruding through a marker boundary.
 - Replaced the synthetic `hidpi_resize` claim with a deterministic
   `dpi_reconfigure` workload and an event-driven `hidpi_transition` fixture.
   The release matrix drives a nested KWin compositor from scale 1.00 to 1.25
@@ -115,10 +121,11 @@ composed frames, fixed-screen UI, retained images, and host-shaped text.
 - The named matrix now uses four independent prepared world scenes and four
   independent cameras, reports renderer work separately from surface acquire,
   prints the actual adapter/backend/driver and present mode, validates fixture
-  source/count contracts, requires Vulkan, and enforces per-fixture renderer-
-  work p95 thresholds. The 60-FPS/acquire thresholds apply only to Immediate;
-  Mailbox/FIFO evidence treats wall FPS and acquire wait as refresh-pacing
-  diagnostics rather than renderer-throughput failures.
+  source/count contracts, pins semantic/performance/HiDPI evidence to one
+  Vulkan adapter identity, and enforces per-fixture renderer-work p95
+  thresholds. Immediate requires 60 FPS; Mailbox/FIFO require 95% of the
+  reported refresh within a 30-60 Hz release reference. Acquire percentiles are
+  diagnostics rather than a scheduler-sensitive one-run verdict.
 - Added the interactive `stroke_gallery` visual oracle with four pages for all
   v0.2 stroke styles, alpha contracts, markers, dashes, camera motion, and short
   accepted geometry.

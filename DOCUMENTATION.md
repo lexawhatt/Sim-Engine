@@ -177,9 +177,12 @@ the marked body endpoint is forced to a butt boundary. Marker length therefore
 cannot invert a short body or collide with a terminal join. Exact 180-degree
 retraces and repeated adjacent points are rejected as structured scene errors
 because no interior-disjoint translucent stroke topology exists for them.
+Every consecutive polyline segment must be drawable; `DegenerateGeometry`
+identifies a line segment or at least one consecutive polyline segment that is
+not.
 
-Every dash pattern carries `max_subsegments` in `1..=1_000_000`. Scene insertion counts visible
-pieces before tessellation and returns
+Every dash pattern carries `max_subsegments` in `1..=1_000_000`. Scene
+insertion counts visible pieces before tessellation and returns
 `SceneError::StrokeExpansionLimitExceeded` atomically when the ceiling would
 be crossed. Dash boundaries that collapse at the path's `f32` coordinate scale
 return `UnrepresentableStrokePattern` instead of entering a non-progressing
@@ -434,10 +437,10 @@ advertised non-VSync mode and may fall back to FIFO. Query
 `renderer.surface_present_mode()` for the concrete Immediate, Mailbox, FIFO,
 or FIFO-relaxed configuration chosen by the surface. This does not guarantee
 that a desktop compositor will scan out above the monitor refresh rate.
-`adapter_name()`, `adapter_backend()`, `adapter_driver()`, and
-`adapter_driver_info()` expose the exact adapter/API evidence that must travel
-with benchmark results; recovery updates all four values to the replacement
-logical device.
+`adapter_name()`, `adapter_backend()`, `adapter_vendor_id()`,
+`adapter_device_id()`, `adapter_driver()`, and `adapter_driver_info()` expose
+the exact adapter/API evidence that must travel with benchmark results;
+recovery updates every value to the replacement logical device.
 
 On Wayland, `Window::pre_present_notify()` installs compositor pacing. Call it
 for ordinary VSync presentation. An explicit uncapped diagnostic loop may omit
@@ -908,21 +911,27 @@ It runs `ui_static_10k`, `ui_90_10`, `four_viewports`, `image_atlas`,
 scenes and four distinct cameras. Surface fixtures print p50/p95/p99 renderer
 work excluding acquire, separate acquire percentiles, observed wall
 throughput, construction time, source counts, vertices, uploads, unique
-retained memory, textures, and draw calls. Every gated surface fixture must run
-on Vulkan. Renderer-work p95 is capped at 5 ms for retained UI, four-camera,
+retained memory, textures, and draw calls. The semantic oracle first selects
+the high-performance Vulkan adapter; backend, name, PCI vendor, and device must
+then match in every surface and HiDPI process. Renderer-work p95 is capped at 5
+ms for retained UI, four-camera,
 image, and glyph workloads, 10 ms for repeated DPI reconfiguration, and 25 ms
 for `ui_90_10`, which deliberately rebuilds and tessellates one thousand
 commands per frame. These fixture-specific ceilings keep a streaming baseline
 from weakening the retained-path oracle. If the selected surface mode is
-Immediate, the gate additionally requires at least 60 observed FPS and acquire
-p95 no greater than 25 ms. Mailbox and FIFO are refresh-synchronized: their
-wall FPS and acquire percentiles remain recorded but are not compared with an
-uncapped throughput threshold. `mixed_layers` remains core-only;
+Immediate, the gate additionally requires at least 60 observed FPS. Mailbox
+and FIFO must sustain 95% of the monitor's reported refresh rate after clamping
+that release reference to 30-60 Hz. Surface-acquire percentiles remain visible
+diagnostics in every mode, but a scheduler-sensitive p95 from one 120-frame run
+is not an independent release threshold. The matrix includes an explicit FIFO
+surface run so the refresh-normalized branch is exercised. `mixed_layers`
+remains core-only;
 `recovery_frame` is the mandatory Vulkan semantic fixture because it restores
 every retained source on a second logical device and verifies bytes/pixels.
 Record the adapter, driver, backend, and concrete present mode with results.
 The checked thresholds are the project's Linux release floor, not a claim that
-raw timings transfer between unrelated GPUs.
+raw timings transfer between unrelated GPUs. A matrix is invalid if semantic,
+performance, and compositor evidence do not name one identical adapter.
 
 The automated `dpi_reconfigure` workload deliberately tests the renderer API.
 The matrix additionally starts a nested KWin compositor and changes its real
@@ -1254,5 +1263,6 @@ The HiDPI step writes `target/linux-hidpi-transition.txt` with the exact VCS
 revision, Vulkan backend, scale, physical size, and transactional event counts.
 
 The gate must run from a clean worktree. Hardware performance or recovery
-claims must additionally name the Linux adapter, backend, driver, workload,
-present mode, and measurement method.
+claims must additionally name the Linux adapter, PCI vendor/device, backend,
+driver, workload, present mode, display refresh where applicable, and
+measurement method.
