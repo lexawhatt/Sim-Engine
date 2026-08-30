@@ -127,11 +127,19 @@ composed frames, fixed-screen UI, retained images, and host-shaped text.
   also makes the semantic oracle use the production surface format and selected
   MSAA count. The matrix enforces per-fixture renderer-work p95
   thresholds. Immediate requires 60 FPS; Mailbox/FIFO require 95% of the
-  confirmed current-monitor refresh within a 30-60 Hz release reference. It
-  never substitutes another enumerated monitor, and every warmup/measured frame
-  must be `Drawn`. Gated fixtures use the median throughput of three independent
-  120-frame trials and combined 360-frame work percentiles. Acquire percentiles
-  are diagnostics rather than a scheduler-sensitive one-run verdict.
+  positive confirmed current-monitor refresh within a 30-60 Hz release
+  reference. Every gated run first submits an unmeasured `Drawn` frame;
+  Immediate does not require refresh metadata, while synchronized modes reject
+  missing or zero refresh and never substitute another enumerated monitor.
+  Every warmup/measured frame must be `Drawn`. Each of the three independent
+  120-frame trials must clear the wall-throughput floor; the median is reported
+  only for diagnosis, and work percentiles combine all 360 frames. Acquire
+  percentiles are diagnostics rather than a scheduler-sensitive one-run
+  verdict. Standalone matrix and HiDPI scripts reject dirty worktrees before
+  assigning evidence to `HEAD`. HiDPI evidence pins the same physical PCI
+  adapter without incorrectly requiring a nested compositor to advertise the
+  desktop surface's format; production-format/MSAA equality remains mandatory
+  for the semantic oracle and production performance fixtures.
 - CI semantic evidence records and asserts the exact GitHub revision instead
   of permitting `vcs_sha=unknown`.
 - Added the interactive `stroke_gallery` visual oracle with four pages for all

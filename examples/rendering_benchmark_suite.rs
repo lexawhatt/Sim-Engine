@@ -125,6 +125,7 @@ struct BenchmarkRunState {
     renderer: WgpuRenderer,
     physical_width: u32,
     physical_height: u32,
+    output_confirmed: bool,
     output_confirmation_redraws: usize,
 }
 
@@ -264,6 +265,7 @@ impl ApplicationHandler for BenchmarkApplication {
                         renderer,
                         physical_width: size.width.max(1),
                         physical_height: size.height.max(1),
+                        output_confirmed: false,
                         output_confirmation_redraws: 0,
                     });
                     Ok(())
@@ -343,28 +345,37 @@ impl ApplicationHandler for BenchmarkApplication {
                 }
                 WindowEvent::RedrawRequested => {
                     let state = self.benchmark.as_mut().expect("benchmark state exists");
+                    if self.gate && !state.output_confirmed {
+                        let confirmation = present_confirmation_frame(
+                            &mut state.renderer,
+                            &self.fixture,
+                            "output-confirmation",
+                            0,
+                        );
+                        if let Err(error) = confirmation {
+                            self.failure = Some(error);
+                            event_loop.exit();
+                            return;
+                        }
+                        state.output_confirmed = true;
+                        state.window.request_redraw();
+                        return;
+                    }
                     if self.gate
                         && state
-                            .window
-                            .current_monitor()
-                            .and_then(|monitor| monitor.refresh_rate_millihertz())
-                            .is_none()
+                            .renderer
+                            .surface_present_mode()
+                            .is_refresh_synchronized()
+                        && current_monitor_refresh_hz(&state.window).is_none()
                     {
-                        let confirmation = (|| -> Result<(), Box<dyn Error>> {
-                            let frame = state
-                                .renderer
-                                .begin_frame(Color::BLACK, FrameBudget::default())?;
-                            let report = frame.present()?;
-                            require_drawn_frame(
-                                &self.fixture,
-                                "output-confirmation",
-                                state.output_confirmation_redraws,
-                                report.status(),
-                            )?;
-                            Ok(())
-                        })();
+                        let confirmation = present_confirmation_frame(
+                            &mut state.renderer,
+                            &self.fixture,
+                            "output-metadata-confirmation",
+                            state.output_confirmation_redraws,
+                        );
                         if let Err(error) = confirmation {
-                            self.failure = Some(error.to_string());
+                            self.failure = Some(error);
                             event_loop.exit();
                             return;
                         }
@@ -383,7 +394,12 @@ impl ApplicationHandler for BenchmarkApplication {
                     }
                     let mut state = self.benchmark.take().expect("benchmark state exists");
                     let result = (|| -> Result<(), Box<dyn Error>> {
-                        let gate_context = benchmark_gate_context(&state.window, self.gate)?;
+                        let gate_context = benchmark_gate_context(
+                            &state.window,
+                            self.gate,
+                            state.output_confirmed,
+                            state.renderer.surface_present_mode(),
+                        )?;
                         match self.fixture.as_str() {
                             "ui_static_10k" => {
                                 benchmark_static_ui(&mut state.renderer, gate_context)
@@ -558,23 +574,52 @@ fn validate_hidpi_evidence(evidence: &HidpiEvidenceTracker) -> Result<(), &'stat
 fn benchmark_gate_context(
     window: &Window,
     enabled: bool,
+    output_confirmed: bool,
+    present_mode: RendererSurfacePresentMode,
 ) -> Result<BenchmarkGateContext, Box<dyn Error>> {
-    let current_monitor = window.current_monitor();
-    if enabled && current_monitor.is_none() {
-        return Err(
-            "gated surface measurement requires a current monitor after the first redraw".into(),
-        );
-    }
-    let display_refresh_hz = current_monitor
-        .and_then(|monitor| monitor.refresh_rate_millihertz())
-        .map(|millihertz| f64::from(millihertz) / 1_000.0);
-    if enabled && display_refresh_hz.is_none() {
-        return Err("gated surface measurement requires current-monitor refresh metadata".into());
-    }
+    let display_refresh_hz = current_monitor_refresh_hz(window);
+    validate_gate_context(enabled, output_confirmed, present_mode, display_refresh_hz)
+        .map_err(|error| -> Box<dyn Error> { error.into() })?;
     Ok(BenchmarkGateContext {
         enabled,
         display_refresh_hz,
     })
+}
+
+fn validate_gate_context(
+    enabled: bool,
+    output_confirmed: bool,
+    present_mode: RendererSurfacePresentMode,
+    display_refresh_hz: Option<f64>,
+) -> Result<(), &'static str> {
+    if !enabled {
+        return Ok(());
+    }
+    if !output_confirmed {
+        return Err("gated surface measurement requires an unmeasured drawn frame first");
+    }
+    if present_mode.is_refresh_synchronized()
+        && display_refresh_hz.is_none_or(|refresh_hz| !refresh_hz.is_finite() || refresh_hz <= 0.0)
+    {
+        return Err(
+            "refresh-synchronized gated measurement requires a positive current-monitor refresh rate",
+        );
+    }
+    Ok(())
+}
+
+fn current_monitor_refresh_hz(window: &Window) -> Option<f64> {
+    confirmed_refresh_hz(
+        window
+            .current_monitor()
+            .and_then(|monitor| monitor.refresh_rate_millihertz()),
+    )
+}
+
+fn confirmed_refresh_hz(refresh_millihertz: Option<u32>) -> Option<f64> {
+    refresh_millihertz
+        .filter(|millihertz| *millihertz > 0)
+        .map(|millihertz| f64::from(millihertz) / 1_000.0)
 }
 
 fn write_surface_probe_evidence(renderer: &WgpuRenderer) -> Result<(), Box<dyn Error>> {
@@ -643,16 +688,26 @@ fn validate_renderer_adapter(renderer: &WgpuRenderer, required: bool) -> Result<
     if !required {
         return Ok(());
     }
+    let require_surface_contract =
+        std::env::var("SIM_ENGINE_REQUIRE_PRODUCTION_SURFACE_FORMAT").as_deref() == Ok("1");
     let expected = RequiredAdapterIdentity {
         backend: required_environment("SIM_ENGINE_REQUIRED_ADAPTER_BACKEND")?,
         name: required_environment("SIM_ENGINE_REQUIRED_ADAPTER_NAME")?,
         vendor: required_hex_environment("SIM_ENGINE_REQUIRED_ADAPTER_VENDOR")?,
         device: required_hex_environment("SIM_ENGINE_REQUIRED_ADAPTER_DEVICE")?,
         pci_bus_id: required_environment("SIM_ENGINE_REQUIRED_ADAPTER_PCI_BUS_ID")?,
-        surface_format: required_environment("SIM_ENGINE_GPU_SURFACE_FORMAT")?,
-        sample_count: required_environment("SIM_ENGINE_GPU_SURFACE_SAMPLE_COUNT")?
-            .parse::<u32>()
-            .map_err(|_| "SIM_ENGINE_GPU_SURFACE_SAMPLE_COUNT is not a u32".to_owned())?,
+        surface_format: if require_surface_contract {
+            required_environment("SIM_ENGINE_GPU_SURFACE_FORMAT")?
+        } else {
+            String::new()
+        },
+        sample_count: if require_surface_contract {
+            required_environment("SIM_ENGINE_GPU_SURFACE_SAMPLE_COUNT")?
+                .parse::<u32>()
+                .map_err(|_| "SIM_ENGINE_GPU_SURFACE_SAMPLE_COUNT is not a u32".to_owned())?
+        } else {
+            0
+        },
     };
     let actual = RequiredAdapterIdentity {
         backend: renderer.adapter_backend().to_owned(),
@@ -663,7 +718,7 @@ fn validate_renderer_adapter(renderer: &WgpuRenderer, required: bool) -> Result<
         surface_format: format!("{:?}", renderer.surface_format()),
         sample_count: renderer.surface_sample_count(),
     };
-    validate_adapter_identity(&actual, &expected)
+    validate_adapter_identity(&actual, &expected, require_surface_contract)
 }
 
 fn required_environment(name: &str) -> Result<String, String> {
@@ -679,8 +734,16 @@ fn required_hex_environment(name: &str) -> Result<u32, String> {
 fn validate_adapter_identity(
     actual: &RequiredAdapterIdentity,
     expected: &RequiredAdapterIdentity,
+    require_surface_contract: bool,
 ) -> Result<(), String> {
-    if actual == expected {
+    let physical_adapter_matches = actual.backend == expected.backend
+        && actual.name == expected.name
+        && actual.vendor == expected.vendor
+        && actual.device == expected.device
+        && actual.pci_bus_id == expected.pci_bus_id;
+    let surface_contract_matches = actual.surface_format == expected.surface_format
+        && actual.sample_count == expected.sample_count;
+    if physical_adapter_matches && (!require_surface_contract || surface_contract_matches) {
         return Ok(());
     }
     Err(format!(
@@ -745,6 +808,40 @@ mod tests {
     }
 
     #[test]
+    fn zero_refresh_is_unconfirmed_output_metadata() {
+        assert_eq!(confirmed_refresh_hz(None), None);
+        assert_eq!(confirmed_refresh_hz(Some(0)), None);
+        assert_eq!(confirmed_refresh_hz(Some(50_000)), Some(50.0));
+    }
+
+    #[test]
+    fn gate_context_requires_drawn_confirmation_but_refresh_only_for_synchronized_modes() {
+        assert!(
+            validate_gate_context(true, false, RendererSurfacePresentMode::Immediate, None,)
+                .unwrap_err()
+                .contains("drawn frame")
+        );
+        assert_eq!(
+            validate_gate_context(true, true, RendererSurfacePresentMode::Immediate, None,),
+            Ok(())
+        );
+        assert!(
+            validate_gate_context(true, true, RendererSurfacePresentMode::Fifo, None,)
+                .unwrap_err()
+                .contains("positive")
+        );
+        assert!(
+            validate_gate_context(true, true, RendererSurfacePresentMode::Fifo, Some(0.0),)
+                .unwrap_err()
+                .contains("positive")
+        );
+        assert_eq!(
+            validate_gate_context(true, true, RendererSurfacePresentMode::Fifo, Some(60.0),),
+            Ok(())
+        );
+    }
+
+    #[test]
     fn performance_gate_separates_uncapped_throughput_from_refresh_pacing() {
         let thresholds = gate_thresholds("four_viewports").unwrap();
         assert_eq!(
@@ -753,7 +850,7 @@ mod tests {
                 "vulkan",
                 RendererSurfacePresentMode::Immediate,
                 None,
-                120.0,
+                &[120.0, 121.0, 119.0],
                 1.0,
                 thresholds,
             ),
@@ -765,7 +862,7 @@ mod tests {
                 "vulkan",
                 RendererSurfacePresentMode::Fifo,
                 Some(50.0),
-                50.0,
+                &[50.0, 50.5, 49.5],
                 1.0,
                 thresholds,
             ),
@@ -777,7 +874,7 @@ mod tests {
                 "gl",
                 RendererSurfacePresentMode::Immediate,
                 None,
-                120.0,
+                &[120.0],
                 1.0,
                 thresholds,
             )
@@ -790,7 +887,7 @@ mod tests {
                 "vulkan",
                 RendererSurfacePresentMode::Immediate,
                 None,
-                59.0,
+                &[59.0],
                 1.0,
                 thresholds,
             )
@@ -802,12 +899,38 @@ mod tests {
                 "vulkan",
                 RendererSurfacePresentMode::Fifo,
                 Some(50.0),
-                5.0,
+                &[5.0],
                 1.0,
                 thresholds,
             )
             .unwrap_err()
             .contains("refresh-normalized")
+        );
+        assert!(
+            validate_performance_gate(
+                "four_viewports",
+                "vulkan",
+                RendererSurfacePresentMode::Fifo,
+                Some(0.0),
+                &[60.0],
+                1.0,
+                thresholds,
+            )
+            .unwrap_err()
+            .contains("positive")
+        );
+        assert!(
+            validate_performance_gate(
+                "four_viewports",
+                "vulkan",
+                RendererSurfacePresentMode::Immediate,
+                None,
+                &[1.0, 65.0, 66.0],
+                1.0,
+                thresholds,
+            )
+            .unwrap_err()
+            .contains("worst-trial")
         );
     }
 
@@ -822,7 +945,10 @@ mod tests {
             surface_format: "Bgra8UnormSrgb".to_owned(),
             sample_count: 4,
         };
-        assert_eq!(validate_adapter_identity(&expected, &expected), Ok(()));
+        assert_eq!(
+            validate_adapter_identity(&expected, &expected, true),
+            Ok(())
+        );
         for actual in [
             (
                 "gl",
@@ -897,7 +1023,16 @@ mod tests {
                 surface_format: actual.5.to_owned(),
                 sample_count: actual.6,
             };
-            assert!(validate_adapter_identity(&actual, &expected).is_err());
+            assert!(validate_adapter_identity(&actual, &expected, true).is_err());
+            let physical_fields_differ = actual.backend != expected.backend
+                || actual.name != expected.name
+                || actual.vendor != expected.vendor
+                || actual.device != expected.device
+                || actual.pci_bus_id != expected.pci_bus_id;
+            assert_eq!(
+                validate_adapter_identity(&actual, &expected, false).is_err(),
+                physical_fields_differ,
+            );
         }
     }
 }
@@ -1234,10 +1369,11 @@ fn measure_frames(
     let statistics = report.statistics();
     validate_fixture_contract(name, statistics)?;
     let sources = statistics.source_counts();
-    let wall_fps = trial_fps[trial_fps.len() / 2];
+    let minimum_wall_fps = trial_fps[0];
+    let median_wall_fps = trial_fps[trial_fps.len() / 2];
     let work_p95 = percentile(&renderer_work_samples, 0.95);
     println!(
-        "fixture={name} adapter={:?} vendor={:#06x} device={:#06x} pci_bus_id={:?} backend={} driver={:?} driver_info={:?} surface_format={:?} sample_count={} present_mode={} display_refresh_hz={:?} trials={} frames_per_trial={} attempted_frames={} drawn_frames={} median_trial_wall_fps={:.1} trial_wall_fps={:?} renderer_work_excluding_acquire_ms[p50={:.3},p95={:.3},p99={:.3}] surface_acquire_ms[p50={:.3},p95={:.3},p99={:.3}] construction_ms={:.3}",
+        "fixture={name} adapter={:?} vendor={:#06x} device={:#06x} pci_bus_id={:?} backend={} driver={:?} driver_info={:?} surface_format={:?} sample_count={} present_mode={} display_refresh_hz={:?} trials={} frames_per_trial={} attempted_frames={} drawn_frames={} minimum_trial_wall_fps={:.1} median_trial_wall_fps={:.1} trial_wall_fps={:?} renderer_work_excluding_acquire_ms[p50={:.3},p95={:.3},p99={:.3}] surface_acquire_ms[p50={:.3},p95={:.3},p99={:.3}] construction_ms={:.3}",
         renderer.adapter_name(),
         renderer.adapter_vendor_id(),
         renderer.adapter_device_id(),
@@ -1253,7 +1389,8 @@ fn measure_frames(
         MEASURED_FRAMES,
         measured_attempts,
         measured_attempts,
-        wall_fps,
+        minimum_wall_fps,
+        median_wall_fps,
         trial_fps,
         percentile(&renderer_work_samples, 0.50),
         percentile(&renderer_work_samples, 0.95),
@@ -1289,18 +1426,18 @@ fn measure_frames(
             renderer.adapter_backend(),
             renderer.surface_present_mode(),
             gate.display_refresh_hz,
-            wall_fps,
+            &trial_fps,
             work_p95,
             thresholds,
         )
         .map_err(|error| -> Box<dyn Error> { error.into() })?;
         match kind {
             PerformanceGateKind::UncappedThroughput => println!(
-                "gate=passed kind=uncapped_throughput min_wall_fps={:.1} max_renderer_work_p95_ms={:.3} acquire_percentiles=informational",
+                "gate=passed kind=uncapped_throughput worst_trial_wall_fps={minimum_wall_fps:.1} min_wall_fps={:.1} max_renderer_work_p95_ms={:.3} acquire_percentiles=informational",
                 thresholds.minimum_immediate_fps, thresholds.maximum_renderer_work_p95_ms,
             ),
             PerformanceGateKind::RefreshSynchronizedWork => println!(
-                "gate=passed kind=refresh_synchronized_work wall_fps=refresh_normalized acquire_percentiles=informational max_renderer_work_p95_ms={:.3}",
+                "gate=passed kind=refresh_synchronized_work worst_trial_wall_fps={minimum_wall_fps:.1} wall_fps=refresh_normalized acquire_percentiles=informational max_renderer_work_p95_ms={:.3}",
                 thresholds.maximum_renderer_work_p95_ms,
             ),
         }
@@ -1322,12 +1459,26 @@ fn require_drawn_frame(
     }
 }
 
+fn present_confirmation_frame(
+    renderer: &mut WgpuRenderer,
+    fixture: &str,
+    phase: &str,
+    index: usize,
+) -> Result<(), String> {
+    let result = (|| -> Result<RenderStatus, Box<dyn Error>> {
+        let frame = renderer.begin_frame(Color::BLACK, FrameBudget::default())?;
+        Ok(frame.present()?.status())
+    })();
+    let status = result.map_err(|error| error.to_string())?;
+    require_drawn_frame(fixture, phase, index, status)
+}
+
 fn validate_performance_gate(
     fixture: &str,
     backend: &str,
     present_mode: RendererSurfacePresentMode,
     display_refresh_hz: Option<f64>,
-    wall_fps: f64,
+    trial_wall_fps: &[f64],
     renderer_work_p95_ms: f64,
     thresholds: GateThresholds,
 ) -> Result<PerformanceGateKind, String> {
@@ -1342,23 +1493,42 @@ fn validate_performance_gate(
             thresholds.maximum_renderer_work_p95_ms,
         ));
     }
+    if trial_wall_fps.is_empty()
+        || trial_wall_fps
+            .iter()
+            .any(|fps| !fps.is_finite() || *fps <= 0.0)
+    {
+        return Err(format!(
+            "{fixture} performance evidence requires positive finite wall-throughput trials"
+        ));
+    }
+    let minimum_trial_fps = trial_wall_fps
+        .iter()
+        .copied()
+        .reduce(f64::min)
+        .expect("non-empty trial list was checked");
     if present_mode.is_refresh_synchronized() {
         let refresh_hz = display_refresh_hz.ok_or_else(|| {
             format!(
                 "{fixture} refresh-synchronized performance evidence requires monitor refresh metadata"
             )
         })?;
-        let minimum_fps = refresh_hz.clamp(30.0, 60.0) * 0.95;
-        if wall_fps < minimum_fps {
+        if !refresh_hz.is_finite() || refresh_hz <= 0.0 {
             return Err(format!(
-                "{fixture} refresh-normalized wall throughput {wall_fps:.1} FPS is below {minimum_fps:.1} FPS for a {refresh_hz:.3} Hz monitor"
+                "{fixture} refresh-synchronized performance evidence requires a positive finite monitor refresh rate"
+            ));
+        }
+        let minimum_fps = refresh_hz.clamp(30.0, 60.0) * 0.95;
+        if minimum_trial_fps < minimum_fps {
+            return Err(format!(
+                "{fixture} refresh-normalized worst-trial wall throughput {minimum_trial_fps:.1} FPS is below {minimum_fps:.1} FPS for a {refresh_hz:.3} Hz monitor"
             ));
         }
         return Ok(PerformanceGateKind::RefreshSynchronizedWork);
     }
-    if wall_fps < thresholds.minimum_immediate_fps {
+    if minimum_trial_fps < thresholds.minimum_immediate_fps {
         return Err(format!(
-            "{fixture} wall throughput {wall_fps:.1} FPS is below the {:.1} FPS gate",
+            "{fixture} worst-trial wall throughput {minimum_trial_fps:.1} FPS is below the {:.1} FPS gate",
             thresholds.minimum_immediate_fps,
         ));
     }

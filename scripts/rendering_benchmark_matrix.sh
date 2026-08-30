@@ -5,6 +5,11 @@ set -eu
 # deterministic work counters; compare results only on the same documented
 # adapter/backend/present-mode setup.
 
+if [ -n "$(git status --porcelain --untracked-files=all)" ]; then
+    echo "rendering benchmark matrix requires a clean worktree" >&2
+    exit 1
+fi
+
 export WGPU_BACKEND=vulkan
 export SIM_ENGINE_REQUIRE_VULKAN=1
 

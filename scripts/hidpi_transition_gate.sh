@@ -4,6 +4,11 @@ set -euo pipefail
 project_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$project_root"
 
+if [[ -n "$(git status --porcelain --untracked-files=all)" ]]; then
+    echo "HiDPI transition gate requires a clean worktree" >&2
+    exit 1
+fi
+
 for command in dbus-run-session kwin_wayland kscreen-doctor; do
     if ! command -v "$command" >/dev/null 2>&1; then
         echo "mandatory HiDPI gate requires $command" >&2
@@ -33,6 +38,7 @@ dbus-run-session -- env \
     XDG_CONFIG_HOME="$fixture_root/config" \
     XDG_DATA_HOME="$fixture_root/data" \
     XDG_CACHE_HOME="$fixture_root/cache" \
+    SIM_ENGINE_REQUIRE_PRODUCTION_SURFACE_FORMAT=0 \
     kwin_wayland \
     --virtual \
     --socket sim-engine-hidpi \

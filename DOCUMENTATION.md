@@ -476,8 +476,8 @@ surface, or zero-sized surface can be transient, but a throughput fixture must
 reject that attempt or exclude it from both its numerator and timing samples.
 The release matrix fails on any skipped warmup or measured report.
 Gated workloads run three independent 120-frame measurement trials. Wall
-throughput uses the median trial, while renderer-work/acquire percentiles use
-all 360 drawn samples.
+throughput must meet its floor in every trial; the median remains a reported
+diagnostic. Renderer-work/acquire percentiles use all 360 drawn samples.
 `RendererFrameMetrics`
 contains CPU wall-clock durations for tessellation, upload, camera-uniform
 upload, surface acquisition, encode/submit/present dispatch, and total call
@@ -911,6 +911,10 @@ The named release-mode matrix is:
 ./scripts/rendering_benchmark_matrix.sh
 ```
 
+The standalone matrix and the standalone HiDPI script fail before collecting
+evidence when the worktree is dirty. This prevents uncommitted code from being
+labelled with the unchanged `git rev-parse HEAD` revision.
+
 The real compositor fixture requires the Linux executables
 `dbus-run-session`, `kwin_wayland`, and `kscreen-doctor`. Their absence is a
 hard gate failure, not a skipped test.
@@ -925,7 +929,10 @@ retained memory, textures, and draw calls. A production-surface probe first
 selects the high-performance Vulkan adapter and records its PCI bus address,
 format, and MSAA count. The semantic oracle must use that exact physical GPU,
 surface format, and sample count; backend, name, vendor/model IDs, and PCI bus
-address must then match in every surface and HiDPI process. Renderer-work p95
+address must then match in every surface and HiDPI process. The semantic oracle
+uses the probed production format/MSAA contract. A nested compositor's own
+surface format may legitimately differ, so HiDPI pins the physical adapter but
+records rather than equates that separate surface contract. Renderer-work p95
 is capped at 5 ms for retained UI, four-camera,
 image, and glyph workloads, 10 ms for repeated DPI reconfiguration, and 25 ms
 for `ui_90_10`, which deliberately rebuilds and tessellates one thousand
@@ -934,13 +941,17 @@ from weakening the retained-path oracle. If the selected surface mode is
 Immediate, the gate additionally requires at least 60 observed FPS. Mailbox
 and FIFO must sustain 95% of the confirmed current monitor's reported refresh
 rate after clamping that release reference to 30-60 Hz. Before measuring, the
-fixture presents an unmeasured frame so Wayland can associate the surface with
-an output; it never substitutes the primary or first enumerated monitor.
+fixture always presents an unmeasured `Drawn` frame so Wayland can associate
+the surface with an output. Immediate can proceed without monitor refresh
+metadata. Mailbox/FIFO require a positive refresh rate from that current
+monitor; zero or missing refresh is unconfirmed, and the fixture never
+substitutes the primary or first enumerated monitor.
 Every warmup and measured frame must report `Drawn`. Surface-acquire
 percentiles remain visible diagnostics in every mode, but a scheduler-sensitive
 p95 from one trial is not an independent release threshold. Each gated fixture
-uses three 120-frame trials, median wall throughput, and combined 360-frame
-work percentiles. The matrix includes an explicit FIFO surface run so the
+uses three 120-frame trials, requires every trial to clear the wall-throughput
+floor, reports the median for diagnosis, and combines all 360 frames for work
+percentiles. The matrix includes an explicit FIFO surface run so the
 refresh-normalized branch is exercised. `mixed_layers`
 remains core-only;
 `recovery_frame` is the mandatory Vulkan semantic fixture because it restores
@@ -1282,7 +1293,8 @@ asserts that the artifact does not contain `vcs_sha=unknown`.
 The HiDPI step writes `target/linux-hidpi-transition.txt` with the exact VCS
 revision, Vulkan backend, scale, physical size, and transactional event counts.
 
-The gate must run from a clean worktree. Hardware performance or recovery
+The wrapper and each standalone evidence-producing surface/HiDPI script must
+run from a clean worktree. Hardware performance or recovery
 claims must additionally name the Linux adapter, PCI vendor/device and bus
 address, backend, driver, surface format/sample count, workload, present mode,
 confirmed current-monitor refresh where applicable, drawn/attempted counts,

@@ -171,26 +171,35 @@ The matrix first probes the real production surface. It pins the selected
 high-performance Vulkan adapter by PCI bus address as well as backend, name,
 vendor, and model, then requires the offscreen semantic oracle and every
 surface/HiDPI process to use that same physical GPU. The oracle uses the
-production surface format and its selected MSAA count. Every warmup and
+production surface format and its selected MSAA count. A nested compositor may
+advertise a different surface format; its HiDPI evidence remains pinned by the
+physical PCI identity rather than pretending two surfaces have identical
+capabilities. Every warmup and
 measured report must be `Drawn`; a timeout, occlusion, or outdated surface
 fails the fixture instead of inflating throughput with skipped attempts.
-Gated workloads use three independent 120-frame trials, compare median trial
-throughput, and calculate renderer-work percentiles across all 360 drawn
-frames, so one scheduler/cold-run outlier cannot decide the release.
+Gated workloads use three independent 120-frame trials. Every trial must meet
+the wall-throughput floor; the reported median is diagnostic only.
+Renderer-work percentiles cover all 360 drawn frames, so one failed trial
+cannot be hidden by two faster trials.
 
 The matrix always enforces fixture-specific p95 ceilings for renderer work
 excluding surface acquisition. Immediate additionally requires 60 presented
 FPS. Mailbox/FIFO wall throughput must reach 95% of the confirmed current
 monitor refresh, bounded to a 30-60 Hz release floor. The window is mapped by
-an unmeasured drawn frame before querying `current_monitor()`; primary/first
-monitor fallbacks are never accepted. Acquire percentiles remain reported but
-do not independently flip the verdict from one scheduler-sensitive sample.
+an unmeasured drawn frame before any output metadata is used. Immediate does
+not require refresh metadata; Mailbox/FIFO require a positive refresh rate
+from the window's confirmed current monitor. Zero/unknown refresh and
+primary/first-monitor fallbacks are never accepted for synchronized evidence.
+Acquire percentiles remain reported but do not independently flip the verdict
+from one scheduler-sensitive sample.
 The matrix also drives a nested KWin compositor through a real scale
 1.00-to-1.25 transition and records the paired event and successful redraw for
 the exact revision on that same physical adapter.
 The automatic transition requires `dbus-run-session`, `kwin_wayland`, and
 `kscreen-doctor`; a missing executable fails the matrix instead of silently
 skipping HiDPI evidence.
+Both the standalone matrix and standalone HiDPI gate reject a dirty worktree,
+so evidence cannot attribute uncommitted code to the current `HEAD`.
 
 `stroke_gallery` is the visual oracle for the v0.2 stroke contract. Pages 1-4
 show every cap/join, half-alpha overlap probes, bounded animated dashes,
