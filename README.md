@@ -190,6 +190,10 @@ an unmeasured drawn frame before any output metadata is used. Immediate does
 not require refresh metadata; Mailbox/FIFO require a positive refresh rate
 from the window's confirmed current monitor. Zero/unknown refresh and
 primary/first-monitor fallbacks are never accepted for synchronized evidence.
+Warmup and measured frames advance one `RedrawRequested` at a time, allowing
+compositor events between every sample. A resize, scale transition, or changed
+current-output identity invalidates the confirmation, discards partial timing
+samples, and restarts from a drawn frame on the new surface generation.
 Acquire percentiles remain reported but do not independently flip the verdict
 from one scheduler-sensitive sample.
 The matrix also drives a nested KWin compositor through a real scale
@@ -199,7 +203,9 @@ The automatic transition requires `dbus-run-session`, `kwin_wayland`, and
 `kscreen-doctor`; a missing executable fails the matrix instead of silently
 skipping HiDPI evidence.
 Both the standalone matrix and standalone HiDPI gate reject a dirty worktree,
-so evidence cannot attribute uncommitted code to the current `HEAD`.
+capture their starting commit, and recheck both clean state and unchanged
+`HEAD` before publishing evidence and at completion. Evidence therefore cannot
+attribute uncommitted or mid-run committed code to the starting revision.
 
 `stroke_gallery` is the visual oracle for the v0.2 stroke contract. Pages 1-4
 show every cap/join, half-alpha overlap probes, bounded animated dashes,

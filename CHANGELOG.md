@@ -136,7 +136,12 @@ composed frames, fixed-screen UI, retained images, and host-shaped text.
   only for diagnosis, and work percentiles combine all 360 frames. Acquire
   percentiles are diagnostics rather than a scheduler-sensitive one-run
   verdict. Standalone matrix and HiDPI scripts reject dirty worktrees before
-  assigning evidence to `HEAD`. HiDPI evidence pins the same physical PCI
+  assigning evidence to `HEAD`, retain the starting SHA, and recheck unchanged
+  `HEAD` plus clean state before promotion and on completion. Gated workloads
+  yield to the event loop between every frame; resize, scale, or output changes
+  invalidate generation-bound confirmation and restart timing after a new
+  unmeasured `Drawn`. The 120th refresh-metadata confirmation present receives
+  its own final follow-up check. HiDPI evidence pins the same physical PCI
   adapter without incorrectly requiring a nested compositor to advertise the
   desktop surface's format; production-format/MSAA equality remains mandatory
   for the semantic oracle and production performance fixtures.

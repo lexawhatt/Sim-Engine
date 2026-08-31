@@ -912,8 +912,11 @@ The named release-mode matrix is:
 ```
 
 The standalone matrix and the standalone HiDPI script fail before collecting
-evidence when the worktree is dirty. This prevents uncommitted code from being
-labelled with the unchanged `git rev-parse HEAD` revision.
+evidence when the worktree is dirty. Each captures its starting revision and
+rechecks both `HEAD` equality and clean state around evidence publication and
+at completion. Temporary manifests are not promoted on a failed run. This
+prevents uncommitted or mid-run committed code from being labelled with the
+starting `git rev-parse HEAD` revision.
 
 The real compositor fixture requires the Linux executables
 `dbus-run-session`, `kwin_wayland`, and `kscreen-doctor`. Their absence is a
@@ -946,6 +949,13 @@ the surface with an output. Immediate can proceed without monitor refresh
 metadata. Mailbox/FIFO require a positive refresh rate from that current
 monitor; zero or missing refresh is unconfirmed, and the fixture never
 substitutes the primary or first enumerated monitor.
+Measurement itself advances by one frame per event-loop redraw. This lets
+`ScaleFactorChanged`, `Resized`, and current-output changes run between every
+warmup or measured sample. Confirmation carries the renderer surface-generation
+number and output identity; any mismatch discards all partial samples and
+requires a new unmeasured `Drawn` before restarting warmup. Metadata retry is
+bounded to 120 confirmation presents, with a final follow-up redraw that can
+accept metadata produced by the 120th present.
 Every warmup and measured frame must report `Drawn`. Surface-acquire
 percentiles remain visible diagnostics in every mode, but a scheduler-sensitive
 p95 from one trial is not an independent release threshold. Each gated fixture
@@ -1294,7 +1304,8 @@ The HiDPI step writes `target/linux-hidpi-transition.txt` with the exact VCS
 revision, Vulkan backend, scale, physical size, and transactional event counts.
 
 The wrapper and each standalone evidence-producing surface/HiDPI script must
-run from a clean worktree. Hardware performance or recovery
+run from a clean worktree and finish on the exact revision captured at start.
+Hardware performance or recovery
 claims must additionally name the Linux adapter, PCI vendor/device and bus
 address, backend, driver, surface format/sample count, workload, present mode,
 confirmed current-monitor refresh where applicable, drawn/attempted counts,

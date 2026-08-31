@@ -4,10 +4,18 @@ set -euo pipefail
 project_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$project_root"
 
-if [[ -n "$(git status --porcelain --untracked-files=all)" ]]; then
-    echo "HiDPI transition gate requires a clean worktree" >&2
-    exit 1
-fi
+start_sha=$(git rev-parse HEAD)
+assert_provenance() {
+    if [[ "$(git rev-parse HEAD)" != "$start_sha" ]]; then
+        echo "HiDPI transition gate HEAD changed during the gate" >&2
+        exit 1
+    fi
+    if [[ -n "$(git status --porcelain --untracked-files=all)" ]]; then
+        echo "HiDPI transition gate requires a clean worktree" >&2
+        exit 1
+    fi
+}
+assert_provenance
 
 for command in dbus-run-session kwin_wayland kscreen-doctor; do
     if ! command -v "$command" >/dev/null 2>&1; then
@@ -17,15 +25,26 @@ for command in dbus-run-session kwin_wayland kscreen-doctor; do
 done
 
 cargo build --release --example rendering_benchmark_suite
+assert_provenance
 
 fixture_root=$(mktemp -d)
 runtime_dir="$fixture_root/runtime"
 mkdir "$runtime_dir"
 mkdir "$fixture_root/config" "$fixture_root/data" "$fixture_root/cache"
 chmod 700 "$runtime_dir"
-trap 'rm -rf -- "$fixture_root"' EXIT
+publish_complete=0
+cleanup() {
+    rm -rf -- "$fixture_root"
+    if [[ "$publish_complete" -ne 1 ]]; then
+        rm -f -- target/linux-hidpi-transition.txt
+    fi
+}
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
-release_sha=$(git rev-parse HEAD)
+release_sha=$start_sha
 export SIM_ENGINE_HIDPI_BINARY="$project_root/target/release/examples/rendering_benchmark_suite"
 export SIM_ENGINE_HIDPI_READY_PATH="$fixture_root/ready"
 export SIM_ENGINE_HIDPI_EVIDENCE_PATH="$fixture_root/evidence.txt"
@@ -50,6 +69,7 @@ dbus-run-session -- env \
     --no-global-shortcuts \
     --exit-with-session "$project_root/scripts/hidpi_transition_controller.sh"
 
+assert_provenance
 grep -Fxq "vcs_sha=$release_sha" "$SIM_ENGINE_HIDPI_EVIDENCE_PATH"
 grep -Fxq 'backend=vulkan' "$SIM_ENGINE_HIDPI_EVIDENCE_PATH"
 if [[ "${SIM_ENGINE_REQUIRE_ADAPTER_IDENTITY:-0}" == 1 ]]; then
@@ -63,5 +83,8 @@ grep -Fxq 'paired_transitions=1' "$SIM_ENGINE_HIDPI_EVIDENCE_PATH"
 grep -Fxq 'completed_transitions=1' "$SIM_ENGINE_HIDPI_EVIDENCE_PATH"
 
 mkdir -p target
+assert_provenance
 cp "$SIM_ENGINE_HIDPI_EVIDENCE_PATH" target/linux-hidpi-transition.txt
+assert_provenance
+publish_complete=1
 echo "HiDPI evidence: target/linux-hidpi-transition.txt"

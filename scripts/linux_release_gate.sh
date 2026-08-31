@@ -2,10 +2,18 @@
 set -euo pipefail
 
 echo "[1/11] clean release revision"
-if [[ -n "$(git status --porcelain --untracked-files=all)" ]]; then
-    echo "release gate requires a clean worktree" >&2
-    exit 1
-fi
+start_sha=$(git rev-parse HEAD)
+assert_provenance() {
+    if [[ "$(git rev-parse HEAD)" != "$start_sha" ]]; then
+        echo "release gate HEAD changed during the gate" >&2
+        exit 1
+    fi
+    if [[ -n "$(git status --porcelain --untracked-files=all)" ]]; then
+        echo "release gate requires a clean worktree" >&2
+        exit 1
+    fi
+}
+assert_provenance
 
 echo "[2/11] formatting"
 cargo fmt --all -- --check
@@ -29,7 +37,8 @@ cargo test --doc --all-features
 RUSTDOCFLAGS="-D warnings" cargo doc --all-features --no-deps
 
 echo "[8/11] strict Linux Vulkan semantics"
-release_sha=$(git rev-parse HEAD)
+assert_provenance
+release_sha=$start_sha
 WGPU_BACKEND=vulkan \
 SIM_ENGINE_SURFACE_EVIDENCE_PATH=target/linux-vulkan-surface.txt \
 SIM_ENGINE_RELEASE_SHA="$release_sha" \
@@ -67,11 +76,13 @@ grep -Fxq "oracle_sample_count=$required_surface_sample_count" target/linux-vulk
 echo "GPU evidence: target/linux-vulkan-adapter.txt"
 
 echo "[9/11] named rendering performance matrix"
+assert_provenance
 WGPU_BACKEND=vulkan \
 SIM_ENGINE_REQUIRE_VULKAN=1 \
 ./scripts/rendering_benchmark_matrix.sh
 
 echo "[10/11] package boundary"
+assert_provenance
 git diff --check
 if cargo package --offline --list \
     | grep -Eq '^(\.workbench/|\.idea/|\.github/|target/)'; then
@@ -81,5 +92,6 @@ fi
 
 echo "[11/11] package verification"
 cargo package --offline
+assert_provenance
 
 echo "Linux release gate passed"
