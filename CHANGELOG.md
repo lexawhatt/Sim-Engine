@@ -77,9 +77,9 @@ composed frames, fixed-screen UI, retained images, and host-shaped text.
 - Arrow markers use the path endpoint as a shared butt boundary and extend
   outward from it. The body never reverses or overlaps a marker, even when two
   markers are longer than a short path or the terminal dash run is absent.
-- Exact 180-degree polyline retraces and repeated adjacent points are rejected
-  during scene validation instead of producing crossed, multiply blended
-  stroke quads.
+- Exact and numerically indistinguishable 180-degree polyline retraces, plus
+  repeated adjacent points, are rejected during scene validation instead of
+  producing pinched or multiply blended stroke quads.
 - Frame retained-memory diagnostics count each referenced CPU, GPU buffer, and
   texture allocation once even when the same resource is drawn multiple times.
 - Target and heatmap composition uniforms now carry an explicit logical
@@ -104,6 +104,14 @@ composed frames, fixed-screen UI, retained images, and host-shaped text.
   finite center's source `f32` ULP. Tessellated vertices are now 80 bytes, and
   scene estimates, upload budgets, recovery memory, and diagnostics reflect
   that exact payload.
+- Rounded-corner arcs and world-unit stroke bodies, joins, and caps use the
+  same anchor-plus-local-offset representation. Any positive representable
+  radius/range remains nonzero; closed-stroke deduplication no longer erases
+  geometry merely because its squared length is below `f32::EPSILON`.
+- Camera/geometry validation preserves base/offset correlation between
+  commands and rejects both pre-transform relative-coordinate overflow and
+  final screen-to-clip overflow, including particle-radius extrusion and
+  retained image/glyph sprite bounds.
 - Streaming composition returns its reusable transient vertex allocation to
   the renderer on every structured error path, preserving steady-state memory
   behavior after a rejected frame.

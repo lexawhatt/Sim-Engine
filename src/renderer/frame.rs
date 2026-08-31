@@ -1883,6 +1883,13 @@ fn present_frame_with_vertices<'frame>(
                     world_clip_y: [0.0; 4],
                     world_mode: [0.0; 4],
                 };
+                if !image_sprites_are_safe_for_target(
+                    batch.sprites(),
+                    viewport.origin,
+                    uniform.destination,
+                ) {
+                    return Err(RendererFrameError::InvalidGeometryTransform.into());
+                }
                 let vertex_count = batch.sprite_count().saturating_mul(6);
                 statistics = statistics.adding(FrameStatistics {
                     pass_count: 1,
@@ -2122,6 +2129,35 @@ fn present_frame_with_vertices<'frame>(
         geometry_streamed,
         tessellation_stats,
     ))
+}
+
+fn image_sprites_are_safe_for_target(
+    sprites: &[ImageSprite2d],
+    viewport_origin: Vec2,
+    clip_transform: [f32; 4],
+) -> bool {
+    if !viewport_origin.is_finite() || !clip_transform.into_iter().all(f32::is_finite) {
+        return false;
+    }
+    sprites.iter().all(|sprite| {
+        let destination = sprite.destination();
+        let minimum = viewport_origin + destination.origin().to_vec2();
+        let maximum = minimum + destination.viewport().size();
+        minimum.is_finite()
+            && maximum.is_finite()
+            && shader_clip_interval_is_safe(
+                f64::from(minimum.x),
+                f64::from(maximum.x),
+                clip_transform[0],
+                clip_transform[2],
+            )
+            && shader_clip_interval_is_safe(
+                f64::from(minimum.y),
+                f64::from(maximum.y),
+                clip_transform[1],
+                clip_transform[3],
+            )
+    })
 }
 
 fn set_particle_rendered(items: &mut [ReadyItem<'_>], presented: bool) {
@@ -2836,6 +2872,43 @@ fn frame_report(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_and_glyph_sprite_bounds_include_final_clip_arithmetic() {
+        let source = ImageTexelRect::new(0, 0, 1, 1).unwrap();
+        let safe = ImageSprite2d::new(
+            source,
+            LogicalViewportRegion::new(
+                LogicalScreenPosition::new(0.0, 0.0),
+                LogicalViewport::new(1.0, 1.0).unwrap(),
+            )
+            .unwrap(),
+            Color::WHITE,
+        )
+        .unwrap();
+        let overflowing = ImageSprite2d::new(
+            source,
+            LogicalViewportRegion::new(
+                LogicalScreenPosition::new(-2.0e38, 0.0),
+                LogicalViewport::new(3.0e38, 1.0).unwrap(),
+            )
+            .unwrap(),
+            Color::WHITE,
+        )
+        .unwrap();
+        let one_pixel_clip = [2.0, -2.0, -1.0, 1.0];
+
+        assert!(image_sprites_are_safe_for_target(
+            &[safe],
+            Vec2::ZERO,
+            one_pixel_clip,
+        ));
+        assert!(!image_sprites_are_safe_for_target(
+            &[overflowing],
+            Vec2::ZERO,
+            one_pixel_clip,
+        ));
+    }
 
     #[test]
     fn frame_budget_accepts_exact_limit_and_rejects_one_over() {

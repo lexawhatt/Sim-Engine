@@ -2,6 +2,25 @@ use std::sync::OnceLock;
 
 use super::*;
 
+#[derive(Clone, Copy)]
+struct WorldPoint {
+    base: Vec2,
+    offset: Vec2,
+}
+
+impl WorldPoint {
+    const fn absolute(point: Vec2) -> Self {
+        Self {
+            base: point,
+            offset: Vec2::ZERO,
+        }
+    }
+
+    const fn anchored(base: Vec2, offset: Vec2) -> Self {
+        Self { base, offset }
+    }
+}
+
 pub(super) fn tessellate_scene(
     scene: &Scene,
     vertices: &mut Vec<Vertex>,
@@ -255,10 +274,9 @@ fn push_circle_shadow_world(
     );
 
     if shadow.spread() > 0.0 {
-        let points = circle_world_offsets(radius_world)?;
+        let points = circle_world_points(center_world, radius_world)?;
         push_closed_polyline_world(
             &points,
-            center_world,
             shadow.spread() * 2.0,
             shadow.color(),
             shadow.offset().to_vec2(),
@@ -274,10 +292,9 @@ fn push_circle_stroke_world(
     stroke: Stroke,
     vertices: &mut Vec<Vertex>,
 ) -> Result<(), TessellationError> {
-    let points = circle_world_offsets(radius_world)?;
+    let points = circle_world_points(center_world, radius_world)?;
     push_closed_polyline_world(
         &points,
-        center_world,
         stroke.width(),
         stroke.color(),
         Vec2::ZERO,
@@ -308,7 +325,6 @@ fn tessellate_rect(
             let points = rounded_rect_points(rect, corner_radius)?;
             push_closed_polyline_world(
                 &points,
-                Vec2::ZERO,
                 shadow.spread() * 2.0,
                 shadow.color(),
                 shadow.offset().to_vec2(),
@@ -325,7 +341,6 @@ fn tessellate_rect(
         let points = rounded_rect_points(rect, corner_radius)?;
         push_closed_polyline_world(
             &points,
-            Vec2::ZERO,
             stroke.width(),
             stroke.color(),
             Vec2::ZERO,
@@ -756,21 +771,21 @@ fn push_world_stroke_run(
         let direction = to - from;
         let start_joint = index > 0;
         let end_joint = index + 2 < points.len();
-        let start_center = if !start_joint
+        let start_center_offset = if !start_joint
             && endpoint_tangent(style, true, starts_path) < 0.0
             && !(starts_path && style.start_marker().is_some())
         {
-            from - precise_unit(direction) * half_width
+            -precise_unit(direction) * half_width
         } else {
-            from
+            Vec2::ZERO
         };
-        let end_center = if !end_joint
+        let end_center_offset = if !end_joint
             && endpoint_tangent(style, false, ends_path) > 0.0
             && !(ends_path && style.end_marker().is_some())
         {
-            to + precise_unit(direction) * half_width
+            precise_unit(direction) * half_width
         } else {
-            to
+            Vec2::ZERO
         };
         let start_offset = |side| {
             if start_joint {
@@ -810,9 +825,10 @@ fn push_world_stroke_run(
         } else {
             0.0
         };
-        let vertex = |world, tangent| {
-            stroke_vertex(
+        let vertex = |world, world_offset, tangent| {
+            stroke_vertex_with_offset(
                 world,
+                world_offset,
                 Vec2::ZERO,
                 direction,
                 direction,
@@ -822,10 +838,10 @@ fn push_world_stroke_run(
                 color,
             )
         };
-        let start_positive = vertex(start_center + start_offset(1.0), start_trim);
-        let end_positive = vertex(end_center + end_offset(1.0), end_trim);
-        let end_negative = vertex(end_center + end_offset(-1.0), end_trim);
-        let start_negative = vertex(start_center + start_offset(-1.0), start_trim);
+        let start_positive = vertex(from, start_center_offset + start_offset(1.0), start_trim);
+        let end_positive = vertex(to, end_center_offset + end_offset(1.0), end_trim);
+        let end_negative = vertex(to, end_center_offset + end_offset(-1.0), end_trim);
+        let start_negative = vertex(from, start_center_offset + start_offset(-1.0), start_trim);
         vertices.extend_from_slice(&[
             start_positive,
             end_positive,
@@ -951,19 +967,18 @@ fn push_world_join_fill(
     {
         return;
     }
-    let inner = center
-        + world_miter_offset(incoming, outgoing, -outer_side, half_width).map_or(
-            Vec2::ZERO,
-            |(offset, multiple)| {
-                if multiple <= style.miter_limit() {
-                    offset
-                } else {
-                    Vec2::ZERO
-                }
-            },
-        );
-    let incoming_outer = center + incoming_unit.perp() * (outer_side * half_width);
-    let outgoing_outer = center + outgoing_unit.perp() * (outer_side * half_width);
+    let inner_offset = world_miter_offset(incoming, outgoing, -outer_side, half_width).map_or(
+        Vec2::ZERO,
+        |(offset, multiple)| {
+            if multiple <= style.miter_limit() {
+                offset
+            } else {
+                Vec2::ZERO
+            }
+        },
+    );
+    let incoming_outer_offset = incoming_unit.perp() * (outer_side * half_width);
+    let outgoing_outer_offset = outgoing_unit.perp() * (outer_side * half_width);
     if style.join() == crate::StrokeJoin2d::Round {
         let start = incoming_unit.perp() * outer_side;
         let finish = outgoing_unit.perp() * outer_side;
@@ -980,14 +995,16 @@ fn push_world_join_fill(
                 )
             };
             vertices.extend_from_slice(&[
-                world_vertex(inner, Vec2::ZERO, color),
-                world_vertex(
-                    center + rotate(index as f32 / ROUND_CAP_SEGMENTS as f32) * half_width,
+                world_vertex_with_offset(center, inner_offset, Vec2::ZERO, color),
+                world_vertex_with_offset(
+                    center,
+                    rotate(index as f32 / ROUND_CAP_SEGMENTS as f32) * half_width,
                     Vec2::ZERO,
                     color,
                 ),
-                world_vertex(
-                    center + rotate((index + 1) as f32 / ROUND_CAP_SEGMENTS as f32) * half_width,
+                world_vertex_with_offset(
+                    center,
+                    rotate((index + 1) as f32 / ROUND_CAP_SEGMENTS as f32) * half_width,
                     Vec2::ZERO,
                     color,
                 ),
@@ -995,9 +1012,9 @@ fn push_world_join_fill(
         }
     } else {
         vertices.extend_from_slice(&[
-            world_vertex(inner, Vec2::ZERO, color),
-            world_vertex(incoming_outer, Vec2::ZERO, color),
-            world_vertex(outgoing_outer, Vec2::ZERO, color),
+            world_vertex_with_offset(center, inner_offset, Vec2::ZERO, color),
+            world_vertex_with_offset(center, incoming_outer_offset, Vec2::ZERO, color),
+            world_vertex_with_offset(center, outgoing_outer_offset, Vec2::ZERO, color),
         ]);
     }
 }
@@ -1082,7 +1099,7 @@ fn push_world_round_cap(
         vertices.push(center_vertex);
         for angle in [angle_start, angle_end] {
             let offset = tangent * (angle.cos() * radius) + normal * (angle.sin() * radius);
-            vertices.push(world_vertex(center + offset, Vec2::ZERO, color));
+            vertices.push(world_vertex_with_offset(center, offset, Vec2::ZERO, color));
         }
     }
 }
@@ -1171,11 +1188,14 @@ fn push_circle_fill_world(
     }
 }
 
-fn circle_world_offsets(radius_world: f32) -> Result<Vec<Vec2>, TessellationError> {
+fn circle_world_points(
+    center_world: Vec2,
+    radius_world: f32,
+) -> Result<Vec<WorldPoint>, TessellationError> {
     let mut points = Vec::new();
     reserve_items(&mut points, CIRCLE_SEGMENTS + 1)?;
     for point in unit_circle_points() {
-        points.push(*point * radius_world);
+        points.push(WorldPoint::anchored(center_world, *point * radius_world));
     }
     Ok(points)
 }
@@ -1223,51 +1243,55 @@ fn push_rect_world(
 
     let center = rect.center();
     for index in 0..points.len() - 1 {
-        vertices.push(world_vertex(
-            center,
+        vertices.push(world_vertex(center, screen_offset, fill.color_at(center)));
+        vertices.push(world_vertex_with_offset(
+            points[index].base,
+            points[index].offset,
             screen_offset,
-            fill.color_at(rect.center()),
+            fill.color_at_with_offset(points[index].base, points[index].offset),
         ));
-        vertices.push(world_vertex(
-            points[index],
+        vertices.push(world_vertex_with_offset(
+            points[index + 1].base,
+            points[index + 1].offset,
             screen_offset,
-            fill.color_at(points[index]),
-        ));
-        vertices.push(world_vertex(
-            points[index + 1],
-            screen_offset,
-            fill.color_at(points[index + 1]),
+            fill.color_at_with_offset(points[index + 1].base, points[index + 1].offset),
         ));
     }
     Ok(())
 }
 
-fn rounded_rect_points(rect: Rect, corner_radius: f32) -> Result<Vec<Vec2>, TessellationError> {
+fn rounded_rect_points(
+    rect: Rect,
+    corner_radius: f32,
+) -> Result<Vec<WorldPoint>, TessellationError> {
     let radius = corner_radius
         .max(0.0)
         .min(rect.width().abs() * 0.5)
         .min(rect.height().abs() * 0.5);
 
-    if radius <= f32::EPSILON {
+    if radius <= 0.0 {
         return Ok(vec![
-            Vec2::new(rect.max.x, rect.min.y),
-            Vec2::new(rect.max.x, rect.max.y),
-            Vec2::new(rect.min.x, rect.max.y),
-            Vec2::new(rect.min.x, rect.min.y),
-            Vec2::new(rect.max.x, rect.min.y),
+            WorldPoint::absolute(Vec2::new(rect.max.x, rect.min.y)),
+            WorldPoint::absolute(Vec2::new(rect.max.x, rect.max.y)),
+            WorldPoint::absolute(Vec2::new(rect.min.x, rect.max.y)),
+            WorldPoint::absolute(Vec2::new(rect.min.x, rect.min.y)),
+            WorldPoint::absolute(Vec2::new(rect.max.x, rect.min.y)),
         ]);
     }
 
+    // Keep each exact rectangle corner as a base and carry the rounded arc as
+    // a local offset. This preserves radii below the corner coordinate's f32
+    // ULP when a camera zoom makes them visible.
     let corners = [
-        Vec2::new(rect.max.x - radius, rect.max.y - radius),
-        Vec2::new(rect.min.x + radius, rect.max.y - radius),
-        Vec2::new(rect.min.x + radius, rect.min.y + radius),
-        Vec2::new(rect.max.x - radius, rect.min.y + radius),
+        (Vec2::new(rect.max.x, rect.max.y), Vec2::new(-1.0, -1.0)),
+        (Vec2::new(rect.min.x, rect.max.y), Vec2::new(1.0, -1.0)),
+        (Vec2::new(rect.min.x, rect.min.y), Vec2::new(1.0, 1.0)),
+        (Vec2::new(rect.max.x, rect.min.y), Vec2::new(-1.0, 1.0)),
     ];
 
     let mut points = Vec::new();
     reserve_items(&mut points, CORNER_SEGMENTS * 4 + 1)?;
-    for (corner_index, center) in corners.into_iter().enumerate() {
+    for (corner_index, (corner, inward)) in corners.into_iter().enumerate() {
         for unit in unit_quarter_circle_points() {
             let unit = match corner_index {
                 0 => *unit,
@@ -1275,7 +1299,7 @@ fn rounded_rect_points(rect: Rect, corner_radius: f32) -> Result<Vec<Vec2>, Tess
                 2 => Vec2::new(-unit.x, -unit.y),
                 _ => Vec2::new(unit.y, -unit.x),
             };
-            points.push(center + unit * radius);
+            points.push(WorldPoint::anchored(corner, (inward + unit) * radius));
         }
     }
     points.push(points[0]);
@@ -1284,8 +1308,7 @@ fn rounded_rect_points(rect: Rect, corner_radius: f32) -> Result<Vec<Vec2>, Tess
 }
 
 fn push_closed_polyline_world(
-    points: &[Vec2],
-    world_origin: Vec2,
+    points: &[WorldPoint],
     width: f32,
     color: Color,
     screen_offset: Vec2,
@@ -1295,12 +1318,12 @@ fn push_closed_polyline_world(
         return Ok(());
     }
 
-    let mut unique_points = Vec::new();
+    let mut unique_points: Vec<WorldPoint> = Vec::new();
     reserve_items(&mut unique_points, points.len() - 1)?;
     for point in &points[..points.len() - 1] {
         if unique_points
             .last()
-            .is_none_or(|previous| (*point - *previous).length_squared() > f32::EPSILON)
+            .is_none_or(|previous| !world_points_equal(*point, *previous))
         {
             unique_points.push(*point);
         }
@@ -1308,7 +1331,7 @@ fn push_closed_polyline_world(
     if unique_points.len() > 1 {
         let first = unique_points[0];
         let last = unique_points[unique_points.len() - 1];
-        if (first - last).length_squared() <= f32::EPSILON {
+        if world_points_equal(first, last) {
             unique_points.pop();
         }
     }
@@ -1322,13 +1345,16 @@ fn push_closed_polyline_world(
         let next = (index + 1) % point_count;
         let previous = (index + point_count - 1) % point_count;
         let after_next = (next + 1) % point_count;
-        let current_previous_direction = unique_points[index] - unique_points[previous];
-        let current_next_direction = unique_points[next] - unique_points[index];
-        let next_next_direction = unique_points[after_next] - unique_points[next];
+        let current_previous_direction =
+            world_point_direction(unique_points[previous], unique_points[index]);
+        let current_next_direction =
+            world_point_direction(unique_points[index], unique_points[next]);
+        let next_next_direction =
+            world_point_direction(unique_points[next], unique_points[after_next]);
 
         vertices.push(legacy_stroke_vertex_with_offset(
-            world_origin,
-            unique_points[index],
+            unique_points[index].base,
+            unique_points[index].offset,
             screen_offset,
             current_previous_direction,
             current_next_direction,
@@ -1336,8 +1362,8 @@ fn push_closed_polyline_world(
             color,
         ));
         vertices.push(legacy_stroke_vertex_with_offset(
-            world_origin,
-            unique_points[next],
+            unique_points[next].base,
+            unique_points[next].offset,
             screen_offset,
             current_next_direction,
             next_next_direction,
@@ -1345,8 +1371,8 @@ fn push_closed_polyline_world(
             color,
         ));
         vertices.push(legacy_stroke_vertex_with_offset(
-            world_origin,
-            unique_points[next],
+            unique_points[next].base,
+            unique_points[next].offset,
             screen_offset,
             current_next_direction,
             next_next_direction,
@@ -1354,8 +1380,8 @@ fn push_closed_polyline_world(
             color,
         ));
         vertices.push(legacy_stroke_vertex_with_offset(
-            world_origin,
-            unique_points[index],
+            unique_points[index].base,
+            unique_points[index].offset,
             screen_offset,
             current_previous_direction,
             current_next_direction,
@@ -1363,8 +1389,8 @@ fn push_closed_polyline_world(
             color,
         ));
         vertices.push(legacy_stroke_vertex_with_offset(
-            world_origin,
-            unique_points[next],
+            unique_points[next].base,
+            unique_points[next].offset,
             screen_offset,
             current_next_direction,
             next_next_direction,
@@ -1372,8 +1398,8 @@ fn push_closed_polyline_world(
             color,
         ));
         vertices.push(legacy_stroke_vertex_with_offset(
-            world_origin,
-            unique_points[index],
+            unique_points[index].base,
+            unique_points[index].offset,
             screen_offset,
             current_previous_direction,
             current_next_direction,
@@ -1382,6 +1408,25 @@ fn push_closed_polyline_world(
         ));
     }
     Ok(())
+}
+
+fn world_points_equal(left: WorldPoint, right: WorldPoint) -> bool {
+    let (horizontal, vertical) = world_point_delta(left, right);
+    horizontal == 0.0 && vertical == 0.0
+}
+
+fn world_point_direction(from: WorldPoint, to: WorldPoint) -> Vec2 {
+    let (horizontal, vertical) = world_point_delta(from, to);
+    Vec2::new(horizontal as f32, vertical as f32)
+}
+
+fn world_point_delta(from: WorldPoint, to: WorldPoint) -> (f64, f64) {
+    (
+        (f64::from(to.base.x) - f64::from(from.base.x))
+            + (f64::from(to.offset.x) - f64::from(from.offset.x)),
+        (f64::from(to.base.y) - f64::from(from.base.y))
+            + (f64::from(to.offset.y) - f64::from(from.offset.y)),
+    )
 }
 
 pub(super) fn world_vertex(world: Vec2, screen_offset: Vec2, color: Color) -> Vertex {

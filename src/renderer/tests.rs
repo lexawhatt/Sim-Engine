@@ -165,6 +165,21 @@ fn particle_culling_keeps_circles_that_intersect_the_logical_viewport() {
 }
 
 #[test]
+fn particle_safety_includes_radius_in_final_clip_arithmetic() {
+    let camera = Camera2d::new(Vec2::ZERO, 1.0).unwrap();
+    let viewport = LogicalViewport::new(1.0, 1.0).unwrap();
+    let uniform = CameraUniform::new(camera, viewport).unwrap();
+    let particle = ParticleGpu {
+        world_position: [0.0, 0.0],
+        depth: 0.0,
+        radius: 2.0e38,
+        color: Color::WHITE.to_array(),
+    };
+
+    assert!(!particle.is_safe_for(uniform));
+}
+
+#[test]
 fn particle_partial_updates_require_an_existing_contiguous_range() {
     assert_eq!(particle_update_range(2, 3, 5), Ok(2..5));
     assert_eq!(particle_update_range(5, 0, 5), Ok(5..5));
@@ -576,6 +591,96 @@ fn stroke_caps_and_width_spaces_follow_their_contract() {
 }
 
 #[test]
+fn world_width_stroke_preserves_width_below_large_base_ulp() {
+    let center = Vec2::new(1.0e20, 0.0);
+    let mut scene = Scene::new(Color::BLACK).unwrap();
+    scene
+        .try_styled_line(
+            Vec2::new(center.x, -1.0),
+            Vec2::new(center.x, 1.0),
+            crate::StrokeStyle2d::world(crate::WorldLength::new(1.0).unwrap(), Color::WHITE)
+                .with_cap(crate::StrokeCap2d::Butt),
+        )
+        .unwrap();
+
+    let (vertices, batches) = tessellate_for_test(&scene);
+    assert_eq!(vertices.len(), 6);
+    assert_eq!(batches.len(), 1);
+    assert!(
+        vertices
+            .iter()
+            .all(|vertex| vertex.world_offset[0].abs() == 0.5)
+    );
+
+    let camera = Camera2d::new(center, 100.0).unwrap();
+    let viewport = LogicalViewport::new(320.0, 240.0).unwrap();
+    let projected: Vec<_> = vertices
+        .iter()
+        .copied()
+        .map(|vertex| vertex_screen_position(vertex, camera, viewport))
+        .collect();
+    let minimum = projected
+        .iter()
+        .map(|point| point.x)
+        .fold(f32::INFINITY, f32::min);
+    let maximum = projected
+        .iter()
+        .map(|point| point.x)
+        .fold(f32::NEG_INFINITY, f32::max);
+    assert!((maximum - minimum - 100.0).abs() < 0.01);
+
+    let mut overflow_scene = Scene::new(Color::BLACK).unwrap();
+    overflow_scene
+        .try_styled_line(
+            Vec2::new(center.x, -1.0),
+            Vec2::new(center.x, 1.0),
+            crate::StrokeStyle2d::world(crate::WorldLength::new(4.0).unwrap(), Color::WHITE)
+                .with_cap(crate::StrokeCap2d::Butt),
+        )
+        .unwrap();
+    let (overflow_vertices, _) = tessellate_for_test(&overflow_scene);
+    let tiny_viewport = LogicalViewport::new(1.0e-38, 1.0).unwrap();
+    let tiny_uniform =
+        CameraUniform::new(Camera2d::new(center, 1.0).unwrap(), tiny_viewport).unwrap();
+    assert!(!GeometryExtents::from_vertices(&overflow_vertices).is_safe_for(tiny_uniform));
+}
+
+#[test]
+fn near_reversal_is_rejected_before_join_tessellation() {
+    let points = vec![Vec2::ZERO, Vec2::X, Vec2::new(0.0, 0.000_000_1)];
+
+    for join in [
+        crate::StrokeJoin2d::Bevel,
+        crate::StrokeJoin2d::Round,
+        crate::StrokeJoin2d::Miter,
+    ] {
+        for style in [
+            crate::StrokeStyle2d::logical(crate::LogicalPixels::new(2.0).unwrap(), Color::WHITE)
+                .with_cap(crate::StrokeCap2d::Butt)
+                .with_join(join),
+            crate::StrokeStyle2d::world(crate::WorldLength::new(2.0).unwrap(), Color::WHITE)
+                .with_cap(crate::StrokeCap2d::Butt)
+                .with_join(join),
+        ] {
+            let mut scene = Scene::new(Color::BLACK).unwrap();
+            assert!(matches!(
+                scene.try_styled_polyline(points.clone(), style),
+                Err(crate::SceneError::DegenerateStrokeTurn {
+                    primitive: crate::ScenePrimitive::Polyline,
+                    vertex_index: 1,
+                })
+            ));
+            assert_eq!(
+                scene.command_count(),
+                0,
+                "{join:?} {:?}",
+                style.width_mode()
+            );
+        }
+    }
+}
+
+#[test]
 fn short_accepted_line_emits_vertices() {
     let mut scene = Scene::new(Color::BLACK).unwrap();
     assert!(scene.line(Vec2::ZERO, Vec2::new(0.005, 0.0), 2.0, Color::WHITE));
@@ -876,8 +981,64 @@ fn cached_circle_samples_close_exactly_at_large_world_scale() {
 }
 
 #[test]
+fn sub_epsilon_closed_strokes_remain_drawable_at_large_zoom() {
+    let mut circle_scene = Scene::new(Color::BLACK).unwrap();
+    circle_scene
+        .try_circle(Vec2::ZERO, 0.000_1, ShapeStyle::stroked(2.0, Color::WHITE))
+        .unwrap();
+    let (circle_vertices, circle_batches) = tessellate_for_test(&circle_scene);
+    assert_eq!(circle_vertices.len(), CIRCLE_SEGMENTS * 6);
+    assert_eq!(circle_batches.len(), 1);
+
+    let mut rounded_rect_scene = Scene::new(Color::BLACK).unwrap();
+    rounded_rect_scene
+        .try_rect(
+            Rect::from_center_size(Vec2::ZERO, Vec2::splat(0.000_1)),
+            0.000_025,
+            ShapeStyle::stroked(2.0, Color::WHITE),
+        )
+        .unwrap();
+    let (rect_vertices, rect_batches) = tessellate_for_test(&rounded_rect_scene);
+    assert_eq!(rect_vertices.len(), 4 * (CORNER_SEGMENTS + 1) * 6);
+    assert_eq!(rect_batches.len(), 1);
+
+    let camera = Camera2d::new(Vec2::ZERO, 100_000.0).unwrap();
+    let viewport = LogicalViewport::new(64.0, 64.0).unwrap();
+    let uniform = CameraUniform::new(camera, viewport).unwrap();
+    assert!(GeometryExtents::from_vertices(&circle_vertices).is_safe_for(uniform));
+    assert!(GeometryExtents::from_vertices(&rect_vertices).is_safe_for(uniform));
+}
+
+#[test]
+fn sub_ulp_rounded_corner_keeps_its_local_arc_offsets() {
+    let mut scene = Scene::new(Color::BLACK).unwrap();
+    scene
+        .try_rect(
+            Rect::from_center_size(Vec2::ZERO, Vec2::splat(1.0)),
+            0.000_000_01,
+            ShapeStyle::stroked(2.0, Color::WHITE),
+        )
+        .unwrap();
+
+    let (vertices, batches) = tessellate_for_test(&scene);
+    assert_eq!(vertices.len(), 4 * (CORNER_SEGMENTS + 1) * 6);
+    assert_eq!(batches.len(), 1);
+    assert!(
+        vertices
+            .iter()
+            .any(|vertex| vertex.world_offset != [0.0; 2])
+    );
+    let camera = Camera2d::new(Vec2::ZERO, 10_000_000_000.0).unwrap();
+    let viewport = LogicalViewport::new(64.0, 64.0).unwrap();
+    assert!(
+        GeometryExtents::from_vertices(&vertices)
+            .is_safe_for(CameraUniform::new(camera, viewport).unwrap())
+    );
+}
+
+#[test]
 fn large_center_circle_fill_preserves_camera_relative_radius() {
-    let center = Vec2::splat(1.0e20);
+    let center = Vec2::new(1.0e20, 0.0);
     let mut scene = Scene::new(Color::BLACK).unwrap();
     scene
         .try_circle(center, 1.0, ShapeStyle::filled(Color::WHITE))
@@ -1101,6 +1262,64 @@ fn geometry_extents_reject_shader_arithmetic_overflow() {
     };
 
     assert!(!extents.is_safe_for(uniform));
+}
+
+#[test]
+fn geometry_extents_reject_world_offset_overflow_before_camera_scale() {
+    let mut scene = Scene::new(Color::BLACK).unwrap();
+    scene
+        .try_circle(Vec2::ZERO, 2.0e38, ShapeStyle::filled(Color::WHITE))
+        .unwrap();
+    let (vertices, _) = tessellate_for_test(&scene);
+    let camera = Camera2d::new(Vec2::splat(-2.0e38), 0.000_1).unwrap();
+    let viewport = LogicalViewport::new(64.0, 64.0).unwrap();
+    let uniform = CameraUniform::new(camera, viewport).unwrap();
+
+    // The projected f64 envelope is small after zoom, but WGSL first adds
+    // 2e38 + 2e38 in f32. Validation must reject that intermediate overflow.
+    assert!(!GeometryExtents::from_vertices(&vertices).is_safe_for(uniform));
+}
+
+#[test]
+fn geometry_extents_reject_final_screen_to_clip_overflow() {
+    let mut scene = Scene::new(Color::BLACK).unwrap();
+    scene
+        .try_circle(Vec2::ZERO, 2.0e38, ShapeStyle::filled(Color::WHITE))
+        .unwrap();
+    let (vertices, _) = tessellate_for_test(&scene);
+    let camera = Camera2d::new(Vec2::ZERO, 1.0).unwrap();
+    let viewport = LogicalViewport::new(1.0, 1.0).unwrap();
+    let uniform = CameraUniform::new(camera, viewport).unwrap();
+
+    assert!(!GeometryExtents::from_vertices(&vertices).is_safe_for(uniform));
+
+    let dynamic = [DynamicGpu {
+        world_position: [2.0e38, 0.0],
+        depth: 0.0,
+        color: Color::WHITE.to_array(),
+    }];
+    assert!(!GeometryExtents::from_dynamic_vertices(&dynamic).is_safe_for(uniform));
+}
+
+#[test]
+fn geometry_extents_preserve_base_offset_correlation_between_commands() {
+    let mut scene = Scene::new(Color::BLACK).unwrap();
+    scene
+        .try_circle(
+            Vec2::new(2.0e38, 0.0),
+            1.0,
+            ShapeStyle::filled(Color::WHITE),
+        )
+        .unwrap();
+    scene
+        .try_circle(Vec2::ZERO, 2.0e38, ShapeStyle::filled(Color::WHITE))
+        .unwrap();
+    let (vertices, _) = tessellate_for_test(&scene);
+    let camera = Camera2d::new(Vec2::ZERO, 1.0).unwrap();
+    let viewport = LogicalViewport::new(64.0, 64.0).unwrap();
+    let uniform = CameraUniform::new(camera, viewport).unwrap();
+
+    assert!(GeometryExtents::from_vertices(&vertices).is_safe_for(uniform));
 }
 
 #[test]
@@ -1630,7 +1849,7 @@ async fn assert_gpu_large_center_circle(
         .as_ref()
         .map(|texture| texture.create_view(&wgpu::TextureViewDescriptor::default()));
 
-    let center = Vec2::splat(1.0e20);
+    let center = Vec2::new(1.0e20, 0.0);
     let viewport = LogicalViewport::new(EXTENT as f32, EXTENT as f32).unwrap();
     let camera = Camera2d::new(center, 8.0).unwrap();
     let camera_uniform = CameraUniform::new(camera, viewport).unwrap();
@@ -1647,9 +1866,20 @@ async fn assert_gpu_large_center_circle(
             ShapeStyle::fill_stroke(Color::WHITE, 2.0, Color::rgb8(255, 0, 0)),
         )
         .unwrap();
+    scene
+        .try_styled_line(
+            Vec2::new(center.x, 1.5),
+            Vec2::new(center.x, 3.5),
+            crate::StrokeStyle2d::world(
+                crate::WorldLength::new(1.0).unwrap(),
+                Color::rgb8(0, 255, 0),
+            )
+            .with_cap(crate::StrokeCap2d::Butt),
+        )
+        .unwrap();
     let prepared = prepare_scene_resources(device, queue, Arc::new(()), &scene)
         .expect("large-center circle should prepare without degenerating");
-    assert_eq!(prepared.tessellation_stats().rendered_command_count(), 1);
+    assert_eq!(prepared.tessellation_stats().rendered_command_count(), 2);
     assert_eq!(prepared.tessellation_stats().dropped_command_count(), 0);
 
     let readback = device.create_buffer(&wgpu::BufferDescriptor {
@@ -1749,6 +1979,20 @@ async fn assert_gpu_large_center_circle(
     assert!(
         outside[channels[0]] < 10 && outside[channels[1]] < 10 && outside[channels[2]] < 10,
         "large-center circle exceeded its camera-relative bounds: {outside:?}"
+    );
+    let world_width_line = pixel(32, 12);
+    assert!(
+        world_width_line[channels[0]] < 10
+            && world_width_line[channels[1]] > 220
+            && world_width_line[channels[2]] < 10,
+        "world-width line collapsed below its large base ULP: {world_width_line:?}"
+    );
+    let beside_world_width_line = pixel(38, 12);
+    assert!(
+        beside_world_width_line[channels[0]] < 10
+            && beside_world_width_line[channels[1]] < 10
+            && beside_world_width_line[channels[2]] < 10,
+        "world-width line exceeded its camera-relative width: {beside_world_width_line:?}"
     );
     drop(bytes);
     readback.unmap();

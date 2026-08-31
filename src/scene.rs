@@ -16,6 +16,7 @@ pub(crate) const CORNER_SEGMENTS: usize = 12;
 pub(crate) const TESSELLATED_VERTEX_BYTES: usize = 20 * size_of::<f32>();
 const MAX_DASH_ELEMENTS: usize = 8;
 const MAX_MITER_LIMIT: f32 = 1_000.0;
+const MIN_STROKE_TURN_SINE: f64 = 0.000_001;
 /// Maximum visible dash pieces one command may request from tessellation.
 pub const MAX_STROKE_DASH_SUBSEGMENTS: usize = 1_000_000;
 
@@ -274,7 +275,7 @@ pub enum SceneError {
     InvalidDimension(ScenePrimitive),
     /// A line segment, or at least one consecutive polyline segment, is not drawable.
     DegenerateGeometry(ScenePrimitive),
-    /// Consecutive polyline segments reverse exactly through the same vertex.
+    /// Consecutive polyline segments form an exact or numerically indistinguishable reversal.
     ///
     /// A retraced centerline has no interior-disjoint alpha-blended stroke
     /// representation. `vertex_index` identifies the reversing path point.
@@ -1304,7 +1305,7 @@ impl DrawCommand {
                     .max(0.0)
                     .min(rect.width().abs() * 0.5)
                     .min(rect.height().abs() * 0.5);
-                let boundary_segments = if radius <= f32::EPSILON {
+                let boundary_segments = if radius <= 0.0 {
                     4
                 } else {
                     4 * (CORNER_SEGMENTS + 1)
@@ -1342,7 +1343,10 @@ fn validate_stroke_path(
             - f64::from(incoming.y) * f64::from(outgoing.x);
         let dot = f64::from(incoming.x) * f64::from(outgoing.x)
             + f64::from(incoming.y) * f64::from(outgoing.y);
-        if cross == 0.0 && dot < 0.0 {
+        let direction_product = f64::from(incoming.x).hypot(f64::from(incoming.y))
+            * f64::from(outgoing.x).hypot(f64::from(outgoing.y));
+        let normalized_cross = cross / direction_product;
+        if normalized_cross.abs() <= MIN_STROKE_TURN_SINE && dot < 0.0 {
             return Err(SceneError::DegenerateStrokeTurn {
                 primitive,
                 vertex_index: index + 1,
@@ -2201,7 +2205,7 @@ impl RadialGradient {
         }
 
         let radius_range = self.outer_radius - self.inner_radius;
-        if radius_range.abs() <= f32::EPSILON {
+        if radius_range == 0.0 {
             return self.outer_color;
         }
 
@@ -2811,7 +2815,7 @@ mod tests {
     }
 
     #[test]
-    fn polyline_rejects_zero_segments_and_exact_reversals() {
+    fn polyline_rejects_zero_segments_and_numerically_reversed_turns() {
         let style = StrokeStyle2d::logical(LogicalPixels::new(2.0).unwrap(), Color::WHITE);
         assert!(matches!(
             DrawCommand::styled_polyline(vec![Vec2::ZERO, Vec2::ZERO, Vec2::X], style),
@@ -2819,6 +2823,16 @@ mod tests {
         ));
         assert!(matches!(
             DrawCommand::styled_polyline(vec![Vec2::ZERO, Vec2::X, Vec2::ZERO], style),
+            Err(SceneError::DegenerateStrokeTurn {
+                primitive: ScenePrimitive::Polyline,
+                vertex_index: 1,
+            })
+        ));
+        assert!(matches!(
+            DrawCommand::styled_polyline(
+                vec![Vec2::ZERO, Vec2::X, Vec2::new(0.0, 0.000_000_1)],
+                style,
+            ),
             Err(SceneError::DegenerateStrokeTurn {
                 primitive: ScenePrimitive::Polyline,
                 vertex_index: 1,
@@ -2946,6 +2960,18 @@ mod tests {
         assert_eq!(reversed.inner_radius(), 5.0);
         assert_eq!(reversed.outer_radius(), 10.0);
         assert_eq!(reversed.color_at(Vec2::ZERO), Color::BLACK);
+    }
+
+    #[test]
+    fn tiny_nonzero_radial_range_preserves_both_color_endpoints() {
+        let gradient =
+            RadialGradient::new(Vec2::ZERO, 0.0, 0.000_000_01, Color::BLACK, Color::WHITE);
+
+        assert_eq!(gradient.color_at(Vec2::ZERO), Color::BLACK);
+        assert_eq!(
+            gradient.color_at(Vec2::new(0.000_000_01, 0.0)),
+            Color::WHITE
+        );
     }
 
     #[test]

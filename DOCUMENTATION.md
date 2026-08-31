@@ -134,11 +134,13 @@ logical-screen shadows. Colors are straight linear RGBA internally.
 `Color::rgb` and `Color::rgba` accept values already in linear space. Render
 boundaries require every channel in `0.0..=1.0`; animation may overshoot, but
 the host must call `Color::clamp` explicitly before inserting that value.
-Circle centers and generated local offsets remain separate through the GPU
-camera transform. A radius that is meaningful relative to a camera centered at
-`1e20` therefore does not disappear merely because `center + radius` rounds
-back to the same source `f32`. Fill, stroke, shadow/spread, and radial-gradient
-sampling all use that same relative representation.
+Generated local offsets remain separate from their world anchors through the
+GPU camera transform. A circle radius, rounded corner, or world-unit stroke
+width that is meaningful under the active zoom therefore does not disappear
+merely because adding it to a large source coordinate would round back to the
+same `f32`. Fill, stroke, joins/caps, shadow/spread, and gradient sampling share
+that representation. Any positive representable radial range remains a real
+range rather than being treated as zero by an epsilon threshold.
 
 #### Rich bounded strokes
 
@@ -179,9 +181,10 @@ independent: `StrokeStyle2d::logical` stays constant under camera zoom, while
 camera. Endpoint markers always use logical pixels so annotations remain
 readable. A marker's base is the path endpoint and its tip extends outward;
 the marked body endpoint is forced to a butt boundary. Marker length therefore
-cannot invert a short body or collide with a terminal join. Exact 180-degree
-retraces and repeated adjacent points are rejected as structured scene errors
-because no interior-disjoint translucent stroke topology exists for them.
+cannot invert a short body or collide with a terminal join. Exact or
+numerically indistinguishable 180-degree retraces and repeated adjacent points
+are rejected as structured scene errors because no interior-disjoint
+translucent stroke topology exists for them.
 Every consecutive polyline segment must be drawable; `DegenerateGeometry`
 identifies a line segment or at least one consecutive polyline segment that is
 not.
@@ -1193,11 +1196,14 @@ camera/geometry arithmetic, grows the GPU vertex buffer when required, uploads
 vertices, acquires the surface, encodes clipped batches, submits, and presents.
 Circle and rounded-corner unit samples are immutable process-wide lookup data;
 per-command positions still receive the exact documented segment counts but do
-not recalculate the same trigonometric samples every frame. Circle samples are
-uploaded as local offsets from their retained center, preserving fill, stroke,
-shadow/spread, and radial-gradient behavior below the center's `f32` ULP. The
-80-byte tessellated vertex size, scene estimates, upload budgets, and reported
-upload bytes all include this relative-world component.
+not recalculate the same trigonometric samples every frame. Circle and rounded
+corner samples, plus world-width stroke extrusion, are uploaded as local
+offsets from retained anchors, preserving their behavior below an anchor's
+`f32` ULP. Correlated bounds validate the actual anchor/offset pairs; validation
+also covers relative-coordinate intermediates and the final screen-to-clip
+multiply/add for ordinary, dynamic, particle, retained image-batch, and glyph
+geometry. The 80-byte tessellated vertex size, scene estimates, upload budgets,
+and reported upload bytes all include this relative-world component.
 
 #### Prepared scenes
 

@@ -167,8 +167,8 @@ pub enum RenderTargetLoad {
 struct GeometryExtents {
     world_min: Vec2,
     world_max: Vec2,
-    world_offset_min: Vec2,
-    world_offset_max: Vec2,
+    correlated_world_min: [Option<CorrelatedWorldComponent>; 2],
+    correlated_world_max: [Option<CorrelatedWorldComponent>; 2],
     depth_min: f32,
     depth_max: f32,
     direction_min: Vec2,
@@ -178,6 +178,12 @@ struct GeometryExtents {
     tangent_distance_max_abs: f32,
     miter_limit_max: f32,
     empty: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CorrelatedWorldComponent {
+    base: f32,
+    offset: f32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -393,6 +399,10 @@ impl ParticleGpu {
         let screen_y = screen.y;
         let clip_x = screen_x * camera.screen_to_clip[0] + camera.screen_to_clip[2];
         let clip_y = screen_y * camera.screen_to_clip[1] + camera.screen_to_clip[3];
+        let screen_min_x = screen_x - self.radius;
+        let screen_max_x = screen_x + self.radius;
+        let screen_min_y = screen_y - self.radius;
+        let screen_max_y = screen_y + self.radius;
         relative_x.is_finite()
             && relative_y.is_finite()
             && screen_x.is_finite()
@@ -403,6 +413,18 @@ impl ParticleGpu {
             && (screen_y - self.radius).is_finite()
             && clip_x.is_finite()
             && clip_y.is_finite()
+            && shader_clip_interval_is_safe(
+                f64::from(screen_min_x),
+                f64::from(screen_max_x),
+                camera.screen_to_clip[0],
+                camera.screen_to_clip[2],
+            )
+            && shader_clip_interval_is_safe(
+                f64::from(screen_min_y),
+                f64::from(screen_max_y),
+                camera.screen_to_clip[1],
+                camera.screen_to_clip[3],
+            )
     }
 
     fn intersects_viewport(self, camera: CameraUniform, viewport: LogicalViewport) -> bool {
@@ -503,8 +525,8 @@ impl GeometryExtents {
         Self {
             world_min: Vec2::splat(f32::INFINITY),
             world_max: Vec2::splat(f32::NEG_INFINITY),
-            world_offset_min: Vec2::splat(f32::INFINITY),
-            world_offset_max: Vec2::splat(f32::NEG_INFINITY),
+            correlated_world_min: [None; 2],
+            correlated_world_max: [None; 2],
             depth_min: f32::INFINITY,
             depth_max: f32::NEG_INFINITY,
             direction_min: Vec2::splat(f32::INFINITY),
@@ -524,10 +546,12 @@ impl GeometryExtents {
         self.world_max.x = self.world_max.x.max(world.x);
         self.world_max.y = self.world_max.y.max(world.y);
         let world_offset = Vec2::new(vertex.world_offset[0], vertex.world_offset[1]);
-        self.world_offset_min.x = self.world_offset_min.x.min(world_offset.x);
-        self.world_offset_min.y = self.world_offset_min.y.min(world_offset.y);
-        self.world_offset_max.x = self.world_offset_max.x.max(world_offset.x);
-        self.world_offset_max.y = self.world_offset_max.y.max(world_offset.y);
+        for (axis, (base, offset)) in [(world.x, world_offset.x), (world.y, world_offset.y)]
+            .into_iter()
+            .enumerate()
+        {
+            self.include_correlated(axis, CorrelatedWorldComponent { base, offset });
+        }
         self.depth_min = self.depth_min.min(vertex.depth);
         self.depth_max = self.depth_max.max(vertex.depth);
 
@@ -561,12 +585,26 @@ impl GeometryExtents {
         self.world_min.y = self.world_min.y.min(world.y);
         self.world_max.x = self.world_max.x.max(world.x);
         self.world_max.y = self.world_max.y.max(world.y);
-        self.world_offset_min = Vec2::ZERO;
-        self.world_offset_max = Vec2::ZERO;
+        for (axis, base) in [world.x, world.y].into_iter().enumerate() {
+            self.include_correlated(axis, CorrelatedWorldComponent { base, offset: 0.0 });
+        }
         self.depth_min = self.depth_min.min(vertex.depth);
         self.depth_max = self.depth_max.max(vertex.depth);
         self.direction_min = Vec2::ZERO;
         self.direction_max = Vec2::ZERO;
+    }
+
+    fn include_correlated(&mut self, axis: usize, candidate: CorrelatedWorldComponent) {
+        if self.correlated_world_min[axis]
+            .is_none_or(|current| correlated_world_less(candidate, current))
+        {
+            self.correlated_world_min[axis] = Some(candidate);
+        }
+        if self.correlated_world_max[axis]
+            .is_none_or(|current| correlated_world_less(current, candidate))
+        {
+            self.correlated_world_max[axis] = Some(candidate);
+        }
     }
 
     fn from_dynamic_vertices(vertices: &[DynamicGpu]) -> Self {
@@ -592,37 +630,42 @@ impl GeometryExtents {
         }
 
         let center = Vec2::new(uniform.camera_center[0], uniform.camera_center[1]);
-        let mut world_horizontal = transformed_world_interval(
+        // Match the vertex shader's operation order. The shader forms
+        // `(world_position - camera_center) + world_offset` in f32 before it
+        // applies either camera row. A small zoom can make the final projected
+        // value look safe in f64 even though that intermediate addition has
+        // already overflowed on the GPU.
+        let Some(relative_horizontal) = shader_relative_component_bounds(
+            self.world_min.x,
+            self.world_max.x,
+            center.x,
+            self.correlated_world_min[0],
+            self.correlated_world_max[0],
+        ) else {
+            return false;
+        };
+        let Some(relative_vertical) = shader_relative_component_bounds(
+            self.world_min.y,
+            self.world_max.y,
+            center.y,
+            self.correlated_world_min[1],
+            self.correlated_world_max[1],
+        ) else {
+            return false;
+        };
+        let world_horizontal = transformed_world_interval(
             uniform.world_to_screen_x,
-            self.world_min,
-            self.world_max,
+            [relative_horizontal.0, relative_vertical.0],
+            [relative_horizontal.1, relative_vertical.1],
             self.depth_min,
             self.depth_max,
-            center,
         );
-        let mut world_vertical = transformed_world_interval(
+        let world_vertical = transformed_world_interval(
             uniform.world_to_screen_y,
-            self.world_min,
-            self.world_max,
+            [relative_horizontal.0, relative_vertical.0],
+            [relative_horizontal.1, relative_vertical.1],
             self.depth_min,
             self.depth_max,
-            center,
-        );
-        world_horizontal = interval_add(
-            world_horizontal,
-            transformed_direction_interval(
-                uniform.world_to_screen_x,
-                self.world_offset_min,
-                self.world_offset_max,
-            ),
-        );
-        world_vertical = interval_add(
-            world_vertical,
-            transformed_direction_interval(
-                uniform.world_to_screen_y,
-                self.world_offset_min,
-                self.world_offset_max,
-            ),
         );
         let direction_horizontal = transformed_direction_interval(
             uniform.world_to_screen_x,
@@ -644,6 +687,20 @@ impl GeometryExtents {
             + maximum_miter
             + self.tangent_distance_max_abs as f64;
 
+        if !shader_clip_interval_is_safe(
+            -horizontal_limit,
+            horizontal_limit,
+            uniform.screen_to_clip[0],
+            uniform.screen_to_clip[2],
+        ) || !shader_clip_interval_is_safe(
+            -vertical_limit,
+            vertical_limit,
+            uniform.screen_to_clip[1],
+            uniform.screen_to_clip[3],
+        ) {
+            return false;
+        }
+
         [
             world_horizontal.0,
             world_horizontal.1,
@@ -661,18 +718,73 @@ impl GeometryExtents {
     }
 }
 
+fn shader_clip_interval_is_safe(
+    screen_minimum: f64,
+    screen_maximum: f64,
+    scale: f32,
+    offset: f32,
+) -> bool {
+    let first_product = screen_minimum * f64::from(scale);
+    let second_product = screen_maximum * f64::from(scale);
+    let minimum_product = first_product.min(second_product);
+    let maximum_product = first_product.max(second_product);
+    let maximum = f64::from(f32::MAX);
+    [
+        first_product,
+        second_product,
+        minimum_product + f64::from(offset),
+        maximum_product + f64::from(offset),
+    ]
+    .into_iter()
+    .all(|value| value.is_finite() && value.abs() <= maximum)
+}
+
+fn shader_relative_component_bounds(
+    world_minimum: f32,
+    world_maximum: f32,
+    camera_center: f32,
+    correlated_minimum: Option<CorrelatedWorldComponent>,
+    correlated_maximum: Option<CorrelatedWorldComponent>,
+) -> Option<(f32, f32)> {
+    // Keep the subtraction in f32 because that is the first WGSL operation.
+    let relative_minimum = world_minimum - camera_center;
+    let relative_maximum = world_maximum - camera_center;
+    if !relative_minimum.is_finite() || !relative_maximum.is_finite() {
+        return None;
+    }
+
+    let evaluate =
+        |component: CorrelatedWorldComponent| (component.base - camera_center) + component.offset;
+    let first = evaluate(correlated_minimum?);
+    let second = evaluate(correlated_maximum?);
+    if !first.is_finite() || !second.is_finite() {
+        return None;
+    }
+    Some((first.min(second), first.max(second)))
+}
+
+fn correlated_world_less(left: CorrelatedWorldComponent, right: CorrelatedWorldComponent) -> bool {
+    exact_f32_sum_parts(left.base, left.offset) < exact_f32_sum_parts(right.base, right.offset)
+}
+
+fn exact_f32_sum_parts(first: f32, second: f32) -> (f64, f64) {
+    let first = f64::from(first);
+    let second = f64::from(second);
+    let sum = first + second;
+    let second_virtual = sum - first;
+    let error = (first - (sum - second_virtual)) + (second - second_virtual);
+    (sum, error)
+}
+
 fn transformed_world_interval(
     row: [f32; 4],
-    minimum: Vec2,
-    maximum: Vec2,
+    minimum: [f32; 2],
+    maximum: [f32; 2],
     depth_minimum: f32,
     depth_maximum: f32,
-    center: Vec2,
 ) -> (f64, f64) {
-    let relative_minimum = minimum - center;
-    let relative_maximum = maximum - center;
-    let horizontal = interval_products(row[0], relative_minimum.x, relative_maximum.x);
-    let vertical = interval_products(row[1], relative_minimum.y, relative_maximum.y);
+    let horizontal = interval_products(row[0], minimum[0], maximum[0]);
+    let vertical = interval_products(row[1], minimum[1], maximum[1]);
     let depth = interval_products(row[2], depth_minimum, depth_maximum);
     (
         horizontal.0 + vertical.0 + depth.0 + row[3] as f64,
@@ -694,10 +806,6 @@ fn interval_products(coefficient: f32, minimum: f32, maximum: f32) -> (f64, f64)
 
 fn interval_max_abs(interval: (f64, f64)) -> f64 {
     interval.0.abs().max(interval.1.abs())
-}
-
-fn interval_add(left: (f64, f64), right: (f64, f64)) -> (f64, f64) {
-    (left.0 + right.0, left.1 + right.1)
 }
 
 /// Result of attempting to draw a frame.
