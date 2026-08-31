@@ -104,8 +104,14 @@ composed frames, fixed-screen UI, retained images, and host-shaped text.
 - The DPI reconfiguration p95 now includes the timed renderer resize/surface
   configure operation instead of measuring only the following frame.
 - Release scripts now compile and run from a read-only detached worktree of the
-  exact evidence SHA with a separate Cargo target directory; failed runs remove
-  stale evidence even when a prerequisite or build step fails.
+  exact evidence SHA with replacement objects disabled and a separate Cargo
+  target directory. Evidence is staged and atomically published as one bundle
+  only after the complete gate succeeds, so crashes cannot expose partial
+  manifests as a passed run.
+- Surface benchmark and HiDPI presents now call winit's
+  `Window::pre_present_notify` immediately before submission; finalization
+  therefore crosses a compositor-aware redraw boundary before accepting the
+  final output/generation snapshot.
 
 - Added exact-limit/one-over budget tests, atomic batch rejection tests,
   conservative-estimate checks against actual tessellation, positioned

@@ -196,9 +196,10 @@ Warmup and measured frames advance one `RedrawRequested` at a time, allowing
 compositor events between every sample. A resize, scale transition, or changed
 current-output identity invalidates the confirmation and discards partial
 timing samples; a surface outside the fixed release extent/scale fails rather
-than being measured as a cheaper workload. The final measured present yields
-through one additional event-loop turn and repeats the generation/output check
-before evidence is published.
+than being measured as a cheaper workload. Every surface submission calls
+`Window::pre_present_notify` immediately before present. The final measured
+present then yields through a compositor-aware redraw boundary and repeats the
+generation/output check before evidence is published.
 Acquire percentiles remain reported but do not independently flip the verdict
 from one scheduler-sensitive sample.
 The matrix also drives a nested KWin compositor through a real scale
@@ -210,10 +211,13 @@ skipping HiDPI evidence.
 The wrapper, standalone matrix, and standalone HiDPI gate reject a dirty
 worktree, then build and execute from a read-only detached worktree of the
 captured commit with a separate Cargo target directory. They recheck the
-calling checkout before accepting results. Evidence therefore remains bound to
-Git object data for the exact recorded SHA even if the mutable calling
-worktree changes while a long gate is running. Failed runs remove previously
-published release manifests.
+calling checkout before accepting results. Replacement refs and legacy grafts
+are rejected, and all Git operations run with replacement objects disabled.
+Evidence therefore remains bound to Git object data for the exact recorded SHA
+even if the mutable calling worktree changes while a long gate is running.
+Child gates write only to hidden staging. The launcher atomically publishes a
+completed bundle after the entire requested gate succeeds; failed, killed, or
+crashed runs cannot leave a bundle that claims success.
 
 `stroke_gallery` is the visual oracle for the v0.2 stroke contract. Pages 1-4
 show every cap/join, half-alpha overlap probes, bounded animated dashes,
@@ -238,10 +242,10 @@ publishable package boundary:
 ./scripts/linux_release_gate.sh
 ```
 
-The gate records production-surface selection in
-`target/linux-vulkan-surface.txt`, matching semantic adapter/oracle evidence in
-`target/linux-vulkan-adapter.txt`, and compositor-transition evidence in
-`target/linux-hidpi-transition.txt`.
+After all 11 steps pass, the launcher atomically publishes
+`target/linux-release-evidence/`. Its `completion.txt` binds the successful
+gate and exact SHA; the same directory contains `linux-vulkan-surface.txt`,
+`linux-vulkan-adapter.txt`, and `linux-hidpi-transition.txt`.
 
 ## License
 

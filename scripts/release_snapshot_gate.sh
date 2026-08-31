@@ -10,7 +10,7 @@ project_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 gate_script=$1
 shift
 case "$gate_script" in
-    scripts/*.sh) ;;
+    scripts/linux_release_gate.sh | scripts/rendering_benchmark_matrix.sh | scripts/hidpi_transition_gate.sh) ;;
     *)
         echo "release snapshot gate only runs repository scripts" >&2
         exit 2
@@ -20,6 +20,8 @@ esac
 cd "$project_root"
 output_dir="$project_root/target"
 mkdir -p "$output_dir"
+final_bundle="$output_dir/linux-release-evidence"
+staging_dir=$(mktemp -d "$output_dir/.linux-release-evidence.XXXXXX")
 snapshot_parent=""
 snapshot_root=""
 snapshot_added=0
@@ -33,9 +35,10 @@ cleanup() {
         rm -rf -- "$snapshot_parent"
     fi
     if [[ "$gate_complete" -ne 1 ]]; then
-        rm -f -- "$output_dir/linux-vulkan-surface.txt" \
-            "$output_dir/linux-vulkan-adapter.txt" \
-            "$output_dir/linux-hidpi-transition.txt"
+        rm -rf -- "$staging_dir"
+    fi
+    if [[ "$gate_complete" -ne 1 ]]; then
+        rm -rf -- "$final_bundle"
     fi
 }
 trap cleanup EXIT
@@ -43,11 +46,27 @@ trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-# Never let a failed new invocation leave an older successful manifest looking
-# current, including failures before tool discovery or compilation.
+# Never let a failed new invocation leave an older successful bundle looking
+# current, including failures before tool discovery or compilation. Individual
+# legacy manifests are also invalidated during the transition to the bundle.
+rm -rf -- "$final_bundle"
 rm -f -- "$output_dir/linux-vulkan-surface.txt" \
     "$output_dir/linux-vulkan-adapter.txt" \
     "$output_dir/linux-hidpi-transition.txt"
+
+if [[ -n "$(git replace -l)" ]]; then
+    echo "release snapshot gate rejects Git replacement refs" >&2
+    exit 1
+fi
+grafts_path=$(git rev-parse --git-path info/grafts)
+if [[ "$grafts_path" != /* ]]; then
+    grafts_path="$project_root/$grafts_path"
+fi
+if [[ -s "$grafts_path" ]]; then
+    echo "release snapshot gate rejects legacy Git grafts" >&2
+    exit 1
+fi
+export GIT_NO_REPLACE_OBJECTS=1
 
 start_sha=$(git rev-parse HEAD)
 if [[ -n "$(git status --porcelain --untracked-files=all)" ]]; then
@@ -69,7 +88,7 @@ set +e
 env \
     SIM_ENGINE_RELEASE_SNAPSHOT=1 \
     SIM_ENGINE_RELEASE_SHA="$start_sha" \
-    SIM_ENGINE_RELEASE_OUTPUT_DIR="$output_dir" \
+    SIM_ENGINE_RELEASE_OUTPUT_DIR="$staging_dir" \
     CARGO_TARGET_DIR="$snapshot_parent/cargo-target" \
     "$snapshot_root/$gate_script" "$@"
 status=$?
@@ -87,4 +106,28 @@ if [[ -n "$(git -C "$project_root" status --porcelain --untracked-files=all)" ]]
     exit 1
 fi
 
+case "$gate_script" in
+    scripts/linux_release_gate.sh | scripts/rendering_benchmark_matrix.sh)
+        required_evidence=(
+            linux-vulkan-surface.txt
+            linux-vulkan-adapter.txt
+            linux-hidpi-transition.txt
+        )
+        ;;
+    scripts/hidpi_transition_gate.sh)
+        required_evidence=(linux-hidpi-transition.txt)
+        ;;
+esac
+for evidence in "${required_evidence[@]}"; do
+    if [[ ! -s "$staging_dir/$evidence" ]]; then
+        echo "release gate completed without required staged evidence: $evidence" >&2
+        exit 1
+    fi
+done
+printf 'format_version=1\nvcs_sha=%s\ngate_script=%s\nstatus=passed\n' \
+    "$start_sha" "$gate_script" >"$staging_dir/completion.txt"
+# This directory rename is the only publication boundary. SIGKILL before it
+# can leave a hidden staging directory, never a bundle that claims success.
+mv -- "$staging_dir" "$final_bundle"
+echo "Release evidence bundle: $final_bundle"
 gate_complete=1

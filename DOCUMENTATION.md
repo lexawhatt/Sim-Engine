@@ -916,10 +916,15 @@ collecting evidence when the worktree is dirty. A common launcher creates a
 read-only detached worktree at the captured revision and gives it a separate
 Cargo target directory; compilation and execution never consume files from the
 mutable calling checkout. The caller's `HEAD` and clean state are checked again
-before success is accepted. Temporary manifests are not promoted on a failed
-run, and stale published manifests are removed even when prerequisites or the
-build fail. This binds evidence to Git object data for the recorded revision
-instead of relying on periodic checks of a mutable source tree.
+before success is accepted. Replacement refs and legacy grafts are rejected,
+and `GIT_NO_REPLACE_OBJECTS=1` applies to checkout, build, and verification.
+Child scripts receive only a hidden staging directory. The launcher writes a
+completion manifest and atomically renames that directory to
+`target/linux-release-evidence/` only after the entire requested gate returns
+successfully. A failed or forcibly killed child can leave at most unpublished
+staging, never a bundle claiming completion. This binds evidence to Git object
+data for the recorded revision instead of relying on periodic checks of a
+mutable source tree.
 
 The real compositor fixture requires the Linux executables
 `dbus-run-session`, `kwin_wayland`, and `kscreen-doctor`. Their absence is a
@@ -955,7 +960,10 @@ the surface with an output. Immediate can proceed without monitor refresh
 metadata. Mailbox/FIFO require a positive refresh rate from that current
 monitor; zero or missing refresh is unconfirmed, and the fixture never
 substitutes the primary or first enumerated monitor.
-Measurement itself advances by one frame per event-loop redraw. This lets
+Measurement itself advances by one frame per event-loop redraw. Every surface
+submission calls `Window::pre_present_notify` immediately before the renderer
+presents, so Wayland schedules the next redraw against the compositor frame
+callback instead of an application-only wakeup. This lets
 `ScaleFactorChanged`, `Resized`, and current-output changes run between every
 warmup or measured sample. Confirmation carries the renderer surface-generation
 number and output identity; any mismatch discards all partial samples and
@@ -1304,15 +1312,17 @@ It checks formatting, Rust 1.90 compatibility, all targets with and without
 default features, strict clippy, doctests, warning-free rustdoc, a mandatory
 Vulkan semantic GPU readback fixture with backend assertion, the Vulkan-pinned
 performance matrix, a real nested-KWin HiDPI transition, `git diff --check`,
-and the offline package boundary. The surface probe writes
-`target/linux-vulkan-surface.txt`; the GPU step writes
-`target/linux-vulkan-adapter.txt`; CI publishes the latter manifest as the
-`linux-vulkan-adapter` artifact. The manifest names the exact VCS SHA, backend,
+and the offline package boundary. A successful local wrapper atomically
+publishes `target/linux-release-evidence/`, containing `completion.txt`,
+`linux-vulkan-surface.txt`, `linux-vulkan-adapter.txt`, and
+`linux-hidpi-transition.txt`. CI's narrower semantic job writes and publishes
+`target/linux-vulkan-adapter.txt` directly as the `linux-vulkan-adapter`
+artifact. The manifest names the exact VCS SHA, backend,
 adapter type, vendor/model IDs, PCI bus address when available, driver, oracle
 format, and sample count for the semantic run. CI supplies `github.sha` and
 asserts that the artifact does not contain `vcs_sha=unknown`.
-The HiDPI step writes `target/linux-hidpi-transition.txt` with the exact VCS
-revision, Vulkan backend, scale, physical size, and transactional event counts.
+The bundled HiDPI manifest records the exact VCS revision, Vulkan backend,
+scale, physical size, and transactional event counts.
 
 The wrapper and each standalone evidence-producing surface/HiDPI script must
 run from a clean worktree and finish on the exact revision captured at start.
