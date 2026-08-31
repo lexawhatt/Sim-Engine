@@ -1510,7 +1510,10 @@ fn present_frame(composer: FrameComposer<'_>) -> Result<FrameReport, FrameCompos
         .logical_viewport()
         .map_err(|_| RendererFrameError::InvalidViewport)?;
     let tessellation_started_at = Instant::now();
-    let mut streaming_vertices = Vec::new();
+    // Reuse the previous frame's transient allocation. Streaming workloads
+    // otherwise allocate and release their entire vertex payload every frame.
+    let mut streaming_vertices = std::mem::take(&mut renderer.vertices);
+    streaming_vertices.clear();
     let mut ready = Vec::new();
     ready
         .try_reserve(items.len())
@@ -2281,23 +2284,12 @@ fn prepare_streaming_scene_resolved<'frame>(
     statistics: &mut FrameStatistics,
     aggregate: &mut TessellationStats,
 ) -> Result<(), FrameComposerError> {
-    let mut vertices = Vec::new();
+    let vertex_start = streaming_vertices.len();
     let mut batches = Vec::new();
-    let stats =
-        tessellate_scene(scene, &mut vertices, &mut batches).map_err(RendererFrameError::from)?;
-    let base = u32::try_from(streaming_vertices.len())
-        .map_err(|_| RendererFrameError::GeometryCapacityTooLarge)?;
-    streaming_vertices
-        .try_reserve(vertices.len())
-        .map_err(|_| FrameComposerError::AllocationFailed {
-            requested_bytes: vertices.len().saturating_mul(std::mem::size_of::<Vertex>()),
-        })?;
-    for batch in &mut batches {
-        batch.vertex_range.start = batch.vertex_range.start.saturating_add(base);
-        batch.vertex_range.end = batch.vertex_range.end.saturating_add(base);
-    }
-    let extents = GeometryExtents::from_vertices(&vertices);
-    streaming_vertices.extend_from_slice(&vertices);
+    let stats = tessellate_scene(scene, streaming_vertices, &mut batches)
+        .map_err(RendererFrameError::from)?;
+    let vertices = &streaming_vertices[vertex_start..];
+    let extents = GeometryExtents::from_vertices(vertices);
     let camera_uniform =
         CameraUniform::new_in_region(camera, viewport.viewport, viewport.origin, target_viewport)
             .ok_or(RendererFrameError::InvalidGeometryTransform)?;

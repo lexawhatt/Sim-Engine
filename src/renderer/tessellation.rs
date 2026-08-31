@@ -1,3 +1,5 @@
+use std::sync::OnceLock;
+
 use super::*;
 
 pub(super) fn tessellate_scene(
@@ -5,19 +7,11 @@ pub(super) fn tessellate_scene(
     vertices: &mut Vec<Vertex>,
     draw_batches: &mut Vec<PreparedDrawBatch>,
 ) -> Result<TessellationStats, TessellationError> {
+    let initial_vertex_count = vertices.len();
+    let initial_batch_count = draw_batches.len();
     let estimate = scene.statistics();
-    reserve_items(
-        vertices,
-        estimate
-            .estimated_tessellated_vertices()
-            .saturating_sub(vertices.len()),
-    )?;
-    reserve_items(
-        draw_batches,
-        estimate
-            .estimated_draw_batches()
-            .saturating_sub(draw_batches.len()),
-    )?;
+    reserve_items(vertices, estimate.estimated_tessellated_vertices())?;
+    reserve_items(draw_batches, estimate.estimated_draw_batches())?;
     let mut stats = TessellationStats {
         command_count: scene.command_count(),
         command_counts: scene.statistics().accepted_by_primitive(),
@@ -81,9 +75,11 @@ pub(super) fn tessellate_scene(
             }),
         }
     }
-    stats.vertex_count = vertices.len();
-    stats.draw_batch_count = draw_batches.len();
-    stats.upload_bytes = vertices.len().saturating_mul(std::mem::size_of::<Vertex>());
+    stats.vertex_count = vertices.len().saturating_sub(initial_vertex_count);
+    stats.draw_batch_count = draw_batches.len().saturating_sub(initial_batch_count);
+    stats.upload_bytes = stats
+        .vertex_count
+        .saturating_mul(std::mem::size_of::<Vertex>());
     validate_tessellated_budget(scene, stats)?;
     Ok(stats)
 }
@@ -1148,12 +1144,9 @@ fn push_circle_fill_world(
 
     let center_vertex = world_vertex(center_world, screen_offset, fill.color_at(center_world));
 
-    for index in 0..CIRCLE_SEGMENTS {
-        let angle_start = index as f32 / CIRCLE_SEGMENTS as f32 * std::f32::consts::TAU;
-        let angle_end = (index + 1) as f32 / CIRCLE_SEGMENTS as f32 * std::f32::consts::TAU;
-        let world_start =
-            center_world + Vec2::new(angle_start.cos(), angle_start.sin()) * radius_world;
-        let world_end = center_world + Vec2::new(angle_end.cos(), angle_end.sin()) * radius_world;
+    for pair in unit_circle_points().windows(2) {
+        let world_start = center_world + pair[0] * radius_world;
+        let world_end = center_world + pair[1] * radius_world;
 
         vertices.push(center_vertex);
         vertices.push(world_vertex(
@@ -1175,11 +1168,30 @@ fn circle_world_points(
 ) -> Result<Vec<Vec2>, TessellationError> {
     let mut points = Vec::new();
     reserve_items(&mut points, CIRCLE_SEGMENTS + 1)?;
-    for index in 0..=CIRCLE_SEGMENTS {
-        let angle = index as f32 / CIRCLE_SEGMENTS as f32 * std::f32::consts::TAU;
-        points.push(center_world + Vec2::new(angle.cos(), angle.sin()) * radius_world);
+    for point in unit_circle_points() {
+        points.push(center_world + *point * radius_world);
     }
     Ok(points)
+}
+
+fn unit_circle_points() -> &'static [Vec2] {
+    static POINTS: OnceLock<[Vec2; CIRCLE_SEGMENTS + 1]> = OnceLock::new();
+    POINTS.get_or_init(|| {
+        std::array::from_fn(|index| {
+            let angle = index as f32 / CIRCLE_SEGMENTS as f32 * std::f32::consts::TAU;
+            Vec2::new(angle.cos(), angle.sin())
+        })
+    })
+}
+
+fn unit_quarter_circle_points() -> &'static [Vec2] {
+    static POINTS: OnceLock<[Vec2; CORNER_SEGMENTS + 1]> = OnceLock::new();
+    POINTS.get_or_init(|| {
+        std::array::from_fn(|step| {
+            let angle = step as f32 / CORNER_SEGMENTS as f32 * std::f32::consts::FRAC_PI_2;
+            Vec2::new(angle.cos(), angle.sin())
+        })
+    })
 }
 
 fn push_rect_world(
@@ -1232,35 +1244,23 @@ fn rounded_rect_points(rect: Rect, corner_radius: f32) -> Result<Vec<Vec2>, Tess
     }
 
     let corners = [
-        (
-            Vec2::new(rect.max.x - radius, rect.max.y - radius),
-            0.0,
-            std::f32::consts::FRAC_PI_2,
-        ),
-        (
-            Vec2::new(rect.min.x + radius, rect.max.y - radius),
-            std::f32::consts::FRAC_PI_2,
-            std::f32::consts::PI,
-        ),
-        (
-            Vec2::new(rect.min.x + radius, rect.min.y + radius),
-            std::f32::consts::PI,
-            std::f32::consts::PI * 1.5,
-        ),
-        (
-            Vec2::new(rect.max.x - radius, rect.min.y + radius),
-            std::f32::consts::PI * 1.5,
-            std::f32::consts::TAU,
-        ),
+        Vec2::new(rect.max.x - radius, rect.max.y - radius),
+        Vec2::new(rect.min.x + radius, rect.max.y - radius),
+        Vec2::new(rect.min.x + radius, rect.min.y + radius),
+        Vec2::new(rect.max.x - radius, rect.min.y + radius),
     ];
 
     let mut points = Vec::new();
     reserve_items(&mut points, CORNER_SEGMENTS * 4 + 1)?;
-    for (center, start_angle, end_angle) in corners {
-        for step in 0..=CORNER_SEGMENTS {
-            let amount = step as f32 / CORNER_SEGMENTS as f32;
-            let angle = start_angle + (end_angle - start_angle) * amount;
-            points.push(center + Vec2::new(angle.cos(), angle.sin()) * radius);
+    for (corner_index, center) in corners.into_iter().enumerate() {
+        for unit in unit_quarter_circle_points() {
+            let unit = match corner_index {
+                0 => *unit,
+                1 => Vec2::new(-unit.y, unit.x),
+                2 => Vec2::new(-unit.x, -unit.y),
+                _ => Vec2::new(unit.y, -unit.x),
+            };
+            points.push(center + unit * radius);
         }
     }
     points.push(points[0]);

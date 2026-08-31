@@ -737,6 +737,50 @@ fn scene_budget_estimate_bounds_actual_tessellation_and_upload() {
 }
 
 #[test]
+fn appended_streaming_tessellation_reports_local_work_and_global_ranges() {
+    let mut first = Scene::new(Color::BLACK).unwrap();
+    first
+        .try_rect(
+            Rect::from_center_size(Vec2::ZERO, Vec2::splat(8.0)),
+            1.5,
+            ShapeStyle::filled(Color::WHITE),
+        )
+        .unwrap();
+    let mut second = Scene::new(Color::BLACK).unwrap();
+    second
+        .try_rect(
+            Rect::from_center_size(Vec2::new(20.0, 0.0), Vec2::splat(8.0)),
+            1.5,
+            ShapeStyle::filled(Color::WHITE),
+        )
+        .unwrap();
+
+    let mut vertices = Vec::new();
+    let mut first_batches = Vec::new();
+    let first_stats = tessellate_scene(&first, &mut vertices, &mut first_batches).unwrap();
+    let first_vertex_count = vertices.len();
+    let mut second_batches = Vec::new();
+    let second_stats = tessellate_scene(&second, &mut vertices, &mut second_batches).unwrap();
+
+    assert_eq!(first_stats.vertex_count(), first_vertex_count);
+    assert_eq!(
+        second_stats.vertex_count(),
+        vertices.len() - first_vertex_count
+    );
+    assert_eq!(second_stats.vertex_count(), first_stats.vertex_count());
+    assert_eq!(
+        second_stats.upload_bytes(),
+        second_stats.vertex_count() * std::mem::size_of::<Vertex>()
+    );
+    assert_eq!(second_stats.draw_batch_count(), 1);
+    assert_eq!(second_batches.len(), 1);
+    assert_eq!(
+        second_batches[0].vertex_range,
+        first_vertex_count as u32..vertices.len() as u32
+    );
+}
+
+#[test]
 fn camera_uniform_matches_public_camera_projection() {
     let Ok(mut camera) = Camera2d::new(Vec2::new(17.0, -23.0), 2.75) else {
         panic!("test camera should be valid");

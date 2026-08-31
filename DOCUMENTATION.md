@@ -1171,10 +1171,13 @@ validate first and replace retained state only after all checks pass.
 
 #### Streaming scenes
 
-The renderer clears reusable CPU storage, tessellates commands, validates
-camera/geometry arithmetic, grows a transient vertex buffer when required,
-uploads vertices, acquires the surface, encodes clipped batches, submits, and
-presents.
+The renderer clears and reuses its previous transient CPU allocation,
+tessellates commands directly into that upload payload, validates
+camera/geometry arithmetic, grows the GPU vertex buffer when required, uploads
+vertices, acquires the surface, encodes clipped batches, submits, and presents.
+Circle and rounded-corner unit samples are immutable process-wide lookup data;
+per-command positions still receive the exact documented segment counts but do
+not recalculate the same trigonometric samples every frame.
 
 #### Prepared scenes
 

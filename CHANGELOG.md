@@ -88,6 +88,12 @@ composed frames, fixed-screen UI, retained images, and host-shaped text.
 - Dynamic-mesh creation, replacement, and restoration now reserve CPU recovery
   storage fallibly; full replacement commits retained state only after all
   validation, reservation, and replacement-buffer creation succeeds.
+- Streaming composition reuses its transient vertex allocation, tessellates
+  directly into the upload buffer without an intermediate full-payload copy,
+  and caches the immutable circle/corner unit samples used by primitive
+  tessellation. The unchanged 90/10 release fixture therefore measures host
+  scene work and GPU upload rather than repeated trigonometry and allocator
+  churn.
 - Adapter diagnostics now expose PCI vendor/device IDs, physical PCI bus
   address, surface format, and sample count. Release evidence rejects any
   semantic, performance, or compositor process that selects a different
