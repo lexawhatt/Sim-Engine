@@ -255,9 +255,10 @@ fn push_circle_shadow_world(
     );
 
     if shadow.spread() > 0.0 {
-        let points = circle_world_points(center_world, radius_world)?;
+        let points = circle_world_offsets(radius_world)?;
         push_closed_polyline_world(
             &points,
+            center_world,
             shadow.spread() * 2.0,
             shadow.color(),
             shadow.offset().to_vec2(),
@@ -273,9 +274,10 @@ fn push_circle_stroke_world(
     stroke: Stroke,
     vertices: &mut Vec<Vertex>,
 ) -> Result<(), TessellationError> {
-    let points = circle_world_points(center_world, radius_world)?;
+    let points = circle_world_offsets(radius_world)?;
     push_closed_polyline_world(
         &points,
+        center_world,
         stroke.width(),
         stroke.color(),
         Vec2::ZERO,
@@ -306,6 +308,7 @@ fn tessellate_rect(
             let points = rounded_rect_points(rect, corner_radius)?;
             push_closed_polyline_world(
                 &points,
+                Vec2::ZERO,
                 shadow.spread() * 2.0,
                 shadow.color(),
                 shadow.offset().to_vec2(),
@@ -322,6 +325,7 @@ fn tessellate_rect(
         let points = rounded_rect_points(rect, corner_radius)?;
         push_closed_polyline_world(
             &points,
+            Vec2::ZERO,
             stroke.width(),
             stroke.color(),
             Vec2::ZERO,
@@ -1142,34 +1146,36 @@ fn push_circle_fill_world(
         return;
     }
 
-    let center_vertex = world_vertex(center_world, screen_offset, fill.color_at(center_world));
+    let center_vertex = world_vertex(
+        center_world,
+        screen_offset,
+        fill.color_at_with_offset(center_world, Vec2::ZERO),
+    );
 
     for pair in unit_circle_points().windows(2) {
-        let world_start = center_world + pair[0] * radius_world;
-        let world_end = center_world + pair[1] * radius_world;
-
+        let world_start_offset = pair[0] * radius_world;
+        let world_end_offset = pair[1] * radius_world;
         vertices.push(center_vertex);
-        vertices.push(world_vertex(
-            world_start,
+        vertices.push(world_vertex_with_offset(
+            center_world,
+            world_start_offset,
             screen_offset,
-            fill.color_at(world_start),
+            fill.color_at_with_offset(center_world, world_start_offset),
         ));
-        vertices.push(world_vertex(
-            world_end,
+        vertices.push(world_vertex_with_offset(
+            center_world,
+            world_end_offset,
             screen_offset,
-            fill.color_at(world_end),
+            fill.color_at_with_offset(center_world, world_end_offset),
         ));
     }
 }
 
-fn circle_world_points(
-    center_world: Vec2,
-    radius_world: f32,
-) -> Result<Vec<Vec2>, TessellationError> {
+fn circle_world_offsets(radius_world: f32) -> Result<Vec<Vec2>, TessellationError> {
     let mut points = Vec::new();
     reserve_items(&mut points, CIRCLE_SEGMENTS + 1)?;
     for point in unit_circle_points() {
-        points.push(center_world + *point * radius_world);
+        points.push(*point * radius_world);
     }
     Ok(points)
 }
@@ -1279,6 +1285,7 @@ fn rounded_rect_points(rect: Rect, corner_radius: f32) -> Result<Vec<Vec2>, Tess
 
 fn push_closed_polyline_world(
     points: &[Vec2],
+    world_origin: Vec2,
     width: f32,
     color: Color,
     screen_offset: Vec2,
@@ -1319,7 +1326,8 @@ fn push_closed_polyline_world(
         let current_next_direction = unique_points[next] - unique_points[index];
         let next_next_direction = unique_points[after_next] - unique_points[next];
 
-        vertices.push(legacy_stroke_vertex(
+        vertices.push(legacy_stroke_vertex_with_offset(
+            world_origin,
             unique_points[index],
             screen_offset,
             current_previous_direction,
@@ -1327,7 +1335,8 @@ fn push_closed_polyline_world(
             half_width,
             color,
         ));
-        vertices.push(legacy_stroke_vertex(
+        vertices.push(legacy_stroke_vertex_with_offset(
+            world_origin,
             unique_points[next],
             screen_offset,
             current_next_direction,
@@ -1335,7 +1344,8 @@ fn push_closed_polyline_world(
             half_width,
             color,
         ));
-        vertices.push(legacy_stroke_vertex(
+        vertices.push(legacy_stroke_vertex_with_offset(
+            world_origin,
             unique_points[next],
             screen_offset,
             current_next_direction,
@@ -1343,7 +1353,8 @@ fn push_closed_polyline_world(
             -half_width,
             color,
         ));
-        vertices.push(legacy_stroke_vertex(
+        vertices.push(legacy_stroke_vertex_with_offset(
+            world_origin,
             unique_points[index],
             screen_offset,
             current_previous_direction,
@@ -1351,7 +1362,8 @@ fn push_closed_polyline_world(
             half_width,
             color,
         ));
-        vertices.push(legacy_stroke_vertex(
+        vertices.push(legacy_stroke_vertex_with_offset(
+            world_origin,
             unique_points[next],
             screen_offset,
             current_next_direction,
@@ -1359,7 +1371,8 @@ fn push_closed_polyline_world(
             -half_width,
             color,
         ));
-        vertices.push(legacy_stroke_vertex(
+        vertices.push(legacy_stroke_vertex_with_offset(
+            world_origin,
             unique_points[index],
             screen_offset,
             current_previous_direction,
@@ -1372,9 +1385,19 @@ fn push_closed_polyline_world(
 }
 
 pub(super) fn world_vertex(world: Vec2, screen_offset: Vec2, color: Color) -> Vertex {
+    world_vertex_with_offset(world, Vec2::ZERO, screen_offset, color)
+}
+
+fn world_vertex_with_offset(
+    world: Vec2,
+    world_offset: Vec2,
+    screen_offset: Vec2,
+    color: Color,
+) -> Vertex {
     Vertex {
         world_position: [world.x, world.y],
         depth: 0.0,
+        world_offset: [world_offset.x, world_offset.y],
         screen_offset: [screen_offset.x, screen_offset.y],
         previous_direction: [0.0; 2],
         next_direction: [0.0; 2],
@@ -1387,16 +1410,19 @@ pub(super) fn world_vertex(world: Vec2, screen_offset: Vec2, color: Color) -> Ve
     }
 }
 
-fn legacy_stroke_vertex(
+#[allow(clippy::too_many_arguments)]
+fn legacy_stroke_vertex_with_offset(
     world: Vec2,
+    world_offset: Vec2,
     screen_offset: Vec2,
     previous_direction: Vec2,
     next_direction: Vec2,
     normal_distance: f32,
     color: Color,
 ) -> Vertex {
-    stroke_vertex(
+    stroke_vertex_with_offset(
         world,
+        world_offset,
         screen_offset,
         previous_direction,
         next_direction,
@@ -1418,8 +1444,34 @@ fn stroke_vertex(
     miter_limit: f32,
     color: Color,
 ) -> Vertex {
-    stroke_vertex_with_role(
+    stroke_vertex_with_offset(
         world,
+        Vec2::ZERO,
+        screen_offset,
+        previous_direction,
+        next_direction,
+        normal_distance,
+        tangent_distance,
+        miter_limit,
+        color,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn stroke_vertex_with_offset(
+    world: Vec2,
+    world_offset: Vec2,
+    screen_offset: Vec2,
+    previous_direction: Vec2,
+    next_direction: Vec2,
+    normal_distance: f32,
+    tangent_distance: f32,
+    miter_limit: f32,
+    color: Color,
+) -> Vertex {
+    stroke_vertex_with_role_and_offset(
+        world,
+        world_offset,
         screen_offset,
         previous_direction,
         next_direction,
@@ -1445,11 +1497,41 @@ fn stroke_vertex_with_role(
     stroke_parameter: f32,
     color: Color,
 ) -> Vertex {
+    stroke_vertex_with_role_and_offset(
+        world,
+        Vec2::ZERO,
+        screen_offset,
+        previous_direction,
+        next_direction,
+        normal_distance,
+        tangent_distance,
+        miter_limit,
+        stroke_role,
+        stroke_parameter,
+        color,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn stroke_vertex_with_role_and_offset(
+    world: Vec2,
+    world_offset: Vec2,
+    screen_offset: Vec2,
+    previous_direction: Vec2,
+    next_direction: Vec2,
+    normal_distance: f32,
+    tangent_distance: f32,
+    miter_limit: f32,
+    stroke_role: f32,
+    stroke_parameter: f32,
+    color: Color,
+) -> Vertex {
     let previous_direction = precise_unit(previous_direction);
     let next_direction = precise_unit(next_direction);
     Vertex {
         world_position: [world.x, world.y],
         depth: 0.0,
+        world_offset: [world_offset.x, world_offset.y],
         screen_offset: [screen_offset.x, screen_offset.y],
         previous_direction: [previous_direction.x, previous_direction.y],
         next_direction: [next_direction.x, next_direction.y],

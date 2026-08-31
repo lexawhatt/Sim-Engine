@@ -13,7 +13,7 @@ use crate::{
 pub(crate) const CIRCLE_SEGMENTS: usize = 64;
 pub(crate) const ROUND_CAP_SEGMENTS: usize = 16;
 pub(crate) const CORNER_SEGMENTS: usize = 12;
-pub(crate) const TESSELLATED_VERTEX_BYTES: usize = 18 * size_of::<f32>();
+pub(crate) const TESSELLATED_VERTEX_BYTES: usize = 20 * size_of::<f32>();
 const MAX_DASH_ELEMENTS: usize = 8;
 const MAX_MITER_LIMIT: f32 = 1_000.0;
 /// Maximum visible dash pieces one command may request from tessellation.
@@ -2021,10 +2021,18 @@ impl Fill {
     /// Degenerate gradients fall back to their end color rather than producing
     /// NaN.
     pub fn color_at(self, world: Vec2) -> Color {
+        self.color_at_with_offset(world, Vec2::ZERO)
+    }
+
+    pub(crate) fn color_at_with_offset(self, world_base: Vec2, world_offset: Vec2) -> Color {
         match self {
             Self::Solid(color) => color,
-            Self::LinearGradient(gradient) => gradient.color_at(world),
-            Self::RadialGradient(gradient) => gradient.color_at(world),
+            Self::LinearGradient(gradient) => {
+                gradient.color_at_with_offset(world_base, world_offset)
+            }
+            Self::RadialGradient(gradient) => {
+                gradient.color_at_with_offset(world_base, world_offset)
+            }
         }
     }
 
@@ -2082,14 +2090,20 @@ impl LinearGradient {
 
     /// Samples the gradient at a world-space point.
     pub fn color_at(self, world: Vec2) -> Color {
-        if !self.is_valid() || !world.is_finite() {
+        self.color_at_with_offset(world, Vec2::ZERO)
+    }
+
+    fn color_at_with_offset(self, world_base: Vec2, world_offset: Vec2) -> Color {
+        if !self.is_valid() || !world_base.is_finite() || !world_offset.is_finite() {
             return self.end_color.clamp();
         }
 
         let axis_x = f64::from(self.end.x) - f64::from(self.start.x);
         let axis_y = f64::from(self.end.y) - f64::from(self.start.y);
-        let relative_x = f64::from(world.x) - f64::from(self.start.x);
-        let relative_y = f64::from(world.y) - f64::from(self.start.y);
+        let relative_x =
+            f64::from(world_base.x) - f64::from(self.start.x) + f64::from(world_offset.x);
+        let relative_y =
+            f64::from(world_base.y) - f64::from(self.start.y) + f64::from(world_offset.y);
         let axis_length_squared = axis_x * axis_x + axis_y * axis_y;
         let amount = ((relative_x * axis_x + relative_y * axis_y) / axis_length_squared)
             .clamp(0.0, 1.0) as f32;
@@ -2178,7 +2192,11 @@ impl RadialGradient {
 
     /// Samples the gradient at a world-space point.
     pub fn color_at(self, world: Vec2) -> Color {
-        if !self.is_valid() || !world.is_finite() {
+        self.color_at_with_offset(world, Vec2::ZERO)
+    }
+
+    fn color_at_with_offset(self, world_base: Vec2, world_offset: Vec2) -> Color {
+        if !self.is_valid() || !world_base.is_finite() || !world_offset.is_finite() {
             return self.outer_color.clamp();
         }
 
@@ -2187,8 +2205,10 @@ impl RadialGradient {
             return self.outer_color;
         }
 
-        let horizontal = f64::from(world.x) - f64::from(self.center.x);
-        let vertical = f64::from(world.y) - f64::from(self.center.y);
+        let horizontal =
+            f64::from(world_base.x) - f64::from(self.center.x) + f64::from(world_offset.x);
+        let vertical =
+            f64::from(world_base.y) - f64::from(self.center.y) + f64::from(world_offset.y);
         let distance = horizontal.hypot(vertical);
         let amount = ((distance - f64::from(self.inner_radius)) / f64::from(radius_range))
             .clamp(0.0, 1.0) as f32;

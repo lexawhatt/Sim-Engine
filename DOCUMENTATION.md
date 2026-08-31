@@ -134,6 +134,11 @@ logical-screen shadows. Colors are straight linear RGBA internally.
 `Color::rgb` and `Color::rgba` accept values already in linear space. Render
 boundaries require every channel in `0.0..=1.0`; animation may overshoot, but
 the host must call `Color::clamp` explicitly before inserting that value.
+Circle centers and generated local offsets remain separate through the GPU
+camera transform. A radius that is meaningful relative to a camera centered at
+`1e20` therefore does not disappear merely because `center + radius` rounds
+back to the same source `f32`. Fill, stroke, shadow/spread, and radial-gradient
+sampling all use that same relative representation.
 
 #### Rich bounded strokes
 
@@ -1107,10 +1112,11 @@ world position + pseudo-depth
 ```
 
 The vertex shader receives compact camera rows mapping relative world X/Y and
-scalar depth into logical screen X/Y. CPU validation checks geometry extents
-against the same arithmetic envelope before submission. Lines retain
-logical-pixel width by carrying a screen-extrusion direction separately from
-world position.
+scalar depth into logical screen X/Y. Generated circle vertices carry a world
+anchor and local offset separately, so the subtraction from the camera happens
+before a small radius is added. CPU validation checks both components against
+the same arithmetic envelope before submission. Lines retain logical-pixel
+width by carrying a screen-extrusion direction separately from world position.
 
 The retained 3D transform is explicit:
 
@@ -1187,7 +1193,11 @@ camera/geometry arithmetic, grows the GPU vertex buffer when required, uploads
 vertices, acquires the surface, encodes clipped batches, submits, and presents.
 Circle and rounded-corner unit samples are immutable process-wide lookup data;
 per-command positions still receive the exact documented segment counts but do
-not recalculate the same trigonometric samples every frame.
+not recalculate the same trigonometric samples every frame. Circle samples are
+uploaded as local offsets from their retained center, preserving fill, stroke,
+shadow/spread, and radial-gradient behavior below the center's `f32` ULP. The
+80-byte tessellated vertex size, scene estimates, upload budgets, and reported
+upload bytes all include this relative-world component.
 
 #### Prepared scenes
 

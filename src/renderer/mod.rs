@@ -26,6 +26,7 @@ const COLOR_MAP_LUT_SIZE: u32 = 256;
 struct Vertex {
     world_position: [f32; 2],
     depth: f32,
+    world_offset: [f32; 2],
     screen_offset: [f32; 2],
     previous_direction: [f32; 2],
     next_direction: [f32; 2],
@@ -166,6 +167,8 @@ pub enum RenderTargetLoad {
 struct GeometryExtents {
     world_min: Vec2,
     world_max: Vec2,
+    world_offset_min: Vec2,
+    world_offset_max: Vec2,
     depth_min: f32,
     depth_max: f32,
     direction_min: Vec2,
@@ -277,18 +280,19 @@ enum TessellationError {
 }
 
 impl Vertex {
-    const ATTRIBUTES: [wgpu::VertexAttribute; 11] = wgpu::vertex_attr_array![
+    const ATTRIBUTES: [wgpu::VertexAttribute; 12] = wgpu::vertex_attr_array![
         0 => Float32x2,
         1 => Float32,
         2 => Float32x2,
         3 => Float32x2,
         4 => Float32x2,
-        5 => Float32,
+        5 => Float32x2,
         6 => Float32,
         7 => Float32,
         8 => Float32,
         9 => Float32,
-        10 => Float32x4
+        10 => Float32,
+        11 => Float32x4
     ];
 
     const LAYOUT: wgpu::VertexBufferLayout<'static> = wgpu::VertexBufferLayout {
@@ -300,6 +304,7 @@ impl Vertex {
     fn is_finite(self) -> bool {
         self.world_position.iter().all(|value| value.is_finite())
             && self.depth.is_finite()
+            && self.world_offset.iter().all(|value| value.is_finite())
             && self.screen_offset.iter().all(|value| value.is_finite())
             && self
                 .previous_direction
@@ -498,6 +503,8 @@ impl GeometryExtents {
         Self {
             world_min: Vec2::splat(f32::INFINITY),
             world_max: Vec2::splat(f32::NEG_INFINITY),
+            world_offset_min: Vec2::splat(f32::INFINITY),
+            world_offset_max: Vec2::splat(f32::NEG_INFINITY),
             depth_min: f32::INFINITY,
             depth_max: f32::NEG_INFINITY,
             direction_min: Vec2::splat(f32::INFINITY),
@@ -516,6 +523,11 @@ impl GeometryExtents {
         self.world_min.y = self.world_min.y.min(world.y);
         self.world_max.x = self.world_max.x.max(world.x);
         self.world_max.y = self.world_max.y.max(world.y);
+        let world_offset = Vec2::new(vertex.world_offset[0], vertex.world_offset[1]);
+        self.world_offset_min.x = self.world_offset_min.x.min(world_offset.x);
+        self.world_offset_min.y = self.world_offset_min.y.min(world_offset.y);
+        self.world_offset_max.x = self.world_offset_max.x.max(world_offset.x);
+        self.world_offset_max.y = self.world_offset_max.y.max(world_offset.y);
         self.depth_min = self.depth_min.min(vertex.depth);
         self.depth_max = self.depth_max.max(vertex.depth);
 
@@ -549,6 +561,8 @@ impl GeometryExtents {
         self.world_min.y = self.world_min.y.min(world.y);
         self.world_max.x = self.world_max.x.max(world.x);
         self.world_max.y = self.world_max.y.max(world.y);
+        self.world_offset_min = Vec2::ZERO;
+        self.world_offset_max = Vec2::ZERO;
         self.depth_min = self.depth_min.min(vertex.depth);
         self.depth_max = self.depth_max.max(vertex.depth);
         self.direction_min = Vec2::ZERO;
@@ -578,7 +592,7 @@ impl GeometryExtents {
         }
 
         let center = Vec2::new(uniform.camera_center[0], uniform.camera_center[1]);
-        let world_horizontal = transformed_world_interval(
+        let mut world_horizontal = transformed_world_interval(
             uniform.world_to_screen_x,
             self.world_min,
             self.world_max,
@@ -586,13 +600,29 @@ impl GeometryExtents {
             self.depth_max,
             center,
         );
-        let world_vertical = transformed_world_interval(
+        let mut world_vertical = transformed_world_interval(
             uniform.world_to_screen_y,
             self.world_min,
             self.world_max,
             self.depth_min,
             self.depth_max,
             center,
+        );
+        world_horizontal = interval_add(
+            world_horizontal,
+            transformed_direction_interval(
+                uniform.world_to_screen_x,
+                self.world_offset_min,
+                self.world_offset_max,
+            ),
+        );
+        world_vertical = interval_add(
+            world_vertical,
+            transformed_direction_interval(
+                uniform.world_to_screen_y,
+                self.world_offset_min,
+                self.world_offset_max,
+            ),
         );
         let direction_horizontal = transformed_direction_interval(
             uniform.world_to_screen_x,
@@ -664,6 +694,10 @@ fn interval_products(coefficient: f32, minimum: f32, maximum: f32) -> (f64, f64)
 
 fn interval_max_abs(interval: (f64, f64)) -> f64 {
     interval.0.abs().max(interval.1.abs())
+}
+
+fn interval_add(left: (f64, f64), right: (f64, f64)) -> (f64, f64) {
+    (left.0 + right.0, left.1 + right.1)
 }
 
 /// Result of attempting to draw a frame.

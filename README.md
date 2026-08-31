@@ -37,7 +37,8 @@ host-shaped glyph runs, explicitly budgeted dynamic triangles, richer bounded
 
 ## Capabilities
 
-- validated circles, rectangles, rounded rectangles, lines, and polylines;
+- validated circles, rectangles, rounded rectangles, lines, and polylines,
+  including camera-relative small circles at large finite world centers;
 - solid, linear-gradient, and radial-gradient fills;
 - logical/world-width strokes with bounded caps, joins, dashes, markers,
   clipping, and stable layer ordering;

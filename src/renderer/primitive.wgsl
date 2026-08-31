@@ -11,15 +11,16 @@ var<uniform> camera: CameraUniform;
 struct VertexIn {
     @location(0) world_position: vec2<f32>,
     @location(1) depth: f32,
-    @location(2) screen_offset: vec2<f32>,
-    @location(3) previous_direction: vec2<f32>,
-    @location(4) next_direction: vec2<f32>,
-    @location(5) normal_distance: f32,
-    @location(6) tangent_distance: f32,
-    @location(7) miter_limit: f32,
-    @location(8) stroke_role: f32,
-    @location(9) stroke_parameter: f32,
-    @location(10) color: vec4<f32>,
+    @location(2) world_offset: vec2<f32>,
+    @location(3) screen_offset: vec2<f32>,
+    @location(4) previous_direction: vec2<f32>,
+    @location(5) next_direction: vec2<f32>,
+    @location(6) normal_distance: f32,
+    @location(7) tangent_distance: f32,
+    @location(8) miter_limit: f32,
+    @location(9) stroke_role: f32,
+    @location(10) stroke_parameter: f32,
+    @location(11) color: vec4<f32>,
 };
 
 struct VertexOut {
@@ -57,7 +58,7 @@ fn same_side(left: f32, right: f32) -> bool {
 
 @vertex
 fn vs_main(input: VertexIn) -> VertexOut {
-    let relative_world = input.world_position - camera.camera_center.xy;
+    let relative_world = (input.world_position - camera.camera_center.xy) + input.world_offset;
     var screen = vec2<f32>(
         dot(camera.world_to_screen_x.xyz, vec3<f32>(relative_world, input.depth)) + camera.world_to_screen_x.w,
         dot(camera.world_to_screen_y.xyz, vec3<f32>(relative_world, input.depth)) + camera.world_to_screen_y.w,

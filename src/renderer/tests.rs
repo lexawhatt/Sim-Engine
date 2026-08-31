@@ -184,6 +184,7 @@ fn vertex_screen_position(vertex: Vertex, camera: Camera2d, viewport: LogicalVie
     };
     let world = Vec2::new(vertex.world_position[0], vertex.world_position[1]);
     let mut screen = uniform.world_to_screen(world, vertex.depth)
+        + uniform.direction_to_screen(Vec2::new(vertex.world_offset[0], vertex.world_offset[1]))
         + Vec2::new(vertex.screen_offset[0], vertex.screen_offset[1]);
     if vertex.normal_distance.abs() > 0.0 || vertex.tangent_distance.abs() > 0.0 {
         let previous = uniform.direction_to_screen(Vec2::new(
@@ -875,6 +876,134 @@ fn cached_circle_samples_close_exactly_at_large_world_scale() {
 }
 
 #[test]
+fn large_center_circle_fill_preserves_camera_relative_radius() {
+    let center = Vec2::splat(1.0e20);
+    let mut scene = Scene::new(Color::BLACK).unwrap();
+    scene
+        .try_circle(center, 1.0, ShapeStyle::filled(Color::WHITE))
+        .unwrap();
+
+    let (vertices, batches) = tessellate_for_test(&scene);
+    assert_eq!(vertices.len(), CIRCLE_SEGMENTS * 3);
+    assert_eq!(batches.len(), 1);
+    assert!(
+        vertices
+            .iter()
+            .all(|vertex| vertex.world_position == [center.x, center.y])
+    );
+    assert!(
+        vertices
+            .iter()
+            .any(|vertex| vertex.world_offset != [0.0, 0.0])
+    );
+
+    let camera = Camera2d::new(center, 10.0).unwrap();
+    let viewport = LogicalViewport::new(100.0, 100.0).unwrap();
+    let uniform = CameraUniform::new(camera, viewport).unwrap();
+    assert!(GeometryExtents::from_vertices(&vertices).is_safe_for(uniform));
+    let triangle: Vec<_> = vertices[..3]
+        .iter()
+        .copied()
+        .map(|vertex| vertex_screen_position(vertex, camera, viewport))
+        .collect();
+    let area_twice = (triangle[1] - triangle[0]).x.mul_add(
+        (triangle[2] - triangle[0]).y,
+        -(triangle[1] - triangle[0]).y * (triangle[2] - triangle[0]).x,
+    );
+    assert!(area_twice.is_finite() && area_twice.abs() > 0.1);
+}
+
+#[test]
+fn circle_world_offsets_remain_inside_shader_arithmetic_validation() {
+    let mut scene = Scene::new(Color::BLACK).unwrap();
+    scene
+        .try_circle(Vec2::ZERO, f32::MAX, ShapeStyle::filled(Color::WHITE))
+        .unwrap();
+    let (vertices, _) = tessellate_for_test(&scene);
+    let camera = Camera2d::new(Vec2::ZERO, 2.0).unwrap();
+    let viewport = LogicalViewport::new(100.0, 100.0).unwrap();
+    let uniform = CameraUniform::new(camera, viewport).unwrap();
+
+    assert!(!GeometryExtents::from_vertices(&vertices).is_safe_for(uniform));
+}
+
+#[test]
+fn large_center_circle_preserves_radial_gradient_offsets() {
+    let center = Vec2::splat(1.0e20);
+    let gradient = crate::RadialGradient::new(center, 0.0, 1.0, Color::BLACK, Color::WHITE);
+    let mut scene = Scene::new(Color::BLACK).unwrap();
+    scene
+        .try_circle(
+            center,
+            1.0,
+            ShapeStyle::filled_with(Fill::RadialGradient(gradient)),
+        )
+        .unwrap();
+
+    let (vertices, _) = tessellate_for_test(&scene);
+    assert_eq!(vertices[0].color, Color::BLACK.to_array());
+    assert_eq!(vertices[1].color, Color::WHITE.to_array());
+    assert_eq!(vertices[2].color, Color::WHITE.to_array());
+}
+
+#[test]
+fn large_center_circle_stroke_and_shadow_preserve_camera_relative_radius() {
+    let center = Vec2::splat(1.0e20);
+    let camera = Camera2d::new(center, 10.0).unwrap();
+    let viewport = LogicalViewport::new(100.0, 100.0).unwrap();
+
+    for style in [
+        ShapeStyle::stroked(3.0, Color::WHITE),
+        ShapeStyle::new(
+            None,
+            None,
+            Some(crate::Shadow::new(
+                LogicalScreenVector::new(4.0, -3.0),
+                2.0,
+                Color::WHITE,
+            )),
+        ),
+    ] {
+        let mut scene = Scene::new(Color::BLACK).unwrap();
+        scene.try_circle(center, 1.0, style).unwrap();
+        let (vertices, batches) = tessellate_for_test(&scene);
+        assert!(!vertices.is_empty());
+        assert_eq!(batches.len(), 1);
+        assert!(vertices.iter().copied().all(Vertex::is_finite));
+        assert!(
+            vertices
+                .iter()
+                .all(|vertex| vertex.world_position == [center.x, center.y])
+        );
+        assert!(
+            vertices
+                .iter()
+                .any(|vertex| vertex.world_offset != [0.0, 0.0])
+        );
+
+        let positions: Vec<_> = vertices
+            .iter()
+            .copied()
+            .map(|vertex| vertex_screen_position(vertex, camera, viewport))
+            .collect();
+        let minimum = positions
+            .iter()
+            .copied()
+            .fold(Vec2::splat(f32::INFINITY), |minimum, point| {
+                Vec2::new(minimum.x.min(point.x), minimum.y.min(point.y))
+            });
+        let maximum = positions
+            .iter()
+            .copied()
+            .fold(Vec2::splat(f32::NEG_INFINITY), |maximum, point| {
+                Vec2::new(maximum.x.max(point.x), maximum.y.max(point.y))
+            });
+        assert!((maximum.x - minimum.x) > 19.0);
+        assert!((maximum.y - minimum.y) > 19.0);
+    }
+}
+
+#[test]
 fn cached_quarter_circle_samples_keep_large_rounded_rect_tangents_forward() {
     let samples = super::tessellation::unit_quarter_circle_points();
     assert_eq!(samples[0], Vec2::X);
@@ -1451,6 +1580,180 @@ async fn assert_gpu_stroke_pixel_matrix(
     );
 }
 
+async fn assert_gpu_large_center_circle(
+    adapter: &wgpu::Adapter,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    format: wgpu::TextureFormat,
+) {
+    const EXTENT: u32 = 64;
+    const ROW_BYTES: u32 = EXTENT * 4;
+    let sample_count = preferred_sample_count(adapter, format);
+    let PipelineResources {
+        pipeline,
+        camera_uniform_buffer,
+        camera_bind_group,
+        ..
+    } = create_pipeline(device, format, sample_count);
+    let target = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("sim-engine large-center circle resolve target"),
+        size: wgpu::Extent3d {
+            width: EXTENT,
+            height: EXTENT,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
+    let multisample = (sample_count > 1).then(|| {
+        device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("sim-engine large-center circle multisample target"),
+            size: wgpu::Extent3d {
+                width: EXTENT,
+                height: EXTENT,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        })
+    });
+    let multisample_view = multisample
+        .as_ref()
+        .map(|texture| texture.create_view(&wgpu::TextureViewDescriptor::default()));
+
+    let center = Vec2::splat(1.0e20);
+    let viewport = LogicalViewport::new(EXTENT as f32, EXTENT as f32).unwrap();
+    let camera = Camera2d::new(center, 8.0).unwrap();
+    let camera_uniform = CameraUniform::new(camera, viewport).unwrap();
+    queue.write_buffer(
+        &camera_uniform_buffer,
+        0,
+        bytemuck::bytes_of(&camera_uniform),
+    );
+    let mut scene = Scene::new(Color::BLACK).unwrap();
+    scene
+        .try_circle(
+            center,
+            1.0,
+            ShapeStyle::fill_stroke(Color::WHITE, 2.0, Color::rgb8(255, 0, 0)),
+        )
+        .unwrap();
+    let prepared = prepare_scene_resources(device, queue, Arc::new(()), &scene)
+        .expect("large-center circle should prepare without degenerating");
+    assert_eq!(prepared.tessellation_stats().rendered_command_count(), 1);
+    assert_eq!(prepared.tessellation_stats().dropped_command_count(), 0);
+
+    let readback = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("sim-engine large-center circle readback"),
+        size: u64::from(ROW_BYTES) * u64::from(EXTENT),
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("sim-engine large-center circle encoder"),
+    });
+    {
+        let attachment_view = multisample_view.as_ref().unwrap_or(&target_view);
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("sim-engine large-center circle pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: attachment_view,
+                depth_slice: None,
+                resolve_target: multisample_view.as_ref().map(|_| &target_view),
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(Color::BLACK.to_wgpu()),
+                    store: if multisample_view.is_some() {
+                        wgpu::StoreOp::Discard
+                    } else {
+                        wgpu::StoreOp::Store
+                    },
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pass.set_pipeline(&pipeline);
+        pass.set_bind_group(0, &camera_bind_group, &[]);
+        pass.set_vertex_buffer(0, prepared.vertex_buffer.slice(..));
+        for batch in &prepared.draw_batches {
+            pass.draw(batch.vertex_range.clone(), 0..1);
+        }
+    }
+    encoder.copy_texture_to_buffer(
+        wgpu::TexelCopyTextureInfo {
+            texture: &target,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::TexelCopyBufferInfo {
+            buffer: &readback,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(ROW_BYTES),
+                rows_per_image: Some(EXTENT),
+            },
+        },
+        wgpu::Extent3d {
+            width: EXTENT,
+            height: EXTENT,
+            depth_or_array_layers: 1,
+        },
+    );
+    let submission = queue.submit([encoder.finish()]);
+    device
+        .poll(wgpu::PollType::Wait {
+            submission_index: Some(submission),
+            timeout: Some(Duration::from_secs(5)),
+        })
+        .expect("large-center circle submission should complete");
+    let slice = readback.slice(..);
+    let (sender, receiver) = mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |result| {
+        sender.send(result).unwrap()
+    });
+    device
+        .poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: Some(Duration::from_secs(5)),
+        })
+        .expect("large-center circle readback should complete");
+    receiver
+        .recv_timeout(Duration::from_secs(5))
+        .expect("large-center circle callback")
+        .expect("large-center circle should map");
+    let bytes = slice
+        .get_mapped_range()
+        .expect("large-center circle mapped bytes");
+    let channels = gpu_oracle_channel_indices(format);
+    let pixel = |x: usize, y: usize| &bytes[y * ROW_BYTES as usize + x * 4..][..4];
+    let center_pixel = pixel(32, 32);
+    assert!(
+        center_pixel[channels[0]] > 220
+            && center_pixel[channels[1]] > 220
+            && center_pixel[channels[2]] > 220,
+        "camera-relative large-center circle fill did not rasterize: {center_pixel:?}"
+    );
+    let outside = pixel(48, 32);
+    assert!(
+        outside[channels[0]] < 10 && outside[channels[1]] < 10 && outside[channels[2]] < 10,
+        "large-center circle exceeded its camera-relative bounds: {outside:?}"
+    );
+    drop(bytes);
+    readback.unmap();
+}
+
 fn parse_gpu_oracle_surface_format(name: &str) -> Option<wgpu::TextureFormat> {
     match name {
         "Rgba8Unorm" => Some(wgpu::TextureFormat::Rgba8Unorm),
@@ -1644,6 +1947,7 @@ fn offscreen_gpu_readback_verifies_camera_depth_and_clip_contract() {
         let validation_scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
         let recovery_validation_scope =
             recovery_device.push_error_scope(wgpu::ErrorFilter::Validation);
+        assert_gpu_large_center_circle(&adapter, &device, &queue, format).await;
         assert_gpu_stroke_pixel_matrix(&adapter, &device, &queue, format).await;
         mesh3d::assert_gpu_depth_contract(&device, &queue, format);
         mesh3d::assert_gpu_scene_recovery_contract(

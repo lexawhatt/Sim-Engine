@@ -98,6 +98,12 @@ composed frames, fixed-screen UI, retained images, and host-shaped text.
   large finite circles close without a residual retrace and maximum-radius
   rounded rectangles meet straight edges without a scale-amplified tangent
   kink.
+- Circle vertices retain the center and local radius offset separately through
+  camera-relative WGSL arithmetic. Fill, stroke, shadow/spread, and radial
+  gradients therefore remain drawable when a small radius lies below a large
+  finite center's source `f32` ULP. Tessellated vertices are now 80 bytes, and
+  scene estimates, upload budgets, recovery memory, and diagnostics reflect
+  that exact payload.
 - Streaming composition returns its reusable transient vertex allocation to
   the renderer on every structured error path, preserving steady-state memory
   behavior after a rejected frame.
