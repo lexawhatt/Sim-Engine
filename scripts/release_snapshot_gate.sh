@@ -20,6 +20,19 @@ esac
 cd "$project_root"
 output_dir="$project_root/target"
 mkdir -p "$output_dir"
+lock_file="$output_dir/.linux-release-gate.lock"
+if ! command -v flock >/dev/null 2>&1; then
+    echo "release snapshot gate requires flock" >&2
+    exit 1
+fi
+# Serialize the destructive invalidation and atomic publication boundary. The
+# descriptor lock is released by the kernel even after SIGKILL; the harmless
+# lock file may remain and can be reused by the next invocation.
+exec 9>"$lock_file"
+if ! flock -n 9; then
+    echo "another Sim;Engine release gate is already running" >&2
+    exit 1
+fi
 final_bundle="$output_dir/linux-release-evidence"
 staging_dir=$(mktemp -d "$output_dir/.linux-release-evidence.XXXXXX")
 snapshot_parent=""
@@ -52,6 +65,7 @@ trap 'exit 143' TERM
 rm -rf -- "$final_bundle"
 rm -f -- "$output_dir/linux-vulkan-surface.txt" \
     "$output_dir/linux-vulkan-adapter.txt" \
+    "$output_dir/linux-vulkan-performance.txt" \
     "$output_dir/linux-hidpi-transition.txt"
 
 if [[ -n "$(git replace -l)" ]]; then
@@ -111,6 +125,7 @@ case "$gate_script" in
         required_evidence=(
             linux-vulkan-surface.txt
             linux-vulkan-adapter.txt
+            linux-vulkan-performance.txt
             linux-hidpi-transition.txt
         )
         ;;
@@ -128,6 +143,6 @@ printf 'format_version=1\nvcs_sha=%s\ngate_script=%s\nstatus=passed\n' \
     "$start_sha" "$gate_script" >"$staging_dir/completion.txt"
 # This directory rename is the only publication boundary. SIGKILL before it
 # can leave a hidden staging directory, never a bundle that claims success.
-mv -- "$staging_dir" "$final_bundle"
+mv -T -- "$staging_dir" "$final_bundle"
 echo "Release evidence bundle: $final_bundle"
 gate_complete=1

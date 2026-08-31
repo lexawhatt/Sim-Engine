@@ -138,6 +138,8 @@ impl ApplicationHandler for DemoApplication {
             renderer_options,
         ))
         .expect("create renderer");
+        let notify_window = Arc::clone(&window);
+        renderer.set_pre_present_notify(move || notify_window.pre_present_notify());
 
         if demo_uses_heatmap() {
             self.scalar_field_texture = Some(
@@ -276,10 +278,6 @@ impl ApplicationHandler for DemoApplication {
                     }
                 });
                 let scene_duration = frame_started_at.elapsed();
-                if self.present_mode == RendererPresentMode::Vsync {
-                    window.pre_present_notify();
-                }
-
                 let (renderer_metrics, command_count, dynamic_mesh_update) = match self
                     .renderer
                     .as_mut()

@@ -219,13 +219,15 @@ impl ApplicationHandler for StereometryApplication {
         };
         let options = WgpuRendererOptions::new(present_mode, window.scale_factor())
             .expect("window scale factor is valid");
-        let renderer = pollster::block_on(WgpuRenderer::new_with_options(
+        let mut renderer = pollster::block_on(WgpuRenderer::new_with_options(
             window.clone(),
             size.width.max(1),
             size.height.max(1),
             options,
         ))
         .expect("create stereometry renderer");
+        let notify_window = Arc::clone(&window);
+        renderer.set_pre_present_notify(move || notify_window.pre_present_notify());
         let cube = renderer
             .create_mesh3d(cube_mesh())
             .expect("cube topology fits the device");
@@ -365,9 +367,6 @@ impl ApplicationHandler for StereometryApplication {
                 let report = renderer
                     .render_scene3d_to_target(target, scene, camera)
                     .expect("render retained depth-tested scene");
-                if !self.uncapped {
-                    window.pre_present_notify();
-                }
                 renderer
                     .compose_render_target(
                         target.color_target(),

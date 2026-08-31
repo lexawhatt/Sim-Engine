@@ -1,4 +1,8 @@
-use std::sync::mpsc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+    mpsc,
+};
 
 use super::config::recovery_quarantine_has_capacity;
 use super::*;
@@ -850,6 +854,50 @@ fn maximum_radius_rounded_rect_stroke_has_no_collapsed_directions() {
             && Vec2::new(vertex.next_direction[0], vertex.next_direction[1]).length_squared()
                 > f32::EPSILON
     }));
+}
+
+#[test]
+fn cached_circle_samples_close_exactly_at_large_world_scale() {
+    let samples = super::tessellation::unit_circle_points();
+    assert_eq!(samples[0], Vec2::X);
+    assert_eq!(samples[CIRCLE_SEGMENTS / 4], Vec2::Y);
+    assert_eq!(samples[CIRCLE_SEGMENTS / 2], Vec2::new(-1.0, 0.0));
+    assert_eq!(samples[CIRCLE_SEGMENTS * 3 / 4], Vec2::new(0.0, -1.0));
+    assert_eq!(samples[CIRCLE_SEGMENTS], Vec2::X);
+
+    let mut scene = Scene::new(Color::BLACK).unwrap();
+    scene.circle(Vec2::ZERO, 20_000.0, ShapeStyle::stroked(3.0, Color::WHITE));
+
+    let (vertices, _) = tessellate_for_test(&scene);
+
+    assert_eq!(vertices.len(), CIRCLE_SEGMENTS * 6);
+    assert!(vertices.iter().copied().all(Vertex::is_finite));
+}
+
+#[test]
+fn cached_quarter_circle_samples_keep_large_rounded_rect_tangents_forward() {
+    let samples = super::tessellation::unit_quarter_circle_points();
+    assert_eq!(samples[0], Vec2::X);
+    assert_eq!(samples[CORNER_SEGMENTS], Vec2::Y);
+
+    let mut scene = Scene::new(Color::BLACK).unwrap();
+    scene.rect(
+        Rect::from_center_size(Vec2::ZERO, Vec2::splat(20_000.0)),
+        10_000.0,
+        ShapeStyle::stroked(3.0, Color::WHITE),
+    );
+
+    let (vertices, _) = tessellate_for_test(&scene);
+    let directions: Vec<_> = vertices
+        .chunks_exact(6)
+        .take(CORNER_SEGMENTS * 4)
+        .map(|quad| Vec2::new(quad[0].next_direction[0], quad[0].next_direction[1]))
+        .collect();
+
+    assert_eq!(directions.len(), CORNER_SEGMENTS * 4);
+    assert!(directions.iter().all(|direction| direction.is_finite()));
+    assert!(directions.windows(2).all(|pair| pair[0].dot(pair[1]) > 0.0));
+    assert!(directions[directions.len() - 1].dot(directions[0]) > 0.0);
 }
 
 #[test]
@@ -3401,4 +3449,28 @@ fn renderer_present_modes_select_concrete_surface_fallbacks() {
     );
     assert!(RendererSurfacePresentMode::Mailbox.is_refresh_synchronized());
     assert!(!RendererSurfacePresentMode::Immediate.is_refresh_synchronized());
+}
+
+#[test]
+fn pre_present_notification_only_paces_synchronized_surface_modes() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&calls);
+    let notify = move || {
+        observed.fetch_add(1, Ordering::Relaxed);
+    };
+
+    invoke_pre_present_notify(RendererSurfacePresentMode::Immediate, Some(&notify));
+    assert_eq!(calls.load(Ordering::Relaxed), 0);
+
+    for mode in [
+        RendererSurfacePresentMode::Mailbox,
+        RendererSurfacePresentMode::Fifo,
+        RendererSurfacePresentMode::FifoRelaxed,
+    ] {
+        invoke_pre_present_notify(mode, Some(&notify));
+    }
+    assert_eq!(calls.load(Ordering::Relaxed), 3);
+
+    invoke_pre_present_notify(RendererSurfacePresentMode::Fifo, None);
+    assert_eq!(calls.load(Ordering::Relaxed), 3);
 }

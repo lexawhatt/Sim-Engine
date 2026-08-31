@@ -94,6 +94,16 @@ composed frames, fixed-screen UI, retained images, and host-shaped text.
   tessellation. The unchanged 90/10 release fixture therefore measures host
   scene work and GPU upload rather than repeated trigonometry and allocator
   churn.
+- Cached circle and quarter-circle samples use exact cardinal endpoints, so
+  large finite circles close without a residual retrace and maximum-radius
+  rounded rectangles meet straight edges without a scale-amplified tangent
+  kink.
+- Streaming composition returns its reusable transient vertex allocation to
+  the renderer on every structured error path, preserving steady-state memory
+  behavior after a rejected frame.
+- `WgpuRenderer::set_pre_present_notify` owns the host pacing boundary:
+  registered callbacks run after queue submission and immediately before
+  FIFO/FIFO-relaxed/Mailbox presentation, while Immediate stays uncapped.
 - Adapter diagnostics now expose PCI vendor/device IDs, physical PCI bus
   address, surface format, and sample count. Release evidence rejects any
   semantic, performance, or compositor process that selects a different
@@ -114,10 +124,15 @@ composed frames, fixed-screen UI, retained images, and host-shaped text.
   target directory. Evidence is staged and atomically published as one bundle
   only after the complete gate succeeds, so crashes cannot expose partial
   manifests as a passed run.
-- Surface benchmark and HiDPI presents now call winit's
-  `Window::pre_present_notify` immediately before submission; finalization
-  therefore crosses a compositor-aware redraw boundary before accepting the
-  final output/generation snapshot.
+- A nonblocking process lock serializes release-evidence invalidation and
+  publication, and Linux `mv -T` makes the completed directory replacement
+  explicit. The bundle now includes a structured performance manifest with
+  all seven surface fixture reports and their exact-SHA passed verdicts.
+- Surface benchmark and HiDPI renderers register winit's
+  `Window::pre_present_notify`; synchronized modes invoke it after submission
+  and immediately before present, while Immediate benchmarks remain unpaced.
+  Finalization still crosses a compositor-aware redraw boundary before
+  accepting the final output/generation snapshot.
 
 - Added exact-limit/one-over budget tests, atomic batch rejection tests,
   conservative-estimate checks against actual tessellation, positioned

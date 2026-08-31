@@ -448,6 +448,7 @@ impl WgpuRenderer {
             pass.draw(0..6, 0..1);
         }
         self.queue.submit([encoder.finish()]);
+        self.notify_before_present();
         self.queue.present(surface_texture);
         particles.statistics.rendered = preparation.visible_count;
         Ok(layered_report(

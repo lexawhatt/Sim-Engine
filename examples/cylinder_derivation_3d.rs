@@ -319,13 +319,15 @@ impl ApplicationHandler for CylinderApplication {
         };
         let options = WgpuRendererOptions::new(present_mode, window.scale_factor())
             .expect("window scale factor is valid");
-        let renderer = pollster::block_on(WgpuRenderer::new_with_options(
+        let mut renderer = pollster::block_on(WgpuRenderer::new_with_options(
             window.clone(),
             size.width.max(1),
             size.height.max(1),
             options,
         ))
         .expect("create cylinder renderer");
+        let notify_window = Arc::clone(&window);
+        renderer.set_pre_present_notify(move || notify_window.pre_present_notify());
         let surface_present_mode = renderer.surface_present_mode();
 
         let cylinder = renderer
@@ -519,9 +521,6 @@ impl ApplicationHandler for CylinderApplication {
                 let report = renderer
                     .render_scene3d_to_target(target, scene, camera)
                     .expect("render cylinder derivation");
-                if !self.uncapped {
-                    window.pre_present_notify();
-                }
                 let composition_report = renderer
                     .compose_render_target(
                         target.color_target(),

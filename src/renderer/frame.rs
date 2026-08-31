@@ -1498,11 +1498,35 @@ fn present_frame(composer: FrameComposer<'_>) -> Result<FrameReport, FrameCompos
         renderer,
         background,
         budget,
-        mut items,
+        items,
         retained_resources: _,
         planned,
         next_insertion: _,
     } = composer;
+    // Always return the transient allocation, including structured error
+    // paths before surface acquisition.
+    let mut streaming_vertices = std::mem::take(&mut renderer.vertices);
+    streaming_vertices.clear();
+    let result = present_frame_with_vertices(
+        renderer,
+        background,
+        budget,
+        items,
+        planned,
+        &mut streaming_vertices,
+    );
+    renderer.vertices = streaming_vertices;
+    result
+}
+
+fn present_frame_with_vertices<'frame>(
+    renderer: &mut WgpuRenderer,
+    background: Color,
+    budget: FrameBudget,
+    mut items: Vec<FrameItem<'frame>>,
+    planned: FrameStatistics,
+    streaming_vertices: &mut Vec<Vertex>,
+) -> Result<FrameReport, FrameComposerError> {
     let frame_started_at = Instant::now();
     items.sort_unstable_by_key(FrameItem::sort_key);
 
@@ -1510,10 +1534,6 @@ fn present_frame(composer: FrameComposer<'_>) -> Result<FrameReport, FrameCompos
         .logical_viewport()
         .map_err(|_| RendererFrameError::InvalidViewport)?;
     let tessellation_started_at = Instant::now();
-    // Reuse the previous frame's transient allocation. Streaming workloads
-    // otherwise allocate and release their entire vertex payload every frame.
-    let mut streaming_vertices = std::mem::take(&mut renderer.vertices);
-    streaming_vertices.clear();
     let mut ready = Vec::new();
     ready
         .try_reserve(items.len())
@@ -1540,7 +1560,7 @@ fn present_frame(composer: FrameComposer<'_>) -> Result<FrameReport, FrameCompos
                 options,
                 renderer,
                 target_viewport,
-                &mut streaming_vertices,
+                &mut *streaming_vertices,
                 &mut ready,
                 &mut statistics,
                 &mut tessellation_stats,
@@ -1554,7 +1574,7 @@ fn present_frame(composer: FrameComposer<'_>) -> Result<FrameReport, FrameCompos
                     camera,
                     viewport,
                     target_viewport,
-                    &mut streaming_vertices,
+                    &mut *streaming_vertices,
                     &mut ready,
                     &mut statistics,
                     &mut tessellation_stats,
@@ -1938,7 +1958,7 @@ fn present_frame(composer: FrameComposer<'_>) -> Result<FrameReport, FrameCompos
         renderer.queue.write_buffer(
             &renderer.vertex_buffer,
             0,
-            bytemuck::cast_slice(&streaming_vertices),
+            bytemuck::cast_slice(streaming_vertices),
         );
     }
     for item in &ready {
@@ -1989,8 +2009,6 @@ fn present_frame(composer: FrameComposer<'_>) -> Result<FrameReport, FrameCompos
             }
         }
     }
-    renderer.vertices = streaming_vertices;
-
     let acquire_started_at = Instant::now();
     let surface_texture = match renderer.surface.get_current_texture() {
         wgpu::CurrentSurfaceTexture::Success(texture)
@@ -2087,6 +2105,7 @@ fn present_frame(composer: FrameComposer<'_>) -> Result<FrameReport, FrameCompos
         }
     }
     renderer.queue.submit([encoder.finish()]);
+    renderer.notify_before_present();
     renderer.queue.present(surface_texture);
     set_particle_rendered(&mut ready, true);
     let encode_submit_present = encode_started_at.elapsed();

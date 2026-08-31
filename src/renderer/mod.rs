@@ -1971,6 +1971,7 @@ pub struct WgpuRenderer {
     config: wgpu::SurfaceConfiguration,
     requested_present_mode: RendererPresentMode,
     surface_present_mode: RendererSurfacePresentMode,
+    pre_present_notify: Option<Arc<dyn Fn() + Send + Sync>>,
     scale_factor: f64,
     pipeline: wgpu::RenderPipeline,
     target_pipeline: wgpu::RenderPipeline,
@@ -2112,6 +2113,7 @@ impl WgpuRenderer {
             config,
             requested_present_mode: options.present_mode(),
             surface_present_mode,
+            pre_present_notify: None,
             scale_factor: options.scale_factor(),
             pipeline,
             target_pipeline,
@@ -2193,6 +2195,30 @@ impl WgpuRenderer {
     /// desktop compositor may still pace host redraw callbacks independently.
     pub fn surface_present_mode(&self) -> RendererSurfacePresentMode {
         self.surface_present_mode
+    }
+
+    /// Installs a host callback invoked immediately before synchronized
+    /// surface presentation.
+    ///
+    /// A winit host should capture its `Arc<Window>` and call
+    /// `Window::pre_present_notify` from this callback. The renderer invokes
+    /// it after command submission and immediately before `Queue::present`,
+    /// but only when the concrete surface mode is Mailbox, FIFO, or
+    /// FIFO-relaxed. Immediate presentation deliberately remains uncapped.
+    pub fn set_pre_present_notify(&mut self, notify: impl Fn() + Send + Sync + 'static) {
+        self.pre_present_notify = Some(Arc::new(notify));
+    }
+
+    /// Removes the synchronized-presentation callback, if one is installed.
+    pub fn clear_pre_present_notify(&mut self) {
+        self.pre_present_notify = None;
+    }
+
+    fn notify_before_present(&self) {
+        invoke_pre_present_notify(
+            self.surface_present_mode,
+            self.pre_present_notify.as_deref(),
+        );
     }
 
     /// Returns the active graphics adapter's human-readable name.
@@ -3650,6 +3676,7 @@ impl WgpuRenderer {
         }
 
         self.queue.submit([encoder.finish()]);
+        self.notify_before_present();
         self.queue.present(surface_texture);
         let encode_submit_present = encode_submit_present_started_at.elapsed();
 
@@ -3806,6 +3833,7 @@ impl WgpuRenderer {
             pass.draw(0..6, 0..1);
         }
         self.queue.submit([encoder.finish()]);
+        self.notify_before_present();
         self.queue.present(surface_texture);
         Ok(render_report(
             RenderStatus::Drawn,
@@ -4034,6 +4062,7 @@ impl WgpuRenderer {
             pass.draw(0..6, 0..1);
         }
         self.queue.submit([encoder.finish()]);
+        self.notify_before_present();
         self.queue.present(surface_texture);
         Ok(render_report(
             RenderStatus::Drawn,
@@ -4439,6 +4468,7 @@ impl WgpuRenderer {
             }
         }
         self.queue.submit([encoder.finish()]);
+        self.notify_before_present();
         self.queue.present(surface_texture);
         field.statistics.rendered = preparation.visible_count;
         Ok(render_report(
@@ -4574,6 +4604,17 @@ impl WgpuRenderer {
         prepared_scene_belongs_to(&self.renderer_identity, &trails.renderer_identity)
             .then_some(())
             .ok_or(RenderTargetError::RendererMismatch)
+    }
+}
+
+fn invoke_pre_present_notify(
+    present_mode: RendererSurfacePresentMode,
+    notify: Option<&(dyn Fn() + Send + Sync)>,
+) {
+    if present_mode.is_refresh_synchronized()
+        && let Some(notify) = notify
+    {
+        notify();
     }
 }
 

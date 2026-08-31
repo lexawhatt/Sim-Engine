@@ -415,6 +415,8 @@ impl ApplicationHandler for BenchmarkApplication {
                 size.height.max(1),
                 options,
             ))?;
+            let notify_window = Arc::clone(&window);
+            renderer.set_pre_present_notify(move || notify_window.pre_present_notify());
             let require_adapter_identity =
                 std::env::var("SIM_ENGINE_REQUIRE_ADAPTER_IDENTITY").as_deref() == Ok("1");
             validate_renderer_adapter(&renderer, require_adapter_identity)
@@ -630,7 +632,6 @@ impl ApplicationHandler for BenchmarkApplication {
                         .renderer
                         .begin_frame(Color::rgb8(9, 12, 18), FrameBudget::default())?;
                     frame.draw_prepared_screen_scene(&state.prepared, FramePassOptions::new(0))?;
-                    state.window.pre_present_notify();
                     Ok(matches!(
                         frame.present()?.status(),
                         sim_engine::RenderStatus::Drawn
@@ -1410,10 +1411,9 @@ fn prepare_static_ui(renderer: &mut WgpuRenderer) -> Result<BenchmarkWorkload, B
             "prepare_cpu_ms={:.3}",
             preparation.as_secs_f64() * 1_000.0
         )),
-        render: Box::new(move |renderer, window, _, _, _| {
+        render: Box::new(move |renderer, _window, _, _, _| {
             let mut frame = renderer.begin_frame(scene.background(), FrameBudget::default())?;
             frame.draw_prepared_screen_scene(&prepared, FramePassOptions::new(0))?;
-            window.pre_present_notify();
             Ok(frame.present()?.into())
         }),
     })
@@ -1428,12 +1428,11 @@ fn prepare_ui_90_10(renderer: &mut WgpuRenderer) -> Result<BenchmarkWorkload, Bo
         name: "ui_90_10",
         construction: initial_construction,
         completion_note: None,
-        render: Box::new(move |renderer, window, frame_index, _, _| {
+        render: Box::new(move |renderer, _window, frame_index, _, _| {
             let streaming = build_screen_scene(STREAMING_COMMANDS, frame_index)?;
             let mut frame = renderer.begin_frame(Color::rgb8(9, 12, 18), FrameBudget::default())?;
             frame.draw_prepared_screen_scene(&prepared, FramePassOptions::new(0))?;
             frame.draw_screen_scene(&streaming, FramePassOptions::new(1))?;
-            window.pre_present_notify();
             Ok(frame.present()?.into())
         }),
     })
@@ -1473,7 +1472,7 @@ fn prepare_four_viewports(
         name: "four_viewports",
         construction,
         completion_note: None,
-        render: Box::new(move |renderer, window, _, _, _| {
+        render: Box::new(move |renderer, _window, _, _, _| {
             let mut frame = renderer.begin_frame(Color::rgb8(9, 12, 18), FrameBudget::default())?;
             for (index, ((scene, camera), region)) in prepared
                 .iter()
@@ -1487,7 +1486,6 @@ fn prepare_four_viewports(
                     FramePassOptions::new(index as i32).with_viewport(region),
                 )?;
             }
-            window.pre_present_notify();
             Ok(frame.present()?.into())
         }),
     })
@@ -1518,7 +1516,7 @@ fn prepare_image_atlas(renderer: &mut WgpuRenderer) -> Result<BenchmarkWorkload,
         name: "image_atlas",
         construction: started.elapsed(),
         completion_note: None,
-        render: Box::new(move |renderer, window, _, _, _| {
+        render: Box::new(move |renderer, _window, _, _, _| {
             let mut frame = renderer.begin_frame(Color::BLACK, FrameBudget::default())?;
             frame.draw_image_batch(
                 &image,
@@ -1526,7 +1524,6 @@ fn prepare_image_atlas(renderer: &mut WgpuRenderer) -> Result<BenchmarkWorkload,
                 ImageSampling::Nearest,
                 FramePassOptions::new(0),
             )?;
-            window.pre_present_notify();
             Ok(frame.present()?.into())
         }),
     })
@@ -1564,7 +1561,7 @@ fn prepare_scientific_text(
         name: "scientific_text",
         construction: started.elapsed(),
         completion_note: None,
-        render: Box::new(move |renderer, window, _, _, _| {
+        render: Box::new(move |renderer, _window, _, _, _| {
             let mut frame = renderer.begin_frame(Color::BLACK, FrameBudget::default())?;
             frame.draw_glyph_run(
                 &atlas,
@@ -1572,7 +1569,6 @@ fn prepare_scientific_text(
                 ImageSampling::Nearest,
                 FramePassOptions::new(0),
             )?;
-            window.pre_present_notify();
             Ok(frame.present()?.into())
         }),
     })
@@ -1589,13 +1585,12 @@ fn prepare_dpi_reconfigure(
         name: "dpi_reconfigure",
         construction: started.elapsed(),
         completion_note: None,
-        render: Box::new(move |renderer, window, frame, width, height| {
+        render: Box::new(move |renderer, _window, frame, width, height| {
             let reconfigure_started = Instant::now();
             renderer.resize_with_scale_factor(width, height, scales[frame % scales.len()])?;
             let reconfigure_work = reconfigure_started.elapsed();
             let mut composed = renderer.begin_frame(scene.background(), FrameBudget::default())?;
             composed.draw_prepared_screen_scene(&prepared, FramePassOptions::new(0))?;
-            window.pre_present_notify();
             Ok(BenchmarkFrame {
                 report: composed.present()?,
                 additional_renderer_work: reconfigure_work,
@@ -1941,14 +1936,13 @@ fn require_drawn_frame(
 
 fn present_confirmation_frame(
     renderer: &mut WgpuRenderer,
-    window: &Window,
+    _window: &Window,
     fixture: &str,
     phase: &str,
     index: usize,
 ) -> Result<(), String> {
     let result = (|| -> Result<RenderStatus, Box<dyn Error>> {
         let frame = renderer.begin_frame(Color::BLACK, FrameBudget::default())?;
-        window.pre_present_notify();
         Ok(frame.present()?.status())
     })();
     let status = result.map_err(|error| error.to_string())?;

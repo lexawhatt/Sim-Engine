@@ -1174,23 +1174,32 @@ fn circle_world_points(
     Ok(points)
 }
 
-fn unit_circle_points() -> &'static [Vec2] {
+pub(super) fn unit_circle_points() -> &'static [Vec2] {
     static POINTS: OnceLock<[Vec2; CIRCLE_SEGMENTS + 1]> = OnceLock::new();
     POINTS.get_or_init(|| {
-        std::array::from_fn(|index| {
+        let mut points = std::array::from_fn(|index| {
             let angle = index as f32 / CIRCLE_SEGMENTS as f32 * std::f32::consts::TAU;
             Vec2::new(angle.cos(), angle.sin())
-        })
+        });
+        points[0] = Vec2::X;
+        points[CIRCLE_SEGMENTS / 4] = Vec2::Y;
+        points[CIRCLE_SEGMENTS / 2] = Vec2::new(-1.0, 0.0);
+        points[CIRCLE_SEGMENTS * 3 / 4] = Vec2::new(0.0, -1.0);
+        points[CIRCLE_SEGMENTS] = Vec2::X;
+        points
     })
 }
 
-fn unit_quarter_circle_points() -> &'static [Vec2] {
+pub(super) fn unit_quarter_circle_points() -> &'static [Vec2] {
     static POINTS: OnceLock<[Vec2; CORNER_SEGMENTS + 1]> = OnceLock::new();
     POINTS.get_or_init(|| {
-        std::array::from_fn(|step| {
+        let mut points = std::array::from_fn(|step| {
             let angle = step as f32 / CORNER_SEGMENTS as f32 * std::f32::consts::FRAC_PI_2;
             Vec2::new(angle.cos(), angle.sin())
-        })
+        });
+        points[0] = Vec2::X;
+        points[CORNER_SEGMENTS] = Vec2::Y;
+        points
     })
 }
 

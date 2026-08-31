@@ -222,13 +222,15 @@ impl ApplicationHandler for StarRemnantApp {
             RendererPresentMode::Vsync
         };
         let options = WgpuRendererOptions::new(present_mode, window.scale_factor()).unwrap();
-        let renderer = pollster::block_on(WgpuRenderer::new_with_options(
+        let mut renderer = pollster::block_on(WgpuRenderer::new_with_options(
             window.clone(),
             size.width.max(1),
             size.height.max(1),
             options,
         ))
         .expect("create stress renderer");
+        let notify_window = Arc::clone(&window);
+        renderer.set_pre_present_notify(move || notify_window.pre_present_notify());
         let gas_texture = renderer
             .create_scalar_field_texture(build_gas_field(0.0))
             .expect("create gas texture");
@@ -330,9 +332,6 @@ impl ApplicationHandler for StarRemnantApp {
                 ) else {
                     return;
                 };
-                if !self.uncapped {
-                    window.pre_present_notify();
-                }
                 let report = renderer
                     .render_layered_visualization(
                         target,

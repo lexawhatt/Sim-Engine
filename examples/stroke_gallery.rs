@@ -165,13 +165,15 @@ impl ApplicationHandler for GalleryApplication {
         };
         let options = WgpuRendererOptions::new(present_mode, window.scale_factor())
             .expect("window scale factor is valid");
-        let renderer = pollster::block_on(WgpuRenderer::new_with_options(
+        let mut renderer = pollster::block_on(WgpuRenderer::new_with_options(
             Arc::clone(&window),
             size.width.max(1),
             size.height.max(1),
             options,
         ))
         .expect("create gallery renderer");
+        let notify_window = Arc::clone(&window);
+        renderer.set_pre_present_notify(move || notify_window.pre_present_notify());
         println!(
             "stroke gallery: 1 caps/joins, 2 alpha, 3 dash/markers, 4 camera edge cases; Space pause, Left/Right scrub, +/- zoom, R reset, Esc exit"
         );

@@ -400,13 +400,15 @@ impl ApplicationHandler for UiDemoApplication {
         };
         let renderer_options = WgpuRendererOptions::new(present_mode, window.scale_factor())
             .expect("window scale factor is valid");
-        let renderer = pollster::block_on(WgpuRenderer::new_with_options(
+        let mut renderer = pollster::block_on(WgpuRenderer::new_with_options(
             window.clone(),
             size.width.max(1),
             size.height.max(1),
             renderer_options,
         ))
         .expect("create UI renderer");
+        let notify_window = Arc::clone(&window);
+        renderer.set_pre_present_notify(move || notify_window.pre_present_notify());
         let (glyph_probe_atlas, glyph_probe_run) =
             create_scientific_glyph_probe(&renderer).expect("create retained glyph probe");
 
@@ -553,9 +555,6 @@ impl ApplicationHandler for UiDemoApplication {
                 let scene_time = frame_started_at.elapsed();
                 let command_count = scene.command_count();
                 let camera = self.active_camera();
-                if !self.uncapped {
-                    window.pre_present_notify();
-                }
                 if let (Some(renderer), Some(glyph_atlas), Some(glyph_run)) = (
                     self.renderer.as_mut(),
                     self.glyph_probe_atlas.as_ref(),

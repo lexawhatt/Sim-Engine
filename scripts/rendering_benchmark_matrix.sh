@@ -33,12 +33,18 @@ release_sha=$start_sha
 mkdir -p "$output_dir"
 surface_evidence=$(mktemp "$output_dir/.linux-vulkan-surface.XXXXXX")
 adapter_evidence=$(mktemp "$output_dir/.linux-vulkan-adapter.XXXXXX")
+performance_evidence=$(mktemp "$output_dir/.linux-vulkan-performance.XXXXXX")
+active_fixture_output=""
 gate_complete=0
 cleanup() {
-    rm -f -- "$surface_evidence" "$adapter_evidence"
+    rm -f -- "$surface_evidence" "$adapter_evidence" "$performance_evidence"
+    if [ -n "$active_fixture_output" ]; then
+        rm -f -- "$active_fixture_output"
+    fi
     if [ "$gate_complete" -ne 1 ]; then
         rm -f -- "$output_dir/linux-vulkan-surface.txt" \
             "$output_dir/linux-vulkan-adapter.txt" \
+            "$output_dir/linux-vulkan-performance.txt" \
             "$output_dir/linux-hidpi-transition.txt"
     fi
 }
@@ -99,19 +105,47 @@ grep -Fxq "oracle_format=$SIM_ENGINE_GPU_SURFACE_FORMAT" "$adapter_evidence"
 grep -Fxq "oracle_sample_count=$SIM_ENGINE_GPU_SURFACE_SAMPLE_COUNT" "$adapter_evidence"
 echo "matrix adapter: $SIM_ENGINE_REQUIRED_ADAPTER_NAME ($SIM_ENGINE_REQUIRED_ADAPTER_VENDOR:$SIM_ENGINE_REQUIRED_ADAPTER_DEVICE at $SIM_ENGINE_REQUIRED_ADAPTER_PCI_BUS_ID), format=$SIM_ENGINE_GPU_SURFACE_FORMAT, samples=$SIM_ENGINE_GPU_SURFACE_SAMPLE_COUNT"
 
-cargo run --release --example rendering_benchmark_suite -- --fixture ui_static_10k --gate
-cargo run --release --example rendering_benchmark_suite -- --fixture ui_static_10k --gate --vsync
-cargo run --release --example rendering_benchmark_suite -- --fixture ui_90_10 --gate
-cargo run --release --example rendering_benchmark_suite -- --fixture four_viewports --gate
-cargo run --release --example rendering_benchmark_suite -- --fixture image_atlas --gate
-cargo run --release --example rendering_benchmark_suite -- --fixture scientific_text --gate
+printf 'format_version=1\nvcs_sha=%s\n' "$release_sha" >"$performance_evidence"
+run_gated_fixture() {
+    fixture=$1
+    shift
+    active_fixture_output=$(mktemp "$output_dir/.linux-vulkan-fixture.XXXXXX")
+    if cargo run --release --example rendering_benchmark_suite -- \
+        --fixture "$fixture" --gate "$@" >"$active_fixture_output" 2>&1; then
+        fixture_status=0
+    else
+        fixture_status=$?
+    fi
+    cat "$active_fixture_output"
+    if [ "$fixture_status" -ne 0 ]; then
+        rm -f -- "$active_fixture_output"
+        active_fixture_output=""
+        return "$fixture_status"
+    fi
+    grep -q '^fixture=' "$active_fixture_output"
+    grep -q '^gate=passed ' "$active_fixture_output"
+    grep -E '^(fixture=|passes=|gate=passed |prepare_cpu_ms=)' \
+        "$active_fixture_output" >>"$performance_evidence"
+    rm -f -- "$active_fixture_output"
+    active_fixture_output=""
+}
+
+run_gated_fixture ui_static_10k
+run_gated_fixture ui_static_10k --vsync
+run_gated_fixture ui_90_10
+run_gated_fixture four_viewports
+run_gated_fixture image_atlas
+run_gated_fixture scientific_text
 cargo run --release --example scene_construction_benchmark -- --commands 10000 --iterations 5
 cargo test --release --no-default-features scene::tests::scene_budget_rejection_is_atomic_and_counted -- --exact
-cargo run --release --example rendering_benchmark_suite -- --fixture dpi_reconfigure --gate
+run_gated_fixture dpi_reconfigure
 ./scripts/hidpi_transition_gate.sh
 
 assert_provenance
+test "$(grep -c '^fixture=' "$performance_evidence")" -eq 7
+test "$(grep -c '^gate=passed ' "$performance_evidence")" -eq 7
 mv "$surface_evidence" "$output_dir/linux-vulkan-surface.txt"
 mv "$adapter_evidence" "$output_dir/linux-vulkan-adapter.txt"
+mv "$performance_evidence" "$output_dir/linux-vulkan-performance.txt"
 assert_provenance
 gate_complete=1

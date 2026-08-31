@@ -430,6 +430,8 @@ let mut renderer = WgpuRenderer::new_with_options(
     window.inner_size().height.max(1),
     options,
 ).await?;
+let notify_window = window.clone();
+renderer.set_pre_present_notify(move || notify_window.pre_present_notify());
 ```
 
 `RendererPresentMode::Vsync` requests FIFO. `NoVsync` requests the fastest
@@ -446,10 +448,13 @@ not sufficient for release identity. `surface_format()` and
 `surface_sample_count()` expose the matching production raster contract.
 Recovery updates every value to the replacement logical device.
 
-On Wayland, `Window::pre_present_notify()` installs compositor pacing. Call it
-for ordinary VSync presentation. An explicit uncapped diagnostic loop may omit
-it when the selected surface mode is Immediate. Mailbox and FIFO still impose
-their own back-pressure.
+On Wayland, `Window::pre_present_notify()` installs compositor pacing. Register
+it once through `WgpuRenderer::set_pre_present_notify`, as above. The renderer
+invokes the callback after command submission and immediately before surface
+present only when the concrete mode is FIFO, FIFO-relaxed, or Mailbox.
+Immediate presentation deliberately omits the callback and remains suitable
+for explicit uncapped diagnostics. The callback survives logical-device
+recovery; call `clear_pre_present_notify` if the host window is replaced.
 
 `renderer.wait_for_gpu_idle()` is for bounded benchmarks and controlled
 readback. Waiting every interactive frame destroys CPU/GPU overlap.
@@ -924,7 +929,9 @@ completion manifest and atomically renames that directory to
 successfully. A failed or forcibly killed child can leave at most unpublished
 staging, never a bundle claiming completion. This binds evidence to Git object
 data for the recorded revision instead of relying on periodic checks of a
-mutable source tree.
+mutable source tree. A nonblocking `flock` serializes invalidation and
+publication, so concurrent wrapper, matrix, or HiDPI invocations fail before
+they can disturb an active gate's evidence.
 
 The real compositor fixture requires the Linux executables
 `dbus-run-session`, `kwin_wayland`, and `kscreen-doctor`. Their absence is a
@@ -960,10 +967,13 @@ the surface with an output. Immediate can proceed without monitor refresh
 metadata. Mailbox/FIFO require a positive refresh rate from that current
 monitor; zero or missing refresh is unconfirmed, and the fixture never
 substitutes the primary or first enumerated monitor.
-Measurement itself advances by one frame per event-loop redraw. Every surface
-submission calls `Window::pre_present_notify` immediately before the renderer
-presents, so Wayland schedules the next redraw against the compositor frame
-callback instead of an application-only wakeup. This lets
+Measurement itself advances by one frame per event-loop redraw. The fixture
+registers a presentation callback with the renderer; FIFO, FIFO-relaxed, and
+Mailbox invoke `Window::pre_present_notify` after queue submission and
+immediately before surface present, while Immediate deliberately skips it.
+This lets synchronized modes schedule the next redraw against the compositor
+frame callback instead of an application-only wakeup without accidentally
+pacing the uncapped throughput oracle. It also lets
 `ScaleFactorChanged`, `Resized`, and current-output changes run between every
 warmup or measured sample. Confirmation carries the renderer surface-generation
 number and output identity; any mismatch discards all partial samples and
@@ -1318,9 +1328,12 @@ performance matrix, a real nested-KWin HiDPI transition, `git diff --check`,
 and the offline package boundary. A successful local wrapper atomically
 publishes `target/linux-release-evidence/`, containing `completion.txt`,
 `linux-vulkan-surface.txt`, `linux-vulkan-adapter.txt`, and
-`linux-hidpi-transition.txt`. CI's narrower semantic job writes and publishes
-`target/linux-vulkan-adapter.txt` directly as the `linux-vulkan-adapter`
-artifact. The manifest names the exact VCS SHA, backend,
+`linux-vulkan-performance.txt`, and `linux-hidpi-transition.txt`. The
+performance manifest records the exact SHA plus every fixture's adapter,
+surface, present mode, trial FPS, CPU/acquire percentiles, deterministic work
+counters, threshold, and passed verdict. CI's narrower semantic job writes and
+publishes `target/linux-vulkan-adapter.txt` directly as the
+`linux-vulkan-adapter` artifact. The manifest names the exact VCS SHA, backend,
 adapter type, vendor/model IDs, PCI bus address when available, driver, oracle
 format, and sample count for the semantic run. CI supplies `github.sha` and
 asserts that the artifact does not contain `vcs_sha=unknown`.
@@ -1329,6 +1342,9 @@ scale, physical size, and transactional event counts.
 
 The wrapper and each standalone evidence-producing surface/HiDPI script must
 run from a clean worktree and finish on the exact revision captured at start.
+Their shared nonblocking `flock` prevents concurrent gates from deleting,
+nesting, or relabeling one another's evidence, and Linux `mv -T` is the sole
+publication boundary.
 Hardware performance or recovery
 claims must additionally name the Linux adapter, PCI vendor/device and bus
 address, backend, driver, surface format/sample count, workload, present mode,
