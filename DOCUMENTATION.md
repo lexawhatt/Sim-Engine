@@ -911,12 +911,15 @@ The named release-mode matrix is:
 ./scripts/rendering_benchmark_matrix.sh
 ```
 
-The standalone matrix and the standalone HiDPI script fail before collecting
-evidence when the worktree is dirty. Each captures its starting revision and
-rechecks both `HEAD` equality and clean state around evidence publication and
-at completion. Temporary manifests are not promoted on a failed run. This
-prevents uncommitted or mid-run committed code from being labelled with the
-starting `git rev-parse HEAD` revision.
+The release wrapper, standalone matrix, and standalone HiDPI script fail before
+collecting evidence when the worktree is dirty. A common launcher creates a
+read-only detached worktree at the captured revision and gives it a separate
+Cargo target directory; compilation and execution never consume files from the
+mutable calling checkout. The caller's `HEAD` and clean state are checked again
+before success is accepted. Temporary manifests are not promoted on a failed
+run, and stale published manifests are removed even when prerequisites or the
+build fail. This binds evidence to Git object data for the recorded revision
+instead of relying on periodic checks of a mutable source tree.
 
 The real compositor fixture requires the Linux executables
 `dbus-run-session`, `kwin_wayland`, and `kscreen-doctor`. Their absence is a
@@ -927,8 +930,11 @@ It runs `ui_static_10k`, `ui_90_10`, `four_viewports`, `image_atlas`,
 `recovery_frame`. The viewport fixture owns four distinct prepared world
 scenes and four distinct cameras. Surface fixtures print p50/p95/p99 renderer
 work excluding acquire, separate acquire percentiles, observed wall
-throughput, construction time, source counts, vertices, uploads, unique
-retained memory, textures, and draw calls. A production-surface probe first
+throughput, construction time, physical surface extent, scale factor, source
+counts, vertices, uploads, unique retained memory, textures, and draw calls.
+Gated performance fixtures require exactly `1280x720` physical pixels at scale
+`1.0`; a compositor resize, minimization, or scale change cannot turn the
+release workload into a cheaper raster test. A production-surface probe first
 selects the high-performance Vulkan adapter and records its PCI bus address,
 format, and MSAA count. The semantic oracle must use that exact physical GPU,
 surface format, and sample count; backend, name, vendor/model IDs, and PCI bus
@@ -955,7 +961,9 @@ warmup or measured sample. Confirmation carries the renderer surface-generation
 number and output identity; any mismatch discards all partial samples and
 requires a new unmeasured `Drawn` before restarting warmup. Metadata retry is
 bounded to 120 confirmation presents, with a final follow-up redraw that can
-accept metadata produced by the 120th present.
+accept metadata produced by the 120th present. After the final measured
+present, a separate finalization redraw repeats the surface-generation and
+output snapshot checks before computing or publishing a verdict.
 Every warmup and measured frame must report `Drawn`. Surface-acquire
 percentiles remain visible diagnostics in every mode, but a scheduler-sensitive
 p95 from one trial is not an independent release threshold. Each gated fixture
@@ -972,6 +980,9 @@ raw timings transfer between unrelated GPUs. A matrix is invalid if semantic,
 performance, and compositor evidence do not name one identical adapter.
 
 The automated `dpi_reconfigure` workload deliberately tests the renderer API.
+Its renderer-work sample includes the timed `resize_with_scale_factor` call and
+`surface.configure` work before `begin_frame`, so the 10 ms p95 applies to the
+reconfiguration as well as the following frame.
 The matrix additionally starts a nested KWin compositor and changes its real
 output scale from 1.00 to 1.25 through `kscreen-doctor`. It accepts evidence
 only when `ScaleFactorChanged`, its following `Resized`, and a drawn frame form

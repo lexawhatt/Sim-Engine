@@ -164,9 +164,11 @@ cargo run --release --example cylinder_derivation_3d -- --uncapped --benchmark
 ```
 
 Run the complete named performance/contract matrix on a Vulkan-capable Linux
-machine with `./scripts/rendering_benchmark_matrix.sh`. Absolute timings are
-comparable only when adapter, driver, backend, present mode, and workload are
-recorded together; deterministic command/vertex/upload counters are portable.
+machine with `./scripts/rendering_benchmark_matrix.sh`. Gated surface workloads
+require a `1280x720` physical surface at scale `1.0`; both values are printed
+in every result. Absolute timings are comparable only when surface extent,
+scale, adapter, driver, backend, present mode, and workload are recorded
+together; deterministic command/vertex/upload counters are portable.
 The matrix first probes the real production surface. It pins the selected
 high-performance Vulkan adapter by PCI bus address as well as backend, name,
 vendor, and model, then requires the offscreen semantic oracle and every
@@ -192,8 +194,11 @@ from the window's confirmed current monitor. Zero/unknown refresh and
 primary/first-monitor fallbacks are never accepted for synchronized evidence.
 Warmup and measured frames advance one `RedrawRequested` at a time, allowing
 compositor events between every sample. A resize, scale transition, or changed
-current-output identity invalidates the confirmation, discards partial timing
-samples, and restarts from a drawn frame on the new surface generation.
+current-output identity invalidates the confirmation and discards partial
+timing samples; a surface outside the fixed release extent/scale fails rather
+than being measured as a cheaper workload. The final measured present yields
+through one additional event-loop turn and repeats the generation/output check
+before evidence is published.
 Acquire percentiles remain reported but do not independently flip the verdict
 from one scheduler-sensitive sample.
 The matrix also drives a nested KWin compositor through a real scale
@@ -202,10 +207,13 @@ the exact revision on that same physical adapter.
 The automatic transition requires `dbus-run-session`, `kwin_wayland`, and
 `kscreen-doctor`; a missing executable fails the matrix instead of silently
 skipping HiDPI evidence.
-Both the standalone matrix and standalone HiDPI gate reject a dirty worktree,
-capture their starting commit, and recheck both clean state and unchanged
-`HEAD` before publishing evidence and at completion. Evidence therefore cannot
-attribute uncommitted or mid-run committed code to the starting revision.
+The wrapper, standalone matrix, and standalone HiDPI gate reject a dirty
+worktree, then build and execute from a read-only detached worktree of the
+captured commit with a separate Cargo target directory. They recheck the
+calling checkout before accepting results. Evidence therefore remains bound to
+Git object data for the exact recorded SHA even if the mutable calling
+worktree changes while a long gate is running. Failed runs remove previously
+published release manifests.
 
 `stroke_gallery` is the visual oracle for the v0.2 stroke contract. Pages 1-4
 show every cap/join, half-alpha overlap probes, bounded animated dashes,

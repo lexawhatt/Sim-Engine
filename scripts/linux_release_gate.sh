@@ -1,8 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+project_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+cd "$project_root"
+if [[ "${SIM_ENGINE_RELEASE_SNAPSHOT:-0}" != 1 ]]; then
+    exec "$project_root/scripts/release_snapshot_gate.sh" \
+        scripts/linux_release_gate.sh "$@"
+fi
+
 echo "[1/11] clean release revision"
-start_sha=$(git rev-parse HEAD)
+start_sha=${SIM_ENGINE_RELEASE_SHA:?release snapshot did not provide an exact SHA}
+output_dir=${SIM_ENGINE_RELEASE_OUTPUT_DIR:?release snapshot did not provide an output directory}
+mkdir -p "$output_dir"
 assert_provenance() {
     if [[ "$(git rev-parse HEAD)" != "$start_sha" ]]; then
         echo "release gate HEAD changed during the gate" >&2
@@ -40,16 +49,16 @@ echo "[8/11] strict Linux Vulkan semantics"
 assert_provenance
 release_sha=$start_sha
 WGPU_BACKEND=vulkan \
-SIM_ENGINE_SURFACE_EVIDENCE_PATH=target/linux-vulkan-surface.txt \
+SIM_ENGINE_SURFACE_EVIDENCE_PATH="$output_dir/linux-vulkan-surface.txt" \
 SIM_ENGINE_RELEASE_SHA="$release_sha" \
 SIM_ENGINE_REQUIRE_ADAPTER_IDENTITY=0 \
 cargo run --release --example rendering_benchmark_suite -- --fixture adapter_probe
-required_adapter_name=$(sed -n 's/^name=//p' target/linux-vulkan-surface.txt)
-required_adapter_vendor=$(sed -n 's/^vendor=//p' target/linux-vulkan-surface.txt)
-required_adapter_device=$(sed -n 's/^device=//p' target/linux-vulkan-surface.txt)
-required_adapter_pci_bus_id=$(sed -n 's/^pci_bus_id=//p' target/linux-vulkan-surface.txt)
-required_surface_format=$(sed -n 's/^surface_format=//p' target/linux-vulkan-surface.txt)
-required_surface_sample_count=$(sed -n 's/^sample_count=//p' target/linux-vulkan-surface.txt)
+required_adapter_name=$(sed -n 's/^name=//p' "$output_dir/linux-vulkan-surface.txt")
+required_adapter_vendor=$(sed -n 's/^vendor=//p' "$output_dir/linux-vulkan-surface.txt")
+required_adapter_device=$(sed -n 's/^device=//p' "$output_dir/linux-vulkan-surface.txt")
+required_adapter_pci_bus_id=$(sed -n 's/^pci_bus_id=//p' "$output_dir/linux-vulkan-surface.txt")
+required_surface_format=$(sed -n 's/^surface_format=//p' "$output_dir/linux-vulkan-surface.txt")
+required_surface_sample_count=$(sed -n 's/^sample_count=//p' "$output_dir/linux-vulkan-surface.txt")
 test -n "$required_adapter_pci_bus_id"
 WGPU_BACKEND=vulkan \
 SIM_ENGINE_REQUIRE_GPU_TESTS=1 \
@@ -63,17 +72,17 @@ SIM_ENGINE_REQUIRED_ADAPTER_PCI_BUS_ID="$required_adapter_pci_bus_id" \
 SIM_ENGINE_REQUIRE_PRODUCTION_SURFACE_FORMAT=1 \
 SIM_ENGINE_GPU_SURFACE_FORMAT="$required_surface_format" \
 SIM_ENGINE_GPU_SURFACE_SAMPLE_COUNT="$required_surface_sample_count" \
-SIM_ENGINE_GPU_EVIDENCE_PATH=target/linux-vulkan-adapter.txt \
+SIM_ENGINE_GPU_EVIDENCE_PATH="$output_dir/linux-vulkan-adapter.txt" \
 SIM_ENGINE_RELEASE_SHA="$release_sha" \
 cargo test --all-features \
   renderer::tests::offscreen_gpu_readback_verifies_camera_depth_and_clip_contract \
   -- --nocapture
-grep -Fxq 'backend=Vulkan' target/linux-vulkan-adapter.txt
-grep -Fxq "vcs_sha=$release_sha" target/linux-vulkan-adapter.txt
-grep -Fxq "pci_bus_id=$required_adapter_pci_bus_id" target/linux-vulkan-adapter.txt
-grep -Fxq "oracle_format=$required_surface_format" target/linux-vulkan-adapter.txt
-grep -Fxq "oracle_sample_count=$required_surface_sample_count" target/linux-vulkan-adapter.txt
-echo "GPU evidence: target/linux-vulkan-adapter.txt"
+grep -Fxq 'backend=Vulkan' "$output_dir/linux-vulkan-adapter.txt"
+grep -Fxq "vcs_sha=$release_sha" "$output_dir/linux-vulkan-adapter.txt"
+grep -Fxq "pci_bus_id=$required_adapter_pci_bus_id" "$output_dir/linux-vulkan-adapter.txt"
+grep -Fxq "oracle_format=$required_surface_format" "$output_dir/linux-vulkan-adapter.txt"
+grep -Fxq "oracle_sample_count=$required_surface_sample_count" "$output_dir/linux-vulkan-adapter.txt"
+echo "GPU evidence: $output_dir/linux-vulkan-adapter.txt"
 
 echo "[9/11] named rendering performance matrix"
 assert_provenance

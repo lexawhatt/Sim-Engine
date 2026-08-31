@@ -3,8 +3,30 @@ set -euo pipefail
 
 project_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$project_root"
+if [[ "${SIM_ENGINE_RELEASE_SNAPSHOT:-0}" != 1 ]]; then
+    exec "$project_root/scripts/release_snapshot_gate.sh" \
+        scripts/hidpi_transition_gate.sh "$@"
+fi
 
-start_sha=$(git rev-parse HEAD)
+start_sha=${SIM_ENGINE_RELEASE_SHA:?release snapshot did not provide an exact SHA}
+output_dir=${SIM_ENGINE_RELEASE_OUTPUT_DIR:?release snapshot did not provide an output directory}
+mkdir -p "$output_dir"
+published_evidence="$output_dir/linux-hidpi-transition.txt"
+fixture_root=""
+publish_complete=0
+cleanup() {
+    if [[ -n "$fixture_root" ]]; then
+        rm -rf -- "$fixture_root"
+    fi
+    if [[ "$publish_complete" -ne 1 ]]; then
+        rm -f -- "$published_evidence"
+    fi
+}
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
 assert_provenance() {
     if [[ "$(git rev-parse HEAD)" != "$start_sha" ]]; then
         echo "HiDPI transition gate HEAD changed during the gate" >&2
@@ -32,20 +54,9 @@ runtime_dir="$fixture_root/runtime"
 mkdir "$runtime_dir"
 mkdir "$fixture_root/config" "$fixture_root/data" "$fixture_root/cache"
 chmod 700 "$runtime_dir"
-publish_complete=0
-cleanup() {
-    rm -rf -- "$fixture_root"
-    if [[ "$publish_complete" -ne 1 ]]; then
-        rm -f -- target/linux-hidpi-transition.txt
-    fi
-}
-trap cleanup EXIT
-trap 'exit 129' HUP
-trap 'exit 130' INT
-trap 'exit 143' TERM
 
 release_sha=$start_sha
-export SIM_ENGINE_HIDPI_BINARY="$project_root/target/release/examples/rendering_benchmark_suite"
+export SIM_ENGINE_HIDPI_BINARY="${CARGO_TARGET_DIR:?}/release/examples/rendering_benchmark_suite"
 export SIM_ENGINE_HIDPI_READY_PATH="$fixture_root/ready"
 export SIM_ENGINE_HIDPI_EVIDENCE_PATH="$fixture_root/evidence.txt"
 export SIM_ENGINE_HIDPI_AUTO_EXIT=1
@@ -82,9 +93,8 @@ grep -Fxq 'scale_factor=1.250' "$SIM_ENGINE_HIDPI_EVIDENCE_PATH"
 grep -Fxq 'paired_transitions=1' "$SIM_ENGINE_HIDPI_EVIDENCE_PATH"
 grep -Fxq 'completed_transitions=1' "$SIM_ENGINE_HIDPI_EVIDENCE_PATH"
 
-mkdir -p target
 assert_provenance
-cp "$SIM_ENGINE_HIDPI_EVIDENCE_PATH" target/linux-hidpi-transition.txt
+cp "$SIM_ENGINE_HIDPI_EVIDENCE_PATH" "$published_evidence"
 assert_provenance
 publish_complete=1
-echo "HiDPI evidence: target/linux-hidpi-transition.txt"
+echo "HiDPI evidence: $published_evidence"

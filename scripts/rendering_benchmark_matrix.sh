@@ -5,7 +5,15 @@ set -eu
 # deterministic work counters; compare results only on the same documented
 # adapter/backend/present-mode setup.
 
-start_sha=$(git rev-parse HEAD)
+project_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+cd "$project_root"
+if [ "${SIM_ENGINE_RELEASE_SNAPSHOT:-0}" != 1 ]; then
+    exec "$project_root/scripts/release_snapshot_gate.sh" \
+        scripts/rendering_benchmark_matrix.sh "$@"
+fi
+
+start_sha=${SIM_ENGINE_RELEASE_SHA:?release snapshot did not provide an exact SHA}
+output_dir=${SIM_ENGINE_RELEASE_OUTPUT_DIR:?release snapshot did not provide an output directory}
 assert_provenance() {
     if [ "$(git rev-parse HEAD)" != "$start_sha" ]; then
         echo "rendering benchmark matrix HEAD changed during the gate" >&2
@@ -22,15 +30,16 @@ export WGPU_BACKEND=vulkan
 export SIM_ENGINE_REQUIRE_VULKAN=1
 
 release_sha=$start_sha
-mkdir -p target
-surface_evidence=$(mktemp target/.linux-vulkan-surface.XXXXXX)
-adapter_evidence=$(mktemp target/.linux-vulkan-adapter.XXXXXX)
+mkdir -p "$output_dir"
+surface_evidence=$(mktemp "$output_dir/.linux-vulkan-surface.XXXXXX")
+adapter_evidence=$(mktemp "$output_dir/.linux-vulkan-adapter.XXXXXX")
 gate_complete=0
 cleanup() {
     rm -f -- "$surface_evidence" "$adapter_evidence"
     if [ "$gate_complete" -ne 1 ]; then
-        rm -f -- target/linux-vulkan-surface.txt target/linux-vulkan-adapter.txt \
-            target/linux-hidpi-transition.txt
+        rm -f -- "$output_dir/linux-vulkan-surface.txt" \
+            "$output_dir/linux-vulkan-adapter.txt" \
+            "$output_dir/linux-hidpi-transition.txt"
     fi
 }
 trap cleanup EXIT
@@ -102,7 +111,7 @@ cargo run --release --example rendering_benchmark_suite -- --fixture dpi_reconfi
 ./scripts/hidpi_transition_gate.sh
 
 assert_provenance
-mv "$surface_evidence" target/linux-vulkan-surface.txt
-mv "$adapter_evidence" target/linux-vulkan-adapter.txt
+mv "$surface_evidence" "$output_dir/linux-vulkan-surface.txt"
+mv "$adapter_evidence" "$output_dir/linux-vulkan-adapter.txt"
 assert_provenance
 gate_complete=1

@@ -37,6 +37,9 @@ const MAX_OUTPUT_CONFIRMATION_REDRAWS: usize = 120;
 const MAX_SURFACE_RESTARTS: usize = 8;
 const STATIC_COMMANDS: usize = 9_000;
 const STREAMING_COMMANDS: usize = 1_000;
+const BENCHMARK_PHYSICAL_WIDTH: u32 = 1_280;
+const BENCHMARK_PHYSICAL_HEIGHT: u32 = 720;
+const BENCHMARK_SCALE_FACTOR: f64 = 1.0;
 
 #[derive(Clone, Copy)]
 struct GateThresholds {
@@ -132,6 +135,7 @@ struct BenchmarkRunState {
     renderer: WgpuRenderer,
     physical_width: u32,
     physical_height: u32,
+    surface_scale_factor: f64,
     surface_generation: u64,
     surface_restarts: usize,
     confirmation: OutputConfirmationState,
@@ -141,7 +145,21 @@ struct BenchmarkRunState {
 }
 
 type BenchmarkRender =
-    Box<dyn FnMut(&mut WgpuRenderer, usize, u32, u32) -> Result<FrameReport, Box<dyn Error>>>;
+    Box<dyn FnMut(&mut WgpuRenderer, usize, u32, u32) -> Result<BenchmarkFrame, Box<dyn Error>>>;
+
+struct BenchmarkFrame {
+    report: FrameReport,
+    additional_renderer_work: Duration,
+}
+
+impl From<FrameReport> for BenchmarkFrame {
+    fn from(report: FrameReport) -> Self {
+        Self {
+            report,
+            additional_renderer_work: Duration::ZERO,
+        }
+    }
+}
 
 struct BenchmarkWorkload {
     name: &'static str,
@@ -160,6 +178,7 @@ enum BenchmarkMeasurementPhase {
         next_frame: usize,
         started: Option<Instant>,
     },
+    Finalizing,
     Complete,
 }
 
@@ -193,6 +212,18 @@ impl BenchmarkMeasurement {
         self.acquire_samples.clear();
         self.trial_fps.clear();
         self.last_report = None;
+    }
+}
+
+fn phase_after_completed_trial(trial: usize, trial_count: usize) -> BenchmarkMeasurementPhase {
+    if trial + 1 == trial_count {
+        BenchmarkMeasurementPhase::Finalizing
+    } else {
+        BenchmarkMeasurementPhase::Trial {
+            trial: trial + 1,
+            next_frame: 0,
+            started: None,
+        }
     }
 }
 
@@ -358,7 +389,10 @@ impl ApplicationHandler for BenchmarkApplication {
                 event_loop.create_window(
                     Window::default_attributes()
                         .with_title(format!("Sim;Engine benchmark | {}", self.fixture))
-                        .with_inner_size(LogicalSize::new(1280.0, 720.0)),
+                        .with_inner_size(LogicalSize::new(
+                            f64::from(BENCHMARK_PHYSICAL_WIDTH),
+                            f64::from(BENCHMARK_PHYSICAL_HEIGHT),
+                        )),
                 )?,
             );
             let size = window.inner_size();
@@ -383,12 +417,14 @@ impl ApplicationHandler for BenchmarkApplication {
                 "ui_static_10k" | "ui_90_10" | "four_viewports" | "image_atlas"
                 | "scientific_text" | "dpi_reconfigure" => {
                     let workload = prepare_benchmark_workload(&self.fixture, &mut renderer)?;
+                    let surface_scale_factor = window.scale_factor();
                     window.request_redraw();
                     self.benchmark = Some(BenchmarkRunState {
                         window,
                         renderer,
                         physical_width: size.width.max(1),
                         physical_height: size.height.max(1),
+                        surface_scale_factor,
                         surface_generation: 0,
                         surface_restarts: 0,
                         confirmation: if self.gate {
@@ -457,8 +493,17 @@ impl ApplicationHandler for BenchmarkApplication {
                 WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                     let state = self.benchmark.as_mut().expect("benchmark state exists");
                     let size = state.window.inner_size();
+                    if self.gate && (size.width == 0 || size.height == 0) {
+                        self.failure = Some(
+                            "gated benchmark surface became zero-sized during a scale transition"
+                                .to_owned(),
+                        );
+                        event_loop.exit();
+                        return;
+                    }
                     state.physical_width = size.width.max(1);
                     state.physical_height = size.height.max(1);
+                    state.surface_scale_factor = scale_factor;
                     if let Err(error) = state.renderer.resize_with_scale_factor(
                         state.physical_width,
                         state.physical_height,
@@ -475,8 +520,16 @@ impl ApplicationHandler for BenchmarkApplication {
                 }
                 WindowEvent::Resized(size) => {
                     let state = self.benchmark.as_mut().expect("benchmark state exists");
+                    if self.gate && (size.width == 0 || size.height == 0) {
+                        self.failure = Some(
+                            "gated benchmark surface became zero-sized during resize".to_owned(),
+                        );
+                        event_loop.exit();
+                        return;
+                    }
                     state.physical_width = size.width.max(1);
                     state.physical_height = size.height.max(1);
+                    state.surface_scale_factor = state.window.scale_factor();
                     if let Err(error) = state.renderer.resize_with_scale_factor(
                         state.physical_width,
                         state.physical_height,
@@ -667,6 +720,27 @@ fn validate_gate_context(
     Ok(())
 }
 
+fn validate_benchmark_surface_contract(
+    physical_width: u32,
+    physical_height: u32,
+    scale_factor: f64,
+) -> Result<(), String> {
+    if !scale_factor.is_finite() || scale_factor <= 0.0 {
+        return Err("gated benchmark requires a positive finite surface scale factor".to_owned());
+    }
+    if scale_factor != BENCHMARK_SCALE_FACTOR {
+        return Err(format!(
+            "gated benchmark requires scale factor {BENCHMARK_SCALE_FACTOR:.3}, observed {scale_factor:.3}"
+        ));
+    }
+    if physical_width != BENCHMARK_PHYSICAL_WIDTH || physical_height != BENCHMARK_PHYSICAL_HEIGHT {
+        return Err(format!(
+            "gated benchmark requires a {BENCHMARK_PHYSICAL_WIDTH}x{BENCHMARK_PHYSICAL_HEIGHT} physical surface, observed {physical_width}x{physical_height}"
+        ));
+    }
+    Ok(())
+}
+
 fn current_output_snapshot(window: &Window) -> Option<OutputSnapshot> {
     window.current_monitor().map(|monitor| OutputSnapshot {
         refresh_millihertz: monitor.refresh_rate_millihertz(),
@@ -712,6 +786,16 @@ fn confirmed_output_is_current<T: PartialEq>(
     observed_output: Option<&T>,
 ) -> bool {
     confirmed_generation == surface_generation && confirmed_output == observed_output
+}
+
+fn renderer_work_excluding_acquire(
+    total_cpu: Duration,
+    surface_acquire: Duration,
+    additional_work: Duration,
+) -> Duration {
+    total_cpu
+        .saturating_sub(surface_acquire)
+        .saturating_add(additional_work)
 }
 
 fn write_surface_probe_evidence(renderer: &WgpuRenderer) -> Result<(), Box<dyn Error>> {
@@ -931,6 +1015,34 @@ mod tests {
     }
 
     #[test]
+    fn release_surface_contract_rejects_extent_and_scale_drift() {
+        assert_eq!(validate_benchmark_surface_contract(1_280, 720, 1.0), Ok(()));
+        assert!(
+            validate_benchmark_surface_contract(320, 180, 1.0)
+                .unwrap_err()
+                .contains("1280x720")
+        );
+        assert!(
+            validate_benchmark_surface_contract(1_280, 720, 2.0)
+                .unwrap_err()
+                .contains("scale factor")
+        );
+        assert!(validate_benchmark_surface_contract(0, 0, 1.0).is_err());
+    }
+
+    #[test]
+    fn renderer_work_includes_pre_frame_reconfiguration() {
+        assert_eq!(
+            renderer_work_excluding_acquire(
+                Duration::from_millis(6),
+                Duration::from_millis(2),
+                Duration::from_millis(12),
+            ),
+            Duration::from_millis(16)
+        );
+    }
+
+    #[test]
     fn final_metadata_present_receives_a_follow_up_check() {
         assert_eq!(
             metadata_confirmation_action(RendererSurfacePresentMode::Fifo, None, 119),
@@ -964,6 +1076,22 @@ mod tests {
         assert!(matches!(
             measurement.phase,
             BenchmarkMeasurementPhase::Warmup { next_frame: 0 }
+        ));
+    }
+
+    #[test]
+    fn final_trial_requires_a_separate_event_loop_finalization_turn() {
+        assert!(matches!(
+            phase_after_completed_trial(2, 3),
+            BenchmarkMeasurementPhase::Finalizing
+        ));
+        assert!(matches!(
+            phase_after_completed_trial(1, 3),
+            BenchmarkMeasurementPhase::Trial {
+                trial: 2,
+                next_frame: 0,
+                started: None
+            }
         ));
     }
 
@@ -1277,7 +1405,7 @@ fn prepare_static_ui(renderer: &mut WgpuRenderer) -> Result<BenchmarkWorkload, B
         render: Box::new(move |renderer, _, _, _| {
             let mut frame = renderer.begin_frame(scene.background(), FrameBudget::default())?;
             frame.draw_prepared_screen_scene(&prepared, FramePassOptions::new(0))?;
-            Ok(frame.present()?)
+            Ok(frame.present()?.into())
         }),
     })
 }
@@ -1296,7 +1424,7 @@ fn prepare_ui_90_10(renderer: &mut WgpuRenderer) -> Result<BenchmarkWorkload, Bo
             let mut frame = renderer.begin_frame(Color::rgb8(9, 12, 18), FrameBudget::default())?;
             frame.draw_prepared_screen_scene(&prepared, FramePassOptions::new(0))?;
             frame.draw_screen_scene(&streaming, FramePassOptions::new(1))?;
-            Ok(frame.present()?)
+            Ok(frame.present()?.into())
         }),
     })
 }
@@ -1349,7 +1477,7 @@ fn prepare_four_viewports(
                     FramePassOptions::new(index as i32).with_viewport(region),
                 )?;
             }
-            Ok(frame.present()?)
+            Ok(frame.present()?.into())
         }),
     })
 }
@@ -1387,7 +1515,7 @@ fn prepare_image_atlas(renderer: &mut WgpuRenderer) -> Result<BenchmarkWorkload,
                 ImageSampling::Nearest,
                 FramePassOptions::new(0),
             )?;
-            Ok(frame.present()?)
+            Ok(frame.present()?.into())
         }),
     })
 }
@@ -1432,7 +1560,7 @@ fn prepare_scientific_text(
                 ImageSampling::Nearest,
                 FramePassOptions::new(0),
             )?;
-            Ok(frame.present()?)
+            Ok(frame.present()?.into())
         }),
     })
 }
@@ -1449,10 +1577,15 @@ fn prepare_dpi_reconfigure(
         construction: started.elapsed(),
         completion_note: None,
         render: Box::new(move |renderer, frame, width, height| {
+            let reconfigure_started = Instant::now();
             renderer.resize_with_scale_factor(width, height, scales[frame % scales.len()])?;
+            let reconfigure_work = reconfigure_started.elapsed();
             let mut composed = renderer.begin_frame(scene.background(), FrameBudget::default())?;
             composed.draw_prepared_screen_scene(&prepared, FramePassOptions::new(0))?;
-            Ok(composed.present()?)
+            Ok(BenchmarkFrame {
+                report: composed.present()?,
+                additional_renderer_work: reconfigure_work,
+            })
         }),
     })
 }
@@ -1474,6 +1607,11 @@ fn advance_benchmark(
     gated: bool,
 ) -> Result<BenchmarkAdvance, Box<dyn Error>> {
     if gated {
+        validate_benchmark_surface_contract(
+            state.physical_width,
+            state.physical_height,
+            state.surface_scale_factor,
+        )?;
         match state.confirmation.clone() {
             OutputConfirmationState::Required => {
                 present_confirmation_frame(
@@ -1557,13 +1695,18 @@ fn advance_benchmark(
     let trial_count = if gate.enabled { GATE_TRIALS } else { 1 };
     match state.measurement.phase {
         BenchmarkMeasurementPhase::Warmup { next_frame } => {
-            let report = (state.workload.render)(
+            let frame = (state.workload.render)(
                 &mut state.renderer,
                 next_frame,
                 state.physical_width,
                 state.physical_height,
             )?;
-            require_drawn_frame(state.workload.name, "warmup", next_frame, report.status())?;
+            require_drawn_frame(
+                state.workload.name,
+                "warmup",
+                next_frame,
+                frame.report.status(),
+            )?;
             if next_frame + 1 == WARMUP_FRAMES {
                 state.measurement.phase = BenchmarkMeasurementPhase::Trial {
                     trial: 0,
@@ -1589,7 +1732,7 @@ fn advance_benchmark(
                 Instant::now()
             };
             let absolute_frame = WARMUP_FRAMES + trial * MEASURED_FRAMES + next_frame;
-            let report = (state.workload.render)(
+            let frame = (state.workload.render)(
                 &mut state.renderer,
                 absolute_frame,
                 state.physical_width,
@@ -1599,21 +1742,23 @@ fn advance_benchmark(
                 state.workload.name,
                 "measurement",
                 absolute_frame,
-                report.status(),
+                frame.report.status(),
             )?;
-            let metrics = report.metrics();
+            let metrics = frame.report.metrics();
             state.measurement.renderer_work_samples.push(
-                metrics
-                    .total_cpu()
-                    .saturating_sub(metrics.surface_acquire())
-                    .as_secs_f64()
+                renderer_work_excluding_acquire(
+                    metrics.total_cpu(),
+                    metrics.surface_acquire(),
+                    frame.additional_renderer_work,
+                )
+                .as_secs_f64()
                     * 1_000.0,
             );
             state
                 .measurement
                 .acquire_samples
                 .push(metrics.surface_acquire().as_secs_f64() * 1_000.0);
-            state.measurement.last_report = Some(report);
+            state.measurement.last_report = Some(frame.report);
 
             if next_frame + 1 == MEASURED_FRAMES {
                 state.renderer.wait_for_gpu_idle()?;
@@ -1621,18 +1766,12 @@ fn advance_benchmark(
                     .measurement
                     .trial_fps
                     .push(MEASURED_FRAMES as f64 / started.elapsed().as_secs_f64());
-                if trial + 1 == trial_count {
-                    state.measurement.phase = BenchmarkMeasurementPhase::Complete;
-                    finish_benchmark(state, gate)?;
-                    Ok(BenchmarkAdvance::Complete)
-                } else {
-                    state.measurement.phase = BenchmarkMeasurementPhase::Trial {
-                        trial: trial + 1,
-                        next_frame: 0,
-                        started: None,
-                    };
-                    Ok(BenchmarkAdvance::Continue)
-                }
+                // The final phase deliberately yields to the event loop
+                // before publishing evidence. A resize, scale, or output
+                // event queued by the final present invalidates the samples
+                // on the following redraw.
+                state.measurement.phase = phase_after_completed_trial(trial, trial_count);
+                Ok(BenchmarkAdvance::Continue)
             } else {
                 state.measurement.phase = BenchmarkMeasurementPhase::Trial {
                     trial,
@@ -1641,6 +1780,11 @@ fn advance_benchmark(
                 };
                 Ok(BenchmarkAdvance::Continue)
             }
+        }
+        BenchmarkMeasurementPhase::Finalizing => {
+            finish_benchmark(state, gate)?;
+            state.measurement.phase = BenchmarkMeasurementPhase::Complete;
+            Ok(BenchmarkAdvance::Complete)
         }
         BenchmarkMeasurementPhase::Complete => Ok(BenchmarkAdvance::Complete),
     }
@@ -1681,7 +1825,7 @@ fn finish_benchmark(
     let median_wall_fps = trial_fps[trial_fps.len() / 2];
     let work_p95 = percentile(renderer_work_samples, 0.95);
     println!(
-        "fixture={name} adapter={:?} vendor={:#06x} device={:#06x} pci_bus_id={:?} backend={} driver={:?} driver_info={:?} surface_format={:?} sample_count={} present_mode={} display_refresh_hz={:?} surface_generation={} surface_restarts={} trials={} frames_per_trial={} attempted_frames={} drawn_frames={} accepted_measurement_frames={} discarded_measurement_frames={} minimum_trial_wall_fps={:.1} median_trial_wall_fps={:.1} trial_wall_fps={:?} renderer_work_excluding_acquire_ms[p50={:.3},p95={:.3},p99={:.3}] surface_acquire_ms[p50={:.3},p95={:.3},p99={:.3}] construction_ms={:.3}",
+        "fixture={name} adapter={:?} vendor={:#06x} device={:#06x} pci_bus_id={:?} backend={} driver={:?} driver_info={:?} surface_format={:?} sample_count={} present_mode={} display_refresh_hz={:?} physical_surface={}x{} surface_scale_factor={:.3} surface_generation={} surface_restarts={} trials={} frames_per_trial={} attempted_frames={} drawn_frames={} accepted_measurement_frames={} discarded_measurement_frames={} minimum_trial_wall_fps={:.1} median_trial_wall_fps={:.1} trial_wall_fps={:?} renderer_work_excluding_acquire_ms[p50={:.3},p95={:.3},p99={:.3}] surface_acquire_ms[p50={:.3},p95={:.3},p99={:.3}] construction_ms={:.3}",
         state.renderer.adapter_name(),
         state.renderer.adapter_vendor_id(),
         state.renderer.adapter_device_id(),
@@ -1693,6 +1837,9 @@ fn finish_benchmark(
         state.renderer.surface_sample_count(),
         state.renderer.surface_present_mode(),
         gate.display_refresh_hz,
+        state.physical_width,
+        state.physical_height,
+        state.surface_scale_factor,
         state.surface_generation,
         state.surface_restarts,
         trial_count,

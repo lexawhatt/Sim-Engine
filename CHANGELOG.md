@@ -97,6 +97,16 @@ composed frames, fixed-screen UI, retained images, and host-shaped text.
 
 ### Testing
 
+- Release performance fixtures now require and report a fixed `1280x720`
+  physical surface at scale `1.0`, reject zero-sized or drifted surfaces, and
+  perform a post-present event-loop finalization check before publishing the
+  last trial.
+- The DPI reconfiguration p95 now includes the timed renderer resize/surface
+  configure operation instead of measuring only the following frame.
+- Release scripts now compile and run from a read-only detached worktree of the
+  exact evidence SHA with a separate Cargo target directory; failed runs remove
+  stale evidence even when a prerequisite or build step fails.
+
 - Added exact-limit/one-over budget tests, atomic batch rejection tests,
   conservative-estimate checks against actual tessellation, positioned
   viewport/DPI math coverage, logical-screen coordinate regressions, frame
