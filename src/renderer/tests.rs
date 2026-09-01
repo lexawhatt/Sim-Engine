@@ -680,9 +680,11 @@ fn world_width_stroke_preserves_width_below_large_base_ulp() {
                 .with_cap(crate::StrokeCap2d::Butt),
         )
         .unwrap();
-    let _ = tessellate_for_test(&overflow_scene);
+    let (overflow_vertices, _) = tessellate_for_test(&overflow_scene);
     let tiny_viewport = LogicalViewport::new(1.0e-38, 1.0).unwrap();
-    assert!(CameraUniform::new(Camera2d::new(center, 1.0).unwrap(), tiny_viewport).is_none());
+    let tiny_uniform =
+        CameraUniform::new(Camera2d::new(center, 1.0).unwrap(), tiny_viewport).unwrap();
+    assert!(!GeometryExtents::from_vertices(&overflow_vertices).is_safe_for(tiny_uniform));
 }
 
 #[test]
@@ -1100,6 +1102,27 @@ fn ftz_sensitive_world_geometry_is_rejected_before_gpu_submission() {
         particle
             .validated_viewport_intersection(uniform, viewport)
             .is_none()
+    );
+}
+
+#[test]
+fn ftz_validation_rejects_only_subnormal_operands_that_affect_geometry() {
+    let largest_subnormal = f32::from_bits(0x007f_ffff);
+    let viewport = LogicalViewport::new(64.0, 64.0).unwrap();
+    let empty_camera = Camera2d::new(Vec2::splat(largest_subnormal), 1.0).unwrap();
+    let empty_uniform = CameraUniform::new(empty_camera, viewport).unwrap();
+    assert!(GeometryExtents::empty(true).is_safe_for(empty_uniform));
+
+    let mut tiny_projection = Camera2d::new(Vec2::ZERO, 1.0).unwrap();
+    tiny_projection.set_projection(crate::Projection2d::new(0.5, largest_subnormal).unwrap());
+    let tiny_projection_uniform = CameraUniform::new(tiny_projection, viewport).unwrap();
+    let vertex = DynamicGpu {
+        world_position: [0.0, 0.0],
+        depth: f32::MAX,
+        color: Color::WHITE.to_array(),
+    };
+    assert!(
+        !GeometryExtents::from_dynamic_vertices(&[vertex]).is_safe_for(tiny_projection_uniform)
     );
 }
 

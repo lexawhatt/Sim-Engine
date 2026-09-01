@@ -528,7 +528,7 @@ impl CameraUniform {
             .chain(self.world_to_screen_x.iter())
             .chain(self.world_to_screen_y.iter())
             .chain(self.screen_to_clip.iter())
-            .all(|value| value.is_finite() && !is_nonzero_subnormal(*value))
+            .all(|value| value.is_finite())
     }
 
     fn world_to_screen(self, world: Vec2, depth: f32) -> Vec2 {
@@ -823,8 +823,9 @@ fn shader_clip_interval_is_safe(
     scale: f32,
     offset: f32,
 ) -> bool {
-    if (is_nonzero_subnormal_f64(screen_minimum) || is_nonzero_subnormal_f64(screen_maximum))
-        && scale != 0.0
+    if ((is_nonzero_subnormal_f64(screen_minimum) || is_nonzero_subnormal_f64(screen_maximum))
+        && scale != 0.0)
+        || (is_nonzero_subnormal(scale) && (screen_minimum != 0.0 || screen_maximum != 0.0))
     {
         return false;
     }
@@ -873,7 +874,10 @@ fn shader_world_dot_range(
     depth_minimum: f32,
     depth_maximum: f32,
 ) -> Option<(f64, f64)> {
-    if ((is_nonzero_subnormal(minimum[0]) || is_nonzero_subnormal(maximum[0])) && row[0] != 0.0)
+    if (is_nonzero_subnormal(row[0]) && (minimum[0] != 0.0 || maximum[0] != 0.0))
+        || (is_nonzero_subnormal(row[1]) && (minimum[1] != 0.0 || maximum[1] != 0.0))
+        || (is_nonzero_subnormal(row[2]) && (depth_minimum != 0.0 || depth_maximum != 0.0))
+        || ((is_nonzero_subnormal(minimum[0]) || is_nonzero_subnormal(maximum[0])) && row[0] != 0.0)
         || ((is_nonzero_subnormal(minimum[1]) || is_nonzero_subnormal(maximum[1])) && row[1] != 0.0)
         || ((is_nonzero_subnormal(depth_minimum) || is_nonzero_subnormal(depth_maximum))
             && row[2] != 0.0)
@@ -889,7 +893,9 @@ fn shader_world_dot_range(
 }
 
 fn shader_direction_dot_range(row: [f32; 4], minimum: Vec2, maximum: Vec2) -> Option<(f64, f64)> {
-    if ((is_nonzero_subnormal(minimum.x) || is_nonzero_subnormal(maximum.x)) && row[0] != 0.0)
+    if (is_nonzero_subnormal(row[0]) && (minimum.x != 0.0 || maximum.x != 0.0))
+        || (is_nonzero_subnormal(row[1]) && (minimum.y != 0.0 || maximum.y != 0.0))
+        || ((is_nonzero_subnormal(minimum.x) || is_nonzero_subnormal(maximum.x)) && row[0] != 0.0)
         || ((is_nonzero_subnormal(minimum.y) || is_nonzero_subnormal(maximum.y)) && row[1] != 0.0)
     {
         return None;

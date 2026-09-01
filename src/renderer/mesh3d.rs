@@ -1453,14 +1453,6 @@ fn validate_shader_transform(
     model_rows: [[f32; 4]; 3],
     camera_rows: [[f32; 4]; 4],
 ) -> Result<(), Mesh3dRenderError> {
-    if model_rows
-        .into_iter()
-        .chain(camera_rows)
-        .flatten()
-        .any(is_nonzero_subnormal)
-    {
-        return Err(Mesh3dRenderError::InvalidGeometryTransform);
-    }
     let requires_ftz_fallback = mesh.has_ftz_sensitive_coordinates();
     // Eight AABB corners are the constant-cost common path. If that
     // conservative envelope fails, inspect only coordinates consumed by the
@@ -2795,6 +2787,39 @@ mod tests {
                 camera.world_to_clip_rows().unwrap(),
             ),
             Err(Mesh3dRenderError::InvalidGeometryTransform)
+        );
+    }
+
+    #[test]
+    fn shader_transform_allows_irrelevant_subnormal_row_operands() {
+        let largest_subnormal = f32::from_bits(0x007f_ffff);
+        let mesh = Mesh3d::with_display_edges(
+            vec![Vec3::ZERO, Vec3::new(0.0, 1.0, 0.0).unwrap()],
+            Vec::new(),
+            vec![MeshEdge3d::new(0, 1).unwrap()],
+        )
+        .unwrap();
+        let transform = Transform3d::new(
+            Vec3::ZERO,
+            Rotation3d::IDENTITY,
+            Vec3::new(largest_subnormal, 1.0, 1.0).unwrap(),
+        )
+        .unwrap();
+        let camera = Camera3d::look_at(
+            Vec3::new(0.0, 0.0, 2.0).unwrap(),
+            Vec3::ZERO,
+            Vec3::Y,
+            Projection3d::orthographic(world(2.0), 1.0, world(0.1), world(10.0)).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            validate_shader_transform(
+                &mesh,
+                transform.model_rows().unwrap(),
+                camera.world_to_clip_rows().unwrap(),
+            ),
+            Ok(())
         );
     }
 
