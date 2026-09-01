@@ -123,8 +123,9 @@ composed frames, fixed-screen UI, retained images, and host-shaped text.
   or dynamic vertex tuples when independent scene-wide world/depth/direction
   extrema form a nonexistent combination. Safe correlated extreme geometry is
   accepted without adding a scan to ordinary frames.
-- Particle projection applies the same association-independent camera-row
-  envelope before a visible instance can reach the GPU.
+- Particle projection and CPU culling apply the same association-independent
+  camera-row envelope through radius extrusion and screen-to-clip arithmetic.
+  A particle is no longer silently culled according to a different CPU fold.
 - Retained 3D model and camera dot products now reject every backend-dependent
   overflowing association, even when the CPU's left fold remains finite.
 - Retained 3D edge validation mirrors the complete post-projection shader

@@ -2207,7 +2207,12 @@ fn prepare_particle_item<'frame>(
             if !instance.is_safe_for(target_uniform) {
                 return Err(RendererFrameError::InvalidGeometryTransform.into());
             }
-            if instance.intersects_viewport(local_uniform, viewport.viewport) {
+            if instance
+                .projected_screen_bounds(local_uniform)
+                .is_none_or(|bounds| {
+                    ParticleGpu::screen_bounds_intersect_viewport(bounds, viewport.viewport)
+                })
+            {
                 field.visible_instances.push(instance);
             }
         }
@@ -2298,10 +2303,14 @@ fn visible_particle_count_for_frame(
 ) -> Result<usize, RendererFrameError> {
     let mut visible = 0;
     for instance in instances {
-        if !instance.is_safe_for(local_camera) || !instance.is_safe_for(target_camera) {
+        let Some(intersects) = instance.validated_viewport_intersection(local_camera, viewport)
+        else {
+            return Err(RendererFrameError::InvalidGeometryTransform);
+        };
+        if !instance.is_safe_for(target_camera) {
             return Err(RendererFrameError::InvalidGeometryTransform);
         }
-        visible += usize::from(instance.intersects_viewport(local_camera, viewport));
+        visible += usize::from(intersects);
     }
     Ok(visible)
 }

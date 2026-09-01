@@ -1134,6 +1134,9 @@ camera-row product and every backend-permitted dot-product accumulation order
 to remain finite. The validator also propagates a rounding/FMA output interval
 through the final screen-to-clip operation; a mathematically finite CPU
 cancellation cannot hide a backend-dependent residual that overflows later.
+Particle visibility uses the same complete projected interval, so culling
+keeps every particle that can intersect the viewport under a permitted GPU
+association instead of relying on one CPU fold.
 The constant-cost scene envelope is the common path. If independent extrema
 form a nonexistent world/depth/direction combination, validation falls back to
 the actual tessellated or dynamic vertex tuples, including the distinct

@@ -199,6 +199,30 @@ fn visible_particle_rejects_backend_dependent_dot_overflow() {
 }
 
 #[test]
+fn particle_validation_propagates_dot_rounding_into_clip_and_culling() {
+    let depth = 0.9 * f32::MAX;
+    let tilt = std::f32::consts::FRAC_PI_4;
+    let particle = ParticleGpu {
+        world_position: [-depth * tilt.sin() * 0.5, -depth * tilt.sin() / tilt.cos()],
+        depth,
+        radius: 1.0,
+        color: Color::WHITE.to_array(),
+    };
+    let mut camera = Camera2d::new(Vec2::ZERO, 1.0).unwrap();
+    camera.set_projection(crate::Projection2d::new(tilt, 1.0).unwrap());
+    let tiny_extent = 8.0 / f32::MAX;
+    let viewport = LogicalViewport::new(tiny_extent, tiny_extent).unwrap();
+    let uniform = CameraUniform::new(camera, viewport).unwrap();
+
+    // The fixed CPU fold cancels to a finite point, but another legal GPU
+    // association leaves a residual which overflows in screen-to-clip.
+    assert!(particle.screen_position(uniform).is_finite());
+    assert!(!particle.is_safe_for(uniform));
+    // Invalid arithmetic must never turn into a silent CPU cull.
+    assert!(particle.intersects_viewport(uniform, viewport));
+}
+
+#[test]
 fn particle_partial_updates_require_an_existing_contiguous_range() {
     assert_eq!(particle_update_range(2, 3, 5), Ok(2..5));
     assert_eq!(particle_update_range(5, 0, 5), Ok(5..5));

@@ -376,6 +376,7 @@ impl ParticleGpu {
         attributes: &Self::ATTRIBUTES,
     };
 
+    #[cfg(test)]
     fn screen_position(self, camera: CameraUniform) -> Vec2 {
         let relative_x = self.world_position[0] - camera.camera_center[0];
         let relative_y = self.world_position[1] - camera.camera_center[1];
@@ -392,62 +393,81 @@ impl ParticleGpu {
     }
 
     fn is_safe_for(self, camera: CameraUniform) -> bool {
+        self.projected_screen_bounds(camera)
+            .is_some_and(|bounds| Self::screen_bounds_are_safe_for_clip(bounds, camera))
+    }
+
+    fn projected_screen_bounds(self, camera: CameraUniform) -> Option<((f64, f64), (f64, f64))> {
         let relative_x = self.world_position[0] - camera.camera_center[0];
         let relative_y = self.world_position[1] - camera.camera_center[1];
+        if !relative_x.is_finite() || !relative_y.is_finite() {
+            return None;
+        }
         let relative = [relative_x, relative_y];
-        let dot_products_are_safe = shader_world_dot_is_safe(
+        let projected_x = shader_world_dot_range(
             camera.world_to_screen_x,
             relative,
             relative,
             self.depth,
             self.depth,
-        ) && shader_world_dot_is_safe(
+        )?;
+        let projected_y = shader_world_dot_range(
             camera.world_to_screen_y,
             relative,
             relative,
             self.depth,
             self.depth,
-        );
-        let screen = self.screen_position(camera);
-        let screen_x = screen.x;
-        let screen_y = screen.y;
-        let clip_x = screen_x * camera.screen_to_clip[0] + camera.screen_to_clip[2];
-        let clip_y = screen_y * camera.screen_to_clip[1] + camera.screen_to_clip[3];
-        let screen_min_x = screen_x - self.radius;
-        let screen_max_x = screen_x + self.radius;
-        let screen_min_y = screen_y - self.radius;
-        let screen_max_y = screen_y + self.radius;
-        relative_x.is_finite()
-            && relative_y.is_finite()
-            && dot_products_are_safe
-            && screen_x.is_finite()
-            && screen_y.is_finite()
-            && (screen_x + self.radius).is_finite()
-            && (screen_x - self.radius).is_finite()
-            && (screen_y + self.radius).is_finite()
-            && (screen_y - self.radius).is_finite()
-            && clip_x.is_finite()
-            && clip_y.is_finite()
-            && shader_clip_interval_is_safe(
-                f64::from(screen_min_x),
-                f64::from(screen_max_x),
-                camera.screen_to_clip[0],
-                camera.screen_to_clip[2],
-            )
-            && shader_clip_interval_is_safe(
-                f64::from(screen_min_y),
-                f64::from(screen_max_y),
-                camera.screen_to_clip[1],
-                camera.screen_to_clip[3],
-            )
+        )?;
+        let radius = f64::from(self.radius);
+        Some((
+            shader_interval_sum_range([projected_x, (-radius, radius)])?,
+            shader_interval_sum_range([projected_y, (-radius, radius)])?,
+        ))
+    }
+
+    fn screen_bounds_are_safe_for_clip(
+        bounds: ((f64, f64), (f64, f64)),
+        camera: CameraUniform,
+    ) -> bool {
+        shader_clip_interval_is_safe(
+            bounds.0.0,
+            bounds.0.1,
+            camera.screen_to_clip[0],
+            camera.screen_to_clip[2],
+        ) && shader_clip_interval_is_safe(
+            bounds.1.0,
+            bounds.1.1,
+            camera.screen_to_clip[1],
+            camera.screen_to_clip[3],
+        )
+    }
+
+    fn screen_bounds_intersect_viewport(
+        bounds: ((f64, f64), (f64, f64)),
+        viewport: LogicalViewport,
+    ) -> bool {
+        bounds.0.1 >= 0.0
+            && bounds.0.0 <= f64::from(viewport.width())
+            && bounds.1.1 >= 0.0
+            && bounds.1.0 <= f64::from(viewport.height())
+    }
+
+    fn validated_viewport_intersection(
+        self,
+        camera: CameraUniform,
+        viewport: LogicalViewport,
+    ) -> Option<bool> {
+        let bounds = self.projected_screen_bounds(camera)?;
+        Self::screen_bounds_are_safe_for_clip(bounds, camera)
+            .then(|| Self::screen_bounds_intersect_viewport(bounds, viewport))
     }
 
     fn intersects_viewport(self, camera: CameraUniform, viewport: LogicalViewport) -> bool {
-        let screen = self.screen_position(camera);
-        screen.x + self.radius >= 0.0
-            && screen.x - self.radius <= viewport.width()
-            && screen.y + self.radius >= 0.0
-            && screen.y - self.radius <= viewport.height()
+        // Validation precedes production culling. If this helper is called on
+        // an invalid instance, keep it conservatively instead of silently
+        // dropping geometry based on one CPU association of the shader dot.
+        self.projected_screen_bounds(camera)
+            .is_none_or(|bounds| Self::screen_bounds_intersect_viewport(bounds, viewport))
     }
 }
 
@@ -849,16 +869,6 @@ fn shader_world_dot_range(
         interval_products(row[2], depth_minimum, depth_maximum),
         (f64::from(row[3]), f64::from(row[3])),
     ])
-}
-
-fn shader_world_dot_is_safe(
-    row: [f32; 4],
-    minimum: [f32; 2],
-    maximum: [f32; 2],
-    depth_minimum: f32,
-    depth_maximum: f32,
-) -> bool {
-    shader_world_dot_range(row, minimum, maximum, depth_minimum, depth_maximum).is_some()
 }
 
 fn shader_direction_dot_range(row: [f32; 4], minimum: Vec2, maximum: Vec2) -> Option<(f64, f64)> {
@@ -4544,10 +4554,12 @@ impl WgpuRenderer {
                 let source_index =
                     uniformly_sampled_index(candidate_index, instance_count, visibility_checked);
                 let instance = field.instances[source_index];
-                if !instance.is_safe_for(camera_uniform) {
+                let Some(intersects) =
+                    instance.validated_viewport_intersection(camera_uniform, viewport)
+                else {
                     return Err(RendererFrameError::InvalidGeometryTransform);
-                }
-                if instance.intersects_viewport(camera_uniform, viewport) {
+                };
+                if intersects {
                     field.visible_instances.push(instance);
                 }
             }
@@ -5123,10 +5135,10 @@ fn visible_particle_count(
 ) -> Result<usize, RendererFrameError> {
     let mut visible = 0;
     for instance in instances.iter().copied() {
-        if !instance.is_safe_for(camera) {
+        let Some(intersects) = instance.validated_viewport_intersection(camera, viewport) else {
             return Err(RendererFrameError::InvalidGeometryTransform);
-        }
-        visible += usize::from(instance.intersects_viewport(camera, viewport));
+        };
+        visible += usize::from(intersects);
     }
     Ok(visible)
 }
