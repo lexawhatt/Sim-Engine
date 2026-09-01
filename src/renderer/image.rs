@@ -121,7 +121,7 @@ pub enum ImageSampling {
 pub enum ImageError {
     /// A width or height was zero.
     ZeroDimension,
-    /// A budget must fit at least one RGBA texel.
+    /// A resource budget cannot fit its minimum image or batch element.
     InvalidBudget,
     /// Dimensions or their RGBA byte arithmetic exceed a configured/device limit.
     DimensionsTooLarge,
@@ -134,18 +134,21 @@ pub enum ImageError {
         /// Required RGBA bytes.
         actual: usize,
     },
-    /// CPU storage for an owned recovery snapshot could not be reserved.
+    /// CPU recovery, conversion, or batch-staging storage could not be
+    /// reserved.
     AllocationFailed {
         /// Bytes requested by the failed reservation.
         requested_bytes: usize,
     },
     /// A retained image belongs to another renderer generation.
     RendererMismatch,
+    /// A recovery operation was given a different logical image than the source used.
+    RecoverySourceMismatch,
     /// A partial update does not fit in the image.
     UpdateRegionOutOfBounds,
     /// A sprite source rectangle or tint is invalid for its image.
     InvalidSprite,
-    /// A sprite batch exceeds its count or retained/GPU byte limit.
+    /// A sprite batch exceeds its retained count or CPU metadata byte limit.
     BatchBudgetExceeded {
         /// Configured upper bound.
         limit: usize,
@@ -158,7 +161,10 @@ impl fmt::Display for ImageError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ZeroDimension => write!(formatter, "image dimensions must be non-zero"),
-            Self::InvalidBudget => write!(formatter, "image budget must fit one RGBA texel"),
+            Self::InvalidBudget => write!(
+                formatter,
+                "resource budget must fit at least one image texel or batch element"
+            ),
             Self::DimensionsTooLarge => write!(formatter, "image dimensions exceed limits"),
             Self::InvalidPixelCount => write!(formatter, "image RGBA byte count is invalid"),
             Self::BudgetExceeded { limit, actual } => {
@@ -169,9 +175,15 @@ impl fmt::Display for ImageError {
             }
             Self::AllocationFailed { requested_bytes } => write!(
                 formatter,
-                "could not reserve {requested_bytes} bytes for image recovery data"
+                "could not reserve {requested_bytes} bytes for image storage or staging"
             ),
             Self::RendererMismatch => write!(formatter, "image belongs to another renderer"),
+            Self::RecoverySourceMismatch => {
+                write!(
+                    formatter,
+                    "image is not a restored copy of the recovery source"
+                )
+            }
             Self::UpdateRegionOutOfBounds => write!(formatter, "image update is out of bounds"),
             Self::InvalidSprite => write!(formatter, "image sprite source or tint is invalid"),
             Self::BatchBudgetExceeded { limit, actual } => {
@@ -202,6 +214,29 @@ impl ImageUploadReport {
     }
 }
 
+/// CPU outcome of replacing a retained image/sprite instance batch.
+///
+/// This report is intentionally distinct from [`ImageUploadReport`]: batch
+/// replacement uploads instance-buffer records and does not replace or upload
+/// the referenced image texture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImageBatchUploadReport {
+    uploaded_instance_bytes: usize,
+    replaced_instance_buffer: bool,
+}
+
+impl ImageBatchUploadReport {
+    /// Returns instance-buffer bytes submitted to the queue.
+    pub const fn uploaded_instance_bytes(self) -> usize {
+        self.uploaded_instance_bytes
+    }
+
+    /// Returns whether the operation replaced the underlying instance buffer.
+    pub const fn replaced_instance_buffer(self) -> bool {
+        self.replaced_instance_buffer
+    }
+}
+
 /// Renderer-owned straight-alpha sRGB RGBA image with exact recovery pixels.
 ///
 /// Source bytes use row-major top-to-bottom `R8 G8 B8 A8` texels. The sRGB GPU
@@ -210,6 +245,7 @@ impl ImageUploadReport {
 pub struct Image2d {
     renderer_identity: Arc<()>,
     pub(super) resource_identity: Arc<()>,
+    pub(super) recovery_identity: Arc<()>,
     texture: wgpu::Texture,
     pub(super) view: wgpu::TextureView,
     width: u32,
@@ -246,10 +282,11 @@ impl Image2d {
 
     /// Returns retained CPU recovery bytes.
     pub fn recovery_memory_bytes(&self) -> usize {
-        self.pixels.len()
+        self.pixels.capacity()
     }
 
-    /// Returns exact single-level GPU texture bytes.
+    /// Returns nominal single-level RGBA8 texel-storage bytes requested from
+    /// the GPU, excluding backend row/tile/page alignment and metadata.
     pub fn gpu_allocation_bytes(&self) -> usize {
         self.pixels.len()
     }
@@ -347,14 +384,16 @@ impl Default for ImageBatchBudget {
     }
 }
 
-/// Renderer-owned atlas sprite batch drawn with one instanced draw call.
+/// Renderer-owned atlas sprite batch drawn with at most one instanced draw call.
 ///
 /// Sprite positions are local logical pixels and can be placed in any frame
 /// viewport without rebuilding or uploading the batch. The exact CPU sprite
-/// list is retained for renderer recovery.
+/// list is retained for renderer recovery. An empty batch is valid and emits
+/// no draw call.
 pub struct ImageBatch2d {
     renderer_identity: Arc<()>,
     image_identity: Arc<()>,
+    pub(super) image_recovery_identity: Arc<()>,
     pub(super) instance_buffer: wgpu::Buffer,
     sprites: Vec<ImageSprite2d>,
     budget: ImageBatchBudget,
@@ -378,7 +417,9 @@ impl ImageBatch2d {
 
     /// Returns retained CPU recovery bytes.
     pub fn recovery_memory_bytes(&self) -> usize {
-        std::mem::size_of_val(self.sprites.as_slice())
+        self.sprites
+            .capacity()
+            .saturating_mul(std::mem::size_of::<ImageSprite2d>())
     }
 
     /// Returns GPU instance-buffer bytes actively addressed by the batch.
@@ -598,7 +639,6 @@ impl WgpuRenderer {
             pixels.len(),
             budget,
             self.device.limits().max_texture_dimension_2d,
-            usize::try_from(self.device.limits().max_buffer_size).unwrap_or(usize::MAX),
         )?;
         let mut owned = Vec::new();
         owned
@@ -636,14 +676,7 @@ impl WgpuRenderer {
         pixels: &[u8],
     ) -> Result<ImageUploadReport, ImageError> {
         self.validate_image(image)?;
-        if !region.fits(image.width, image.height) {
-            return Err(ImageError::UpdateRegionOutOfBounds);
-        }
-        let required =
-            image_byte_count(region.width, region.height).ok_or(ImageError::DimensionsTooLarge)?;
-        if pixels.len() != required {
-            return Err(ImageError::InvalidPixelCount);
-        }
+        let required = validate_image_region_upload(image, region, pixels.len())?;
         write_image_texture(
             &self.queue,
             &image.texture,
@@ -670,12 +703,14 @@ impl WgpuRenderer {
 
     /// Recreates an exact image for this renderer from retained source bytes.
     pub fn restore_image(&self, source: &Image2d) -> Result<Image2d, ImageError> {
-        self.create_image_rgba8_from_slice(
+        let mut restored = self.create_image_rgba8_from_slice(
             source.width,
             source.height,
             &source.pixels,
             source.budget,
-        )
+        )?;
+        restored.recovery_identity = Arc::clone(&source.recovery_identity);
+        Ok(restored)
     }
 
     /// Creates one retained instanced batch tied to an image or atlas.
@@ -702,7 +737,7 @@ impl WgpuRenderer {
         image: &Image2d,
         batch: &mut ImageBatch2d,
         sprites: Vec<ImageSprite2d>,
-    ) -> Result<ImageUploadReport, ImageError> {
+    ) -> Result<ImageBatchUploadReport, ImageError> {
         self.validate_image_batch(image, batch)?;
         let replacement = self.create_image_batch(image, sprites, batch.budget)?;
         let uploaded_bytes = replacement
@@ -710,9 +745,9 @@ impl WgpuRenderer {
             .len()
             .saturating_mul(std::mem::size_of::<ImageInstance>());
         *batch = replacement;
-        Ok(ImageUploadReport {
-            uploaded_bytes,
-            replaced_texture: true,
+        Ok(ImageBatchUploadReport {
+            uploaded_instance_bytes: uploaded_bytes,
+            replaced_instance_buffer: true,
         })
     }
 
@@ -722,12 +757,20 @@ impl WgpuRenderer {
         image: &Image2d,
         source: &ImageBatch2d,
     ) -> Result<ImageBatch2d, ImageError> {
+        self.validate_image(image)?;
+        if !Arc::ptr_eq(&image.recovery_identity, &source.image_recovery_identity) {
+            return Err(ImageError::RecoverySourceMismatch);
+        }
+        preflight_image_batch_capacity(&self.device, source.sprites.len(), source.budget)?;
         let mut sprites = Vec::new();
+        let requested_bytes = source
+            .sprites
+            .len()
+            .checked_mul(std::mem::size_of::<ImageSprite2d>())
+            .ok_or(ImageError::DimensionsTooLarge)?;
         sprites
             .try_reserve_exact(source.sprites.len())
-            .map_err(|_| ImageError::AllocationFailed {
-                requested_bytes: source.recovery_memory_bytes(),
-            })?;
+            .map_err(|_| ImageError::AllocationFailed { requested_bytes })?;
         sprites.extend_from_slice(&source.sprites);
         self.create_image_batch(image, sprites, source.budget)
     }
@@ -753,6 +796,22 @@ impl WgpuRenderer {
     }
 }
 
+pub(super) fn validate_image_region_upload(
+    image: &Image2d,
+    region: ImageTexelRect,
+    pixel_count: usize,
+) -> Result<usize, ImageError> {
+    if !region.fits(image.width, image.height) {
+        return Err(ImageError::UpdateRegionOutOfBounds);
+    }
+    let required =
+        image_byte_count(region.width, region.height).ok_or(ImageError::DimensionsTooLarge)?;
+    if pixel_count != required {
+        return Err(ImageError::InvalidPixelCount);
+    }
+    Ok(required)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn create_image_batch_resources(
     device: &wgpu::Device,
@@ -762,30 +821,25 @@ pub(super) fn create_image_batch_resources(
     sprites: Vec<ImageSprite2d>,
     budget: ImageBatchBudget,
 ) -> Result<ImageBatch2d, ImageError> {
-    let retained_bytes = sprites
-        .len()
-        .checked_mul(std::mem::size_of::<ImageSprite2d>())
-        .ok_or(ImageError::DimensionsTooLarge)?;
-    if sprites.len() > budget.max_sprites {
-        return Err(ImageError::BatchBudgetExceeded {
-            limit: budget.max_sprites,
-            actual: sprites.len(),
-        });
-    }
-    if retained_bytes > budget.max_retained_bytes {
-        return Err(ImageError::BatchBudgetExceeded {
-            limit: budget.max_retained_bytes,
-            actual: retained_bytes,
-        });
-    }
+    preflight_image_batch_capacity(device, sprites.len(), budget)?;
     let gpu_bytes = sprites
         .len()
         .max(1)
         .checked_mul(std::mem::size_of::<ImageInstance>())
         .ok_or(ImageError::DimensionsTooLarge)?;
-    if gpu_bytes as u64 > device.limits().max_buffer_size {
-        return Err(ImageError::DimensionsTooLarge);
+    if sprites.iter().any(|sprite| {
+        !sprite.source.fits(image.width, image.height)
+            || !sprite.tint.is_normalized()
+            || !logical_image_region_is_portable(sprite.destination)
+    }) {
+        return Err(ImageError::InvalidSprite);
     }
+    let sprites = compact_vec_with_byte_limit(sprites, budget.max_retained_bytes, |actual| {
+        ImageError::BatchBudgetExceeded {
+            limit: budget.max_retained_bytes,
+            actual,
+        }
+    })?;
     let mut instances = Vec::new();
     instances
         .try_reserve_exact(sprites.len())
@@ -795,9 +849,6 @@ pub(super) fn create_image_batch_resources(
                 .saturating_mul(std::mem::size_of::<ImageInstance>()),
         })?;
     for sprite in &sprites {
-        if !sprite.source.fits(image.width, image.height) || !sprite.tint.is_normalized() {
-            return Err(ImageError::InvalidSprite);
-        }
         let origin = sprite.destination.origin().to_vec2();
         let viewport = sprite.destination.viewport();
         let image_width = image.width as f32;
@@ -832,14 +883,34 @@ pub(super) fn create_image_batch_resources(
     });
     if !instances.is_empty() {
         queue.write_buffer(&instance_buffer, 0, bytemuck::cast_slice(&instances));
+        submit_pending_uploads(queue);
     }
     Ok(ImageBatch2d {
         renderer_identity,
         image_identity: Arc::clone(&image.resource_identity),
+        image_recovery_identity: Arc::clone(&image.recovery_identity),
         instance_buffer,
         sprites,
         budget,
     })
+}
+
+pub(super) fn logical_image_region_is_portable(region: LogicalViewportRegion) -> bool {
+    let origin = region.origin().to_vec2();
+    let size = region.viewport().size();
+    [origin.x, origin.y, size.x, size.y]
+        .into_iter()
+        .all(is_portable_shader_source)
+        && shader_interval_sum_range([
+            (f64::from(origin.x), f64::from(origin.x)),
+            (0.0, f64::from(size.x)),
+        ])
+        .is_some()
+        && shader_interval_sum_range([
+            (f64::from(origin.y), f64::from(origin.y)),
+            (0.0, f64::from(size.y)),
+        ])
+        .is_some()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -858,8 +929,15 @@ pub(super) fn create_image_resources(
         pixels.len(),
         budget,
         device.limits().max_texture_dimension_2d,
-        usize::try_from(device.limits().max_buffer_size).unwrap_or(usize::MAX),
     )?;
+    // Do not retain an arbitrarily over-capacity caller allocation behind a
+    // small logical image budget. Compaction finishes before GPU mutation.
+    let pixels = compact_vec_with_byte_limit(pixels, budget.max_bytes, |actual| {
+        ImageError::BudgetExceeded {
+            limit: budget.max_bytes,
+            actual,
+        }
+    })?;
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("sim-engine retained RGBA image"),
         size: wgpu::Extent3d {
@@ -879,6 +957,7 @@ pub(super) fn create_image_resources(
     Ok(Image2d {
         renderer_identity,
         resource_identity: Arc::new(()),
+        recovery_identity: Arc::new(()),
         texture,
         view,
         width,
@@ -888,13 +967,38 @@ pub(super) fn create_image_resources(
     })
 }
 
-fn validate_image_shape(
+fn compact_vec_with_byte_limit<T: Copy>(
+    values: Vec<T>,
+    maximum_bytes: usize,
+    capacity_error: impl FnOnce(usize) -> ImageError,
+) -> Result<Vec<T>, ImageError> {
+    let element_size = std::mem::size_of::<T>();
+    let allocation_bytes = values.capacity().saturating_mul(element_size);
+    if allocation_bytes <= maximum_bytes {
+        return Ok(values);
+    }
+    let requested_bytes = values
+        .len()
+        .checked_mul(element_size)
+        .ok_or(ImageError::DimensionsTooLarge)?;
+    let mut compact = Vec::new();
+    compact
+        .try_reserve_exact(values.len())
+        .map_err(|_| ImageError::AllocationFailed { requested_bytes })?;
+    compact.extend_from_slice(&values);
+    let actual = compact.capacity().saturating_mul(element_size);
+    if actual > maximum_bytes {
+        return Err(capacity_error(actual));
+    }
+    Ok(compact)
+}
+
+pub(super) fn validate_image_shape(
     width: u32,
     height: u32,
     pixel_count: usize,
     budget: ImageBudget,
     max_texture_dimension: u32,
-    max_allocation_bytes: usize,
 ) -> Result<usize, ImageError> {
     if width == 0 || height == 0 {
         return Err(ImageError::ZeroDimension);
@@ -914,13 +1018,43 @@ fn validate_image_shape(
             actual: bytes,
         });
     }
-    if bytes > max_allocation_bytes {
-        return Err(ImageError::DimensionsTooLarge);
-    }
     if pixel_count != bytes {
         return Err(ImageError::InvalidPixelCount);
     }
     Ok(bytes)
+}
+
+pub(super) fn preflight_image_batch_capacity(
+    device: &wgpu::Device,
+    sprite_count: usize,
+    budget: ImageBatchBudget,
+) -> Result<(), ImageError> {
+    if sprite_count > budget.max_sprites {
+        return Err(ImageError::BatchBudgetExceeded {
+            limit: budget.max_sprites,
+            actual: sprite_count,
+        });
+    }
+    if u32::try_from(sprite_count).is_err() {
+        return Err(ImageError::DimensionsTooLarge);
+    }
+    let retained_bytes = sprite_count
+        .checked_mul(std::mem::size_of::<ImageSprite2d>())
+        .ok_or(ImageError::DimensionsTooLarge)?;
+    if retained_bytes > budget.max_retained_bytes {
+        return Err(ImageError::BatchBudgetExceeded {
+            limit: budget.max_retained_bytes,
+            actual: retained_bytes,
+        });
+    }
+    let gpu_bytes = sprite_count
+        .max(1)
+        .checked_mul(std::mem::size_of::<ImageInstance>())
+        .ok_or(ImageError::DimensionsTooLarge)?;
+    if gpu_bytes as u64 > device.limits().max_buffer_size {
+        return Err(ImageError::DimensionsTooLarge);
+    }
+    Ok(())
 }
 
 fn image_byte_count(width: u32, height: u32) -> Option<usize> {
@@ -958,6 +1092,7 @@ fn write_image_texture(
             depth_or_array_layers: 1,
         },
     );
+    submit_pending_uploads(queue);
 }
 
 #[cfg(test)]
@@ -967,18 +1102,18 @@ mod tests {
     #[test]
     fn image_shape_checks_budget_device_and_exact_pixels_before_allocation() {
         let budget = ImageBudget::new(8, 8, 8 * 8 * 4).unwrap();
-        assert_eq!(validate_image_shape(8, 8, 256, budget, 8, 256), Ok(256));
+        assert_eq!(validate_image_shape(8, 8, 256, budget, 8), Ok(256));
         assert_eq!(
-            validate_image_shape(8, 8, 255, budget, 8, 256),
+            validate_image_shape(8, 8, 255, budget, 8),
             Err(ImageError::InvalidPixelCount)
         );
         assert_eq!(
-            validate_image_shape(9, 1, 36, budget, 16, 256),
+            validate_image_shape(9, 1, 36, budget, 16),
             Err(ImageError::DimensionsTooLarge)
         );
         let strict = ImageBudget::new(8, 8, 64).unwrap();
         assert_eq!(
-            validate_image_shape(8, 8, 256, strict, 8, 256),
+            validate_image_shape(8, 8, 256, strict, 8),
             Err(ImageError::BudgetExceeded {
                 limit: 64,
                 actual: 256,
@@ -1000,6 +1135,22 @@ mod tests {
     }
 
     #[test]
+    fn retained_sprite_region_must_fit_portable_shader_sources() {
+        let subnormal = LogicalViewportRegion::new(
+            LogicalScreenPosition::new(f32::from_bits(1), 0.0),
+            LogicalViewport::new(1.0, 1.0).unwrap(),
+        )
+        .unwrap();
+        let overflowing = LogicalViewportRegion::new(
+            LogicalScreenPosition::new(2.0e38, 0.0),
+            LogicalViewport::new(2.0e38, 1.0).unwrap(),
+        )
+        .unwrap();
+        assert!(!logical_image_region_is_portable(subnormal));
+        assert!(!logical_image_region_is_portable(overflowing));
+    }
+
+    #[test]
     fn sprite_rejects_finite_inputs_whose_logical_extent_overflows() {
         let source = ImageTexelRect::new(0, 0, 1, 1).unwrap();
         let destination = LogicalViewportRegion::new(
@@ -1011,5 +1162,28 @@ mod tests {
             ImageSprite2d::new(source, destination, Color::WHITE),
             Err(ImageError::InvalidSprite)
         );
+    }
+
+    #[test]
+    fn texture_and_batch_upload_reports_have_distinct_resource_semantics() {
+        let replacement = ImageUploadReport {
+            uploaded_bytes: 64,
+            replaced_texture: true,
+        };
+        let region = ImageUploadReport {
+            uploaded_bytes: 16,
+            replaced_texture: false,
+        };
+        let batch = ImageBatchUploadReport {
+            uploaded_instance_bytes: 96,
+            replaced_instance_buffer: true,
+        };
+
+        assert!(replacement.replaced_texture());
+        assert!(!region.replaced_texture());
+        assert_eq!(replacement.uploaded_bytes(), 64);
+        assert_eq!(region.uploaded_bytes(), 16);
+        assert!(batch.replaced_instance_buffer());
+        assert_eq!(batch.uploaded_instance_bytes(), 96);
     }
 }

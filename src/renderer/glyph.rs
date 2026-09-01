@@ -160,6 +160,13 @@ pub enum GlyphError {
         /// Repeated identity.
         glyph: GlyphId,
     },
+    /// Two distinct glyph identities claim overlapping atlas texels.
+    OverlappingGlyph {
+        /// Identity whose rectangle was rejected.
+        glyph: GlyphId,
+        /// Existing identity whose rectangle overlaps it.
+        conflicting_glyph: GlyphId,
+    },
     /// A positioned run references a glyph absent from its atlas.
     MissingGlyph {
         /// Missing identity.
@@ -169,7 +176,8 @@ pub enum GlyphError {
     },
     /// A glyph destination, tint, or atlas rectangle is invalid.
     InvalidGlyph,
-    /// CPU storage for retained atlas or run metadata could not be reserved.
+    /// CPU storage for retained metadata or temporary validation/conversion
+    /// scratch could not be reserved.
     AllocationFailed {
         /// Minimum bytes requested by the failed reservation.
         requested_bytes: usize,
@@ -191,6 +199,15 @@ impl fmt::Display for GlyphError {
             Self::DuplicateGlyph { glyph } => {
                 write!(formatter, "glyph identity {} is duplicated", glyph.value())
             }
+            Self::OverlappingGlyph {
+                glyph,
+                conflicting_glyph,
+            } => write!(
+                formatter,
+                "glyph identity {} overlaps atlas texels owned by glyph {}",
+                glyph.value(),
+                conflicting_glyph.value()
+            ),
             Self::MissingGlyph { glyph, index } => write!(
                 formatter,
                 "glyph identity {} at run index {index} is absent from the atlas",
@@ -199,7 +216,7 @@ impl fmt::Display for GlyphError {
             Self::InvalidGlyph => write!(formatter, "glyph placement or atlas region is invalid"),
             Self::AllocationFailed { requested_bytes } => write!(
                 formatter,
-                "could not reserve {requested_bytes} bytes for glyph recovery metadata"
+                "could not reserve {requested_bytes} bytes for glyph metadata or scratch storage"
             ),
         }
     }
@@ -266,12 +283,15 @@ impl GlyphAtlas2d {
 
     /// Returns exact CPU bytes retained for image and glyph recovery.
     pub fn recovery_memory_bytes(&self) -> usize {
-        self.image
-            .recovery_memory_bytes()
-            .saturating_add(std::mem::size_of_val(self.entries.as_slice()))
+        self.image.recovery_memory_bytes().saturating_add(
+            self.entries
+                .capacity()
+                .saturating_mul(std::mem::size_of::<GlyphAtlasEntry>()),
+        )
     }
 
-    /// Returns the single-level GPU image allocation bytes.
+    /// Returns nominal single-level RGBA8 texel-storage bytes, excluding
+    /// opaque backend alignment, tiling, allocation pages, and metadata.
     pub fn gpu_allocation_bytes(&self) -> usize {
         self.image.gpu_allocation_bytes()
     }
@@ -367,11 +387,12 @@ impl GlyphRunStatistics {
     }
 }
 
-/// Renderer-owned positioned glyph run drawn as one instanced atlas batch.
+/// Renderer-owned positioned glyph run drawn as at most one instanced atlas batch.
 ///
 /// A run references exactly one atlas. Mixed fallback fonts remain explicit:
 /// build one run per atlas and submit them at the same frame order. The host is
 /// responsible for shaping, baseline selection, fallback, and line breaking.
+/// An empty run is valid and emits no draw call.
 pub struct GlyphRun2d {
     pub(super) batch: ImageBatch2d,
     glyphs: Vec<PositionedGlyph2d>,
@@ -412,7 +433,10 @@ impl GlyphRun2d {
 
     /// Returns exact CPU glyph and sprite-description recovery bytes.
     pub fn recovery_memory_bytes(&self) -> usize {
-        glyph_retained_bytes(self.glyphs.len()).unwrap_or(usize::MAX)
+        self.glyphs
+            .capacity()
+            .saturating_mul(std::mem::size_of::<PositionedGlyph2d>())
+            .saturating_add(self.batch.recovery_memory_bytes())
     }
 
     /// Returns GPU instance-buffer bytes actively addressable by the run.
@@ -458,30 +482,39 @@ impl WgpuRenderer {
         if !entry.source.fits(atlas.image.width(), atlas.image.height()) {
             return Err(GlyphError::InvalidGlyph);
         }
-        let insertion = match atlas
-            .entries
-            .binary_search_by_key(&entry.glyph, |candidate| candidate.glyph)
-        {
-            Ok(index) => {
-                if atlas.entries[index].source != entry.source {
-                    return Err(GlyphError::DuplicateGlyph { glyph: entry.glyph });
-                }
-                None
-            }
-            Err(index) => Some(index),
-        };
+        image::validate_image_region_upload(&atlas.image, entry.source, pixels.len())?;
+        let insertion = validate_glyph_insertion(&atlas.entries, entry)?;
         if insertion.is_some() {
             validate_metadata_capacity(atlas.entries.len().saturating_add(1), atlas.budget)?;
-            atlas
-                .entries
-                .try_reserve(1)
-                .map_err(|_| GlyphError::AllocationFailed {
-                    requested_bytes: std::mem::size_of::<GlyphAtlasEntry>(),
-                })?;
         }
+        let replacement_entries = if let Some(index) = insertion {
+            let new_len = atlas.entries.len() + 1;
+            let requested_bytes = new_len
+                .checked_mul(std::mem::size_of::<GlyphAtlasEntry>())
+                .ok_or(GlyphError::InvalidGlyph)?;
+            let mut replacement = Vec::new();
+            replacement
+                .try_reserve_exact(new_len)
+                .map_err(|_| GlyphError::AllocationFailed { requested_bytes })?;
+            replacement.extend_from_slice(&atlas.entries[..index]);
+            replacement.push(entry);
+            replacement.extend_from_slice(&atlas.entries[index..]);
+            let actual = replacement
+                .capacity()
+                .saturating_mul(std::mem::size_of::<GlyphAtlasEntry>());
+            if actual > atlas.budget.max_metadata_bytes {
+                return Err(GlyphError::MetadataBudgetExceeded {
+                    limit: atlas.budget.max_metadata_bytes,
+                    actual,
+                });
+            }
+            Some(replacement)
+        } else {
+            None
+        };
         let report = self.update_image_region(&mut atlas.image, entry.source, pixels)?;
-        if let Some(index) = insertion {
-            atlas.entries.insert(index, entry);
+        if let Some(replacement) = replacement_entries {
+            atlas.entries = replacement;
         }
         Ok(GlyphUploadReport {
             uploaded_bytes: report.uploaded_bytes(),
@@ -509,6 +542,13 @@ impl WgpuRenderer {
 
     /// Restores exact atlas pixels and metadata for this renderer generation.
     pub fn restore_glyph_atlas(&self, source: &GlyphAtlas2d) -> Result<GlyphAtlas2d, GlyphError> {
+        image::validate_image_shape(
+            source.image.width(),
+            source.image.height(),
+            source.image.pixels().len(),
+            source.budget.image,
+            self.device.limits().max_texture_dimension_2d,
+        )?;
         let mut entries = Vec::new();
         entries
             .try_reserve_exact(source.entries.len())
@@ -522,6 +562,16 @@ impl WgpuRenderer {
             source.image.height(),
             source.budget,
         )?;
+        entries = compact_glyph_vec(entries, source.budget.max_metadata_bytes)?;
+        let actual = entries
+            .capacity()
+            .saturating_mul(std::mem::size_of::<GlyphAtlasEntry>());
+        if actual > source.budget.max_metadata_bytes {
+            return Err(GlyphError::MetadataBudgetExceeded {
+                limit: source.budget.max_metadata_bytes,
+                actual,
+            });
+        }
         let image = self.restore_image(&source.image)?;
         Ok(GlyphAtlas2d {
             image,
@@ -536,6 +586,20 @@ impl WgpuRenderer {
         atlas: &GlyphAtlas2d,
         source: &GlyphRun2d,
     ) -> Result<GlyphRun2d, GlyphError> {
+        self.validate_image(&atlas.image)?;
+        if !Arc::ptr_eq(
+            &atlas.image.recovery_identity,
+            &source.batch.image_recovery_identity,
+        ) {
+            return Err(ImageError::RecoverySourceMismatch.into());
+        }
+        validate_glyph_run_sources(&atlas.entries, &source.glyphs, source.batch.sprites())?;
+        validate_glyph_run_budget(source.glyphs.len(), source.budget)?;
+        validate_glyph_membership(&atlas.entries, &source.glyphs)?;
+        measure_glyphs(&source.glyphs)?;
+        let batch_budget =
+            ImageBatchBudget::new(source.budget.max_glyphs, source.budget.max_retained_bytes)?;
+        image::preflight_image_batch_capacity(&self.device, source.glyphs.len(), batch_budget)?;
         let retained_bytes = source
             .glyphs
             .len()
@@ -572,7 +636,24 @@ pub(super) fn create_glyph_atlas_resources(
     mut entries: Vec<GlyphAtlasEntry>,
     budget: GlyphAtlasBudget,
 ) -> Result<GlyphAtlas2d, GlyphError> {
+    image::validate_image_shape(
+        width,
+        height,
+        pixels.len(),
+        budget.image,
+        device.limits().max_texture_dimension_2d,
+    )?;
     validate_atlas_entries(&mut entries, width, height, budget)?;
+    entries = compact_glyph_vec(entries, budget.max_metadata_bytes)?;
+    let actual_metadata_bytes = entries
+        .capacity()
+        .saturating_mul(std::mem::size_of::<GlyphAtlasEntry>());
+    if actual_metadata_bytes > budget.max_metadata_bytes {
+        return Err(GlyphError::MetadataBudgetExceeded {
+            limit: budget.max_metadata_bytes,
+            actual: actual_metadata_bytes,
+        });
+    }
     let image = image::create_image_resources(
         device,
         queue,
@@ -598,9 +679,26 @@ pub(super) fn create_glyph_run_resources(
     budget: GlyphRunBudget,
 ) -> Result<GlyphRun2d, GlyphError> {
     validate_glyph_run_budget(glyphs.len(), budget)?;
+    validate_glyph_membership(&atlas.entries, &glyphs)?;
     let bounds = measure_glyphs(&glyphs)?;
-    let sprites = resolve_glyph_sprites(&atlas.entries, &glyphs)?;
     let batch_budget = ImageBatchBudget::new(budget.max_glyphs, budget.max_retained_bytes)?;
+    image::preflight_image_batch_capacity(device, glyphs.len(), batch_budget)?;
+    let glyphs = compact_glyph_vec(glyphs, budget.max_retained_bytes)?;
+    let sprites = resolve_glyph_sprites(&atlas.entries, &glyphs)?;
+    let actual_retained_bytes = glyphs
+        .capacity()
+        .saturating_mul(std::mem::size_of::<PositionedGlyph2d>())
+        .saturating_add(
+            sprites
+                .capacity()
+                .saturating_mul(std::mem::size_of::<ImageSprite2d>()),
+        );
+    if actual_retained_bytes > budget.max_retained_bytes {
+        return Err(GlyphError::MetadataBudgetExceeded {
+            limit: budget.max_retained_bytes,
+            actual: actual_retained_bytes,
+        });
+    }
     let batch = image::create_image_batch_resources(
         device,
         queue,
@@ -615,6 +713,22 @@ pub(super) fn create_glyph_run_resources(
         bounds,
         budget,
     })
+}
+
+fn compact_glyph_vec<T: Copy>(values: Vec<T>, maximum_bytes: usize) -> Result<Vec<T>, GlyphError> {
+    if values.capacity().saturating_mul(std::mem::size_of::<T>()) <= maximum_bytes {
+        return Ok(values);
+    }
+    let requested_bytes = values
+        .len()
+        .checked_mul(std::mem::size_of::<T>())
+        .ok_or(GlyphError::InvalidGlyph)?;
+    let mut compact = Vec::new();
+    compact
+        .try_reserve_exact(values.len())
+        .map_err(|_| GlyphError::AllocationFailed { requested_bytes })?;
+    compact.extend_from_slice(&values);
+    Ok(compact)
 }
 
 fn validate_atlas_entries(
@@ -633,7 +747,277 @@ fn validate_atlas_entries(
             return Err(GlyphError::DuplicateGlyph { glyph: entry.glyph });
         }
     }
+    validate_non_overlapping_glyph_entries(entries)
+}
+
+#[derive(Clone, Copy)]
+struct GlyphSweepEvent {
+    x: u32,
+    starts: bool,
+    entry_index: usize,
+    minimum_y: u32,
+    maximum_y: u32,
+}
+
+fn validate_non_overlapping_glyph_entries(entries: &[GlyphAtlasEntry]) -> Result<(), GlyphError> {
+    if entries.len() < 2 {
+        return Ok(());
+    }
+    let endpoint_count = entries
+        .len()
+        .checked_mul(2)
+        .ok_or(GlyphError::InvalidGlyph)?;
+    let mut events = Vec::new();
+    events
+        .try_reserve_exact(endpoint_count)
+        .map_err(|_| GlyphError::AllocationFailed {
+            requested_bytes: endpoint_count.saturating_mul(std::mem::size_of::<GlyphSweepEvent>()),
+        })?;
+    let mut vertical_coordinates = Vec::new();
+    vertical_coordinates
+        .try_reserve_exact(endpoint_count)
+        .map_err(|_| GlyphError::AllocationFailed {
+            requested_bytes: endpoint_count.saturating_mul(std::mem::size_of::<u32>()),
+        })?;
+    for (entry_index, entry) in entries.iter().copied().enumerate() {
+        let source = entry.source;
+        let maximum_x = source
+            .x()
+            .checked_add(source.width())
+            .ok_or(GlyphError::InvalidGlyph)?;
+        let maximum_y = source
+            .y()
+            .checked_add(source.height())
+            .ok_or(GlyphError::InvalidGlyph)?;
+        events.push(GlyphSweepEvent {
+            x: source.x(),
+            starts: true,
+            entry_index,
+            minimum_y: source.y(),
+            maximum_y,
+        });
+        events.push(GlyphSweepEvent {
+            x: maximum_x,
+            starts: false,
+            entry_index,
+            minimum_y: source.y(),
+            maximum_y,
+        });
+        vertical_coordinates.push(source.y());
+        vertical_coordinates.push(maximum_y);
+    }
+    // End events precede start events at the same x so edge-touching atlas
+    // rectangles remain valid.
+    events.sort_unstable_by_key(|event| (event.x, event.starts));
+    vertical_coordinates.sort_unstable();
+    vertical_coordinates.dedup();
+    let interval_count = vertical_coordinates.len().saturating_sub(1);
+    let tree_len = interval_count
+        .checked_mul(4)
+        .and_then(|value| value.checked_add(4))
+        .ok_or(GlyphError::InvalidGlyph)?;
+    let mut maximum_coverage = Vec::new();
+    maximum_coverage
+        .try_reserve_exact(tree_len)
+        .map_err(|_| GlyphError::AllocationFailed {
+            requested_bytes: tree_len.saturating_mul(std::mem::size_of::<i32>()),
+        })?;
+    maximum_coverage.resize(tree_len, 0_i32);
+    let mut lazy_coverage = Vec::new();
+    lazy_coverage
+        .try_reserve_exact(tree_len)
+        .map_err(|_| GlyphError::AllocationFailed {
+            requested_bytes: tree_len.saturating_mul(std::mem::size_of::<i32>()),
+        })?;
+    lazy_coverage.resize(tree_len, 0_i32);
+    let mut active = Vec::new();
+    active
+        .try_reserve_exact(entries.len())
+        .map_err(|_| GlyphError::AllocationFailed {
+            requested_bytes: entries.len().saturating_mul(std::mem::size_of::<bool>()),
+        })?;
+    active.resize(entries.len(), false);
+
+    for event in events {
+        let minimum = vertical_coordinates
+            .binary_search(&event.minimum_y)
+            .expect("glyph sweep endpoints came from the coordinate set");
+        let maximum = vertical_coordinates
+            .binary_search(&event.maximum_y)
+            .expect("glyph sweep endpoints came from the coordinate set");
+        if event.starts {
+            if glyph_coverage_max(
+                &maximum_coverage,
+                &lazy_coverage,
+                1,
+                0,
+                interval_count,
+                minimum,
+                maximum,
+            ) > 0
+            {
+                let entry = entries[event.entry_index];
+                let conflict = active
+                    .iter()
+                    .enumerate()
+                    .find(|(index, active)| {
+                        **active && glyph_rectangles_overlap(entries[*index].source, entry.source)
+                    })
+                    .map(|(index, _)| entries[index].glyph)
+                    .expect("positive sweep coverage has an active owning glyph");
+                return Err(GlyphError::OverlappingGlyph {
+                    glyph: entry.glyph,
+                    conflicting_glyph: conflict,
+                });
+            }
+            glyph_coverage_add(
+                &mut maximum_coverage,
+                &mut lazy_coverage,
+                1,
+                0,
+                interval_count,
+                minimum,
+                maximum,
+                1,
+            );
+            active[event.entry_index] = true;
+        } else {
+            glyph_coverage_add(
+                &mut maximum_coverage,
+                &mut lazy_coverage,
+                1,
+                0,
+                interval_count,
+                minimum,
+                maximum,
+                -1,
+            );
+            active[event.entry_index] = false;
+        }
+    }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn glyph_coverage_add(
+    maximum_coverage: &mut [i32],
+    lazy_coverage: &mut [i32],
+    node: usize,
+    left: usize,
+    right: usize,
+    query_left: usize,
+    query_right: usize,
+    amount: i32,
+) {
+    if query_left <= left && right <= query_right {
+        maximum_coverage[node] += amount;
+        lazy_coverage[node] += amount;
+        return;
+    }
+    let middle = left + (right - left) / 2;
+    if query_left < middle {
+        glyph_coverage_add(
+            maximum_coverage,
+            lazy_coverage,
+            node * 2,
+            left,
+            middle,
+            query_left,
+            query_right,
+            amount,
+        );
+    }
+    if query_right > middle {
+        glyph_coverage_add(
+            maximum_coverage,
+            lazy_coverage,
+            node * 2 + 1,
+            middle,
+            right,
+            query_left,
+            query_right,
+            amount,
+        );
+    }
+    maximum_coverage[node] =
+        lazy_coverage[node] + maximum_coverage[node * 2].max(maximum_coverage[node * 2 + 1]);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn glyph_coverage_max(
+    maximum_coverage: &[i32],
+    lazy_coverage: &[i32],
+    node: usize,
+    left: usize,
+    right: usize,
+    query_left: usize,
+    query_right: usize,
+) -> i32 {
+    if query_left <= left && right <= query_right {
+        return maximum_coverage[node];
+    }
+    let middle = left + (right - left) / 2;
+    let mut maximum = 0;
+    if query_left < middle {
+        maximum = maximum.max(glyph_coverage_max(
+            maximum_coverage,
+            lazy_coverage,
+            node * 2,
+            left,
+            middle,
+            query_left,
+            query_right,
+        ));
+    }
+    if query_right > middle {
+        maximum = maximum.max(glyph_coverage_max(
+            maximum_coverage,
+            lazy_coverage,
+            node * 2 + 1,
+            middle,
+            right,
+            query_left,
+            query_right,
+        ));
+    }
+    lazy_coverage[node] + maximum
+}
+
+fn validate_glyph_insertion(
+    entries: &[GlyphAtlasEntry],
+    entry: GlyphAtlasEntry,
+) -> Result<Option<usize>, GlyphError> {
+    match entries.binary_search_by_key(&entry.glyph, |candidate| candidate.glyph) {
+        Ok(index) => {
+            if entries[index].source != entry.source {
+                return Err(GlyphError::DuplicateGlyph { glyph: entry.glyph });
+            }
+            Ok(None)
+        }
+        Err(index) => {
+            if let Some(conflict) = entries
+                .iter()
+                .find(|candidate| glyph_rectangles_overlap(candidate.source, entry.source))
+            {
+                return Err(GlyphError::OverlappingGlyph {
+                    glyph: entry.glyph,
+                    conflicting_glyph: conflict.glyph,
+                });
+            }
+            Ok(Some(index))
+        }
+    }
+}
+
+fn glyph_rectangles_overlap(left: ImageTexelRect, right: ImageTexelRect) -> bool {
+    let left_max_x = u64::from(left.x()) + u64::from(left.width());
+    let left_max_y = u64::from(left.y()) + u64::from(left.height());
+    let right_max_x = u64::from(right.x()) + u64::from(right.width());
+    let right_max_y = u64::from(right.y()) + u64::from(right.height());
+    u64::from(left.x()) < right_max_x
+        && u64::from(right.x()) < left_max_x
+        && u64::from(left.y()) < right_max_y
+        && u64::from(right.y()) < left_max_y
 }
 
 fn validate_metadata_capacity(
@@ -692,6 +1076,7 @@ fn resolve_glyph_sprites(
     entries: &[GlyphAtlasEntry],
     glyphs: &[PositionedGlyph2d],
 ) -> Result<Vec<ImageSprite2d>, GlyphError> {
+    validate_glyph_membership(entries, glyphs)?;
     let mut sprites = Vec::new();
     sprites
         .try_reserve_exact(glyphs.len())
@@ -703,6 +1088,7 @@ fn resolve_glyph_sprites(
     for (index, glyph) in glyphs.iter().copied().enumerate() {
         let source = find_entry(entries, glyph.glyph)
             .map(GlyphAtlasEntry::source)
+            // The complete lookup scan above makes this branch defensive.
             .ok_or(GlyphError::MissingGlyph {
                 glyph: glyph.glyph,
                 index,
@@ -712,7 +1098,45 @@ fn resolve_glyph_sprites(
     Ok(sprites)
 }
 
+fn validate_glyph_membership(
+    entries: &[GlyphAtlasEntry],
+    glyphs: &[PositionedGlyph2d],
+) -> Result<(), GlyphError> {
+    if let Some((index, glyph)) = glyphs
+        .iter()
+        .enumerate()
+        .find(|(_, glyph)| find_entry(entries, glyph.glyph).is_none())
+    {
+        return Err(GlyphError::MissingGlyph {
+            glyph: glyph.glyph,
+            index,
+        });
+    }
+    Ok(())
+}
+
+fn validate_glyph_run_sources(
+    entries: &[GlyphAtlasEntry],
+    glyphs: &[PositionedGlyph2d],
+    sprites: &[ImageSprite2d],
+) -> Result<(), GlyphError> {
+    if glyphs.len() != sprites.len()
+        || glyphs.iter().zip(sprites).any(|(glyph, sprite)| {
+            find_entry(entries, glyph.glyph).map(GlyphAtlasEntry::source) != Some(sprite.source())
+        })
+    {
+        return Err(ImageError::RecoverySourceMismatch.into());
+    }
+    Ok(())
+}
+
 fn measure_glyphs(glyphs: &[PositionedGlyph2d]) -> Result<GlyphRunBounds, GlyphError> {
+    if glyphs
+        .iter()
+        .any(|glyph| !image::logical_image_region_is_portable(glyph.destination))
+    {
+        return Err(GlyphError::InvalidGlyph);
+    }
     let Some(first) = glyphs.first().copied() else {
         return Ok(GlyphRunBounds { region: None });
     };
@@ -796,6 +1220,65 @@ mod tests {
             validate_atlas_entries(&mut outside, 2, 1, budget),
             Err(GlyphError::InvalidGlyph)
         );
+
+        let mut overlapping = vec![
+            GlyphAtlasEntry::new(GlyphId::new(10), ImageTexelRect::new(0, 0, 2, 2).unwrap()),
+            GlyphAtlasEntry::new(GlyphId::new(11), ImageTexelRect::new(1, 1, 2, 2).unwrap()),
+        ];
+        assert_eq!(
+            validate_atlas_entries(&mut overlapping, 4, 4, budget),
+            Err(GlyphError::OverlappingGlyph {
+                glyph: GlyphId::new(11),
+                conflicting_glyph: GlyphId::new(10),
+            })
+        );
+    }
+
+    #[test]
+    fn incremental_glyph_overlap_is_rejected_before_metadata_or_pixel_update() {
+        let entries = [GlyphAtlasEntry::new(
+            GlyphId::new(1),
+            ImageTexelRect::new(0, 0, 4, 4).unwrap(),
+        )];
+        let overlapping =
+            GlyphAtlasEntry::new(GlyphId::new(2), ImageTexelRect::new(3, 0, 4, 4).unwrap());
+        assert_eq!(
+            validate_glyph_insertion(&entries, overlapping),
+            Err(GlyphError::OverlappingGlyph {
+                glyph: GlyphId::new(2),
+                conflicting_glyph: GlyphId::new(1),
+            })
+        );
+        assert_eq!(entries.len(), 1);
+
+        let adjacent =
+            GlyphAtlasEntry::new(GlyphId::new(2), ImageTexelRect::new(4, 0, 4, 4).unwrap());
+        assert_eq!(validate_glyph_insertion(&entries, adjacent), Ok(Some(1)));
+
+        let below = GlyphAtlasEntry::new(GlyphId::new(2), ImageTexelRect::new(0, 8, 4, 4).unwrap());
+        assert_eq!(validate_glyph_insertion(&entries, below), Ok(Some(1)));
+
+        let entries_below = [GlyphAtlasEntry::new(
+            GlyphId::new(1),
+            ImageTexelRect::new(0, 8, 4, 4).unwrap(),
+        )];
+        let above = GlyphAtlasEntry::new(GlyphId::new(2), ImageTexelRect::new(0, 0, 4, 4).unwrap());
+        assert_eq!(validate_glyph_insertion(&entries_below, above), Ok(Some(1)));
+    }
+
+    #[test]
+    fn default_maximum_non_overlapping_atlas_validation_is_subquadratic() {
+        let mut entries = Vec::with_capacity(65_536);
+        for glyph in 0..65_536_u32 {
+            entries.push(GlyphAtlasEntry::new(
+                GlyphId::new(glyph),
+                ImageTexelRect::new(glyph % 256, glyph / 256, 1, 1).unwrap(),
+            ));
+        }
+        assert_eq!(
+            validate_atlas_entries(&mut entries, 256, 256, GlyphAtlasBudget::default()),
+            Ok(())
+        );
     }
 
     #[test]
@@ -822,6 +1305,25 @@ mod tests {
                 glyph: GlyphId::new('Σ' as u32),
                 index: 0,
             })
+        );
+    }
+
+    #[test]
+    fn glyph_run_recovery_rejects_forked_atlas_mapping() {
+        let glyph = positioned(42, 1.0);
+        let left = rectangle(0);
+        let right = rectangle(1);
+        let source_entries = [GlyphAtlasEntry::new(GlyphId::new(42), left)];
+        let forked_entries = [GlyphAtlasEntry::new(GlyphId::new(42), right)];
+        let source_sprites = [ImageSprite2d::new(left, glyph.destination(), glyph.tint()).unwrap()];
+
+        assert_eq!(
+            validate_glyph_run_sources(&source_entries, &[glyph], &source_sprites),
+            Ok(())
+        );
+        assert_eq!(
+            validate_glyph_run_sources(&forked_entries, &[glyph], &source_sprites),
+            Err(GlyphError::Image(ImageError::RecoverySourceMismatch))
         );
     }
 }

@@ -8,17 +8,58 @@ public API reaches 1.0.
 
 No unreleased changes.
 
-## 0.2.0 - 2026-08-29
+## 0.2.0 - 2026-09-01
 
 Second official Linux release. This release turns the Sim;X integration
 foundation developed after 0.1.0 into supported, bounded APIs for complete
 composed frames, fixed-screen UI, retained images, and host-shaped text.
 
+### Breaking changes and migration from 0.1
+
+- `WgpuRenderer::resize` now returns
+  `Result<(), RendererConfigurationError>` so active-device surface limits are
+  checked before configuration. Propagate the result with `?`, handle the
+  structured error, or use an explicit `expect` where the host has already
+  bounded window dimensions.
+- `ParticleRenderBudget::new(visible, gpu, upload)` now takes an explicit
+  combined CPU-retention ceiling as its second argument:
+  `ParticleRenderBudget::new(visible, retained, gpu, upload)`. Size `retained`
+  for both the exact recovery snapshot and the worst visibility-staging
+  allocation; `ParticleRenderBudget::INSTANCE_BYTES` is available for deriving
+  the byte count from instance capacities.
+- `WgpuRenderer::render_layered_visualization` now returns
+  `LayeredVisualizationReport` instead of `RenderReport`. Existing
+  `status()`/`metrics()` call sites remain source-compatible unless they name or
+  store the concrete result type; update those annotations and use the new
+  `render_pass_count()`/`draw_call_count()` accessors when encoded-work evidence
+  is required.
+- Existing public error enums gained structured capacity,
+  portability, recovery, and transform variants, including
+  the core-only `LogicalViewportError`, `Mesh3dError`, and `SceneError`, plus
+  `RendererConfigurationError`, `RendererInitError`, `PreparedSceneError`,
+  `RendererFrameError`, `DynamicMeshError`, `ParticleFieldError`,
+  `Mesh3dResourceError`, `Mesh3dRenderError`, `Scene3dError`, and
+  `ScalarFieldTextureError` with `wgpu` enabled.
+  Downstream exhaustive matches must add the new arms (or a deliberate
+  fallback arm) when moving from 0.1.
+- Hardware clipping of partially visible caller-provided triangles is no
+  longer accepted implicitly. Retained 3D surfaces return
+  `UnportableSurfaceTopology`, and `DynamicMesh2d` frames return
+  `InvalidGeometryTransform`; keep triangles inside the full target clip
+  volume, split them at a host-controlled clipping boundary, or use edge-only
+  3D geometry when only a crossing construction line is required. Positioned
+  item viewport/scissor clipping remains supported.
+
 ### Added
 
-- Explicit `SceneBudget` limits and `SceneStatistics` for commands, retained
-  points/bytes, conservative and actual tessellated vertices, upload bytes,
-  and draw batches.
+- Explicit `SceneBudget` limits for commands, points, retained payload,
+  committed command/polyline allocation, conservative tessellation/upload, and
+  draw batches. `SceneStatistics` reports logical construction/estimate usage,
+  `Scene::allocation_bytes` reports committed allocation, and
+  `TessellationStats` reports actual rendering work. Budgeted command-vector
+  growth is transactional and cannot commit above its allocation cap;
+  documentation specifies bounded replacement headroom while old and staging
+  allocations coexist.
 - Atomic `Scene::try_extend_to_layers` for high-volume mixed-layer construction
   with one `O(N log N)` ordering pass, plus validated `DrawCommand` builders.
 - `ScreenScene` and `PreparedScreenScene` for fixed top-left logical-pixel
@@ -31,10 +72,15 @@ composed frames, fixed-screen UI, retained images, and host-shaped text.
   world/screen scenes, dynamic meshes, particles, scalar fields, and composable
   2D or retained-3D color targets.
 - Frame diagnostics for total, streaming, and reused vertices, streaming and
-  total upload bytes, referenced texture bytes, passes, commands, and draw
+  total upload bytes, referenced nominal texel-storage bytes, passes, commands, and draw
   calls.
 - Actual encoder, render-pass, queue-submission, and surface-present counts on
   `FrameReport`, including zeroes for skipped surface frames.
+- `Mesh3dRenderReport` now exposes actual retained-scene render-pass and draw-
+  call counts, allowing compound offscreen-plus-surface workloads to report
+  complete encoded GPU work.
+- `LayeredVisualizationReport` with actual encoded pass/draw counts for the
+  fused scalar-field, particle-overlay, and surface-composition path.
 - Bounded retained `Image2d` resources, partial region upload, atlas source
   rectangles, nearest/linear sampling, logical sprite batches, world-space
   image quads, exact pixels for recovery, and image composition in
@@ -44,6 +90,9 @@ composed frames, fixed-screen UI, retained images, and host-shaped text.
   missing-glyph outcomes, incremental uploads, and exact atlas/run recovery.
 - `DynamicMeshBudget` and `create_dynamic_mesh_with_budget` for bounded raw
   filled triangles in the common frame ordering path.
+- Particle budgets now cap the combined retained recovery snapshot and
+  visibility-staging CPU allocation in addition to visible instances, GPU
+  bytes, per-frame uploads, and visibility checks.
 - Reusable `StrokeStyle2d` with explicit logical-pixel or world-unit widths,
   butt/square/round caps, bevel/round/bounded-miter joins, allocation-free dash
   patterns with phase and expansion limits, and logical-pixel arrow markers.
@@ -55,14 +104,42 @@ composed frames, fixed-screen UI, retained images, and host-shaped text.
 - A core-only adversarial scene-construction benchmark.
 - A release-mode `rendering_benchmark_suite` and matrix runner covering the
   named static-10k, 90/10 prepared/streaming, four-viewport, image-atlas,
-  scientific-text, mixed-layer, budget-rejection, HiDPI-resize, and retained-
-  resource recovery fixtures.
-- Nested-KWin HiDPI gate scripts, packaged with the crate, which fail closed
+  scientific-text, bounded particle/scalar, retained-3D, mixed-layer, budget-
+  rejection, HiDPI-resize, and retained-resource recovery fixtures.
+- Repository-only nested-KWin HiDPI gate scripts, which fail closed
   when the required compositor or output-control tooling is unavailable.
 - A retained scientific glyph-atlas probe in `ui_demo`, reused above all four
   world-camera workloads without steady-state atlas or instance upload.
 
 ### Changed
+
+- Image texture uploads and image-batch replacement now return distinct
+  reports, so hosts can distinguish texture replacement from instance-buffer
+  replacement without false cache invalidation.
+- Glyph atlases reject overlapping rectangles for distinct identities during
+  both initial construction and incremental upload, so existing retained runs
+  cannot silently sample texels overwritten by a later glyph.
+- Glyph-run recovery verifies every retained glyph-to-rectangle mapping, not
+  only the ancestor image identity, so divergent restored atlas branches
+  cannot silently remap an existing run.
+- Particle-only and fused layered frames now include camera validation and
+  visibility selection in the common pre-upload preparation metric. Like
+  ordinary and composed scenes, skipped surface frames retain that completed
+  CPU work while reporting no queue upload or encode/submit/present stage.
+- Screen-space polylines validate coordinates, every segment and turn, stroke
+  arithmetic, and bounded dash expansion before allocating their converted
+  point buffer or applying work budgets, preserving the same deterministic
+  validation-error precedence as ordinary `Scene` polylines.
+- 3D camera/target and target-texel scale matching now use symmetric relative
+  `f64` tolerance, including portrait ratios below one, so extreme narrow
+  targets cannot accept materially anisotropic logical viewports.
+- `FrameComposer::present` performs a zero-allocation viewport/camera/uniform
+  preflight before caller-count-sized ready-item scratch reservation. Streaming
+  scenes validate their camera before device estimates and tessellation, and a
+  late geometry-transform rejection rolls back appended transient vertices.
+- Initial construction and device recovery share one submitted particle-unit
+  buffer helper, so a recovered queue cannot retain a deferred static upload
+  while subsequent surface frames are skipped.
 
 - Ordinary tessellation now uses fallible CPU reservations and rechecks actual
   vertex, upload-byte, and batch work against the originating scene budget
@@ -80,8 +157,9 @@ composed frames, fixed-screen UI, retained images, and host-shaped text.
 - Exact and numerically indistinguishable 180-degree polyline retraces, plus
   repeated adjacent points, are rejected during scene validation instead of
   producing pinched or multiply blended stroke quads.
-- Frame retained-memory diagnostics count each referenced CPU, GPU buffer, and
-  texture allocation once even when the same resource is drawn multiple times.
+- Frame retained-memory diagnostics count each referenced CPU allocation, GPU
+  buffer allocation, and nominal texture payload once even when the same
+  resource is drawn multiple times.
 - Target and heatmap composition uniforms now carry an explicit logical
   destination, allowing offscreen resources to scale into bounded frame
   viewports without abusing scissor clipping.
@@ -108,19 +186,18 @@ composed frames, fixed-screen UI, retained images, and host-shaped text.
   same anchor-plus-local-offset representation. Positive normal `f32`
   radii/ranges remain nonzero; closed-stroke deduplication no longer erases
   geometry merely because its squared length is below `f32::EPSILON`.
-- GPU-transform validation rejects nonzero subnormal operands that a conforming
-  WGSL backend may flush to zero whenever those operands affect world/local
-  geometry, particles, camera rows, or screen-to-clip output. Extreme zoom
-  therefore cannot turn a silently collapsed primitive into a backend-specific
-  result, while irrelevant zero-multiplied camera components remain valid.
+- GPU-transform validation now applies one conservative portability envelope
+  to tessellated 2D, dynamic triangles, particles, and retained 3D. Nonzero
+  subnormal geometric sources, coordinate/transform values outside `2^120`,
+  and arithmetic that cannot be bounded inside WGSL's specified accuracy
+  domains are rejected uniformly. Normalized color channels remain outside
+  this transform envelope.
 - Display and render-target pixel scales are bounded so all non-empty `u32`
   target dimensions, half-viewport translations, and reciprocal clip
   coefficients remain normal finite `f32` values.
-- Exact fixed-coordinate shader dots enumerate legal f32 association and FMA
-  results rather than applying a coarse error margin. Safe maximum-magnitude
-  sums remain accepted, while retained 3D vertices whose clip-plane
-  classification varies by legal backend association are rejected before GPU
-  submission.
+- Dot-product envelopes use directed-rounding error bounds rather than assuming
+  Rust's round-to-nearest result. Retained 3D vertices whose conservative
+  clip-plane classification is ambiguous are rejected before GPU submission.
 - Hidden 3D dash arithmetic is validated against the complete clipped viewport
   diagonal. A fixed CPU dot-product fold can no longer hide dash-phase overflow
   available to another legal GPU association.
@@ -130,15 +207,8 @@ composed frames, fixed-screen UI, retained images, and host-shaped text.
   association can no longer collapse a line that another backend renders.
   Frustum-side checks follow the shader's common homogeneous scaling and reject
   negative plane distances that can flush to the inclusive `-0` boundary or
-  change side when scaled clip components are rounded separately. Exact clip
-  candidate states retain their correlation with the pair maximum and
-  reciprocal homogeneous scale, avoiding invented boundary crossings.
-  Exact component-selection rows preserve finite association envelopes at the
-  `f32` limit instead of adding a spurious generic rounding margin.
-  Exact subnormal dot operands are evaluated through both preserved and
-  flushed states, so an ordinary translation may safely absorb an irrelevant
-  FTZ difference without rejecting the object. The same exact fallback covers
-  dynamic 2D vertices before screen translation.
+  change side when scaled clip components are rounded separately. Homogeneous
+  reciprocals are restricted to the WGSL division-accuracy domain.
 - Camera/geometry validation preserves base/offset correlation between
   commands and rejects both pre-transform relative-coordinate overflow and
   final screen-to-clip overflow, including particle-radius extrusion and
@@ -150,14 +220,13 @@ composed frames, fixed-screen UI, retained images, and host-shaped text.
   into the next shader operation. A finite cancellation can no longer become
   an overflowing 2D screen-to-clip multiplication or an overflowing retained-
   3D camera product after a different legal GPU association.
-- The constant-cost 2D geometry envelope now falls back to actual tessellated
-  or dynamic vertex tuples when independent scene-wide world/depth/direction
-  extrema form a nonexistent combination. Safe correlated extreme geometry is
-  accepted without adding a scan to ordinary frames.
-- Base/offset aggregation now follows the shader's rounded
-  `(base - camera_center) + offset` operation rather than ordering pairs by an
-  idealized exact sum. The conservative fast envelope cannot miss a one-ULP
-  extremum; exact vertex fallback still recovers safe correlated geometry.
+- The 2D geometry envelope provides a conservative aggregate proof, followed
+  where necessary by exact retained-source scans for per-vertex FTZ,
+  direction, and stroke-branch hazards. Geometry is accepted only when both
+  the aggregate arithmetic and every relevant shader source are portable.
+- Base and generated local offsets are projected independently before their
+  logical-screen values are added. The matching conservative envelope cannot
+  lose small geometry inside a large world anchor or miss a one-ULP extremum.
 - Particle projection and CPU culling apply the same association-independent
   camera-row envelope through radius extrusion and screen-to-clip arithmetic.
   A particle is no longer silently culled according to a different CPU fold.
@@ -166,13 +235,48 @@ composed frames, fixed-screen UI, retained images, and host-shaped text.
 - Retained 3D edge validation mirrors the complete post-projection shader
   arithmetic, including doubled raster width, logical-distance and dash phase,
   NDC extrusion, homogeneous scaling, and the final clip-coordinate addition.
-- Retained 3D transform validation now falls back from its constant-cost AABB
-  envelope to the mesh's actual correlated vertices instead of rejecting on a
-  nonexistent corner, and edge extrusion bounds use the actual projected
-  normal component on each axis.
+- Retained 3D transform validation checks every visible mesh vertex instead of
+  relying on an AABB proof that can miss interior cancellation or
+  flush-to-zero cases. Homogeneous clipping, division, projection, and edge
+  extrusion propagate conservative ranges through the actual shader order.
+- Retained images and glyph sprites now validate viewport, origin, extent, and
+  final clip arithmetic against the same portability envelope as ordinary
+  scene geometry.
+- Prepared scenes reject non-portable command sources before tessellation can
+  allocate caller-sized staging, then reject non-portable derived vertices
+  before allocating or uploading retained GPU buffers. Streaming and offscreen scenes complete all
+  fallible geometry validation before queue mutation.
+- Particle conversion, visibility staging, restoration, and retained-3D
+  per-frame growth use fallible host reservations. Multi-buffer 3D growth is
+  atomic: either both replacement staging/buffer pairs are ready or renderer
+  state is unchanged.
+- Retained-3D insertion, prepared-scene restoration, scalar-field restoration,
+  image/glyph staging, and dynamic-mesh creation now complete deterministic
+  validation and fallible host reservation before mutating GPU or retained
+  state. Colormap caching uses its fixed 256-entry LUT as the cache key instead
+  of cloning an unbounded host stop list during rendering.
+- Retained dynamic meshes, particles, 3D mesh vertices, model transforms,
+  image sprites, and glyph placements now reject non-portable shader sources
+  at create/update/restore boundaries before staging or GPU mutation.
+- Composed-frame color-map accounting follows the renderer's one-entry cache
+  exactly after stable pass ordering: adjacent equal LUTs share work, while an
+  `A, B, A` sequence reports and budgets all three simultaneously referenced
+  LUT allocations.
+- Logical round joins no longer use WGSL `atan2`, `sin`, or `cos`; a normalized
+  fixed fan avoids undefined-accuracy domains at exact right angles. CPU
+  validation rejects join/reversal/miter configurations too close to
+  topology-changing shader thresholds.
+- 3D per-frame buffers are sized from visible objects only. Every visible
+  transform is validated before host/GPU staging grows, and host reservations
+  are fallible rather than panic-prone.
 - Streaming composition returns its reusable transient vertex allocation to
   the renderer on every structured error path, preserving steady-state memory
   behavior after a rejected frame.
+- Surface paths now acquire successfully before enqueueing any per-frame GPU
+  writes, so repeated timeout/occlusion/outdated skips cannot accumulate native
+  upload staging. Standalone retained-resource mutations immediately submit
+  their transfers without waiting, bounding the same staging lifetime when no
+  surface frame is presented.
 - `WgpuRenderer::set_pre_present_notify` owns the host pacing boundary:
   registered callbacks run after queue submission and immediately before
   FIFO/FIFO-relaxed/Mailbox presentation, while Immediate stays uncapped.
@@ -199,7 +303,7 @@ composed frames, fixed-screen UI, retained images, and host-shaped text.
 - A nonblocking process lock serializes release-evidence invalidation and
   publication, and Linux `mv -T` makes the completed directory replacement
   explicit. The bundle now includes a structured performance manifest with
-  all seven surface fixture reports and their exact-SHA passed verdicts.
+  all nine surface fixture reports and their exact-SHA passed verdicts.
 - Surface benchmark and HiDPI renderers register winit's
   `Window::pre_present_notify`; synchronized modes invoke it after submission
   and immediately before present, while Immediate benchmarks remain unpaced.
@@ -259,6 +363,35 @@ composed frames, fixed-screen UI, retained images, and host-shaped text.
 - Added the interactive `stroke_gallery` visual oracle with four pages for all
   v0.2 stroke styles, alpha contracts, markers, dashes, camera motion, and short
   accepted geometry.
+- The mandatory performance matrix now exercises the fused bounded
+  scalar/particle presentation path with visibility capping and per-frame
+  instance upload, plus independently transformed retained 3D surfaces and
+  visible/hidden edge passes composed through a color target. The retained-3D
+  fixture also validates 4,096 budgeted dynamic triangles per frame.
+
+### Fixed
+
+- Reject world-unit `StrokeStyle2d` widths at the fixed-screen `ScreenScene`
+  boundary instead of numerically reinterpreting them as logical pixels.
+- Keep `ScreenScene`'s internally Y-flipped ordinary commands private instead
+  of exposing untyped `Vec2` values that contradict its top-left/downward-Y
+  public coordinate contract.
+- Interpret generic `ShapeStyle` gradient coordinates in `ScreenScene`'s
+  downward-Y space and convert them exactly once, and reject non-positive
+  rectangle sizes so the supplied `min` remains the promised top-left.
+- Add `ScreenScene::try_square_rect` and its layer variant so exact square
+  corners do not require an invalid zero-valued `LogicalPixels` length.
+- Reject every surface triangle that requires hardware frustum clipping, and
+  separately reject fully inside triangles whose projected topology can change
+  across legal shader association/FMA choices. Fully inside triangles must
+  retain one normal signed-area direction; triangles wholly outside one common
+  frustum plane remain deterministic raster no-ops.
+- Apply the same per-triangle clip and signed-area interval proof to
+  `DynamicMesh2d`, preventing a legal shader FMA association from turning one
+  host-side collapsed triangle into a large visible primitive.
+- Project tessellator local offsets and particle quad radii independently from
+  large anchors/viewport origins, and reject ambiguous fill, stroke, or particle
+  visibility before GPU submission.
 
 ## 0.1.0 - 2026-08-25
 

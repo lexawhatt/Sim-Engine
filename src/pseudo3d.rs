@@ -472,9 +472,13 @@ impl Camera3d {
 
     /// Projects a world point into logical screen coordinates.
     ///
-    /// Points behind the camera return an error. Points outside the configured
-    /// frustum still return finite coordinates with `inside_view` set to false,
-    /// allowing a later mesh stage to clip segments and triangles explicitly.
+    /// Points behind the camera return an error. Outside-frustum points whose
+    /// projection remains representable return finite coordinates with
+    /// `inside_view` set to false, allowing host-side classification without
+    /// losing the projected anchor; extreme finite inputs may instead return
+    /// [`Pseudo3dError::ArithmeticOverflow`]. In the v0.2 retained renderer,
+    /// explicit display edges are clipped while partially clipped surface
+    /// triangles are rejected fail-closed as unportable topology.
     pub fn project_world(
         self,
         point: Vec3,
@@ -870,6 +874,25 @@ mod tests {
         assert_eq!(
             camera.project_world(vector(0.0, 0.0, 6.0), viewport),
             Err(Pseudo3dError::PointBehindCamera)
+        );
+    }
+
+    #[test]
+    fn perspective_camera_reports_unrepresentable_outside_projection() {
+        let camera = Camera3d::look_at(
+            Vec3::ZERO,
+            vector(0.0, 0.0, -1.0),
+            Vec3::Y,
+            Projection3d::perspective(std::f32::consts::FRAC_PI_2, 1.0, world(0.1), world(10.0))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            camera.project_world(
+                vector(f32::MAX, 0.0, -f32::MIN_POSITIVE),
+                LogicalViewport::new(100.0, 100.0).unwrap(),
+            ),
+            Err(Pseudo3dError::ArithmeticOverflow)
         );
     }
 

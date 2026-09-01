@@ -21,14 +21,14 @@ scenes, positioned 2D viewports, offscreen scene rendering, a heterogeneous
 single-present frame composer, retained RGBA images and atlas batches,
 host-shaped glyph runs, explicitly budgeted dynamic triangles, richer bounded
 2D strokes, and a named rendering benchmark matrix. See the
-[0.2.0 changelog](CHANGELOG.md#020---2026-08-29) for the complete delta from
+[0.2.0 changelog](https://github.com/lexawhatt/Sim-Engine/blob/v0.2.0/CHANGELOG.md#020---2026-09-01) for the complete delta from
 0.1.0.
 
 ## Documentation
 
-- [Library documentation](DOCUMENTATION.md) - installation, concepts, every
+- [Library documentation](https://github.com/lexawhatt/Sim-Engine/blob/v0.2.0/DOCUMENTATION.md) - installation, concepts, every
   rendering path, recovery, performance, architecture, and examples.
-- [Changelog](CHANGELOG.md) - release history and user-visible changes.
+- [Changelog](https://github.com/lexawhatt/Sim-Engine/blob/v0.2.0/CHANGELOG.md) - release history and user-visible changes.
 - Generated API reference:
 
   ```bash
@@ -52,7 +52,7 @@ host-shaped glyph runs, explicitly budgeted dynamic triangles, richer bounded
 - scalar-field textures, color maps, partial updates, and heatmaps;
 - offscreen targets, composition, and bounded trails;
 - device recovery with explicit retained-resource restoration;
-- typed logical-pixel, 3D world-length, and target-scale boundaries;
+- typed logical-pixel, 2D/3D world-length, and target-scale boundaries;
 - retained 3D meshes, independent transforms, hardware depth, and visible or
   dashed hidden mathematical edges;
 - atomic retained-3D scene recovery that preserves stable object IDs and visual
@@ -70,12 +70,15 @@ color targets under one frame budget and one surface presentation.
 `DynamicMeshBudget` limits caller-provided filled triangles and makes full
 updates allocation-fallible and atomic.
 
-GPU transform validation accounts for backend-legal floating-point
-reassociation/FMA results across chained 2D and 3D stages. Fast scene-wide
-envelopes remain the common path; correlated extreme vertices receive an exact
-tuple fallback instead of being rejected because of a nonexistent min/max
-combination. Particle clipping and culling use the same complete projected
-range.
+GPU transform validation uses one conservative portability envelope for 2D
+scenes, dynamic triangles, particles, and retained 3D. Nonzero subnormal
+coordinate/transform operands, coordinate magnitudes above `2^120`, ambiguous
+geometry-branch thresholds, and arithmetic ranges that cannot be proven
+portable are rejected with a structured transform error before submission.
+Normalized linear color channels are not geometric operands and may include
+subnormal values; their contribution is below the precision of current
+normalized render targets. This intentionally prefers a clear rejection over
+backend-dependent geometry disappearance or topology.
 
 Translucent section materials, hatching, projected 3D anchors, and 3D picking
 are not part of v0.2.0.
@@ -124,7 +127,9 @@ scene.try_rect(
 ```
 
 Window creation stays in the host. Renderer initialization is asynchronous;
-steady-state updates and rendering are synchronous submissions:
+steady-state updates and rendering are synchronous submissions. Standalone
+retained-resource mutations submit their transfer immediately (without waiting
+for GPU completion), while a skipped surface frame enqueues no uploads:
 
 ```rust,ignore
 let options = WgpuRendererOptions::new(
@@ -174,8 +179,11 @@ cargo run --release --example stereometry_3d -- --uncapped
 cargo run --release --example cylinder_derivation_3d -- --uncapped --benchmark
 ```
 
-Run the complete named performance/contract matrix on a Vulkan-capable Linux
-machine with `./scripts/rendering_benchmark_matrix.sh`. Gated surface workloads
+From a Sim;Engine repository checkout, run the complete named
+performance/contract matrix on a Vulkan-capable Linux machine with
+`./scripts/rendering_benchmark_matrix.sh`. Release scripts are repository
+tooling and are intentionally not shipped in the crates.io source archive.
+Gated surface workloads
 require a `1280x720` physical surface at scale `1.0`; both values are printed
 in every result. Absolute timings are comparable only when surface extent,
 scale, adapter, driver, backend, present mode, and workload are recorded
@@ -215,6 +223,11 @@ present then yields through a compositor-aware redraw boundary and repeats the
 generation/output check before evidence is published.
 Acquire percentiles remain reported but do not independently flip the verdict
 from one scheduler-sensitive sample.
+The mandatory workloads include the fused bounded particle/scalar path and a
+retained-3D target-composition path with 4,096 budgeted dynamic triangles, so
+per-particle portability/culling/upload, dynamic-triangle proofs, and per-object
+surface/hidden-edge validation cannot regress outside the release performance
+evidence.
 The matrix also drives a nested KWin compositor through a real scale
 1.00-to-1.25 transition and records the paired event and successful redraw for
 the exact revision on that same physical adapter.
@@ -247,7 +260,8 @@ text shaping.
 
 ## Verification
 
-The v0.2.0 Linux release gate checks the declared Rust 1.90 MSRV, all targets
+From a clean Sim;Engine repository checkout, the v0.2.0 Linux release gate
+checks the declared Rust 1.90 MSRV, all targets
 with and without the renderer, strict clippy, rustdoc, Vulkan semantic GPU
 readback with a backend assertion, the Vulkan performance matrix on a real
 surface, a transactional nested-compositor HiDPI transition, and the
@@ -262,7 +276,7 @@ After all 11 steps pass, the launcher atomically publishes
 gate and exact SHA; the same directory contains `linux-vulkan-surface.txt`,
 `linux-vulkan-adapter.txt`, `linux-vulkan-performance.txt`, and
 `linux-hidpi-transition.txt`. The performance manifest preserves the complete
-fixture counters, timings, thresholds, and passed verdicts for all seven
+fixture counters, timings, thresholds, and passed verdicts for all nine
 surface runs instead of leaving them only in terminal output.
 
 ## License

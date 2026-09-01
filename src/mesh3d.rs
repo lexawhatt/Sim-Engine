@@ -1,15 +1,14 @@
-use std::{collections::BTreeSet, error::Error, fmt, sync::Arc};
+use std::{error::Error, fmt, sync::Arc};
 
 use crate::{Color, LogicalPixels, Vec3};
 
 const MAX_LOGICAL_EDGE_METRIC: f32 = 1_048_576.0;
-const FTZ_SENSITIVE_COORDINATE_LIMIT: f32 = f32::MIN_POSITIVE * 16_777_216.0;
 
 /// Surface material for one retained 3D instance.
 ///
 /// The representation is private so translucent and hatched section modes can
-/// be added without changing [`crate::Mesh3dInstance`] construction. The first
-/// renderer slice supports only opaque color/depth-writing surfaces.
+/// be added without changing `Mesh3dInstance` construction. The first renderer
+/// slice supports only opaque color/depth-writing surfaces.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SurfaceStyle3d {
     color: Color,
@@ -100,6 +99,12 @@ struct HiddenEdgeStyle3d {
 }
 
 impl WireframeStyle3d {
+    /// Largest accepted width, dash, or gap in logical pixels.
+    ///
+    /// The bound keeps every style-derived shader operation inside the
+    /// cross-backend arithmetic envelope.
+    pub const MAX_LOGICAL_PIXELS: f32 = MAX_LOGICAL_EDGE_METRIC;
+
     /// Creates solid visible edges with hidden fragments disabled.
     pub fn visible(color: Color, width: LogicalPixels) -> Result<Self, Mesh3dStyleError> {
         validate_edge_color_width(color, width)?;
@@ -122,8 +127,8 @@ impl WireframeStyle3d {
         gap_length: LogicalPixels,
     ) -> Result<Self, Mesh3dStyleError> {
         validate_edge_color_width(color, width)?;
-        if dash_length.get() > MAX_LOGICAL_EDGE_METRIC
-            || gap_length.get() > MAX_LOGICAL_EDGE_METRIC
+        if !is_stable_edge_metric(dash_length.get())
+            || !is_stable_edge_metric(gap_length.get())
             || !(dash_length.get() + gap_length.get()).is_finite()
         {
             return Err(Mesh3dStyleError::InvalidDashPattern);
@@ -182,9 +187,11 @@ impl WireframeStyle3d {
 pub enum Mesh3dStyleError {
     /// Surface color must be normalized and opaque in the initial material mode.
     InvalidSurfaceColor,
-    /// Edge color must be normalized and opaque, and width must be finite and positive.
+    /// Edge color must be normalized and opaque, and width must be a normal
+    /// positive value no greater than [`WireframeStyle3d::MAX_LOGICAL_PIXELS`].
     InvalidColorOrWidth,
-    /// Hidden dash and gap lengths must both be finite and positive.
+    /// Hidden dash and gap must be normal positive values, each no greater than
+    /// [`WireframeStyle3d::MAX_LOGICAL_PIXELS`], with a finite sum.
     InvalidDashPattern,
 }
 
@@ -193,10 +200,16 @@ impl fmt::Display for Mesh3dStyleError {
         match self {
             Self::InvalidSurfaceColor => write!(formatter, "3D surface color must be opaque"),
             Self::InvalidColorOrWidth => {
-                write!(formatter, "3D edge color must be opaque and width positive")
+                write!(
+                    formatter,
+                    "3D edge color must be opaque and width must be normal and in 0..={MAX_LOGICAL_EDGE_METRIC} logical pixels"
+                )
             }
             Self::InvalidDashPattern => {
-                write!(formatter, "3D hidden-edge dash and gap must be positive")
+                write!(
+                    formatter,
+                    "3D hidden-edge dash and gap must each be normal and in 0..={MAX_LOGICAL_EDGE_METRIC} logical pixels with a finite sum"
+                )
             }
         }
     }
@@ -205,11 +218,15 @@ impl fmt::Display for Mesh3dStyleError {
 impl Error for Mesh3dStyleError {}
 
 fn validate_edge_color_width(color: Color, width: LogicalPixels) -> Result<(), Mesh3dStyleError> {
-    if color.is_normalized() && color.alpha() == 1.0 && width.get() <= MAX_LOGICAL_EDGE_METRIC {
+    if color.is_normalized() && color.alpha() == 1.0 && is_stable_edge_metric(width.get()) {
         Ok(())
     } else {
         Err(Mesh3dStyleError::InvalidColorOrWidth)
     }
+}
+
+fn is_stable_edge_metric(value: f32) -> bool {
+    value.is_normal() && value <= MAX_LOGICAL_EDGE_METRIC
 }
 
 /// One explicit display edge in a retained 3D mesh.
@@ -250,6 +267,13 @@ impl MeshEdge3d {
     }
 }
 
+#[derive(Debug, PartialEq)]
+struct Mesh3dStorage {
+    vertices: Vec<Vec3>,
+    triangle_indices: Vec<u32>,
+    display_edges: Vec<MeshEdge3d>,
+}
+
 /// Immutable validated topology for retained stereometry rendering.
 ///
 /// Vertices use caller-defined model-space world units. Triangle indices are a
@@ -262,12 +286,9 @@ impl MeshEdge3d {
 /// construction edges. A mesh may contain surfaces, display edges, or both.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Mesh3d {
-    vertices: Arc<[Vec3]>,
-    triangle_indices: Arc<[u32]>,
-    display_edges: Arc<[MeshEdge3d]>,
+    storage: Arc<Mesh3dStorage>,
     bounds_min: Vec3,
     bounds_max: Vec3,
-    has_ftz_sensitive_coordinates: bool,
 }
 
 impl Mesh3d {
@@ -318,7 +339,6 @@ impl Mesh3d {
             }
         }
 
-        let mut unique_edges = BTreeSet::new();
         for edge in &display_edges {
             validate_index(edge.start, vertices.len())?;
             validate_index(edge.end, vertices.len())?;
@@ -328,48 +348,67 @@ impl Mesh3d {
                     end: edge.end,
                 });
             }
-            if !unique_edges.insert(edge.canonical()) {
-                return Err(Mesh3dError::DuplicateDisplayEdge {
-                    start: edge.start,
-                    end: edge.end,
-                });
-            }
+        }
+
+        let canonical_bytes = display_edges
+            .len()
+            .checked_mul(std::mem::size_of::<((u32, u32), usize)>())
+            .ok_or(Mesh3dError::AllocationFailed {
+                requested_bytes: usize::MAX,
+            })?;
+        let mut canonical_edges = Vec::new();
+        canonical_edges
+            .try_reserve_exact(display_edges.len())
+            .map_err(|_| Mesh3dError::AllocationFailed {
+                requested_bytes: canonical_bytes,
+            })?;
+        for (index, edge) in display_edges.iter().enumerate() {
+            canonical_edges.push((edge.canonical(), index));
+        }
+        canonical_edges.sort_unstable_by_key(|entry| entry.0);
+        if let Some(pair) = canonical_edges
+            .windows(2)
+            .find(|pair| pair[0].0 == pair[1].0)
+        {
+            let duplicate = display_edges[pair[0].1.max(pair[1].1)];
+            return Err(Mesh3dError::DuplicateDisplayEdge {
+                start: duplicate.start,
+                end: duplicate.end,
+            });
         }
 
         let (bounds_min, bounds_max) = mesh_bounds(&vertices);
-        let has_ftz_sensitive_coordinates = vertices.iter().any(|vertex| {
-            [vertex.x(), vertex.y(), vertex.z()]
-                .into_iter()
-                .any(|value| value != 0.0 && value.abs() < FTZ_SENSITIVE_COORDINATE_LIMIT)
-        });
         Ok(Self {
-            vertices: vertices.into(),
-            triangle_indices: triangle_indices.into(),
-            display_edges: display_edges.into(),
+            // One fixed-size Arc control block makes Mesh3d cloning O(1)
+            // without copying any caller-scale topology buffers.
+            storage: Arc::new(Mesh3dStorage {
+                vertices,
+                triangle_indices,
+                display_edges,
+            }),
             bounds_min,
             bounds_max,
-            has_ftz_sensitive_coordinates,
         })
     }
 
     /// Returns immutable model-space vertices.
     pub fn vertices(&self) -> &[Vec3] {
-        &self.vertices
+        &self.storage.vertices
     }
 
     /// Returns the flat host-wound triangle index list.
     pub fn triangle_indices(&self) -> &[u32] {
-        &self.triangle_indices
+        &self.storage.triangle_indices
     }
 
     /// Returns explicit mathematical edges, excluding triangulation diagonals.
     pub fn display_edges(&self) -> &[MeshEdge3d] {
-        &self.display_edges
+        &self.storage.display_edges
     }
 
     /// Returns the number of retained triangles.
     pub fn triangle_count(&self) -> usize {
-        self.triangle_indices.len() / 3
+        self.storage.triangle_indices.len() / 3
     }
 
     /// Returns the inclusive model-space lower bound.
@@ -382,25 +421,22 @@ impl Mesh3d {
         self.bounds_max
     }
 
-    /// Returns whether exact vertex validation is needed for portable WGSL FTZ behavior.
-    #[cfg(feature = "wgpu")]
-    pub(crate) const fn has_ftz_sensitive_coordinates(&self) -> bool {
-        self.has_ftz_sensitive_coordinates
-    }
-
     /// Returns retained CPU bytes used by vertices, indices, and display edges.
     pub fn recovery_memory_bytes(&self) -> usize {
-        self.vertices
-            .len()
+        self.storage
+            .vertices
+            .capacity()
             .saturating_mul(std::mem::size_of::<Vec3>())
             .saturating_add(
-                self.triangle_indices
-                    .len()
+                self.storage
+                    .triangle_indices
+                    .capacity()
                     .saturating_mul(std::mem::size_of::<u32>()),
             )
             .saturating_add(
-                self.display_edges
-                    .len()
+                self.storage
+                    .display_edges
+                    .capacity()
                     .saturating_mul(std::mem::size_of::<MeshEdge3d>()),
             )
     }
@@ -413,7 +449,7 @@ pub enum Mesh3dError {
     EmptyVertices,
     /// A retained mesh requires at least one triangle or display edge.
     EmptyGeometry,
-    /// The triangle index list was empty or not divisible by three.
+    /// The triangle index list was not divisible by three.
     InvalidTriangleIndexCount {
         /// Rejected number of indices.
         index_count: usize,
@@ -444,6 +480,11 @@ pub enum Mesh3dError {
         /// Second endpoint in the rejected declaration.
         end: u32,
     },
+    /// Temporary validation storage could not be reserved.
+    AllocationFailed {
+        /// Bytes requested for duplicate-edge validation.
+        requested_bytes: usize,
+    },
 }
 
 impl fmt::Display for Mesh3dError {
@@ -455,7 +496,7 @@ impl fmt::Display for Mesh3dError {
             }
             Self::InvalidTriangleIndexCount { index_count } => write!(
                 formatter,
-                "3D mesh triangle index count must be non-zero and divisible by three, got {index_count}"
+                "3D mesh triangle index count, when present, must be divisible by three, got {index_count}"
             ),
             Self::IndexOutOfBounds {
                 index,
@@ -473,6 +514,10 @@ impl fmt::Display for Mesh3dError {
             Self::DuplicateDisplayEdge { start, end } => {
                 write!(formatter, "3D display edge {start}-{end} is duplicated")
             }
+            Self::AllocationFailed { requested_bytes } => write!(
+                formatter,
+                "could not reserve {requested_bytes} bytes for 3D mesh validation"
+            ),
         }
     }
 }
@@ -663,6 +708,10 @@ mod tests {
             Err(Mesh3dStyleError::InvalidColorOrWidth)
         );
         assert_eq!(
+            WireframeStyle3d::visible(Color::WHITE, logical(f32::MIN_POSITIVE / 2.0)),
+            Err(Mesh3dStyleError::InvalidColorOrWidth)
+        );
+        assert_eq!(
             WireframeStyle3d::visible(Color::rgb(-0.01, 0.0, 0.0), logical(1.0)),
             Err(Mesh3dStyleError::InvalidColorOrWidth)
         );
@@ -670,6 +719,17 @@ mod tests {
             WireframeStyle3d::visible(Color::WHITE, logical(1.0))
                 .unwrap()
                 .with_hidden(Color::WHITE, logical(1.0), logical(f32::MAX), logical(2.0),),
+            Err(Mesh3dStyleError::InvalidDashPattern)
+        );
+        assert_eq!(
+            WireframeStyle3d::visible(Color::WHITE, logical(1.0))
+                .unwrap()
+                .with_hidden(
+                    Color::WHITE,
+                    logical(1.0),
+                    logical(f32::MIN_POSITIVE / 2.0),
+                    logical(2.0),
+                ),
             Err(Mesh3dStyleError::InvalidDashPattern)
         );
         assert_eq!(

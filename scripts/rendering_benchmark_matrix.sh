@@ -124,7 +124,7 @@ run_gated_fixture() {
     fi
     grep -q '^fixture=' "$active_fixture_output"
     grep -q '^gate=passed ' "$active_fixture_output"
-    grep -E '^(fixture=|passes=|gate=passed |prepare_cpu_ms=)' \
+    grep -E '^(fixture=|passes=|layered\[|retained_3d\[|gate=passed |prepare_cpu_ms=|particle_scalar_contract=|retained_3d_contract=)' \
         "$active_fixture_output" >>"$performance_evidence"
     rm -f -- "$active_fixture_output"
     active_fixture_output=""
@@ -136,14 +136,23 @@ run_gated_fixture ui_90_10
 run_gated_fixture four_viewports
 run_gated_fixture image_atlas
 run_gated_fixture scientific_text
+run_gated_fixture particle_scalar
+run_gated_fixture retained_3d
 cargo run --release --example scene_construction_benchmark -- --commands 10000 --iterations 5
 cargo test --release --no-default-features scene::tests::scene_budget_rejection_is_atomic_and_counted -- --exact
 run_gated_fixture dpi_reconfigure
 ./scripts/hidpi_transition_gate.sh
 
 assert_provenance
-test "$(grep -c '^fixture=' "$performance_evidence")" -eq 7
-test "$(grep -c '^gate=passed ' "$performance_evidence")" -eq 7
+test "$(grep -c '^fixture=' "$performance_evidence")" -eq 9
+test "$(grep -c '^gate=passed ' "$performance_evidence")" -eq 9
+grep -q '^fixture=particle_scalar ' "$performance_evidence"
+test "$(grep -c '^layered\[passes=3,draw_calls=3,scalar=256x144,target=640x360,.*particles_submitted=16384,particles_checked=8192,particles_visible=6848,particles_culled=1344,particles_budget_limited=8192,particles_dropped=0,particles_rendered=6848\]$' "$performance_evidence")" -eq 1
+test "$(grep -c '^particle_scalar_contract=retained:16384,visibility_cap:8192,field:256x144,target:640x360$' "$performance_evidence")" -eq 1
+grep -q '^fixture=retained_3d ' "$performance_evidence"
+test "$(grep -c '^passes=2 commands=2 vertices=12294 .*draw_calls=2 sources\[streaming=0,prepared=0,dynamic=1,particles=0,scalars=0,images=0,glyphs=0,targets=1\]$' "$performance_evidence")" -eq 1
+test "$(grep -Ec '^retained_3d\[objects=48,triangles=576,edges=576,render_passes=2,draw_calls=146,retained_cpu_bytes=[1-9][0-9]*,retained_buffer_bytes=[1-9][0-9]*,texture_bytes=[1-9][0-9]*\]$' "$performance_evidence")" -eq 1
+test "$(grep -c '^retained_3d_contract=objects:48,triangles:576,edges:576,dynamic_triangles:4096$' "$performance_evidence")" -eq 1
 mv "$surface_evidence" "$output_dir/linux-vulkan-surface.txt"
 mv "$adapter_evidence" "$output_dir/linux-vulkan-adapter.txt"
 mv "$performance_evidence" "$output_dir/linux-vulkan-performance.txt"

@@ -1,11 +1,12 @@
 use std::mem::size_of;
 
+use crate::scene::validate_styled_polyline;
 #[cfg(any(feature = "wgpu", test))]
 use crate::{Camera2d, LogicalViewport};
 use crate::{
     Color, Fill, Layer, LinearGradient, LogicalPixels, LogicalScreenPosition, LogicalScreenVector,
-    RadialGradient, Rect, Scene, SceneBudget, SceneBudgetResource, SceneCommand, SceneError,
-    ScenePrimitive, SceneStatistics, ScreenClipRect, ShapeStyle, StrokeStyle2d, Vec2,
+    RadialGradient, Rect, Scene, SceneBudget, SceneBudgetResource, SceneError, ScenePrimitive,
+    SceneStatistics, ScreenClipRect, ShapeStyle, StrokeStyle2d, StrokeWidthMode2d, Vec2,
 };
 
 /// A bounded 2D scene whose geometry is expressed in logical screen pixels.
@@ -13,7 +14,10 @@ use crate::{
 /// The origin is the top-left of the active logical viewport and positive y
 /// points downward. Geometry stays fixed while world cameras pan, zoom, rotate,
 /// or change pseudo-projection. Physical DPI conversion remains a renderer
-/// boundary operation.
+/// boundary operation. Gradient coordinates inside a [`ShapeStyle`] are also
+/// interpreted in this top-left/downward space and converted exactly once at
+/// insertion; the same style passed to an ordinary [`Scene`] instead uses
+/// world coordinates.
 #[derive(Debug, Clone)]
 pub struct ScreenScene {
     scene: Scene,
@@ -60,9 +64,9 @@ impl ScreenScene {
         self.scene.command_count()
     }
 
-    /// Returns accepted commands in shared layer and insertion order.
-    pub fn commands(&self) -> &[SceneCommand] {
-        self.scene.commands()
+    /// Returns actual command/polyline allocation bytes retained for reuse.
+    pub fn allocation_bytes(&self) -> usize {
+        self.scene.allocation_bytes()
     }
 
     /// Replaces the logical-screen clip captured by subsequent commands.
@@ -117,11 +121,15 @@ impl ScreenScene {
         radius: LogicalPixels,
         style: ShapeStyle,
     ) -> Result<(), SceneError> {
-        self.scene
-            .try_circle_on_layer(layer, screen_to_internal(center), radius.get(), style)
+        self.scene.try_circle_on_layer(
+            layer,
+            screen_to_internal(center),
+            radius.get(),
+            screen_shape_style_to_internal(style),
+        )
     }
 
-    /// Appends a rectangle from a logical top-left position and size.
+    /// Appends a rectangle from a logical top-left position and positive size.
     pub fn try_rect(
         &mut self,
         min: LogicalScreenPosition,
@@ -132,7 +140,21 @@ impl ScreenScene {
         self.try_rect_on_layer(Layer::DEFAULT, min, size, corner_radius, style)
     }
 
-    /// Appends a logical-screen rectangle to an explicit shared draw layer.
+    /// Appends a square-cornered rectangle from a logical top-left position
+    /// and positive size.
+    ///
+    /// This entry point represents an exact zero corner radius without
+    /// weakening [`LogicalPixels`]' strictly-positive length invariant.
+    pub fn try_square_rect(
+        &mut self,
+        min: LogicalScreenPosition,
+        size: LogicalScreenVector,
+        style: ShapeStyle,
+    ) -> Result<(), SceneError> {
+        self.try_square_rect_on_layer(Layer::DEFAULT, min, size, style)
+    }
+
+    /// Appends a logical-screen rectangle with positive size to a shared layer.
     pub fn try_rect_on_layer(
         &mut self,
         layer: Layer,
@@ -141,10 +163,26 @@ impl ScreenScene {
         corner_radius: LogicalPixels,
         style: ShapeStyle,
     ) -> Result<(), SceneError> {
-        let max = min.to_vec2() + size.to_vec2();
+        self.try_rect_with_radius_on_layer(layer, min, size, corner_radius.get(), style)
+    }
+
+    fn try_rect_with_radius_on_layer(
+        &mut self,
+        layer: Layer,
+        min: LogicalScreenPosition,
+        size: LogicalScreenVector,
+        corner_radius: f32,
+        style: ShapeStyle,
+    ) -> Result<(), SceneError> {
+        let size_value = size.to_vec2();
+        let max = min.to_vec2() + size_value;
         if !min.is_finite() || !size.is_finite() || !max.is_finite() {
             self.scene.record_external_rejection(ScenePrimitive::Rect);
             return Err(SceneError::NonFiniteGeometry(ScenePrimitive::Rect));
+        }
+        if size_value.x <= 0.0 || size_value.y <= 0.0 {
+            self.scene.record_external_rejection(ScenePrimitive::Rect);
+            return Err(SceneError::InvalidDimension(ScenePrimitive::Rect));
         }
         self.scene.try_rect_on_layer(
             layer,
@@ -152,9 +190,20 @@ impl ScreenScene {
                 screen_vec_to_internal(min.to_vec2()),
                 screen_vec_to_internal(max),
             ),
-            corner_radius.get(),
-            style,
+            corner_radius,
+            screen_shape_style_to_internal(style),
         )
+    }
+
+    /// Appends a square-cornered logical-screen rectangle to a shared layer.
+    pub fn try_square_rect_on_layer(
+        &mut self,
+        layer: Layer,
+        min: LogicalScreenPosition,
+        size: LogicalScreenVector,
+        style: ShapeStyle,
+    ) -> Result<(), SceneError> {
+        self.try_rect_with_radius_on_layer(layer, min, size, 0.0, style)
     }
 
     /// Appends a line whose endpoints and width use logical pixels.
@@ -204,6 +253,10 @@ impl ScreenScene {
         to: LogicalScreenPosition,
         style: StrokeStyle2d,
     ) -> Result<(), SceneError> {
+        if style.width_mode() != StrokeWidthMode2d::LogicalPixels {
+            self.scene.record_external_rejection(ScenePrimitive::Line);
+            return Err(SceneError::InvalidStroke(ScenePrimitive::Line));
+        }
         self.scene.try_styled_line_on_layer(
             layer,
             screen_to_internal(from),
@@ -249,6 +302,18 @@ impl ScreenScene {
         points: &[LogicalScreenPosition],
         style: StrokeStyle2d,
     ) -> Result<(), SceneError> {
+        if style.width_mode() != StrokeWidthMode2d::LogicalPixels {
+            self.scene
+                .record_external_rejection(ScenePrimitive::Polyline);
+            return Err(SceneError::InvalidStroke(ScenePrimitive::Polyline));
+        }
+        if let Err(error) =
+            validate_styled_polyline(points.iter().copied().map(screen_to_internal), style)
+        {
+            self.scene
+                .record_external_rejection(ScenePrimitive::Polyline);
+            return Err(error);
+        }
         if let Some(budget) = self.scene.budget() {
             let requested = self
                 .scene
@@ -265,13 +330,25 @@ impl ScreenScene {
                 });
             }
         }
+        let minimum_point_bytes = points.len().saturating_mul(size_of::<Vec2>());
+        if let Err(error) = self.scene.preflight_command_storage(1, minimum_point_bytes) {
+            self.scene
+                .record_external_rejection(ScenePrimitive::Polyline);
+            return Err(error);
+        }
         let mut internal = Vec::new();
-        if internal.try_reserve(points.len()).is_err() {
+        if internal.try_reserve_exact(points.len()).is_err() {
             self.scene
                 .record_external_rejection(ScenePrimitive::Polyline);
             return Err(SceneError::AllocationFailed {
-                requested_bytes: points.len().saturating_mul(size_of::<Vec2>()),
+                requested_bytes: minimum_point_bytes,
             });
+        }
+        let actual_point_bytes = internal.capacity().saturating_mul(size_of::<Vec2>());
+        if let Err(error) = self.scene.preflight_command_storage(1, actual_point_bytes) {
+            self.scene
+                .record_external_rejection(ScenePrimitive::Polyline);
+            return Err(error);
         }
         internal.extend(points.iter().copied().map(screen_to_internal));
         self.scene
@@ -286,8 +363,8 @@ impl ScreenScene {
         end_color: Color,
     ) -> Fill {
         Fill::LinearGradient(LinearGradient::new(
-            screen_to_internal(start),
-            screen_to_internal(end),
+            start.to_vec2(),
+            end.to_vec2(),
             start_color,
             end_color,
         ))
@@ -302,7 +379,7 @@ impl ScreenScene {
         outer_color: Color,
     ) -> Fill {
         Fill::RadialGradient(RadialGradient::new(
-            screen_to_internal(center),
+            center.to_vec2(),
             inner_radius.map_or(0.0, LogicalPixels::get),
             outer_radius.get(),
             inner_color,
@@ -333,6 +410,26 @@ fn screen_vec_to_internal(value: Vec2) -> Vec2 {
     Vec2::new(value.x, -value.y)
 }
 
+fn screen_shape_style_to_internal(style: ShapeStyle) -> ShapeStyle {
+    let fill = style.fill().map(|fill| match fill {
+        Fill::Solid(color) => Fill::Solid(color),
+        Fill::LinearGradient(gradient) => Fill::LinearGradient(LinearGradient::new(
+            screen_vec_to_internal(gradient.start()),
+            screen_vec_to_internal(gradient.end()),
+            gradient.start_color(),
+            gradient.end_color(),
+        )),
+        Fill::RadialGradient(gradient) => Fill::RadialGradient(RadialGradient::new(
+            screen_vec_to_internal(gradient.center()),
+            gradient.inner_radius(),
+            gradient.outer_radius(),
+            gradient.inner_color(),
+            gradient.outer_color(),
+        )),
+    });
+    ShapeStyle::new(fill, style.stroke(), style.shadow())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -355,7 +452,7 @@ mod tests {
 
     #[test]
     fn logical_screen_polyline_checks_budget_before_copying_points() {
-        let budget = SceneBudget::new(1, 2, usize::MAX, usize::MAX, usize::MAX, 1);
+        let budget = SceneBudget::new(1, 2, usize::MAX, usize::MAX, usize::MAX, usize::MAX, 1);
         let mut scene = ScreenScene::with_budget(Color::BLACK, budget).unwrap();
         let points = [
             LogicalScreenPosition::new(0.0, 0.0),
@@ -373,5 +470,173 @@ mod tests {
         );
         assert_eq!(scene.command_count(), 0);
         assert_eq!(scene.statistics().rejected_commands(), 1);
+    }
+
+    #[test]
+    fn logical_screen_polyline_checks_allocation_before_copying_points() {
+        let budget = SceneBudget::new(1, usize::MAX, usize::MAX, usize::MAX, 1, usize::MAX, 1);
+        let mut scene = ScreenScene::with_budget(Color::BLACK, budget).unwrap();
+        let points = [
+            LogicalScreenPosition::new(0.0, 0.0),
+            LogicalScreenPosition::new(1.0, 0.0),
+            LogicalScreenPosition::new(2.0, 0.0),
+        ];
+
+        assert!(matches!(
+            scene.try_polyline(&points, LogicalPixels::new(1.0).unwrap(), Color::WHITE),
+            Err(SceneError::BudgetExceeded {
+                resource: SceneBudgetResource::AllocationBytes,
+                limit: 1,
+                ..
+            })
+        ));
+        assert_eq!(scene.command_count(), 0);
+        assert_eq!(scene.allocation_bytes(), 0);
+        assert_eq!(scene.statistics().rejected_commands(), 1);
+    }
+
+    #[test]
+    fn logical_screen_polyline_validates_before_caller_sized_allocation() {
+        let budget = SceneBudget::new(1, 1, usize::MAX, usize::MAX, 1, usize::MAX, 1);
+        let mut scene = ScreenScene::with_budget(Color::BLACK, budget).unwrap();
+        let non_finite = [
+            LogicalScreenPosition::new(f32::NAN, 0.0),
+            LogicalScreenPosition::new(1.0, 0.0),
+        ];
+
+        assert_eq!(
+            scene.try_polyline(&non_finite, LogicalPixels::new(1.0).unwrap(), Color::WHITE,),
+            Err(SceneError::NonFiniteGeometry(ScenePrimitive::Polyline))
+        );
+        assert_eq!(scene.allocation_bytes(), 0);
+
+        let degenerate = [
+            LogicalScreenPosition::new(0.0, 0.0),
+            LogicalScreenPosition::new(0.0, 0.0),
+            LogicalScreenPosition::new(1.0, 0.0),
+        ];
+        assert_eq!(
+            scene.try_polyline(&degenerate, LogicalPixels::new(1.0).unwrap(), Color::WHITE,),
+            Err(SceneError::DegenerateGeometry(ScenePrimitive::Polyline))
+        );
+        assert_eq!(scene.allocation_bytes(), 0);
+        assert_eq!(scene.statistics().rejected_commands(), 2);
+    }
+
+    #[test]
+    fn logical_screen_styled_paths_reject_world_width_before_allocation() {
+        let mut scene = ScreenScene::new(Color::BLACK).unwrap();
+        let style = StrokeStyle2d::world(crate::WorldLength::new(2.0).unwrap(), Color::WHITE);
+        let start = LogicalScreenPosition::new(0.0, 0.0);
+        let end = LogicalScreenPosition::new(8.0, 0.0);
+
+        assert_eq!(
+            scene.try_styled_line(start, end, style),
+            Err(SceneError::InvalidStroke(ScenePrimitive::Line))
+        );
+        assert_eq!(
+            scene.try_styled_polyline(&[start, end], style),
+            Err(SceneError::InvalidStroke(ScenePrimitive::Polyline))
+        );
+        assert_eq!(scene.command_count(), 0);
+        assert_eq!(scene.allocation_bytes(), 0);
+        assert_eq!(scene.statistics().rejected_commands(), 2);
+    }
+
+    #[test]
+    fn logical_screen_rect_requires_positive_size_at_declared_top_left() {
+        let mut scene = ScreenScene::new(Color::BLACK).unwrap();
+        let min = LogicalScreenPosition::new(100.0, 100.0);
+        for size in [
+            LogicalScreenVector::new(-50.0, 20.0),
+            LogicalScreenVector::new(50.0, -20.0),
+            LogicalScreenVector::new(0.0, 20.0),
+            LogicalScreenVector::new(50.0, 0.0),
+        ] {
+            assert_eq!(
+                scene.try_rect(
+                    min,
+                    size,
+                    LogicalPixels::new(1.0).unwrap(),
+                    ShapeStyle::filled(Color::WHITE),
+                ),
+                Err(SceneError::InvalidDimension(ScenePrimitive::Rect))
+            );
+        }
+        assert_eq!(scene.command_count(), 0);
+        assert_eq!(scene.statistics().rejected_commands(), 4);
+    }
+
+    #[test]
+    fn logical_screen_square_rect_expresses_an_exact_zero_corner_radius() {
+        let mut scene = ScreenScene::new(Color::BLACK).unwrap();
+        scene
+            .try_square_rect(
+                LogicalScreenPosition::new(10.0, 20.0),
+                LogicalScreenVector::new(100.0, 50.0),
+                ShapeStyle::filled(Color::WHITE),
+            )
+            .unwrap();
+
+        let crate::DrawCommand::Rect(rect) = scene.scene.commands()[0].command() else {
+            panic!("square screen rectangle should retain a rectangle command");
+        };
+        assert_eq!(rect.corner_radius(), 0.0);
+        assert_eq!(rect.rect().min(), Vec2::new(10.0, -20.0));
+        assert_eq!(rect.rect().max(), Vec2::new(110.0, -70.0));
+    }
+
+    #[test]
+    fn screen_shape_gradients_are_converted_exactly_once() {
+        let red = Color::rgb8(255, 0, 0);
+        let blue = Color::rgb8(0, 0, 255);
+        let mut scene = ScreenScene::new(Color::BLACK).unwrap();
+        scene
+            .try_rect(
+                LogicalScreenPosition::new(0.0, 0.0),
+                LogicalScreenVector::new(100.0, 100.0),
+                LogicalPixels::new(1.0).unwrap(),
+                ShapeStyle::filled_with(Fill::LinearGradient(LinearGradient::new(
+                    Vec2::ZERO,
+                    Vec2::new(0.0, 100.0),
+                    red,
+                    blue,
+                ))),
+            )
+            .unwrap();
+        scene
+            .try_circle(
+                LogicalScreenPosition::new(20.0, 30.0),
+                LogicalPixels::new(10.0).unwrap(),
+                ShapeStyle::filled_with(ScreenScene::radial_gradient(
+                    LogicalScreenPosition::new(20.0, 30.0),
+                    None,
+                    LogicalPixels::new(10.0).unwrap(),
+                    red,
+                    blue,
+                )),
+            )
+            .unwrap();
+
+        let crate::DrawCommand::Rect(rect) = scene.scene.commands()[0].command() else {
+            panic!("screen rectangle should retain a rectangle command");
+        };
+        let Some(Fill::LinearGradient(linear)) = rect.style().fill() else {
+            panic!("screen rectangle should retain its linear gradient");
+        };
+        assert_eq!(linear.start(), Vec2::ZERO);
+        assert_eq!(linear.end(), Vec2::new(0.0, -100.0));
+        assert_eq!(linear.color_at(Vec2::ZERO), red);
+        assert_eq!(linear.color_at(Vec2::new(0.0, -100.0)), blue);
+
+        let crate::DrawCommand::Circle(circle) = scene.scene.commands()[1].command() else {
+            panic!("screen circle should retain a circle command");
+        };
+        let Some(Fill::RadialGradient(radial)) = circle.style().fill() else {
+            panic!("screen circle should retain its radial gradient");
+        };
+        assert_eq!(radial.center(), Vec2::new(20.0, -30.0));
+        assert_eq!(radial.color_at(Vec2::new(20.0, -30.0)), red);
+        assert_eq!(radial.color_at(Vec2::new(30.0, -30.0)), blue);
     }
 }

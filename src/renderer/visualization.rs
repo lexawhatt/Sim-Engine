@@ -10,7 +10,7 @@ pub(super) struct CompositionPipelines {
 }
 
 pub(super) struct CachedColorMap {
-    pub(super) source: ColorMap,
+    pub(super) lut: [u8; COLOR_MAP_LUT_SIZE as usize * 4],
     pub(super) _texture: wgpu::Texture,
     pub(super) view: wgpu::TextureView,
 }
@@ -103,6 +103,7 @@ pub(super) fn create_composition_pipeline(
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LayeredVisualizationOptions {
     minimum: f32,
+    maximum: f32,
     value_extent: f32,
     sampling: ScalarFieldSampling,
     blend_mode: BlendMode,
@@ -125,6 +126,7 @@ impl LayeredVisualizationOptions {
         }
         Ok(Self {
             minimum,
+            maximum,
             value_extent,
             sampling: ScalarFieldSampling::Linear,
             blend_mode: BlendMode::Replace,
@@ -156,7 +158,7 @@ impl LayeredVisualizationOptions {
 
     /// Returns the finite scalar range represented by the heatmap.
     pub fn value_range(self) -> (f32, f32) {
-        (self.minimum, self.minimum + self.value_extent)
+        (self.minimum, self.maximum)
     }
 
     /// Returns the selected scalar sampling mode.
@@ -175,6 +177,36 @@ impl LayeredVisualizationOptions {
     }
 }
 
+/// Status, timings, and encoded-work counters for one fused scalar/particle frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LayeredVisualizationReport {
+    report: RenderReport,
+    render_pass_count: usize,
+    draw_call_count: usize,
+}
+
+impl LayeredVisualizationReport {
+    /// Returns whether the surface frame was drawn or temporarily skipped.
+    pub fn status(self) -> RenderStatus {
+        self.report.status()
+    }
+
+    /// Returns CPU-side renderer stage timings.
+    pub fn metrics(self) -> RendererFrameMetrics {
+        self.report.metrics()
+    }
+
+    /// Returns render passes actually encoded for this call.
+    pub const fn render_pass_count(self) -> usize {
+        self.render_pass_count
+    }
+
+    /// Returns draw calls actually encoded for this call.
+    pub const fn draw_call_count(self) -> usize {
+        self.draw_call_count
+    }
+}
+
 /// Failure while drawing a bounded scalar-field and particle composition.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum LayeredVisualizationError {
@@ -187,13 +219,13 @@ pub enum LayeredVisualizationError {
         /// Upper scalar endpoint supplied by the host.
         maximum: f32,
     },
-    /// A clear color contains NaN or infinity.
+    /// A clear color is not normalized finite linear RGBA.
     InvalidBackground,
     /// Final composition opacity is outside the normalized finite range.
     InvalidOpacity,
     /// Camera arithmetic cannot produce finite particle geometry.
     InvalidGeometryTransform,
-    /// Surface acquisition or presentation failed.
+    /// Particle preparation, surface acquisition, or frame presentation failed.
     Frame(RendererFrameError),
 }
 
@@ -240,15 +272,89 @@ impl WgpuRenderer {
         particles: &mut ParticleField2d,
         camera: &Camera2d,
         options: LayeredVisualizationOptions,
-    ) -> Result<RenderReport, LayeredVisualizationError> {
+    ) -> Result<LayeredVisualizationReport, LayeredVisualizationError> {
+        let frame_started_at = Instant::now();
+        let preparation_started_at = Instant::now();
         self.validate_render_target(target)
             .map_err(|_| LayeredVisualizationError::RendererMismatch)?;
         self.validate_scalar_field_texture(scalar)
             .map_err(|_| LayeredVisualizationError::RendererMismatch)?;
         self.validate_particle_field(particles)
             .map_err(|_| LayeredVisualizationError::RendererMismatch)?;
+        if !scalar_normalization_is_portable(scalar, options.minimum, options.value_extent) {
+            return Err(LayeredVisualizationError::InvalidValueRange {
+                minimum: options.minimum,
+                maximum: options.maximum,
+            });
+        }
 
-        let frame_started_at = Instant::now();
+        // Particle validation and all fallible host reservation complete before
+        // any heatmap cache or queue mutation.
+        let preparation = self
+            .prepare_particle_draw(particles, *camera)
+            .map_err(|error| match error {
+                RendererFrameError::InvalidGeometryTransform => {
+                    LayeredVisualizationError::InvalidGeometryTransform
+                }
+                other => LayeredVisualizationError::Frame(other),
+            })?;
+        let preparation_duration = preparation_started_at.elapsed();
+
+        let acquire_started_at = Instant::now();
+        let surface_texture = match self.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(texture)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(texture) => texture,
+            wgpu::CurrentSurfaceTexture::Timeout => {
+                particles.statistics = preparation.statistics;
+                return Ok(skipped_layered_report(layered_report(
+                    RenderStatus::Skipped(RendererSurfaceStatus::Timeout),
+                    preparation_duration,
+                    Duration::ZERO,
+                    Duration::ZERO,
+                    acquire_started_at.elapsed(),
+                    Duration::ZERO,
+                    frame_started_at.elapsed(),
+                )));
+            }
+            wgpu::CurrentSurfaceTexture::Occluded => {
+                particles.statistics = preparation.statistics;
+                return Ok(skipped_layered_report(layered_report(
+                    RenderStatus::Skipped(RendererSurfaceStatus::Occluded),
+                    preparation_duration,
+                    Duration::ZERO,
+                    Duration::ZERO,
+                    acquire_started_at.elapsed(),
+                    Duration::ZERO,
+                    frame_started_at.elapsed(),
+                )));
+            }
+            wgpu::CurrentSurfaceTexture::Outdated => {
+                let _ = self.resize(self.config.width, self.config.height);
+                particles.statistics = preparation.statistics;
+                return Ok(skipped_layered_report(layered_report(
+                    RenderStatus::Skipped(RendererSurfaceStatus::Outdated),
+                    preparation_duration,
+                    Duration::ZERO,
+                    Duration::ZERO,
+                    acquire_started_at.elapsed(),
+                    Duration::ZERO,
+                    frame_started_at.elapsed(),
+                )));
+            }
+            wgpu::CurrentSurfaceTexture::Lost => {
+                return Err(LayeredVisualizationError::Frame(
+                    RendererFrameError::Surface(RendererSurfaceStatus::Lost),
+                ));
+            }
+            wgpu::CurrentSurfaceTexture::Validation => {
+                return Err(LayeredVisualizationError::Frame(
+                    RendererFrameError::Surface(RendererSurfaceStatus::Validation),
+                ));
+            }
+        };
+        let surface_acquire = acquire_started_at.elapsed();
+        let (particle_upload, camera_uniform_upload) =
+            self.upload_particle_draw(particles, preparation);
         let upload_started_at = Instant::now();
         let color_map_view = self.color_map_view(color_map);
         let scalar_view = scalar
@@ -305,66 +411,7 @@ impl WgpuRenderer {
                 },
             ],
         });
-        let preparation = self
-            .prepare_particle_draw(particles, *camera)
-            .map_err(|error| match error {
-                RendererFrameError::InvalidGeometryTransform => {
-                    LayeredVisualizationError::InvalidGeometryTransform
-                }
-                other => LayeredVisualizationError::Frame(other),
-            })?;
-        let upload = upload_started_at.elapsed();
-
-        let acquire_started_at = Instant::now();
-        let surface_texture = match self.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(texture)
-            | wgpu::CurrentSurfaceTexture::Suboptimal(texture) => texture,
-            wgpu::CurrentSurfaceTexture::Timeout => {
-                particles.statistics.rendered = 0;
-                return Ok(layered_report(
-                    RenderStatus::Skipped(RendererSurfaceStatus::Timeout),
-                    upload,
-                    preparation.camera_uniform_upload,
-                    acquire_started_at.elapsed(),
-                    Duration::ZERO,
-                    frame_started_at.elapsed(),
-                ));
-            }
-            wgpu::CurrentSurfaceTexture::Occluded => {
-                particles.statistics.rendered = 0;
-                return Ok(layered_report(
-                    RenderStatus::Skipped(RendererSurfaceStatus::Occluded),
-                    upload,
-                    preparation.camera_uniform_upload,
-                    acquire_started_at.elapsed(),
-                    Duration::ZERO,
-                    frame_started_at.elapsed(),
-                ));
-            }
-            wgpu::CurrentSurfaceTexture::Outdated => {
-                self.resize(self.config.width, self.config.height);
-                particles.statistics.rendered = 0;
-                return Ok(layered_report(
-                    RenderStatus::Skipped(RendererSurfaceStatus::Outdated),
-                    upload,
-                    preparation.camera_uniform_upload,
-                    acquire_started_at.elapsed(),
-                    Duration::ZERO,
-                    frame_started_at.elapsed(),
-                ));
-            }
-            wgpu::CurrentSurfaceTexture::Lost => {
-                return Err(LayeredVisualizationError::Frame(
-                    RendererFrameError::Surface(RendererSurfaceStatus::Lost),
-                ));
-            }
-            wgpu::CurrentSurfaceTexture::Validation => {
-                return Err(LayeredVisualizationError::Frame(
-                    RendererFrameError::Surface(RendererSurfaceStatus::Validation),
-                ));
-            }
-        };
-        let surface_acquire = acquire_started_at.elapsed();
+        let upload = combined_layered_upload(particle_upload, upload_started_at.elapsed());
         let encode_started_at = Instant::now();
         let surface_view = surface_texture
             .texture
@@ -378,6 +425,8 @@ impl WgpuRenderer {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("sim-engine layered visualization encoder"),
             });
+        let mut render_pass_count = 0_usize;
+        let mut draw_call_count = 0_usize;
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("sim-engine layered heatmap pass"),
@@ -400,6 +449,8 @@ impl WgpuRenderer {
             pass.set_pipeline(&self.target_heatmap_pipeline);
             pass.set_bind_group(0, &heatmap_bind_group, &[]);
             pass.draw(0..6, 0..1);
+            render_pass_count += 1;
+            draw_call_count += 1;
         }
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -424,7 +475,9 @@ impl WgpuRenderer {
                 pass.set_vertex_buffer(0, self.particle_unit_buffer.slice(..));
                 pass.set_vertex_buffer(1, particles.instance_buffer.slice(..));
                 pass.draw(0..6, 0..preparation.visible_count as u32);
+                draw_call_count += 1;
             }
+            render_pass_count += 1;
         }
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -446,24 +499,43 @@ impl WgpuRenderer {
             pass.set_pipeline(self.composition_pipelines.pipeline(options.blend_mode));
             pass.set_bind_group(0, &composition_bind_group, &[]);
             pass.draw(0..6, 0..1);
+            render_pass_count += 1;
+            draw_call_count += 1;
         }
         self.queue.submit([encoder.finish()]);
         self.notify_before_present();
         self.queue.present(surface_texture);
-        particles.statistics.rendered = preparation.visible_count;
-        Ok(layered_report(
-            RenderStatus::Drawn,
-            upload,
-            preparation.camera_uniform_upload,
-            surface_acquire,
-            encode_started_at.elapsed(),
-            frame_started_at.elapsed(),
-        ))
+        particles.statistics = ParticleStatistics {
+            rendered: preparation.visible_count,
+            ..preparation.statistics
+        };
+        Ok(LayeredVisualizationReport {
+            report: layered_report(
+                RenderStatus::Drawn,
+                preparation_duration,
+                upload,
+                camera_uniform_upload,
+                surface_acquire,
+                encode_started_at.elapsed(),
+                frame_started_at.elapsed(),
+            ),
+            render_pass_count,
+            draw_call_count,
+        })
+    }
+}
+
+fn skipped_layered_report(report: RenderReport) -> LayeredVisualizationReport {
+    LayeredVisualizationReport {
+        report,
+        render_pass_count: 0,
+        draw_call_count: 0,
     }
 }
 
 fn layered_report(
     status: RenderStatus,
+    preparation: Duration,
     upload: Duration,
     camera_uniform_upload: Duration,
     surface_acquire: Duration,
@@ -472,7 +544,7 @@ fn layered_report(
 ) -> RenderReport {
     render_report(
         status,
-        Duration::ZERO,
+        preparation,
         upload,
         camera_uniform_upload,
         surface_acquire,
@@ -482,4 +554,52 @@ fn layered_report(
         true,
         TessellationStats::default(),
     )
+}
+
+fn combined_layered_upload(particle_upload: Duration, remaining_upload: Duration) -> Duration {
+    particle_upload.saturating_add(remaining_upload)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{combined_layered_upload, layered_report, skipped_layered_report};
+    use crate::{RenderStatus, RendererSurfaceStatus};
+    use std::time::Duration;
+
+    #[test]
+    fn layered_upload_includes_particle_and_composition_uploads() {
+        assert_eq!(
+            combined_layered_upload(Duration::from_millis(7), Duration::from_millis(3)),
+            Duration::from_millis(10)
+        );
+    }
+
+    #[test]
+    fn layered_reports_completed_preparation_for_drawn_and_skipped_frames() {
+        let preparation = Duration::from_millis(4);
+        let drawn = layered_report(
+            RenderStatus::Drawn,
+            preparation,
+            Duration::ZERO,
+            Duration::ZERO,
+            Duration::ZERO,
+            Duration::ZERO,
+            preparation,
+        );
+        let skipped = layered_report(
+            RenderStatus::Skipped(RendererSurfaceStatus::Timeout),
+            preparation,
+            Duration::ZERO,
+            Duration::ZERO,
+            Duration::from_millis(1),
+            Duration::ZERO,
+            Duration::from_millis(5),
+        );
+
+        assert_eq!(drawn.metrics().tessellation(), preparation);
+        assert_eq!(skipped.metrics().tessellation(), preparation);
+        let skipped = skipped_layered_report(skipped);
+        assert_eq!(skipped.render_pass_count(), 0);
+        assert_eq!(skipped.draw_call_count(), 0);
+    }
 }

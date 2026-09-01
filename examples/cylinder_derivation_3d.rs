@@ -488,8 +488,10 @@ impl ApplicationHandler for CylinderApplication {
                 window.request_redraw();
             }
             WindowEvent::Resized(size) => {
-                if let Some(renderer) = self.renderer.as_mut() {
-                    renderer.resize(size.width, size.height);
+                if let Some(renderer) = self.renderer.as_mut()
+                    && let Err(error) = renderer.resize(size.width, size.height)
+                {
+                    eprintln!("resize rejected: {error}");
                 }
                 self.recreate_target(size.width, size.height);
             }

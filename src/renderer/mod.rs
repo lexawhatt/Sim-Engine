@@ -20,9 +20,15 @@ use config::select_surface_present_mode;
 const INITIAL_VERTEX_CAPACITY: usize = 4096;
 const PREFERRED_SAMPLE_COUNT: u32 = 4;
 const COLOR_MAP_LUT_SIZE: u32 = 256;
-// Below 2^-102 adjacent normal f32 values can differ by a subnormal amount.
-// Such sources require exact tuple validation after camera-relative subtraction.
-const FTZ_SENSITIVE_SOURCE_LIMIT: f32 = f32::MIN_POSITIVE * 16_777_216.0;
+// Stay inside the WGSL division accuracy domain and reject denormal geometric
+// operands. This deliberately narrow transform envelope is shared by every GPU path.
+const MAX_PORTABLE_SHADER_VALUE: f32 = f32::from_bits((247_u32) << 23); // 2^120
+
+fn is_portable_shader_source(value: f32) -> bool {
+    value.is_finite()
+        && value.abs() <= MAX_PORTABLE_SHADER_VALUE
+        && (value == 0.0 || value.abs() >= f32::MIN_POSITIVE)
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
@@ -162,7 +168,7 @@ pub enum BlendMode {
 pub enum RenderTargetLoad {
     /// Preserve existing target pixels and blend new geometry over them.
     Load,
-    /// Clear the target to a finite straight-alpha color before drawing.
+    /// Clear the target to normalized finite straight-linear RGBA before drawing.
     Clear(Color),
 }
 
@@ -181,7 +187,6 @@ struct GeometryExtents {
     tangent_distance_max_abs: f32,
     miter_limit_max: f32,
     vertex_count: usize,
-    requires_ftz_fallback: bool,
     empty: bool,
 }
 
@@ -195,9 +200,9 @@ struct ScissorRect {
 
 #[derive(Debug, Clone, Copy)]
 struct ParticleDrawPreparation {
+    camera_uniform: CameraUniform,
     visible_count: usize,
-    upload: Duration,
-    camera_uniform_upload: Duration,
+    statistics: ParticleStatistics,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -391,54 +396,63 @@ impl ParticleGpu {
         )
     }
 
-    fn is_safe_for(self, camera: CameraUniform) -> bool {
-        self.projected_screen_bounds(camera)
-            .is_some_and(|bounds| Self::screen_bounds_are_safe_for_clip(bounds, camera))
+    fn is_safe_for(self, camera: CameraUniform, viewport: LogicalViewport) -> bool {
+        self.validated_viewport_intersection(camera, viewport)
+            .is_some()
+    }
+
+    fn transform_sources_are_portable(self) -> bool {
+        self.world_position
+            .into_iter()
+            .chain([self.depth, self.radius])
+            .all(is_portable_shader_source)
     }
 
     fn projected_screen_bounds(self, camera: CameraUniform) -> Option<((f64, f64), (f64, f64))> {
-        let relative_x = self.world_position[0] - camera.camera_center[0];
-        let relative_y = self.world_position[1] - camera.camera_center[1];
-        if !relative_x.is_finite() || !relative_y.is_finite() {
-            return None;
-        }
-        let relative = [relative_x, relative_y];
-        let projected_x = shader_world_dot_range(
-            camera.world_to_screen_x,
-            relative,
-            relative,
-            self.depth,
-            self.depth,
-        )?;
-        let projected_y = shader_world_dot_range(
-            camera.world_to_screen_y,
-            relative,
-            relative,
-            self.depth,
-            self.depth,
-        )?;
+        let center = self.projected_screen_center_bounds(camera)?;
         let radius = f64::from(self.radius);
         Some((
-            shader_interval_sum_range([projected_x, (-radius, radius)])?,
-            shader_interval_sum_range([projected_y, (-radius, radius)])?,
+            shader_interval_sum_range([center.0, (-radius, radius)])?,
+            shader_interval_sum_range([center.1, (-radius, radius)])?,
         ))
     }
 
-    fn screen_bounds_are_safe_for_clip(
-        bounds: ((f64, f64), (f64, f64)),
+    fn projected_screen_center_bounds(
+        self,
         camera: CameraUniform,
-    ) -> bool {
-        shader_clip_interval_is_safe(
-            bounds.0.0,
-            bounds.0.1,
-            camera.screen_to_clip[0],
-            camera.screen_to_clip[2],
-        ) && shader_clip_interval_is_safe(
-            bounds.1.0,
-            bounds.1.1,
-            camera.screen_to_clip[1],
-            camera.screen_to_clip[3],
-        )
+    ) -> Option<((f64, f64), (f64, f64))> {
+        let relative_x = shader_relative_component_bounds(
+            self.world_position[0],
+            self.world_position[0],
+            camera.camera_center[0],
+            0.0,
+            0.0,
+        )?;
+        let relative_y = shader_relative_component_bounds(
+            self.world_position[1],
+            self.world_position[1],
+            camera.camera_center[1],
+            0.0,
+            0.0,
+        )?;
+        let relative_minimum = [relative_x.0, relative_y.0];
+        let relative_maximum = [relative_x.1, relative_y.1];
+        Some((
+            shader_world_dot_range(
+                camera.world_to_screen_x,
+                relative_minimum,
+                relative_maximum,
+                self.depth,
+                self.depth,
+            )?,
+            shader_world_dot_range(
+                camera.world_to_screen_y,
+                relative_minimum,
+                relative_maximum,
+                self.depth,
+                self.depth,
+            )?,
+        ))
     }
 
     fn screen_bounds_intersect_viewport(
@@ -456,9 +470,77 @@ impl ParticleGpu {
         camera: CameraUniform,
         viewport: LogicalViewport,
     ) -> Option<bool> {
-        let bounds = self.projected_screen_bounds(camera)?;
-        Self::screen_bounds_are_safe_for_clip(bounds, camera)
-            .then(|| Self::screen_bounds_intersect_viewport(bounds, viewport))
+        if !self.transform_sources_are_portable() || !camera.sources_are_portable() {
+            return None;
+        }
+        let center = self.projected_screen_center_bounds(camera)?;
+        if !self.clip_expansion_is_stable(center, camera) {
+            return None;
+        }
+        let radius = f64::from(self.radius);
+        let width = f64::from(viewport.width());
+        let height = f64::from(viewport.height());
+        let wholly_outside = center.0.1 + radius < 0.0
+            || center.0.0 - radius > width
+            || center.1.1 + radius < 0.0
+            || center.1.0 - radius > height;
+        if wholly_outside {
+            return Some(false);
+        }
+        // Every permitted dot/FMA association must leave a positive-area
+        // portion of the quad inside the viewport. If visibility itself can
+        // change between legal shader lowerings, fail closed before upload.
+        let always_intersects = center.0.0 + radius > 0.0
+            && center.0.1 - radius < width
+            && center.1.0 + radius > 0.0
+            && center.1.1 - radius < height;
+        always_intersects.then_some(true)
+    }
+
+    fn clip_expansion_is_stable(
+        self,
+        center: ((f64, f64), (f64, f64)),
+        camera: CameraUniform,
+    ) -> bool {
+        (0..2).all(|axis| {
+            let center_clip = rounded_f32_product_range(
+                center_axis(center, axis),
+                (
+                    f64::from(camera.screen_to_clip[axis]),
+                    f64::from(camera.screen_to_clip[axis]),
+                ),
+            )
+            .and_then(|scaled| {
+                rounded_f32_add_range(
+                    scaled,
+                    (
+                        f64::from(camera.screen_to_clip[axis + 2]),
+                        f64::from(camera.screen_to_clip[axis + 2]),
+                    ),
+                    false,
+                )
+            });
+            let extent = rounded_f32_product_range(
+                (f64::from(self.radius), f64::from(self.radius)),
+                (
+                    f64::from(camera.screen_to_clip[axis].abs()),
+                    f64::from(camera.screen_to_clip[axis].abs()),
+                ),
+            );
+            let (Some(center_clip), Some(extent)) = (center_clip, extent) else {
+                return false;
+            };
+            if extent.0 < f64::from(f32::MIN_POSITIVE) {
+                return false;
+            }
+            let Some(negative) = rounded_f32_add_range(center_clip, extent, true) else {
+                return false;
+            };
+            let Some(positive) = rounded_f32_add_range(center_clip, extent, false) else {
+                return false;
+            };
+            positive.0 - negative.1 >= f64::from(f32::MIN_POSITIVE)
+        })
     }
 
     fn intersects_viewport(self, camera: CameraUniform, viewport: LogicalViewport) -> bool {
@@ -468,6 +550,10 @@ impl ParticleGpu {
         self.projected_screen_bounds(camera)
             .is_none_or(|bounds| Self::screen_bounds_intersect_viewport(bounds, viewport))
     }
+}
+
+fn center_axis(center: ((f64, f64), (f64, f64)), axis: usize) -> (f64, f64) {
+    if axis == 0 { center.0 } else { center.1 }
 }
 
 impl CameraUniform {
@@ -519,7 +605,16 @@ impl CameraUniform {
                 1.0,
             ],
         };
-        uniform.is_finite().then_some(uniform)
+        (uniform.is_finite() && uniform.sources_are_portable()).then_some(uniform)
+    }
+
+    fn sources_are_portable(self) -> bool {
+        self.camera_center
+            .into_iter()
+            .chain(self.world_to_screen_x)
+            .chain(self.world_to_screen_y)
+            .chain(self.screen_to_clip)
+            .all(is_portable_shader_source)
     }
 
     fn is_finite(self) -> bool {
@@ -570,7 +665,6 @@ impl GeometryExtents {
             tangent_distance_max_abs: 0.0,
             miter_limit_max: 1.0,
             vertex_count: 0,
-            requires_ftz_fallback: false,
             empty: is_empty,
         }
     }
@@ -583,19 +677,14 @@ impl GeometryExtents {
         self.world_max.x = self.world_max.x.max(world.x);
         self.world_max.y = self.world_max.y.max(world.y);
         let world_offset = Vec2::new(vertex.world_offset[0], vertex.world_offset[1]);
-        self.requires_ftz_fallback |= [world.x, world.y, world_offset.x, world_offset.y]
-            .into_iter()
-            .any(is_ftz_sensitive_source);
         self.world_offset_min.x = self.world_offset_min.x.min(world_offset.x);
         self.world_offset_min.y = self.world_offset_min.y.min(world_offset.y);
         self.world_offset_max.x = self.world_offset_max.x.max(world_offset.x);
         self.world_offset_max.y = self.world_offset_max.y.max(world_offset.y);
         self.depth_min = self.depth_min.min(vertex.depth);
         self.depth_max = self.depth_max.max(vertex.depth);
-        self.requires_ftz_fallback |= is_nonzero_subnormal(vertex.depth);
 
         for direction in [vertex.previous_direction, vertex.next_direction] {
-            self.requires_ftz_fallback |= direction.into_iter().any(is_nonzero_subnormal);
             self.direction_min.x = self.direction_min.x.min(direction[0]);
             self.direction_min.y = self.direction_min.y.min(direction[1]);
             self.direction_max.x = self.direction_max.x.max(direction[0]);
@@ -610,7 +699,6 @@ impl GeometryExtents {
             .screen_offset_max_abs
             .y
             .max(vertex.screen_offset[1].abs());
-        self.requires_ftz_fallback |= vertex.screen_offset.into_iter().any(is_nonzero_subnormal);
         self.normal_distance_max_abs = self
             .normal_distance_max_abs
             .max(vertex.normal_distance.abs());
@@ -618,15 +706,11 @@ impl GeometryExtents {
             .tangent_distance_max_abs
             .max(vertex.tangent_distance.abs());
         self.miter_limit_max = self.miter_limit_max.max(vertex.miter_limit);
-        self.requires_ftz_fallback |= is_nonzero_subnormal(vertex.normal_distance)
-            || is_nonzero_subnormal(vertex.tangent_distance);
     }
 
     fn include_dynamic(&mut self, vertex: DynamicGpu) {
         self.vertex_count += 1;
         let world = Vec2::new(vertex.world_position[0], vertex.world_position[1]);
-        self.requires_ftz_fallback |= [world.x, world.y].into_iter().any(is_ftz_sensitive_source)
-            || is_nonzero_subnormal(vertex.depth);
         self.world_min.x = self.world_min.x.min(world.x);
         self.world_min.y = self.world_min.y.min(world.y);
         self.world_max.x = self.world_max.x.max(world.x);
@@ -660,22 +744,16 @@ impl GeometryExtents {
         if self.empty {
             return true;
         }
-        if self.vertex_count > 1 && self.requires_ftz_fallback {
-            return false;
-        }
-
         let center = Vec2::new(uniform.camera_center[0], uniform.camera_center[1]);
-        // Match the vertex shader's operation order. The shader forms
-        // `(world_position - camera_center) + world_offset` in f32 before it
-        // applies either camera row. A small zoom can make the final projected
-        // value look safe in f64 even though that intermediate addition has
-        // already overflowed on the GPU.
+        // Match the vertex shader's split-anchor operation order. Generated
+        // local offsets are projected separately so they cannot disappear
+        // when their world anchor is much larger than the local geometry.
         let Some(relative_horizontal) = shader_relative_component_bounds(
             self.world_min.x,
             self.world_max.x,
             center.x,
-            self.world_offset_min.x,
-            self.world_offset_max.x,
+            0.0,
+            0.0,
         ) else {
             return false;
         };
@@ -683,14 +761,14 @@ impl GeometryExtents {
             self.world_min.y,
             self.world_max.y,
             center.y,
-            self.world_offset_min.y,
-            self.world_offset_max.y,
+            0.0,
+            0.0,
         ) else {
             return false;
         };
         let relative_minimum = [relative_horizontal.0, relative_vertical.0];
         let relative_maximum = [relative_horizontal.1, relative_vertical.1];
-        let Some(world_horizontal) = shader_world_dot_range(
+        let Some(projected_world_horizontal) = shader_world_dot_range(
             uniform.world_to_screen_x,
             relative_minimum,
             relative_maximum,
@@ -699,13 +777,37 @@ impl GeometryExtents {
         ) else {
             return false;
         };
-        let Some(world_vertical) = shader_world_dot_range(
+        let Some(projected_world_vertical) = shader_world_dot_range(
             uniform.world_to_screen_y,
             relative_minimum,
             relative_maximum,
             self.depth_min,
             self.depth_max,
         ) else {
+            return false;
+        };
+        let Some(projected_offset_horizontal) = shader_direction_dot_range(
+            uniform.world_to_screen_x,
+            self.world_offset_min,
+            self.world_offset_max,
+        ) else {
+            return false;
+        };
+        let Some(projected_offset_vertical) = shader_direction_dot_range(
+            uniform.world_to_screen_y,
+            self.world_offset_min,
+            self.world_offset_max,
+        ) else {
+            return false;
+        };
+        let Some(world_horizontal) =
+            shader_interval_sum_range([projected_world_horizontal, projected_offset_horizontal])
+        else {
+            return false;
+        };
+        let Some(world_vertical) =
+            shader_interval_sum_range([projected_world_vertical, projected_offset_vertical])
+        else {
             return false;
         };
         let Some(direction_horizontal) = shader_direction_dot_range(
@@ -722,7 +824,6 @@ impl GeometryExtents {
         ) else {
             return false;
         };
-        let maximum_miter = self.normal_distance_max_abs as f64 * self.miter_limit_max as f64;
         if [
             self.screen_offset_max_abs.x,
             self.screen_offset_max_abs.y,
@@ -734,20 +835,24 @@ impl GeometryExtents {
         {
             return false;
         }
-        let horizontal_padding = self.screen_offset_max_abs.x as f64
-            + maximum_miter
-            + self.tangent_distance_max_abs as f64;
-        let vertical_padding = self.screen_offset_max_abs.y as f64
-            + maximum_miter
-            + self.tangent_distance_max_abs as f64;
-        let horizontal_bounds = (
-            world_horizontal.0 - horizontal_padding,
-            world_horizontal.1 + horizontal_padding,
-        );
-        let vertical_bounds = (
-            world_vertical.0 - vertical_padding,
-            world_vertical.1 + vertical_padding,
-        );
+        let Some(horizontal_bounds) = shader_stroke_screen_bounds(
+            world_horizontal,
+            self.screen_offset_max_abs.x,
+            self.normal_distance_max_abs,
+            self.tangent_distance_max_abs,
+            self.miter_limit_max,
+        ) else {
+            return false;
+        };
+        let Some(vertical_bounds) = shader_stroke_screen_bounds(
+            world_vertical,
+            self.screen_offset_max_abs.y,
+            self.normal_distance_max_abs,
+            self.tangent_distance_max_abs,
+            self.miter_limit_max,
+        ) else {
+            return false;
+        };
 
         if !shader_clip_interval_is_safe(
             horizontal_bounds.0,
@@ -782,6 +887,32 @@ impl GeometryExtents {
     }
 }
 
+fn shader_stroke_screen_bounds(
+    world_screen: (f64, f64),
+    screen_offset_max_abs: f32,
+    normal_distance_max_abs: f32,
+    tangent_distance_max_abs: f32,
+    miter_limit_max: f32,
+) -> Option<(f64, f64)> {
+    // `safe_unit` and the miter path are backend-selected inverse-square-root
+    // arithmetic. A component of a mathematically unit vector is at most one;
+    // two is a deliberately loose portable bound that also contains its
+    // permitted approximation error. Propagate the shader's two additions
+    // separately so a tiny later clip scale cannot hide screen-space overflow.
+    const UNIT_COMPONENT_BOUND: f64 = 2.0;
+    let normal = f64::from(normal_distance_max_abs);
+    let tangent = f64::from(tangent_distance_max_abs);
+    let miter = normal * f64::from(miter_limit_max.max(1.0));
+    let normal_component = UNIT_COMPONENT_BOUND * normal.max(miter);
+    let tangent_component = UNIT_COMPONENT_BOUND * tangent;
+    let extrusion = shader_interval_sum_range([
+        (-normal_component, normal_component),
+        (-tangent_component, tangent_component),
+    ])?;
+    let offset = f64::from(screen_offset_max_abs);
+    shader_interval_sum_range([world_screen, extrusion, (-offset, offset)])
+}
+
 #[derive(Clone, Copy)]
 enum GeometryValidationSource<'a> {
     Tessellated(&'a [Vertex]),
@@ -793,136 +924,822 @@ fn geometry_is_safe_for(
     source: GeometryValidationSource<'_>,
     uniform: CameraUniform,
 ) -> bool {
-    if extents.is_safe_for(uniform) {
-        return true;
-    }
-
-    match source {
-        GeometryValidationSource::Tessellated(vertices) => vertices
-            .iter()
-            .copied()
-            .all(|vertex| tessellated_vertex_is_safe_for(vertex, uniform)),
-        GeometryValidationSource::Dynamic(vertices) => vertices
-            .iter()
-            .copied()
-            .all(|vertex| dynamic_vertex_is_safe_for(vertex, uniform)),
-    }
+    geometry_sources_are_portable(source)
+        && match source {
+            GeometryValidationSource::Tessellated(vertices) => {
+                geometry_vertex_centers_are_portable(source, uniform)
+                    && tessellated_triangle_topology_is_portable(vertices, uniform)
+                    && vertices
+                        .iter()
+                        .all(|vertex| logical_stroke_branches_are_stable(*vertex, uniform))
+            }
+            GeometryValidationSource::Dynamic(vertices) => {
+                // The triangle proof projects every vertex itself, so do not
+                // duplicate the same per-vertex dot envelopes first.
+                dynamic_triangle_topology_is_portable(vertices, uniform)
+            }
+        }
+        && uniform.sources_are_portable()
+        && extents.is_safe_for(uniform)
 }
 
-fn dynamic_vertex_is_safe_for(vertex: DynamicGpu, uniform: CameraUniform) -> bool {
-    let Some((horizontal, vertical)) =
-        exact_2d_screen_ranges(vertex.world_position, [0.0, 0.0], vertex.depth, uniform)
-    else {
+fn dynamic_triangle_topology_is_portable(vertices: &[DynamicGpu], uniform: CameraUniform) -> bool {
+    if !vertices.len().is_multiple_of(3) {
         return false;
-    };
-    exact_clip_interval_is_safe(
-        horizontal.0,
-        horizontal.1,
-        uniform.screen_to_clip[0],
-        uniform.screen_to_clip[2],
-    ) && exact_clip_interval_is_safe(
-        vertical.0,
-        vertical.1,
-        uniform.screen_to_clip[1],
-        uniform.screen_to_clip[3],
-    )
-}
-
-fn exact_clip_interval_is_safe(
-    screen_minimum: f64,
-    screen_maximum: f64,
-    scale: f32,
-    offset: f32,
-) -> bool {
-    f64::from(screen_minimum as f32) == screen_minimum
-        && f64::from(screen_maximum as f32) == screen_maximum
-        && [screen_minimum as f32, screen_maximum as f32]
-            .into_iter()
-            .all(|screen| {
-                exact_shader_dot_source_range([scale, offset, 0.0, 0.0], [screen, 1.0, 0.0, 0.0])
-                    .is_some()
-            })
-}
-
-fn exact_2d_screen_ranges(
-    world: [f32; 2],
-    world_offset: [f32; 2],
-    depth: f32,
-    uniform: CameraUniform,
-) -> Option<((f64, f64), (f64, f64))> {
-    let mut relative = [(0.0_f32, 0.0_f32); 2];
-    for axis in 0..2 {
-        let subtracted =
-            exact_shader_binary_source_range(world[axis], uniform.camera_center[axis], true)?;
-        let first = exact_shader_binary_source_range(subtracted.0, world_offset[axis], false)?;
-        let second = exact_shader_binary_source_range(subtracted.1, world_offset[axis], false)?;
-        relative[axis] = (first.0.min(second.0), first.1.max(second.1));
     }
-
-    let mut output = [(f64::INFINITY, f64::NEG_INFINITY); 2];
-    for relative_x in distinct_range_endpoints(relative[0]) {
-        for relative_y in distinct_range_endpoints(relative[1]) {
-            let point = [relative_x, relative_y, depth, 1.0];
-            for (axis, row) in [uniform.world_to_screen_x, uniform.world_to_screen_y]
-                .into_iter()
-                .enumerate()
-            {
-                let range = exact_shader_dot_source_range(row, point)?;
-                output[axis].0 = output[axis].0.min(range.0);
-                output[axis].1 = output[axis].1.max(range.1);
-            }
+    let minimum_normal = f64::from(f32::MIN_POSITIVE);
+    for triangle in vertices.chunks_exact(3) {
+        let Some(first) = dynamic_vertex_clip_ranges(triangle[0], uniform) else {
+            return false;
+        };
+        let Some(second) = dynamic_vertex_clip_ranges(triangle[1], uniform) else {
+            return false;
+        };
+        let Some(third) = dynamic_vertex_clip_ranges(triangle[2], uniform) else {
+            return false;
+        };
+        let clip = [first, second, third];
+        if clip_triangle_is_wholly_outside(clip) {
+            continue;
         }
-    }
-    output
-        .into_iter()
-        .all(|range| range.0.is_finite() && range.1.is_finite())
-        .then_some((output[0], output[1]))
-}
-
-fn distinct_range_endpoints(range: (f32, f32)) -> impl Iterator<Item = f32> {
-    [Some(range.0), (range.1 != range.0).then_some(range.1)]
-        .into_iter()
-        .flatten()
-}
-
-fn exact_shader_binary_source_range(left: f32, right: f32, subtract: bool) -> Option<(f32, f32)> {
-    let left_values = [left, 0.0];
-    let right_values = [right, 0.0];
-    let left_len = if is_nonzero_subnormal(left) { 2 } else { 1 };
-    let right_len = if is_nonzero_subnormal(right) { 2 } else { 1 };
-    let mut minimum = f32::INFINITY;
-    let mut maximum = f32::NEG_INFINITY;
-    for &left in &left_values[..left_len] {
-        for &right in &right_values[..right_len] {
-            let result = if subtract { left - right } else { left + right };
-            if !result.is_finite() {
-                return None;
-            }
-            minimum = minimum.min(result);
-            maximum = maximum.max(result);
-            if is_nonzero_subnormal(result) {
-                minimum = minimum.min(0.0);
-                maximum = maximum.max(0.0);
-            }
+        if !clip_triangle_is_wholly_inside(clip) {
+            // v0.2 does not yet carry conservative interval polygons through
+            // hardware clipping. Reject partially clipped dynamic triangles
+            // rather than permit backend-selected topology.
+            return false;
         }
-    }
-    Some((minimum, maximum))
-}
-
-fn tessellated_vertex_is_safe_for(vertex: Vertex, uniform: CameraUniform) -> bool {
-    let mut extents = GeometryExtents::from_vertices(std::slice::from_ref(&vertex));
-    // `previous_direction` and `next_direction` are two independent shader
-    // dots. Do not synthesize a direction by mixing components from the two
-    // tuples when the scene-wide envelope needs its exact fallback.
-    for direction in [vertex.previous_direction, vertex.next_direction] {
-        let direction = Vec2::new(direction[0], direction[1]);
-        extents.direction_min = direction;
-        extents.direction_max = direction;
-        if !extents.is_safe_for(uniform) {
+        if !clip_triangle_has_stable_signed_area(clip, minimum_normal) {
             return false;
         }
     }
     true
+}
+
+fn tessellated_triangle_topology_is_portable(vertices: &[Vertex], uniform: CameraUniform) -> bool {
+    if !vertices.len().is_multiple_of(3) {
+        return false;
+    }
+    let minimum_normal = f64::from(f32::MIN_POSITIVE);
+    for triangle in vertices.chunks_exact(3) {
+        let has_shader_extrusion = !triangle
+            .iter()
+            .all(|vertex| vertex.normal_distance == 0.0 && vertex.tangent_distance == 0.0);
+        if has_shader_extrusion {
+            let Some(first) = logical_stroke_vertex_screen_ranges(triangle[0], uniform) else {
+                return false;
+            };
+            let Some(second) = logical_stroke_vertex_screen_ranges(triangle[1], uniform) else {
+                return false;
+            };
+            let Some(third) = logical_stroke_vertex_screen_ranges(triangle[2], uniform) else {
+                return false;
+            };
+            if [first, second, third].iter().all(|output| output.1)
+                && triangle_position_sources_equal(triangle)
+            {
+                continue;
+            }
+            let Some(first) = screen_ranges_to_clip(first.0, uniform) else {
+                return false;
+            };
+            let Some(second) = screen_ranges_to_clip(second.0, uniform) else {
+                return false;
+            };
+            let Some(third) = screen_ranges_to_clip(third.0, uniform) else {
+                return false;
+            };
+            let clip = [first, second, third];
+            if !clip_triangle_is_wholly_outside(clip)
+                && !clip_triangle_has_stable_signed_area(clip, minimum_normal)
+            {
+                return false;
+            }
+            continue;
+        }
+        let Some(first) = tessellated_vertex_clip_ranges(triangle[0], uniform) else {
+            return false;
+        };
+        let Some(second) = tessellated_vertex_clip_ranges(triangle[1], uniform) else {
+            return false;
+        };
+        let Some(third) = tessellated_vertex_clip_ranges(triangle[2], uniform) else {
+            return false;
+        };
+        let clip = [first, second, third];
+        if clip_triangle_is_wholly_outside(clip) {
+            continue;
+        }
+        if !clip_triangle_has_stable_signed_area(clip, minimum_normal) {
+            return false;
+        }
+    }
+    true
+}
+
+fn clip_triangle_is_wholly_outside(clip: [[(f64, f64); 2]; 3]) -> bool {
+    (0..2).any(|axis| {
+        clip.iter().all(|point| point[axis].1 < -1.0)
+            || clip.iter().all(|point| point[axis].0 > 1.0)
+    })
+}
+
+fn clip_triangle_is_wholly_inside(clip: [[(f64, f64); 2]; 3]) -> bool {
+    clip.iter()
+        .all(|point| point.iter().all(|axis| axis.0 >= -1.0 && axis.1 <= 1.0))
+}
+
+fn clip_triangle_has_stable_signed_area(
+    clip: [[(f64, f64); 2]; 3],
+    minimum_magnitude: f64,
+) -> bool {
+    let Some(first_x) = shader_interval_difference(clip[1][0], clip[0][0]) else {
+        return false;
+    };
+    let Some(first_y) = shader_interval_difference(clip[2][1], clip[0][1]) else {
+        return false;
+    };
+    let Some(second_y) = shader_interval_difference(clip[1][1], clip[0][1]) else {
+        return false;
+    };
+    let Some(second_x) = shader_interval_difference(clip[2][0], clip[0][0]) else {
+        return false;
+    };
+    let Some(positive) = shader_interval_product(first_x, first_y) else {
+        return false;
+    };
+    let Some(negative) = shader_interval_product(second_y, second_x) else {
+        return false;
+    };
+    let Some(area) = shader_interval_difference(positive, negative) else {
+        return false;
+    };
+    area.0 >= minimum_magnitude || area.1 <= -minimum_magnitude
+}
+
+fn dynamic_vertex_clip_ranges(
+    vertex: DynamicGpu,
+    uniform: CameraUniform,
+) -> Option<[(f64, f64); 2]> {
+    let relative_x = shader_relative_component_bounds(
+        vertex.world_position[0],
+        vertex.world_position[0],
+        uniform.camera_center[0],
+        0.0,
+        0.0,
+    )?;
+    let relative_y = shader_relative_component_bounds(
+        vertex.world_position[1],
+        vertex.world_position[1],
+        uniform.camera_center[1],
+        0.0,
+        0.0,
+    )?;
+    let minimum = [relative_x.0, relative_y.0];
+    let maximum = [relative_x.1, relative_y.1];
+    let screen = [
+        shader_world_dot_range(
+            uniform.world_to_screen_x,
+            minimum,
+            maximum,
+            vertex.depth,
+            vertex.depth,
+        )?,
+        shader_world_dot_range(
+            uniform.world_to_screen_y,
+            minimum,
+            maximum,
+            vertex.depth,
+            vertex.depth,
+        )?,
+    ];
+    screen_ranges_to_clip(screen, uniform)
+}
+
+fn tessellated_vertex_clip_ranges(
+    vertex: Vertex,
+    uniform: CameraUniform,
+) -> Option<[(f64, f64); 2]> {
+    screen_ranges_to_clip(tessellated_vertex_screen_ranges(vertex, uniform)?, uniform)
+}
+
+fn tessellated_vertex_screen_ranges(
+    vertex: Vertex,
+    uniform: CameraUniform,
+) -> Option<[(f64, f64); 2]> {
+    let base = tessellated_vertex_base_screen_ranges(vertex, uniform)?;
+    Some([
+        rounded_f32_add_range(
+            base[0],
+            (
+                f64::from(vertex.screen_offset[0]),
+                f64::from(vertex.screen_offset[0]),
+            ),
+            false,
+        )?,
+        rounded_f32_add_range(
+            base[1],
+            (
+                f64::from(vertex.screen_offset[1]),
+                f64::from(vertex.screen_offset[1]),
+            ),
+            false,
+        )?,
+    ])
+}
+
+fn tessellated_vertex_base_screen_ranges(
+    vertex: Vertex,
+    uniform: CameraUniform,
+) -> Option<[(f64, f64); 2]> {
+    let relative_x = shader_relative_component_bounds(
+        vertex.world_position[0],
+        vertex.world_position[0],
+        uniform.camera_center[0],
+        0.0,
+        0.0,
+    )?;
+    let relative_y = shader_relative_component_bounds(
+        vertex.world_position[1],
+        vertex.world_position[1],
+        uniform.camera_center[1],
+        0.0,
+        0.0,
+    )?;
+    let minimum = [relative_x.0, relative_y.0];
+    let maximum = [relative_x.1, relative_y.1];
+    let world_offset = Vec2::new(vertex.world_offset[0], vertex.world_offset[1]);
+    Some([
+        shader_interval_sum_range([
+            shader_world_dot_range(
+                uniform.world_to_screen_x,
+                minimum,
+                maximum,
+                vertex.depth,
+                vertex.depth,
+            )?,
+            shader_direction_dot_range(uniform.world_to_screen_x, world_offset, world_offset)?,
+        ])?,
+        shader_interval_sum_range([
+            shader_world_dot_range(
+                uniform.world_to_screen_y,
+                minimum,
+                maximum,
+                vertex.depth,
+                vertex.depth,
+            )?,
+            shader_direction_dot_range(uniform.world_to_screen_y, world_offset, world_offset)?,
+        ])?,
+    ])
+}
+
+fn triangle_position_sources_equal(triangle: &[Vertex]) -> bool {
+    triangle.windows(2).all(|pair| {
+        pair[0].world_position == pair[1].world_position
+            && pair[0].depth == pair[1].depth
+            && pair[0].world_offset == pair[1].world_offset
+            && pair[0].screen_offset == pair[1].screen_offset
+    })
+}
+
+fn logical_stroke_vertex_screen_ranges(
+    vertex: Vertex,
+    uniform: CameraUniform,
+) -> Option<([(f64, f64); 2], bool)> {
+    let base = tessellated_vertex_base_screen_ranges(vertex, uniform)?;
+    let previous_source = Vec2::new(vertex.previous_direction[0], vertex.previous_direction[1]);
+    let next_source = Vec2::new(vertex.next_direction[0], vertex.next_direction[1]);
+    let previous_projected = [
+        shader_direction_dot_range(uniform.world_to_screen_x, previous_source, previous_source)?,
+        shader_direction_dot_range(uniform.world_to_screen_y, previous_source, previous_source)?,
+    ];
+    let next_projected = if vertex.previous_direction == vertex.next_direction {
+        previous_projected
+    } else {
+        [
+            shader_direction_dot_range(uniform.world_to_screen_x, next_source, next_source)?,
+            shader_direction_dot_range(uniform.world_to_screen_y, next_source, next_source)?,
+        ]
+    };
+    let previous_tangent = stroke_safe_unit_range(previous_projected)?;
+    let next_tangent = if vertex.previous_direction == vertex.next_direction {
+        previous_tangent
+    } else {
+        stroke_safe_unit_range(next_projected)?
+    };
+    let previous_normal = [range_negate(previous_tangent[1]), previous_tangent[0]];
+    let next_normal = [range_negate(next_tangent[1]), next_tangent[0]];
+    let turn = if vertex.previous_direction == vertex.next_direction {
+        (0.0, 0.0)
+    } else {
+        rounded_f32_add_range(
+            rounded_f32_product_range(previous_tangent[0], next_tangent[1])?,
+            rounded_f32_product_range(previous_tangent[1], next_tangent[0])?,
+            true,
+        )?
+    };
+    let turn_sign = if turn.0 > 0.0 {
+        1.0
+    } else if turn.1 < 0.0 {
+        -1.0
+    } else if vertex.previous_direction == vertex.next_direction {
+        0.0
+    } else {
+        return None;
+    };
+    let combined_normal = [
+        rounded_f32_add_range(previous_normal[0], next_normal[0], false)?,
+        rounded_f32_add_range(previous_normal[1], next_normal[1], false)?,
+    ];
+    let miter = stroke_safe_unit_range(combined_normal);
+    let miter_state = miter.and_then(|miter| {
+        let denominator = range_dot(miter, next_normal)?;
+        if denominator.0 <= 0.001 && denominator.1 >= -0.001 {
+            return None;
+        }
+        let reciprocal = rounded_f32_division_range((1.0, 1.0), denominator)?;
+        let multiple = range_abs(reciprocal);
+        let limit = f64::from(vertex.miter_limit);
+        let within_limit = if multiple.1 <= limit {
+            true
+        } else if multiple.0 > limit {
+            false
+        } else {
+            return None;
+        };
+        let scalar = rounded_f32_product_range(
+            reciprocal,
+            (
+                f64::from(vertex.normal_distance),
+                f64::from(vertex.normal_distance),
+            ),
+        )?;
+        Some((range_vector_scale(miter, scalar)?, within_limit))
+    });
+    let normal_scalar = (
+        f64::from(vertex.normal_distance),
+        f64::from(vertex.normal_distance),
+    );
+    let tangent_scalar = (
+        f64::from(vertex.tangent_distance),
+        f64::from(vertex.tangent_distance),
+    );
+    let next_normal_offset = range_vector_scale(next_normal, normal_scalar)?;
+    let previous_normal_offset = range_vector_scale(previous_normal, normal_scalar)?;
+    let tangent_offset = range_vector_scale(next_tangent, tangent_scalar)?;
+    let mut inactive_candidate = false;
+    let mut extrusion = range_vector_add(next_normal_offset, tangent_offset)?;
+    if (1.0..=3.0).contains(&vertex.stroke_role) {
+        if turn_sign == 0.0 {
+            extrusion = next_normal_offset;
+        } else {
+            let side = vertex.normal_distance.signum();
+            let outer_side = -turn_sign;
+            if side * outer_side <= 0.0 {
+                extrusion = miter_state
+                    .filter(|state| state.1)
+                    .map_or([(0.0, 0.0); 2], |state| state.0);
+            } else if vertex.stroke_role == 2.0 && miter_state.is_some_and(|state| state.1) {
+                extrusion = miter_state?.0;
+            } else if vertex.stroke_parameter < 0.0 {
+                extrusion = previous_normal_offset;
+            } else {
+                extrusion = next_normal_offset;
+            }
+        }
+        extrusion = range_vector_add(extrusion, tangent_offset)?;
+    } else if vertex.stroke_role >= 4.0 {
+        let inner = matches!(vertex.stroke_role as i32, 5 | 7 | 9);
+        let side = vertex.normal_distance.signum();
+        let candidate_side = if inner { -side } else { side };
+        let mut active = turn_sign != 0.0 && candidate_side * -turn_sign > 0.0;
+        if matches!(vertex.stroke_role as i32, 6 | 7) {
+            active &= miter_state.is_none_or(|state| !state.1);
+        }
+        if !active {
+            inactive_candidate = true;
+            extrusion = [(0.0, 0.0); 2];
+        } else if inner {
+            extrusion = miter_state
+                .filter(|state| state.1)
+                .map_or([(0.0, 0.0); 2], |state| state.0);
+        } else if vertex.stroke_role == 8.0 {
+            let side_range = (f64::from(candidate_side), f64::from(candidate_side));
+            let start = range_vector_scale(previous_normal, side_range)?;
+            let finish = range_vector_scale(next_normal, side_range)?;
+            let amount = f64::from(vertex.stroke_parameter);
+            let mixed = range_vector_add(
+                range_vector_scale(start, (1.0 - amount, 1.0 - amount))?,
+                range_vector_scale(finish, (amount, amount))?,
+            )?;
+            extrusion = range_vector_scale(
+                stroke_safe_unit_range(mixed)?,
+                (
+                    f64::from(vertex.normal_distance.abs()),
+                    f64::from(vertex.normal_distance.abs()),
+                ),
+            )?;
+        } else if vertex.stroke_parameter < 0.0 {
+            extrusion = previous_normal_offset;
+        } else {
+            extrusion = next_normal_offset;
+        }
+    } else if miter_state.is_some_and(|state| state.1) {
+        extrusion = range_vector_add(miter_state?.0, tangent_offset)?;
+    }
+    let screen = range_vector_add(base, extrusion)?;
+    let screen_offset = [
+        (
+            f64::from(vertex.screen_offset[0]),
+            f64::from(vertex.screen_offset[0]),
+        ),
+        (
+            f64::from(vertex.screen_offset[1]),
+            f64::from(vertex.screen_offset[1]),
+        ),
+    ];
+    Some((range_vector_add(screen, screen_offset)?, inactive_candidate))
+}
+
+fn range_vector_add(left: [(f64, f64); 2], right: [(f64, f64); 2]) -> Option<[(f64, f64); 2]> {
+    Some([
+        rounded_f32_add_range(left[0], right[0], false)?,
+        rounded_f32_add_range(left[1], right[1], false)?,
+    ])
+}
+
+fn range_vector_scale(vector: [(f64, f64); 2], scalar: (f64, f64)) -> Option<[(f64, f64); 2]> {
+    Some([
+        rounded_f32_product_range(vector[0], scalar)?,
+        rounded_f32_product_range(vector[1], scalar)?,
+    ])
+}
+
+fn range_dot(left: [(f64, f64); 2], right: [(f64, f64); 2]) -> Option<(f64, f64)> {
+    rounded_f32_add_range(
+        rounded_f32_product_range(left[0], right[0])?,
+        rounded_f32_product_range(left[1], right[1])?,
+        false,
+    )
+}
+
+fn range_negate(value: (f64, f64)) -> (f64, f64) {
+    (-value.1, -value.0)
+}
+
+fn range_abs(value: (f64, f64)) -> (f64, f64) {
+    if value.0 <= 0.0 && value.1 >= 0.0 {
+        (0.0, value.0.abs().max(value.1.abs()))
+    } else {
+        (
+            value.0.abs().min(value.1.abs()),
+            value.0.abs().max(value.1.abs()),
+        )
+    }
+}
+
+fn stroke_safe_unit_range(direction: [(f64, f64); 2]) -> Option<[(f64, f64); 2]> {
+    let horizontal_abs = range_abs(direction[0]);
+    let vertical_abs = range_abs(direction[1]);
+    let scale = (
+        horizontal_abs.0.max(vertical_abs.0),
+        horizontal_abs.1.max(vertical_abs.1),
+    );
+    if scale.0 < f64::from(f32::MIN_POSITIVE) {
+        return None;
+    }
+    let scaled = [
+        rounded_f32_division_range(direction[0], scale)?,
+        rounded_f32_division_range(direction[1], scale)?,
+    ];
+    let length_squared = range_dot(scaled, scaled)?;
+    if length_squared.0 < f64::from(f32::MIN_POSITIVE) {
+        return None;
+    }
+    let mut inverse_length =
+        rounded_f32_range(1.0 / length_squared.1.sqrt(), 1.0 / length_squared.0.sqrt())?;
+    // WGSL permits two ULP error for inverseSqrt. Add two outward neighbours;
+    // an inexact endpoint may already carry one additional rounding neighbour.
+    for _ in 0..2 {
+        inverse_length = (
+            f64::from(next_f32_down(inverse_length.0 as f32)?),
+            f64::from(next_f32_up(inverse_length.1 as f32)?),
+        );
+    }
+    range_vector_scale(scaled, inverse_length)
+}
+
+fn rounded_f32_division_range(
+    numerator: (f64, f64),
+    denominator: (f64, f64),
+) -> Option<(f64, f64)> {
+    if denominator.0 <= 0.0 && denominator.1 >= 0.0 {
+        return None;
+    }
+    let quotients = [
+        numerator.0 / denominator.0,
+        numerator.0 / denominator.1,
+        numerator.1 / denominator.0,
+        numerator.1 / denominator.1,
+    ];
+    let mut range = rounded_f32_range(
+        quotients.into_iter().fold(f64::INFINITY, f64::min),
+        quotients.into_iter().fold(f64::NEG_INFINITY, f64::max),
+    )?;
+    // WGSL permits 2.5 ULP division error. Three outward neighbours cover it;
+    // an inexact endpoint may already carry one additional rounding neighbour.
+    for _ in 0..3 {
+        range = (
+            f64::from(next_f32_down(range.0 as f32)?),
+            f64::from(next_f32_up(range.1 as f32)?),
+        );
+    }
+    Some(range)
+}
+
+fn rounded_f32_product_range(left: (f64, f64), right: (f64, f64)) -> Option<(f64, f64)> {
+    let products = [
+        left.0 * right.0,
+        left.0 * right.1,
+        left.1 * right.0,
+        left.1 * right.1,
+    ];
+    rounded_f32_range(
+        products.into_iter().fold(f64::INFINITY, f64::min),
+        products.into_iter().fold(f64::NEG_INFINITY, f64::max),
+    )
+}
+
+fn rounded_f32_add_range(
+    left: (f64, f64),
+    right: (f64, f64),
+    subtract: bool,
+) -> Option<(f64, f64)> {
+    let (minimum, maximum) = if subtract {
+        (left.0 - right.1, left.1 - right.0)
+    } else {
+        (left.0 + right.0, left.1 + right.1)
+    };
+    rounded_f32_range(minimum, maximum)
+}
+
+fn rounded_f32_range(minimum: f64, maximum: f64) -> Option<(f64, f64)> {
+    if !minimum.is_finite()
+        || !maximum.is_finite()
+        || minimum < -f64::from(MAX_PORTABLE_SHADER_VALUE)
+        || maximum > f64::from(MAX_PORTABLE_SHADER_VALUE)
+    {
+        return None;
+    }
+    if minimum == maximum && f64::from(minimum as f32) == minimum {
+        return Some((minimum, maximum));
+    }
+    let mut minimum = f64::from(next_f32_down(minimum as f32)?);
+    let mut maximum = f64::from(next_f32_up(maximum as f32)?);
+    let minimum_normal = f64::from(f32::MIN_POSITIVE);
+    if maximum > 0.0 && minimum < minimum_normal {
+        minimum = minimum.min(0.0);
+    }
+    if minimum < 0.0 && maximum > -minimum_normal {
+        maximum = maximum.max(0.0);
+    }
+    Some((minimum, maximum))
+}
+
+fn next_f32_down(value: f32) -> Option<f32> {
+    if !value.is_finite() {
+        return None;
+    }
+    let next = if value == 0.0 {
+        -f32::from_bits(1)
+    } else if value > 0.0 {
+        f32::from_bits(value.to_bits().checked_sub(1)?)
+    } else {
+        f32::from_bits(value.to_bits().checked_add(1)?)
+    };
+    next.is_finite().then_some(next)
+}
+
+fn next_f32_up(value: f32) -> Option<f32> {
+    if !value.is_finite() {
+        return None;
+    }
+    let next = if value == 0.0 {
+        f32::from_bits(1)
+    } else if value > 0.0 {
+        f32::from_bits(value.to_bits().checked_add(1)?)
+    } else {
+        f32::from_bits(value.to_bits().checked_sub(1)?)
+    };
+    next.is_finite().then_some(next)
+}
+
+fn screen_ranges_to_clip(
+    screen: [(f64, f64); 2],
+    uniform: CameraUniform,
+) -> Option<[(f64, f64); 2]> {
+    Some([
+        shader_interval_sum_range([
+            interval_products_f64(uniform.screen_to_clip[0], screen[0].0, screen[0].1),
+            (
+                f64::from(uniform.screen_to_clip[2]),
+                f64::from(uniform.screen_to_clip[2]),
+            ),
+        ])?,
+        shader_interval_sum_range([
+            interval_products_f64(uniform.screen_to_clip[1], screen[1].0, screen[1].1),
+            (
+                f64::from(uniform.screen_to_clip[3]),
+                f64::from(uniform.screen_to_clip[3]),
+            ),
+        ])?,
+    ])
+}
+
+fn shader_interval_difference(left: (f64, f64), right: (f64, f64)) -> Option<(f64, f64)> {
+    shader_interval_sum_range([left, (-right.1, -right.0)])
+}
+
+fn shader_interval_product(left: (f64, f64), right: (f64, f64)) -> Option<(f64, f64)> {
+    let products = [
+        left.0 * right.0,
+        left.0 * right.1,
+        left.1 * right.0,
+        left.1 * right.1,
+    ];
+    shader_interval_sum_range([(
+        products.into_iter().fold(f64::INFINITY, f64::min),
+        products.into_iter().fold(f64::NEG_INFINITY, f64::max),
+    )])
+}
+
+fn geometry_vertex_centers_are_portable(
+    source: GeometryValidationSource<'_>,
+    uniform: CameraUniform,
+) -> bool {
+    let dynamic_center_is_portable = |world: [f32; 2], depth: f32| {
+        let Some(relative_x) = shader_relative_component_bounds(
+            world[0],
+            world[0],
+            uniform.camera_center[0],
+            0.0,
+            0.0,
+        ) else {
+            return false;
+        };
+        let Some(relative_y) = shader_relative_component_bounds(
+            world[1],
+            world[1],
+            uniform.camera_center[1],
+            0.0,
+            0.0,
+        ) else {
+            return false;
+        };
+        let minimum = [relative_x.0, relative_y.0];
+        let maximum = [relative_x.1, relative_y.1];
+        shader_world_dot_range(uniform.world_to_screen_x, minimum, maximum, depth, depth).is_some()
+            && shader_world_dot_range(uniform.world_to_screen_y, minimum, maximum, depth, depth)
+                .is_some()
+    };
+    match source {
+        GeometryValidationSource::Tessellated(vertices) => vertices
+            .iter()
+            .all(|vertex| tessellated_vertex_clip_ranges(*vertex, uniform).is_some()),
+        GeometryValidationSource::Dynamic(vertices) => vertices
+            .iter()
+            .all(|vertex| dynamic_center_is_portable(vertex.world_position, vertex.depth)),
+    }
+}
+
+fn geometry_sources_are_portable(source: GeometryValidationSource<'_>) -> bool {
+    match source {
+        GeometryValidationSource::Tessellated(vertices) => vertices.iter().all(|vertex| {
+            vertex
+                .world_position
+                .into_iter()
+                .chain(vertex.world_offset)
+                .chain(vertex.screen_offset)
+                .chain(vertex.previous_direction)
+                .chain(vertex.next_direction)
+                .chain([
+                    vertex.depth,
+                    vertex.normal_distance,
+                    vertex.tangent_distance,
+                    vertex.miter_limit,
+                ])
+                .all(is_portable_shader_source)
+        }),
+        GeometryValidationSource::Dynamic(vertices) => vertices.iter().all(|vertex| {
+            vertex
+                .world_position
+                .into_iter()
+                .chain([vertex.depth])
+                .all(is_portable_shader_source)
+        }),
+    }
+}
+
+fn logical_stroke_branches_are_stable(vertex: Vertex, uniform: CameraUniform) -> bool {
+    if vertex.normal_distance == 0.0 && vertex.tangent_distance == 0.0 {
+        return true;
+    }
+    let project = |direction: [f32; 2]| {
+        [
+            f64::from(uniform.world_to_screen_x[0]) * f64::from(direction[0])
+                + f64::from(uniform.world_to_screen_x[1]) * f64::from(direction[1]),
+            f64::from(uniform.world_to_screen_y[0]) * f64::from(direction[0])
+                + f64::from(uniform.world_to_screen_y[1]) * f64::from(direction[1]),
+        ]
+    };
+    let stable_projected_direction = |direction: [f32; 2]| {
+        let direction = Vec2::new(direction[0], direction[1]);
+        let horizontal =
+            shader_direction_dot_range(uniform.world_to_screen_x, direction, direction)?;
+        let vertical = shader_direction_dot_range(uniform.world_to_screen_y, direction, direction)?;
+        let fixed = project([direction.x, direction.y]);
+        let component_minimum_magnitude = |range: (f64, f64)| {
+            if range.0 > 0.0 {
+                range.0
+            } else if range.1 < 0.0 {
+                -range.1
+            } else {
+                0.0
+            }
+        };
+        let lower_length =
+            component_minimum_magnitude(horizontal).hypot(component_minimum_magnitude(vertical));
+        let fixed_length = fixed[0].hypot(fixed[1]);
+        let uncertainty = (horizontal.0 - fixed[0])
+            .abs()
+            .max((horizontal.1 - fixed[0]).abs())
+            .hypot(
+                (vertical.0 - fixed[1])
+                    .abs()
+                    .max((vertical.1 - fixed[1]).abs()),
+            );
+        let minimum_normal = f64::from(f32::MIN_POSITIVE);
+        (lower_length >= minimum_normal
+            && fixed_length.is_finite()
+            && uncertainty.is_finite()
+            && uncertainty <= fixed_length * 1.0e-6)
+            .then_some(fixed)
+    };
+    let Some(previous_projected) = stable_projected_direction(vertex.previous_direction) else {
+        return false;
+    };
+    let Some(next_projected) = stable_projected_direction(vertex.next_direction) else {
+        return false;
+    };
+    if vertex.previous_direction == vertex.next_direction {
+        // The shader detects source equality and reuses one projection and
+        // normalization result, so identical directions cannot acquire a
+        // backend-dependent artificial turn.
+        return true;
+    }
+
+    let normalize = |value: [f64; 2]| {
+        let scale = value[0].abs().max(value[1].abs());
+        if !scale.is_finite() || scale <= 0.0 {
+            return None;
+        }
+        let scaled = [value[0] / scale, value[1] / scale];
+        let length = scaled[0].hypot(scaled[1]);
+        (length.is_finite() && length > 0.0).then_some([scaled[0] / length, scaled[1] / length])
+    };
+    let Some(previous) = normalize(previous_projected) else {
+        return false;
+    };
+    let Some(next) = normalize(next_projected) else {
+        return false;
+    };
+    let turn = previous[0] * next[1] - previous[1] * next[0];
+    let tangent_dot = previous[0] * next[0] + previous[1] * next[1];
+    if !turn.is_finite() || !tangent_dot.is_finite() {
+        return false;
+    }
+    // Keep every topology-changing comparison far outside WGSL's permitted
+    // normal-operation error. Exact repeated directions took the fast path.
+    if turn.abs() <= 1.0e-4 || tangent_dot <= -0.999_9 {
+        return false;
+    }
+
+    let previous_normal = [-previous[1], previous[0]];
+    let next_normal = [-next[1], next[0]];
+    let combined = [
+        previous_normal[0] + next_normal[0],
+        previous_normal[1] + next_normal[1],
+    ];
+    let Some(miter) = normalize(combined) else {
+        return false;
+    };
+    let denominator = miter[0] * next_normal[0] + miter[1] * next_normal[1];
+    if !denominator.is_finite() || denominator.abs() <= 0.002 {
+        return false;
+    }
+    let miter_multiple = 1.0 / denominator.abs();
+    let limit = f64::from(vertex.miter_limit);
+    let comparison_margin = 1.0e-4 * miter_multiple.abs().max(limit.abs()).max(1.0);
+    (miter_multiple - limit).abs() > comparison_margin
 }
 
 fn shader_clip_interval_is_safe(
@@ -950,51 +1767,50 @@ fn shader_relative_component_bounds(
     camera_center: f32,
     offset_minimum: f32,
     offset_maximum: f32,
-) -> Option<(f32, f32)> {
-    // Keep the subtraction in f32 because that is the first WGSL operation.
-    let relative_minimum = world_minimum - camera_center;
-    let relative_maximum = world_maximum - camera_center;
-    if !relative_minimum.is_finite() || !relative_maximum.is_finite() {
-        return None;
+) -> Option<(f64, f64)> {
+    // Exact equal f32 operands subtract to exact zero on every backend. Keep
+    // that important camera-relative case tight so separately projected local
+    // tessellation offsets remain usable at large world anchors.
+    let subtraction = if world_minimum == camera_center && world_maximum == camera_center {
+        (0.0, 0.0)
+    } else {
+        shader_interval_sum_range([
+            (f64::from(world_minimum), f64::from(world_maximum)),
+            (-f64::from(camera_center), -f64::from(camera_center)),
+        ])?
+    };
+    if offset_minimum == 0.0 && offset_maximum == 0.0 {
+        Some(subtraction)
+    } else {
+        shader_interval_sum_range([
+            subtraction,
+            (f64::from(offset_minimum), f64::from(offset_maximum)),
+        ])
     }
-
-    // Exact `base + offset` ordering is not sufficient here: the shader first
-    // rounds `base - camera_center`, so two close correlated sums can reverse
-    // order by an ULP. Independent extrema are conservative for that actual
-    // operation sequence. The rare false rejection is recovered by the exact
-    // per-vertex fallback in `geometry_is_safe_for`.
-    let minimum = relative_minimum + offset_minimum;
-    let maximum = relative_maximum + offset_maximum;
-    if !minimum.is_finite()
-        || !maximum.is_finite()
-        || is_nonzero_subnormal(minimum)
-        || is_nonzero_subnormal(maximum)
-    {
-        return None;
-    }
-    Some((minimum, maximum))
 }
 
 fn shader_world_dot_range(
     row: [f32; 4],
-    minimum: [f32; 2],
-    maximum: [f32; 2],
+    minimum: [f64; 2],
+    maximum: [f64; 2],
     depth_minimum: f32,
     depth_maximum: f32,
 ) -> Option<(f64, f64)> {
     if (is_nonzero_subnormal(row[0]) && (minimum[0] != 0.0 || maximum[0] != 0.0))
         || (is_nonzero_subnormal(row[1]) && (minimum[1] != 0.0 || maximum[1] != 0.0))
         || (is_nonzero_subnormal(row[2]) && (depth_minimum != 0.0 || depth_maximum != 0.0))
-        || ((is_nonzero_subnormal(minimum[0]) || is_nonzero_subnormal(maximum[0])) && row[0] != 0.0)
-        || ((is_nonzero_subnormal(minimum[1]) || is_nonzero_subnormal(maximum[1])) && row[1] != 0.0)
+        || ((is_nonzero_subnormal_f64(minimum[0]) || is_nonzero_subnormal_f64(maximum[0]))
+            && row[0] != 0.0)
+        || ((is_nonzero_subnormal_f64(minimum[1]) || is_nonzero_subnormal_f64(maximum[1]))
+            && row[1] != 0.0)
         || ((is_nonzero_subnormal(depth_minimum) || is_nonzero_subnormal(depth_maximum))
             && row[2] != 0.0)
     {
         return None;
     }
     shader_interval_sum_range([
-        interval_products(row[0], minimum[0], maximum[0]),
-        interval_products(row[1], minimum[1], maximum[1]),
+        interval_products_f64(row[0], minimum[0], maximum[0]),
+        interval_products_f64(row[1], minimum[1], maximum[1]),
         interval_products(row[2], depth_minimum, depth_maximum),
         (f64::from(row[3]), f64::from(row[3])),
     ])
@@ -1025,11 +1841,7 @@ fn shader_interval_sum_range<const N: usize>(terms: [(f64, f64); N]) -> Option<(
     // same-sign partial sum, then return the complete finite output interval.
     // Keeping that interval is essential when a later shader stage multiplies
     // a cancellation residual by another large coefficient.
-    if terms.iter().all(|term| term.0 == term.1) {
-        return exact_shader_sum_range(terms);
-    }
-
-    let maximum = f64::from(f32::MAX);
+    let maximum = f64::from(MAX_PORTABLE_SHADER_VALUE);
     let mut positive_sum = 0.0;
     let mut negative_sum = 0.0;
     let mut minimum_sum = 0.0;
@@ -1057,8 +1869,8 @@ fn shader_interval_sum_range<const N: usize>(terms: [(f64, f64); N]) -> Option<(
 
     // Exact zero terms do not participate in any association, and an isolated
     // exactly representable product needs no rounding allowance. This keeps
-    // identity rows valid at `f32::MAX` while retaining a conservative margin
-    // for every product/addition which can actually round.
+    // component-selection rows tight inside the portability envelope while
+    // retaining a conservative margin for operations which can round.
     let active_terms = terms
         .iter()
         .filter(|term| term.0 != 0.0 || term.1 != 0.0)
@@ -1088,7 +1900,9 @@ fn shader_interval_sum_range<const N: usize>(terms: [(f64, f64); N]) -> Option<(
         .count();
     let operation_count = inexact_products + active_terms.saturating_sub(1);
     let operation_count = operation_count as f64;
-    let unit_roundoff = 2.0_f64.powi(-24);
+    // WGSL correctly-rounded operations may select either adjacent f32 value;
+    // use the directed-rounding bound rather than Rust's round-to-nearest.
+    let unit_roundoff = 2.0_f64.powi(-23);
     let gamma = operation_count * unit_roundoff / (1.0 - operation_count * unit_roundoff);
     let subnormal_margin = if magnitude_sum > 0.0 {
         operation_count * f64::from(f32::MIN_POSITIVE)
@@ -1112,183 +1926,12 @@ fn shader_interval_sum_range<const N: usize>(terms: [(f64, f64); N]) -> Option<(
     Some((minimum_output, maximum_output))
 }
 
-#[derive(Clone, Copy, Debug)]
-struct ExactShaderCandidates {
-    values: [f32; 64],
-    len: usize,
-}
-
-impl ExactShaderCandidates {
-    const EMPTY: Self = Self {
-        values: [0.0; 64],
-        len: 0,
-    };
-
-    fn singleton(value: f32) -> Self {
-        let mut candidates = Self::EMPTY;
-        candidates.values[0] = value;
-        candidates.len = 1;
-        candidates
-    }
-
-    fn insert(&mut self, value: f32) -> Option<()> {
-        if !value.is_finite() {
-            return None;
-        }
-        // WGSL permits every subnormal intermediate to be flushed before a
-        // later add/FMA. Preserve both outcomes in the association set;
-        // downstream validation can decide whether the difference matters.
-        if is_nonzero_subnormal(value) {
-            self.insert_distinct(0.0)?;
-        }
-        self.insert_distinct(value)
-    }
-
-    fn insert_distinct(&mut self, value: f32) -> Option<()> {
-        if self.as_slice().contains(&value) {
-            return Some(());
-        }
-        if self.len == self.values.len() {
-            return None;
-        }
-        self.values[self.len] = value;
-        self.len += 1;
-        Some(())
-    }
-
-    fn extend(&mut self, other: Self) -> Option<()> {
-        for &value in other.as_slice() {
-            self.insert_distinct(value)?;
-        }
-        Some(())
-    }
-
-    fn as_slice(&self) -> &[f32] {
-        &self.values[..self.len]
-    }
-
-    fn range(self) -> Option<(f64, f64)> {
-        let minimum = self.as_slice().iter().copied().reduce(f32::min)?;
-        let maximum = self.as_slice().iter().copied().reduce(f32::max)?;
-        Some((f64::from(minimum), f64::from(maximum)))
-    }
-}
-
-fn exact_shader_sum_range<const N: usize>(terms: [(f64, f64); N]) -> Option<(f64, f64)> {
-    exact_shader_sum_candidates(terms)?.range()
-}
-
-fn exact_shader_sum_candidates<const N: usize>(
-    terms: [(f64, f64); N],
-) -> Option<ExactShaderCandidates> {
-    if N > 4 || terms.iter().any(|term| term.0 != term.1) {
-        return None;
-    }
-
-    let mut active = [0.0_f64; 4];
-    let mut active_len = 0;
-    for &(term, _) in &terms {
-        if term != 0.0 {
-            active[active_len] = term;
-            active_len += 1;
-        }
-    }
-    if active_len == 0 {
-        return Some(ExactShaderCandidates::singleton(0.0));
-    }
-
-    // Exhaustively evaluate every binary association of separately rounded
-    // products plus every nested FMA contraction. Four terms is the largest
-    // shader dot used by the renderer, so this fixed-size oracle is both tight
-    // at f32::MAX and bounded in steady-state validation.
-    let mut candidates = [ExactShaderCandidates::EMPTY; 16];
-    let complete_mask = (1_usize << active_len) - 1;
-    for mask in 1..=complete_mask {
-        if mask.is_power_of_two() {
-            let index = mask.trailing_zeros() as usize;
-            candidates[mask].insert(active[index] as f32)?;
-        }
-
-        let mut left = (mask - 1) & mask;
-        while left != 0 {
-            let right = mask ^ left;
-            if right != 0 && left < right {
-                let left_candidates = candidates[left];
-                let right_candidates = candidates[right];
-                for &left_value in &left_candidates.values[..left_candidates.len] {
-                    for &right_value in &right_candidates.values[..right_candidates.len] {
-                        candidates[mask].insert(left_value + right_value)?;
-                    }
-                }
-            }
-            left = (left - 1) & mask;
-        }
-
-        if !mask.is_power_of_two() {
-            for (index, &active_term) in active.iter().take(active_len).enumerate() {
-                let term_mask = 1_usize << index;
-                if mask & term_mask == 0 {
-                    continue;
-                }
-                let rest = mask ^ term_mask;
-                let rest_candidates = candidates[rest];
-                for &rest_value in &rest_candidates.values[..rest_candidates.len] {
-                    candidates[mask].insert((active_term + f64::from(rest_value)) as f32)?;
-                }
-            }
-        }
-    }
-
-    Some(candidates[complete_mask])
-}
-
-fn exact_shader_dot_source_range(row: [f32; 4], point: [f32; 4]) -> Option<(f64, f64)> {
-    exact_shader_dot_source_candidates(row, point)?.range()
-}
-
-fn exact_shader_dot_source_candidates(
-    row: [f32; 4],
-    point: [f32; 4],
-) -> Option<ExactShaderCandidates> {
-    let terms =
-        std::array::from_fn::<_, 4, _>(|axis| f64::from(row[axis]) * f64::from(point[axis]));
-    let source_ftz_mask = (0..4).fold(0_u8, |mask, axis| {
-        if terms[axis] != 0.0
-            && (is_nonzero_subnormal(row[axis]) || is_nonzero_subnormal(point[axis]))
-        {
-            mask | (1 << axis)
-        } else {
-            mask
-        }
-    });
-    let mut output = ExactShaderCandidates::EMPTY;
-    for flushed in 0_u8..16 {
-        if flushed & !source_ftz_mask != 0 {
-            continue;
-        }
-        let selected: [(f64, f64); 4] = std::array::from_fn(|axis| {
-            let value = if flushed & (1 << axis) == 0 {
-                terms[axis]
-            } else {
-                0.0
-            };
-            (value, value)
-        });
-        output.extend(exact_shader_sum_candidates(selected)?)?;
-    }
-    (output.len > 0).then_some(output)
-}
-
 fn is_nonzero_subnormal(value: f32) -> bool {
     value != 0.0 && value.abs() < f32::MIN_POSITIVE
 }
 
 fn is_nonzero_subnormal_f64(value: f64) -> bool {
     value != 0.0 && value.abs() < f64::from(f32::MIN_POSITIVE)
-}
-
-fn is_ftz_sensitive_source(value: f32) -> bool {
-    value != 0.0 && value.abs() < FTZ_SENSITIVE_SOURCE_LIMIT
 }
 
 fn interval_products(coefficient: f32, minimum: f32, maximum: f32) -> (f64, f64) {
@@ -1304,7 +1947,8 @@ fn interval_products_f64(coefficient: f32, minimum: f64, maximum: f64) -> (f64, 
 /// Result of attempting to draw a frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RenderStatus {
-    /// Commands were submitted and the frame was presented.
+    /// Commands were submitted successfully. Surface paths also requested
+    /// presentation; offscreen paths completed their target submission only.
     Drawn,
     /// The frame was skipped because the window surface was temporarily unavailable.
     Skipped(RendererSurfaceStatus),
@@ -1329,12 +1973,27 @@ pub struct RendererFrameMetrics {
 }
 
 impl RendererFrameMetrics {
-    /// Returns CPU time spent validating and tessellating scene commands.
+    /// Returns CPU time spent preparing visual work before GPU uploads.
+    ///
+    /// For an ordinary streaming scene this is validation and tessellation.
+    /// A heterogeneous [`FrameComposer`](crate::FrameComposer) frame also
+    /// includes viewport and source validation, particle visibility selection,
+    /// scalar LUT generation, and preparation of retained image/glyph draws.
     pub fn tessellation(self) -> Duration {
         self.tessellation
     }
 
-    /// Returns CPU time spent writing transient vertex data into the GPU buffer.
+    /// Returns CPU time spent preparing and enqueueing non-camera per-frame GPU data.
+    ///
+    /// Depending on the rendering path this includes transient vertex or
+    /// instance writes, scalar LUT and pass-uniform uploads, and creation of
+    /// the per-frame bindings needed by image, glyph, scalar, particle, or
+    /// composition passes. The camera-only write remains separately available
+    /// through [`Self::camera_uniform_upload`]. This is CPU preparation/enqueue
+    /// time, not GPU execution time. An ordinary streaming frame can include
+    /// pre-acquire transient buffer
+    /// capacity creation here, so a skipped report may have a non-zero duration
+    /// even though it performed no queue write and reports zero uploaded bytes.
     pub fn upload(self) -> Duration {
         self.upload
     }
@@ -1365,12 +2024,22 @@ impl RendererFrameMetrics {
         self.total_cpu
     }
 
-    /// Returns whether this frame reused geometry from a [`PreparedScene`].
+    /// Returns whether this frame referenced retained visual geometry.
+    ///
+    /// This includes prepared scenes and retained sprite/glyph batches. It is
+    /// a broad workload-classification hint rather than a statement that the
+    /// frame performed no uploads, and it can be true together with
+    /// [`Self::geometry_streamed`].
     pub fn geometry_reused(self) -> bool {
         self.geometry_reused
     }
 
-    /// Returns whether this frame rendered geometry updated through [`DynamicMesh2d`].
+    /// Returns whether this frame contained dynamically supplied visual work.
+    ///
+    /// This includes dynamic meshes, particle visibility instances, and scalar
+    /// field passes. It is a broad workload-classification hint rather than an
+    /// allocation or upload guarantee, and it can be true together with
+    /// [`Self::geometry_reused`].
     pub fn geometry_streamed(self) -> bool {
         self.geometry_streamed
     }
@@ -1420,7 +2089,14 @@ pub enum RendererSurfaceStatus {
 pub enum RendererFrameError {
     /// The presentation surface was lost or rejected frame acquisition.
     Surface(RendererSurfaceStatus),
-    /// Camera and geometry are finite separately but overflow when transformed together.
+    /// Camera, geometry, stroke arithmetic, or dynamic-triangle topology
+    /// cannot be proven portable on the GPU.
+    ///
+    /// This includes nonzero subnormal or excessively large shader sources,
+    /// transform ranges that may overflow under permitted GPU arithmetic, and
+    /// stroke branch decisions that are ambiguous after projection, every
+    /// dynamic triangle requiring partial frustum clipping, and projected
+    /// triangle orientation that may change with legal shader association.
     InvalidGeometryTransform,
     /// A logical viewport is outside the active surface or render target.
     InvalidViewport,
@@ -1429,6 +2105,11 @@ pub enum RendererFrameError {
     /// CPU storage for scene tessellation could not be reserved.
     SceneAllocationFailed {
         /// Minimum additional bytes requested by the failed reservation.
+        requested_bytes: usize,
+    },
+    /// CPU storage for the camera-visible particle subset could not be reserved.
+    ParticleAllocationFailed {
+        /// Bytes requested for the rejected visible-instance vector.
         requested_bytes: usize,
     },
     /// Actual renderer work exceeded a scene's explicit limit.
@@ -1447,7 +2128,10 @@ impl fmt::Display for RendererFrameError {
         match self {
             Self::Surface(status) => write!(formatter, "renderer surface failed: {status:?}"),
             Self::InvalidGeometryTransform => {
-                write!(formatter, "camera and geometry overflow the GPU transform")
+                write!(
+                    formatter,
+                    "camera, geometry, or dynamic topology is outside the portable GPU envelope"
+                )
             }
             Self::InvalidViewport => {
                 write!(
@@ -1461,6 +2145,10 @@ impl fmt::Display for RendererFrameError {
             Self::SceneAllocationFailed { requested_bytes } => write!(
                 formatter,
                 "could not reserve {requested_bytes} additional bytes for scene tessellation"
+            ),
+            Self::ParticleAllocationFailed { requested_bytes } => write!(
+                formatter,
+                "could not reserve {requested_bytes} bytes for visible particle instances"
             ),
             Self::SceneBudgetExceeded {
                 resource,
@@ -1487,10 +2175,24 @@ pub enum RendererInitError {
     RequestDevice(wgpu::RequestDeviceError),
     /// The surface did not expose a usable default configuration.
     NoSurfaceConfig,
+    /// Requested physical dimensions exceed the selected device limit.
+    SurfaceDimensionsTooLarge {
+        /// Rejected physical width.
+        width: u32,
+        /// Rejected physical height.
+        height: u32,
+        /// Device maximum for either dimension.
+        limit: u32,
+    },
     /// The bounded previous-device quarantine is full.
     RecoveryLimitReached {
         /// Configured maximum number of quarantined logical devices.
         limit: usize,
+    },
+    /// CPU storage for quarantining the previous device could not be reserved.
+    RecoveryAllocationFailed {
+        /// Additional bytes requested for one quarantine entry.
+        requested_bytes: usize,
     },
 }
 
@@ -1501,9 +2203,21 @@ impl fmt::Display for RendererInitError {
             Self::RequestAdapter(error) => write!(formatter, "failed to request adapter: {error}"),
             Self::RequestDevice(error) => write!(formatter, "failed to request device: {error}"),
             Self::NoSurfaceConfig => write!(formatter, "surface has no supported default config"),
+            Self::SurfaceDimensionsTooLarge {
+                width,
+                height,
+                limit,
+            } => write!(
+                formatter,
+                "surface dimensions {width}x{height} exceed device limit {limit}"
+            ),
             Self::RecoveryLimitReached { limit } => write!(
                 formatter,
                 "device recovery limit reached with {limit} quarantined devices"
+            ),
+            Self::RecoveryAllocationFailed { requested_bytes } => write!(
+                formatter,
+                "could not reserve {requested_bytes} bytes for device recovery quarantine"
             ),
         }
     }
@@ -1524,6 +2238,15 @@ pub enum RendererConfigurationError {
         /// Rejected maximum retained-device count.
         limit: usize,
     },
+    /// Requested physical dimensions exceed the active device limit.
+    SurfaceDimensionsTooLarge {
+        /// Rejected physical width.
+        width: u32,
+        /// Rejected physical height.
+        height: u32,
+        /// Device maximum for either dimension.
+        limit: u32,
+    },
 }
 
 impl fmt::Display for RendererConfigurationError {
@@ -1536,6 +2259,14 @@ impl fmt::Display for RendererConfigurationError {
             Self::InvalidRecoveryLimit { limit } => write!(
                 formatter,
                 "renderer recovery quarantine must retain between 1 and 8 devices, got {limit}"
+            ),
+            Self::SurfaceDimensionsTooLarge {
+                width,
+                height,
+                limit,
+            } => write!(
+                formatter,
+                "surface dimensions {width}x{height} exceed device limit {limit}"
             ),
         }
     }
@@ -1566,6 +2297,9 @@ impl Error for RendererCoordinateError {}
 pub enum PreparedSceneError {
     /// Tessellated geometry exceeds the active device's vertex-buffer limit.
     CapacityTooLarge,
+    /// Command sources or derived tessellated vertices are outside the
+    /// portable GPU input envelope.
+    InvalidGeometrySources,
     /// CPU storage for scene tessellation could not be reserved.
     AllocationFailed {
         /// Minimum additional bytes requested by the failed reservation.
@@ -1591,6 +2325,10 @@ impl fmt::Display for PreparedSceneError {
                     "prepared scene exceeds the GPU vertex-buffer limit"
                 )
             }
+            Self::InvalidGeometrySources => write!(
+                formatter,
+                "prepared scene contains non-portable GPU geometry sources"
+            ),
             Self::AllocationFailed { requested_bytes } => write!(
                 formatter,
                 "could not reserve {requested_bytes} additional bytes for prepared-scene tessellation"
@@ -1683,7 +2421,7 @@ pub struct PreparedScene {
     renderer_identity: Arc<()>,
     background: Color,
     vertex_buffer: Arc<wgpu::Buffer>,
-    vertices: Arc<[Vertex]>,
+    vertices: Arc<Vec<Vertex>>,
     command_count: usize,
     vertex_count: usize,
     geometry_extents: GeometryExtents,
@@ -1744,7 +2482,7 @@ impl DynamicVertex2d {
 pub enum DynamicMeshError {
     /// Triangle-list vertex counts must be divisible by three.
     InvalidVertexCount,
-    /// A position, depth, or color contains NaN or infinity.
+    /// A position/depth is outside the portable shader envelope or a color is invalid.
     InvalidVertex,
     /// A partial update lies outside the mesh's current vertex range.
     UpdateRangeOutOfBounds,
@@ -1779,7 +2517,7 @@ impl fmt::Display for DynamicMeshError {
             ),
             Self::InvalidVertex => write!(
                 formatter,
-                "dynamic mesh positions/depth must be finite and colors normalized"
+                "dynamic mesh positions/depth must be portable and colors normalized"
             ),
             Self::UpdateRangeOutOfBounds => write!(
                 formatter,
@@ -1906,7 +2644,9 @@ impl DynamicMesh2d {
 
     /// Returns retained CPU memory used for validation and future updates.
     pub fn recovery_memory_bytes(&self) -> usize {
-        self.vertices.len() * std::mem::size_of::<DynamicGpu>()
+        self.vertices
+            .capacity()
+            .saturating_mul(std::mem::size_of::<DynamicGpu>())
     }
 
     /// Returns explicit limits, or `None` for the compatibility constructor.
@@ -1989,32 +2729,46 @@ impl ParticleStatistics {
     }
 }
 
-/// Hard per-field limits that keep particle visualization from starving a host simulation.
+/// Hard steady-state per-field limits for bounding particle visualization.
+///
+/// Atomic replacement temporarily retains the old and fully prepared new
+/// state together. Its CPU/GPU peak is therefore bounded by the sum of the old
+/// and new budgets, while every committed field stays within its own budget.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ParticleRenderBudget {
     max_visible_instances: usize,
+    max_retained_bytes: usize,
     max_gpu_bytes: usize,
     max_upload_bytes_per_frame: usize,
     max_visibility_checks_per_frame: usize,
 }
 
 impl ParticleRenderBudget {
+    /// Bytes used by one retained or visibility-staging particle slot.
+    pub const INSTANCE_BYTES: usize = std::mem::size_of::<ParticleGpu>();
+
     /// No application-level cap beyond active-device allocation limits.
     pub const UNBOUNDED: Self = Self {
         max_visible_instances: usize::MAX,
+        max_retained_bytes: usize::MAX,
         max_gpu_bytes: usize::MAX,
         max_upload_bytes_per_frame: usize::MAX,
         max_visibility_checks_per_frame: usize::MAX,
     };
 
-    /// Creates explicit visible-instance, GPU-memory, and per-frame upload caps.
+    /// Creates explicit visible-instance, retained-CPU, GPU-memory, and
+    /// per-frame upload caps.
     pub fn new(
         max_visible_instances: usize,
+        max_retained_bytes: usize,
         max_gpu_bytes: usize,
         max_upload_bytes_per_frame: usize,
     ) -> Result<Self, ParticleBudgetError> {
-        let minimum_bytes = std::mem::size_of::<ParticleGpu>();
+        let minimum_bytes = Self::INSTANCE_BYTES;
+        let minimum_retained_bytes = minimum_bytes.saturating_mul(2);
         if max_visible_instances == 0
+            || max_visible_instances > u32::MAX as usize
+            || max_retained_bytes < minimum_retained_bytes
             || max_gpu_bytes < minimum_bytes
             || max_upload_bytes_per_frame < minimum_bytes
         {
@@ -2022,6 +2776,7 @@ impl ParticleRenderBudget {
         }
         Ok(Self {
             max_visible_instances,
+            max_retained_bytes,
             max_gpu_bytes,
             max_upload_bytes_per_frame,
             max_visibility_checks_per_frame: usize::MAX,
@@ -2044,6 +2799,11 @@ impl ParticleRenderBudget {
     /// Returns the maximum camera-visible instances considered for drawing.
     pub const fn max_visible_instances(self) -> usize {
         self.max_visible_instances
+    }
+
+    /// Returns the maximum steady-state engine-owned particle allocation in bytes.
+    pub const fn max_retained_bytes(self) -> usize {
+        self.max_retained_bytes
     }
 
     /// Returns the maximum particle instance-buffer allocation in bytes.
@@ -2077,7 +2837,8 @@ impl Default for ParticleRenderBudget {
 /// Invalid particle visualization resource budget.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParticleBudgetError {
-    /// Every enabled budget must fit at least one particle instance.
+    /// CPU retention must fit one source plus one staging slot; GPU/upload
+    /// limits must each fit at least one visible particle instance.
     InvalidLimit,
 }
 
@@ -2085,7 +2846,7 @@ impl fmt::Display for ParticleBudgetError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "particle budget must fit at least one visible instance"
+            "particle budget must fit one retained instance, its visibility staging slot, and one visible GPU upload"
         )
     }
 }
@@ -2130,7 +2891,9 @@ impl ParticleField2d {
 
     /// Returns retained CPU memory used for recovery and validation.
     pub fn recovery_memory_bytes(&self) -> usize {
-        self.instances.len() * std::mem::size_of::<ParticleGpu>()
+        self.instances
+            .capacity()
+            .saturating_mul(std::mem::size_of::<ParticleGpu>())
     }
 
     /// Returns currently reserved CPU bytes for retained and culled instance lists.
@@ -2151,7 +2914,7 @@ impl ParticleField2d {
 /// Failure while creating or updating a [`ParticleField2d`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParticleFieldError {
-    /// An input instance violates the finite particle contract.
+    /// An input instance violates the portable particle contract.
     InvalidInstance,
     /// A partial update lies outside the field's current instance range.
     UpdateRangeOutOfBounds,
@@ -2159,12 +2922,28 @@ pub enum ParticleFieldError {
     RendererMismatch,
     /// The instance capacity exceeds the current device's buffer limit.
     CapacityTooLarge,
+    /// The retained CPU allocation exceeds the host-selected hard ceiling.
+    RetainedBudgetExceeded {
+        /// Configured retained-allocation ceiling.
+        limit: usize,
+        /// Required or actually reserved retained bytes.
+        actual: usize,
+    },
+    /// Particle retention, replacement, or visibility-staging storage could
+    /// not be reserved without panicking.
+    AllocationFailed {
+        /// Bytes requested by the failed particle-storage reservation.
+        requested_bytes: usize,
+    },
 }
 
 impl fmt::Display for ParticleFieldError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidInstance => write!(formatter, "particle field instances must be valid"),
+            Self::InvalidInstance => write!(
+                formatter,
+                "particle field positions, depth, and radius must be portable and colors valid"
+            ),
             Self::UpdateRangeOutOfBounds => {
                 write!(
                     formatter,
@@ -2180,6 +2959,14 @@ impl fmt::Display for ParticleFieldError {
                     "particle field exceeds the GPU instance-buffer limit"
                 )
             }
+            Self::RetainedBudgetExceeded { limit, actual } => write!(
+                formatter,
+                "particle retained CPU allocation {actual} bytes exceeds limit {limit}"
+            ),
+            Self::AllocationFailed { requested_bytes } => write!(
+                formatter,
+                "could not reserve {requested_bytes} bytes for particle storage"
+            ),
         }
     }
 }
@@ -2227,7 +3014,7 @@ pub enum ParticleFieldRenderError {
     RendererMismatch,
     /// The clear color is not normalized linear RGBA.
     InvalidBackground,
-    /// Camera transformation would produce non-finite particle geometry.
+    /// Particle projection cannot be proven inside the portable GPU envelope.
     InvalidGeometryTransform,
     /// Surface acquisition or presentation failed.
     Frame(RendererFrameError),
@@ -2257,6 +3044,8 @@ pub struct ScalarFieldTexture {
     renderer_identity: Arc<()>,
     texture: wgpu::Texture,
     field: ScalarField,
+    source_minimum: f32,
+    source_maximum: f32,
 }
 
 impl ScalarFieldTexture {
@@ -2277,12 +3066,16 @@ impl ScalarFieldTexture {
 
     /// Returns retained CPU scalar bytes used for device-loss recovery.
     pub fn recovery_memory_bytes(&self) -> usize {
-        std::mem::size_of_val(self.field.values())
+        self.field.value_allocation_bytes()
     }
 
-    /// Returns allocated `R32Float` texel bytes on the GPU.
+    /// Returns nominal `R32Float` texel-storage bytes requested from the GPU,
+    /// excluding backend row/tile/page alignment and metadata.
     pub fn gpu_allocation_bytes(&self) -> usize {
-        self.recovery_memory_bytes()
+        self.field
+            .values()
+            .len()
+            .saturating_mul(std::mem::size_of::<f32>())
     }
 }
 
@@ -2329,7 +3122,7 @@ impl TrailBuffer2d {
         self.front.size()
     }
 
-    /// Returns total allocated bytes for both ping-pong textures.
+    /// Returns nominal texel-storage bytes for both ping-pong textures.
     pub fn allocation_bytes(&self) -> usize {
         self.front
             .allocation_bytes()
@@ -2353,7 +3146,9 @@ impl RenderTarget2d {
         (self.width, self.height)
     }
 
-    /// Returns the exact single-level GPU texture allocation implied by its format.
+    /// Returns nominal single-level texel-storage bytes implied by its format.
+    /// Backend row/tile/page alignment and resource metadata are not observable
+    /// through wgpu and are therefore excluded.
     pub fn allocation_bytes(&self) -> usize {
         self.allocation_bytes
     }
@@ -2421,6 +3216,13 @@ pub enum ScalarFieldTextureError {
     InvalidUpdateValueCount,
     /// A region value was NaN or infinite.
     NonFiniteUpdateValue,
+    /// A finite scalar source lies outside the portable GPU arithmetic envelope.
+    NonPortableValue,
+    /// CPU recovery storage could not be reserved.
+    AllocationFailed {
+        /// Bytes requested for the rejected retained scalar copy.
+        requested_bytes: usize,
+    },
 }
 
 impl fmt::Display for ScalarFieldTextureError {
@@ -2446,6 +3248,14 @@ impl fmt::Display for ScalarFieldTextureError {
             Self::NonFiniteUpdateValue => {
                 write!(formatter, "scalar texture update values must be finite")
             }
+            Self::NonPortableValue => write!(
+                formatter,
+                "scalar values must be normal-or-zero and remain inside the portable GPU arithmetic envelope"
+            ),
+            Self::AllocationFailed { requested_bytes } => write!(
+                formatter,
+                "could not reserve {requested_bytes} bytes for scalar field recovery data"
+            ),
         }
     }
 }
@@ -2552,9 +3362,16 @@ impl PreparedScene {
         self.draw_batches.len()
     }
 
-    /// Returns retained CPU vertex bytes available for device-loss recovery.
+    /// Returns currently allocated CPU recovery bytes for vertices and draw batches.
     pub fn recovery_memory_bytes(&self) -> usize {
-        self.vertices.len() * std::mem::size_of::<Vertex>()
+        self.vertices
+            .capacity()
+            .saturating_mul(std::mem::size_of::<Vertex>())
+            .saturating_add(
+                self.draw_batches
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<PreparedDrawBatch>()),
+            )
     }
 
     /// Returns command-level tessellation results captured during preparation.
@@ -2703,6 +3520,14 @@ impl WgpuRenderer {
 
         let width = width.max(1);
         let height = height.max(1);
+        let dimension_limit = device.limits().max_texture_dimension_2d;
+        if width > dimension_limit || height > dimension_limit {
+            return Err(RendererInitError::SurfaceDimensionsTooLarge {
+                width,
+                height,
+                limit: dimension_limit,
+            });
+        }
         let surface_capabilities = surface.get_capabilities(&adapter);
         let mut config = surface
             .get_default_config(&adapter, width, height)
@@ -2732,7 +3557,7 @@ impl WgpuRenderer {
             heatmap_bind_group_layout,
         } = create_pipeline(&device, config.format, sample_count);
         let vertex_buffer = Arc::new(create_vertex_buffer(&device, INITIAL_VERTEX_CAPACITY));
-        let particle_unit_buffer = create_particle_unit_buffer(&device, &queue);
+        let particle_unit_buffer = create_submitted_particle_unit_buffer(&device, &queue);
         let multisample_target = create_multisample_target(&device, &config, sample_count);
         let image_renderer = ImageRenderer::new(&device, config.format, sample_count);
         let mesh3d_renderer = Mesh3dRenderer::new(&device, config.format);
@@ -2772,7 +3597,7 @@ impl WgpuRenderer {
             vertex_capacity: INITIAL_VERTEX_CAPACITY,
             multisample_target,
             sample_count,
-            vertices: Vec::with_capacity(INITIAL_VERTEX_CAPACITY),
+            vertices: Vec::new(),
             draw_batches: Vec::new(),
             retired_devices: Vec::new(),
             max_quarantined_devices: options.max_quarantined_devices(),
@@ -2949,16 +3774,18 @@ impl WgpuRenderer {
     ///
     /// Zero width or height is ignored because minimized windows often report
     /// zero size and `wgpu` cannot configure a zero-sized surface.
-    pub fn resize(&mut self, width: u32, height: u32) {
+    pub fn resize(&mut self, width: u32, height: u32) -> Result<(), RendererConfigurationError> {
         if width == 0 || height == 0 {
-            return;
+            return Ok(());
         }
+        validate_surface_dimensions(width, height, self.device.limits().max_texture_dimension_2d)?;
 
         self.config.width = width;
         self.config.height = height;
         self.surface.configure(&self.device, &self.config);
         self.multisample_target =
             create_multisample_target(&self.device, &self.config, self.sample_count);
+        Ok(())
     }
 
     /// Reconfigures physical surface size and logical-to-physical display scale.
@@ -2973,8 +3800,15 @@ impl WgpuRenderer {
         scale_factor: f64,
     ) -> Result<(), RendererConfigurationError> {
         validate_scale_factor(scale_factor)?;
+        if width != 0 && height != 0 {
+            validate_surface_dimensions(
+                width,
+                height,
+                self.device.limits().max_texture_dimension_2d,
+            )?;
+        }
+        self.resize(width, height)?;
         self.scale_factor = scale_factor;
-        self.resize(width, height);
         Ok(())
     }
 
@@ -3078,24 +3912,6 @@ impl WgpuRenderer {
         }
 
         let frame_started_at = Instant::now();
-        let tessellation_started_at = Instant::now();
-        self.vertices.clear();
-        self.draw_batches.clear();
-        let tessellation_stats =
-            tessellate_scene(scene, &mut self.vertices, &mut self.draw_batches)
-                .map_err(RendererFrameError::from)
-                .map_err(RenderTargetError::Frame)?;
-        self.ensure_vertex_capacity(self.vertices.len())
-            .map_err(RenderTargetError::Frame)?;
-        let tessellation = tessellation_started_at.elapsed();
-
-        let upload_started_at = Instant::now();
-        if !self.vertices.is_empty() {
-            self.queue
-                .write_buffer(&self.vertex_buffer, 0, bytemuck::cast_slice(&self.vertices));
-        }
-        let upload = upload_started_at.elapsed();
-
         let scale = pixel_scale.get();
         let target_viewport = LogicalViewport::new(
             target.width() as f32 / scale,
@@ -3131,6 +3947,21 @@ impl WgpuRenderer {
             CameraUniform::new_in_region(*camera, local_viewport, origin, target_viewport).ok_or(
                 RenderTargetError::Frame(RendererFrameError::InvalidGeometryTransform),
             )?;
+
+        let tessellation_started_at = Instant::now();
+        if !scene_estimate_fits_streaming_device(scene, &self.device, 0, self.vertex_capacity) {
+            return Err(RenderTargetError::Frame(
+                RendererFrameError::GeometryCapacityTooLarge,
+            ));
+        }
+        self.vertices.clear();
+        self.draw_batches.clear();
+        let tessellation_stats =
+            tessellate_scene(scene, &mut self.vertices, &mut self.draw_batches)
+                .map_err(RendererFrameError::from)
+                .map_err(RenderTargetError::Frame)?;
+        let tessellation = tessellation_started_at.elapsed();
+
         let extents = GeometryExtents::from_vertices(&self.vertices);
         if !geometry_is_safe_for(
             extents,
@@ -3141,6 +3972,14 @@ impl WgpuRenderer {
                 RendererFrameError::InvalidGeometryTransform,
             ));
         }
+        let upload_started_at = Instant::now();
+        self.ensure_vertex_capacity(self.vertices.len())
+            .map_err(RenderTargetError::Frame)?;
+        if !self.vertices.is_empty() {
+            self.queue
+                .write_buffer(&self.vertex_buffer, 0, bytemuck::cast_slice(&self.vertices));
+        }
+        let upload = upload_started_at.elapsed();
         let uniform_started_at = Instant::now();
         self.queue.write_buffer(
             &self.camera_uniform_buffer,
@@ -3158,7 +3997,9 @@ impl WgpuRenderer {
         {
             let load = match load {
                 RenderTargetLoad::Load => wgpu::LoadOp::Load,
-                RenderTargetLoad::Clear(color) => wgpu::LoadOp::Clear(color.to_wgpu()),
+                RenderTargetLoad::Clear(color) => {
+                    wgpu::LoadOp::Clear(premultiplied_wgpu_color(color))
+                }
             };
             let color_attachment = wgpu::RenderPassColorAttachment {
                 view: &target.view,
@@ -3224,25 +4065,33 @@ impl WgpuRenderer {
         viewport: Option<LogicalViewportRegion>,
     ) -> Result<RenderReport, RendererFrameError> {
         let frame_started_at = Instant::now();
+        let (_, _, camera_uniform) = self.surface_geometry_context(*camera, viewport)?;
         let tessellation_started_at = Instant::now();
+        if !scene_estimate_fits_streaming_device(scene, &self.device, 0, self.vertex_capacity) {
+            return Err(RendererFrameError::GeometryCapacityTooLarge);
+        }
         self.vertices.clear();
         self.draw_batches.clear();
         let tessellation_stats =
             tessellate_scene(scene, &mut self.vertices, &mut self.draw_batches)?;
-        self.ensure_vertex_capacity(self.vertices.len())?;
         let tessellation = tessellation_started_at.elapsed();
 
-        let upload_started_at = Instant::now();
-        if !self.vertices.is_empty() {
-            self.queue
-                .write_buffer(&self.vertex_buffer, 0, bytemuck::cast_slice(&self.vertices));
+        let geometry_extents = GeometryExtents::from_vertices(&self.vertices);
+        if !geometry_is_safe_for(
+            geometry_extents,
+            GeometryValidationSource::Tessellated(&self.vertices),
+            camera_uniform,
+        ) {
+            return Err(RendererFrameError::InvalidGeometryTransform);
         }
+
+        let upload_started_at = Instant::now();
+        self.ensure_vertex_capacity(self.vertices.len())?;
         let upload = upload_started_at.elapsed();
 
         let vertex_buffer = Arc::clone(&self.vertex_buffer);
         let draw_batches = std::mem::take(&mut self.draw_batches);
         let vertices = std::mem::take(&mut self.vertices);
-        let geometry_extents = GeometryExtents::from_vertices(&vertices);
         let result = self.draw_geometry(
             scene.background(),
             &vertex_buffer,
@@ -3254,7 +4103,9 @@ impl WgpuRenderer {
             tessellation,
             upload,
             false,
+            true,
             false,
+            Some(&vertices),
             tessellation_stats,
             frame_started_at,
             viewport,
@@ -3360,14 +4211,18 @@ impl WgpuRenderer {
         if let Some(budget) = budget {
             validate_dynamic_mesh_budget(budget, vertices.len())?;
         }
-        let vertices = dynamic_vertices_to_gpu(vertices)?;
         let vertex_capacity = dynamic_vertex_capacity(vertices.len())
             .filter(|capacity| buffer_capacity_fits::<DynamicGpu>(&self.device, *capacity))
             .ok_or(DynamicMeshError::CapacityTooLarge)?;
+        let vertices = dynamic_vertices_to_gpu(vertices)?;
+        if let Some(budget) = budget {
+            validate_dynamic_retained_capacity(budget, &vertices)?;
+        }
         let vertex_buffer = Arc::new(create_dynamic_vertex_buffer(&self.device, vertex_capacity));
         if !vertices.is_empty() {
             self.queue
                 .write_buffer(&vertex_buffer, 0, bytemuck::cast_slice(&vertices));
+            submit_pending_uploads(&self.queue);
         }
         Ok(DynamicMesh2d {
             renderer_identity: Arc::clone(&self.renderer_identity),
@@ -3447,6 +4302,7 @@ impl WgpuRenderer {
             let offset = (first_vertex * std::mem::size_of::<DynamicGpu>()) as wgpu::BufferAddress;
             self.queue
                 .write_buffer(&mesh.vertex_buffer, offset, bytemuck::cast_slice(&vertices));
+            submit_pending_uploads(&self.queue);
             mesh.vertices[first_vertex..end].copy_from_slice(&vertices);
             mesh.geometry_extents = GeometryExtents::from_dynamic_vertices(&mesh.vertices);
         }
@@ -3458,6 +4314,11 @@ impl WgpuRenderer {
     }
 
     /// Draws dynamic triangle-list geometry with a normalized clear color.
+    ///
+    /// Every potentially visible triangle must remain fully inside the full
+    /// surface clip volume and have a portable projected orientation. A
+    /// hardware-clipped or ambiguous triangle returns
+    /// `DynamicMeshRenderError::Frame(RendererFrameError::InvalidGeometryTransform)`.
     pub fn render_dynamic_mesh(
         &mut self,
         mesh: &DynamicMesh2d,
@@ -3469,6 +4330,10 @@ impl WgpuRenderer {
     }
 
     /// Draws dynamic triangle-list geometry and returns per-frame CPU metrics.
+    ///
+    /// Full-surface clip-volume crossing and association-dependent projected
+    /// topology are rejected as
+    /// `DynamicMeshRenderError::Frame(RendererFrameError::InvalidGeometryTransform)`.
     pub fn render_dynamic_mesh_with_metrics(
         &mut self,
         mesh: &DynamicMesh2d,
@@ -3496,6 +4361,8 @@ impl WgpuRenderer {
             Duration::ZERO,
             false,
             true,
+            true,
+            None,
             TessellationStats::default(),
             Instant::now(),
             None,
@@ -3515,16 +4382,24 @@ impl WgpuRenderer {
         self.create_particle_field_with_budget(instances, ParticleRenderBudget::UNBOUNDED)
     }
 
-    /// Creates an instanced particle field with hard GPU-memory and upload limits.
+    /// Creates an instanced particle field with hard retained-CPU, GPU-memory,
+    /// upload, visible-instance, and visibility-work limits.
     pub fn create_particle_field_with_budget(
         &self,
         instances: &[ParticleInstance2d],
         budget: ParticleRenderBudget,
     ) -> Result<ParticleField2d, ParticleFieldError> {
-        let instances = particle_instances_to_gpu(instances)?;
+        validate_particle_retained_count(instances.len(), budget)?;
         let instance_capacity = particle_budgeted_capacity(instances.len(), budget)
             .filter(|capacity| buffer_capacity_fits::<ParticleGpu>(&self.device, *capacity))
             .ok_or(ParticleFieldError::CapacityTooLarge)?;
+        let instances = particle_instances_to_gpu(instances)?;
+        let visible_instances = allocate_particle_staging(instances.len(), budget)?;
+        validate_particle_retained_capacities(
+            instances.capacity(),
+            visible_instances.capacity(),
+            budget,
+        )?;
         let instance_buffer = Arc::new(create_particle_instance_buffer(
             &self.device,
             instance_capacity,
@@ -3532,9 +4407,9 @@ impl WgpuRenderer {
         Ok(ParticleField2d {
             renderer_identity: Arc::clone(&self.renderer_identity),
             instance_buffer,
-            statistics: particle_statistics(instances.len(), instances.len(), 0),
+            statistics: particle_idle_statistics(instances.len()),
             instances,
-            visible_instances: Vec::new(),
+            visible_instances,
             instance_capacity,
             budget,
         })
@@ -3547,19 +4422,33 @@ impl WgpuRenderer {
         budget: ParticleRenderBudget,
     ) -> Result<(), ParticleFieldError> {
         self.validate_particle_field(field)?;
+        validate_particle_retained_count(field.instances.len(), budget)?;
         let desired_capacity = particle_budgeted_capacity(field.instances.len(), budget)
             .filter(|capacity| buffer_capacity_fits::<ParticleGpu>(&self.device, *capacity))
             .ok_or(ParticleFieldError::CapacityTooLarge)?;
-        if desired_capacity != field.instance_capacity {
-            field.instance_buffer = Arc::new(create_particle_instance_buffer(
+        let visible_instances = allocate_particle_staging(field.instances.len(), budget)?;
+        let replacement_instances = compact_particle_instances(
+            &field.instances,
+            field.instances.capacity(),
+            visible_instances.capacity(),
+            budget,
+        )?;
+        let replacement_buffer = (desired_capacity != field.instance_capacity).then(|| {
+            Arc::new(create_particle_instance_buffer(
                 &self.device,
                 desired_capacity,
-            ));
+            ))
+        });
+        if let Some(instance_buffer) = replacement_buffer {
+            field.instance_buffer = instance_buffer;
             field.instance_capacity = desired_capacity;
         }
+        if let Some(instances) = replacement_instances {
+            field.instances = instances;
+        }
         field.budget = budget;
-        field.visible_instances.clear();
-        field.statistics = particle_statistics(field.instances.len(), field.instances.len(), 0);
+        field.visible_instances = visible_instances;
+        field.statistics = particle_idle_statistics(field.instances.len());
         Ok(())
     }
 
@@ -3581,20 +4470,31 @@ impl WgpuRenderer {
     ) -> Result<ParticleFieldUpdateReport, ParticleFieldError> {
         let update_started_at = Instant::now();
         self.validate_particle_field(field)?;
-        let instances = particle_instances_to_gpu(instances)?;
+        validate_particle_retained_count(instances.len(), field.budget)?;
         let desired_capacity = particle_budgeted_capacity(instances.len(), field.budget)
             .filter(|capacity| buffer_capacity_fits::<ParticleGpu>(&self.device, *capacity))
             .ok_or(ParticleFieldError::CapacityTooLarge)?;
+        let instances = particle_instances_to_gpu(instances)?;
+        let visible_instances = allocate_particle_staging(instances.len(), field.budget)?;
+        validate_particle_retained_capacities(
+            instances.capacity(),
+            visible_instances.capacity(),
+            field.budget,
+        )?;
         let reallocated = desired_capacity > field.instance_capacity;
-        if reallocated {
-            field.instance_capacity = desired_capacity;
-            field.instance_buffer = Arc::new(create_particle_instance_buffer(
+        let replacement_buffer = reallocated.then(|| {
+            Arc::new(create_particle_instance_buffer(
                 &self.device,
-                field.instance_capacity,
-            ));
+                desired_capacity,
+            ))
+        });
+        if let Some(instance_buffer) = replacement_buffer {
+            field.instance_buffer = instance_buffer;
+            field.instance_capacity = desired_capacity;
         }
-        field.statistics = particle_statistics(instances.len(), instances.len(), 0);
+        field.statistics = particle_idle_statistics(instances.len());
         field.instances = instances;
+        field.visible_instances = visible_instances;
         Ok(ParticleFieldUpdateReport {
             statistics: field.statistics,
             preparation: update_started_at.elapsed(),
@@ -3627,7 +4527,7 @@ impl WgpuRenderer {
         if !instances.is_empty() {
             field.instances[range].copy_from_slice(&instances);
         }
-        field.statistics = particle_statistics(field.instances.len(), field.instances.len(), 0);
+        field.statistics = particle_idle_statistics(field.instances.len());
         Ok(ParticleFieldUpdateReport {
             statistics: field.statistics,
             preparation: update_started_at.elapsed(),
@@ -3811,12 +4711,20 @@ impl WgpuRenderer {
     ) -> Result<ScalarFieldUploadReport, ScalarFieldTextureError> {
         let upload_started_at = Instant::now();
         self.validate_scalar_field_texture(texture)?;
+        validate_scalar_field_device_extent(&self.device, &field)?;
+        if !scalar_field_sources_are_portable(&field) {
+            return Err(ScalarFieldTextureError::NonPortableValue);
+        }
+        let field = compact_scalar_field_for_retention(field)?;
+        let (source_minimum, source_maximum) = field.value_range();
         let reallocated = texture.width() != field.width() || texture.height() != field.height();
         if reallocated {
             texture.texture = create_scalar_field_texture(&self.device, &field)?;
         }
         upload_scalar_field_texture(&self.queue, &texture.texture, &field)?;
         texture.field = field;
+        texture.source_minimum = source_minimum;
+        texture.source_maximum = source_maximum;
         Ok(ScalarFieldUploadReport {
             upload: upload_started_at.elapsed(),
             reallocated,
@@ -3835,6 +4743,45 @@ impl WgpuRenderer {
     ) -> Result<ScalarFieldUploadReport, ScalarFieldTextureError> {
         let upload_started_at = Instant::now();
         self.validate_scalar_field_texture(texture)?;
+        if values.iter().any(|value| !value.is_finite()) {
+            return Err(ScalarFieldTextureError::NonFiniteUpdateValue);
+        }
+        if values
+            .iter()
+            .copied()
+            .any(|value| !is_portable_shader_source(value))
+        {
+            return Err(ScalarFieldTextureError::NonPortableValue);
+        }
+        validate_scalar_field_texture_region(
+            texture.width(),
+            texture.height(),
+            x,
+            y,
+            width,
+            height,
+            values.len(),
+        )?;
+        let update_minimum = values.iter().copied().fold(f32::INFINITY, f32::min);
+        let update_maximum = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let overwrites_extremum = (y..y + height).any(|row| {
+            let start = row * texture.width() + x;
+            texture.field.values()[start..start + width]
+                .iter()
+                .any(|value| *value == texture.source_minimum || *value == texture.source_maximum)
+        });
+        let (source_minimum, source_maximum) = if overwrites_extremum {
+            scalar_region_result_range(&texture.field, x, y, width, height, values)
+        } else {
+            (
+                texture.source_minimum.min(update_minimum),
+                texture.source_maximum.max(update_maximum),
+            )
+        };
+        let source_extent = f64::from(source_maximum) - f64::from(source_minimum);
+        if !source_extent.is_finite() || source_extent > f64::from(MAX_PORTABLE_SHADER_VALUE) {
+            return Err(ScalarFieldTextureError::NonPortableValue);
+        }
         texture
             .field
             .replace_region(x, y, width, height, values)
@@ -3856,6 +4803,8 @@ impl WgpuRenderer {
             height,
             values,
         )?;
+        texture.source_minimum = source_minimum;
+        texture.source_maximum = source_maximum;
         Ok(ScalarFieldUploadReport {
             upload: upload_started_at.elapsed(),
             reallocated: false,
@@ -3867,7 +4816,9 @@ impl WgpuRenderer {
         &self,
         source: &ScalarFieldTexture,
     ) -> Result<ScalarFieldTexture, ScalarFieldTextureError> {
-        self.create_scalar_field_texture(source.field.clone())
+        validate_scalar_field_device_extent(&self.device, &source.field)?;
+        let field = clone_scalar_field_for_restore(&source.field)?;
+        self.create_scalar_field_texture(field)
     }
 
     /// Draws a scalar texture across the logical viewport through a color map.
@@ -3897,6 +4848,9 @@ impl WgpuRenderer {
             .map_err(|_| ScalarFieldRenderError::RendererMismatch)?;
         let value_extent = scalar_value_range_extent(minimum, maximum)
             .ok_or(ScalarFieldRenderError::InvalidValueRange { minimum, maximum })?;
+        if !scalar_normalization_is_portable(texture, minimum, value_extent) {
+            return Err(ScalarFieldRenderError::InvalidValueRange { minimum, maximum });
+        }
         if !background.is_normalized() {
             return Err(ScalarFieldRenderError::InvalidBackground);
         }
@@ -3925,6 +4879,9 @@ impl WgpuRenderer {
             .map_err(|_| ScalarFieldRenderError::RendererMismatch)?;
         let value_extent = scalar_value_range_extent(minimum, maximum)
             .ok_or(ScalarFieldRenderError::InvalidValueRange { minimum, maximum })?;
+        if !scalar_normalization_is_portable(texture, minimum, value_extent) {
+            return Err(ScalarFieldRenderError::InvalidValueRange { minimum, maximum });
+        }
         if !background.is_normalized() {
             return Err(ScalarFieldRenderError::InvalidBackground);
         }
@@ -3976,6 +4933,9 @@ impl WgpuRenderer {
             .map_err(|_| ScalarFieldRenderError::RendererMismatch)?;
         let value_extent = scalar_value_range_extent(minimum, maximum)
             .ok_or(ScalarFieldRenderError::InvalidValueRange { minimum, maximum })?;
+        if !scalar_normalization_is_portable(texture, minimum, value_extent) {
+            return Err(ScalarFieldRenderError::InvalidValueRange { minimum, maximum });
+        }
         if !background.is_normalized() {
             return Err(ScalarFieldRenderError::InvalidBackground);
         }
@@ -4129,6 +5089,8 @@ impl WgpuRenderer {
             Duration::ZERO,
             true,
             false,
+            false,
+            None,
             scene.tessellation,
             Instant::now(),
             None,
@@ -4136,24 +5098,11 @@ impl WgpuRenderer {
         .map_err(PreparedSceneRenderError::Frame)
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn draw_geometry(
-        &mut self,
-        background: Color,
-        vertex_buffer: &wgpu::Buffer,
-        vertex_count: usize,
-        geometry_extents: GeometryExtents,
-        geometry_validation: GeometryValidationSource<'_>,
-        draw_batches: &[PreparedDrawBatch],
+    fn surface_geometry_context(
+        &self,
         camera: Camera2d,
-        tessellation: Duration,
-        upload: Duration,
-        geometry_reused: bool,
-        geometry_streamed: bool,
-        tessellation_stats: TessellationStats,
-        frame_started_at: Instant,
         viewport_region: Option<LogicalViewportRegion>,
-    ) -> Result<RenderReport, RendererFrameError> {
+    ) -> Result<(LogicalViewport, ScissorRect, CameraUniform), RendererFrameError> {
         let (logical_width, logical_height) = self.logical_size();
         let target_viewport = LogicalViewport::new(logical_width, logical_height)
             .map_err(|_| RendererFrameError::InvalidGeometryTransform)?;
@@ -4179,21 +5128,37 @@ impl WgpuRenderer {
             self.config.height,
         )
         .ok_or(RendererFrameError::InvalidViewport)?;
-        let camera_uniform_upload_started_at = Instant::now();
-        let Some(camera_uniform) =
+        let camera_uniform =
             CameraUniform::new_in_region(camera, viewport, viewport_origin, target_viewport)
-        else {
-            return Err(RendererFrameError::InvalidGeometryTransform);
-        };
+                .ok_or(RendererFrameError::InvalidGeometryTransform)?;
+        Ok((viewport, viewport_scissor, camera_uniform))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_geometry(
+        &mut self,
+        background: Color,
+        vertex_buffer: &wgpu::Buffer,
+        vertex_count: usize,
+        geometry_extents: GeometryExtents,
+        geometry_validation: GeometryValidationSource<'_>,
+        draw_batches: &[PreparedDrawBatch],
+        camera: Camera2d,
+        tessellation: Duration,
+        mut upload: Duration,
+        geometry_reused: bool,
+        geometry_streamed: bool,
+        uses_dynamic_pipeline: bool,
+        pending_vertex_upload: Option<&[Vertex]>,
+        tessellation_stats: TessellationStats,
+        frame_started_at: Instant,
+        viewport_region: Option<LogicalViewportRegion>,
+    ) -> Result<RenderReport, RendererFrameError> {
+        let (viewport, viewport_scissor, camera_uniform) =
+            self.surface_geometry_context(camera, viewport_region)?;
         if !geometry_is_safe_for(geometry_extents, geometry_validation, camera_uniform) {
             return Err(RendererFrameError::InvalidGeometryTransform);
         }
-        self.queue.write_buffer(
-            &self.camera_uniform_buffer,
-            0,
-            bytemuck::bytes_of(&camera_uniform),
-        );
-        let camera_uniform_upload = camera_uniform_upload_started_at.elapsed();
 
         let surface_acquire_started_at = Instant::now();
         let surface_texture = match self.surface.get_current_texture() {
@@ -4204,7 +5169,7 @@ impl WgpuRenderer {
                     RenderStatus::Skipped(RendererSurfaceStatus::Timeout),
                     tessellation,
                     upload,
-                    camera_uniform_upload,
+                    Duration::ZERO,
                     surface_acquire_started_at.elapsed(),
                     Duration::ZERO,
                     frame_started_at.elapsed(),
@@ -4218,7 +5183,7 @@ impl WgpuRenderer {
                     RenderStatus::Skipped(RendererSurfaceStatus::Occluded),
                     tessellation,
                     upload,
-                    camera_uniform_upload,
+                    Duration::ZERO,
                     surface_acquire_started_at.elapsed(),
                     Duration::ZERO,
                     frame_started_at.elapsed(),
@@ -4228,12 +5193,12 @@ impl WgpuRenderer {
                 ));
             }
             wgpu::CurrentSurfaceTexture::Outdated => {
-                self.resize(self.config.width, self.config.height);
+                let _ = self.resize(self.config.width, self.config.height);
                 return Ok(render_report(
                     RenderStatus::Skipped(RendererSurfaceStatus::Outdated),
                     tessellation,
                     upload,
-                    camera_uniform_upload,
+                    Duration::ZERO,
                     surface_acquire_started_at.elapsed(),
                     Duration::ZERO,
                     frame_started_at.elapsed(),
@@ -4252,6 +5217,21 @@ impl WgpuRenderer {
             }
         };
         let surface_acquire = surface_acquire_started_at.elapsed();
+        let vertex_upload_started_at = Instant::now();
+        if let Some(vertices) = pending_vertex_upload
+            && !vertices.is_empty()
+        {
+            self.queue
+                .write_buffer(vertex_buffer, 0, bytemuck::cast_slice(vertices));
+        }
+        upload = upload.saturating_add(vertex_upload_started_at.elapsed());
+        let camera_uniform_upload_started_at = Instant::now();
+        self.queue.write_buffer(
+            &self.camera_uniform_buffer,
+            0,
+            bytemuck::bytes_of(&camera_uniform),
+        );
+        let camera_uniform_upload = camera_uniform_upload_started_at.elapsed();
 
         let encode_submit_present_started_at = Instant::now();
         let surface_view = surface_texture
@@ -4288,7 +5268,7 @@ impl WgpuRenderer {
             });
 
             if vertex_count > 0 {
-                let pipeline = if geometry_streamed {
+                let pipeline = if uses_dynamic_pipeline {
                     &self.dynamic_pipeline
                 } else {
                     &self.pipeline
@@ -4350,11 +5330,6 @@ impl WgpuRenderer {
         background: Color,
         frame_started_at: Instant,
     ) -> Result<RenderReport, RendererFrameError> {
-        let upload_started_at = Instant::now();
-        let color_map_view = self.color_map_view(color_map);
-        let scalar_view = texture
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
         let uniform = HeatmapUniform::new(
             minimum,
             value_extent,
@@ -4362,6 +5337,68 @@ impl WgpuRenderer {
             texture.height(),
             sampling,
         );
+        let acquire_started_at = Instant::now();
+        let surface_texture = match self.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(texture)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(texture) => texture,
+            wgpu::CurrentSurfaceTexture::Timeout => {
+                return Ok(render_report(
+                    RenderStatus::Skipped(RendererSurfaceStatus::Timeout),
+                    Duration::ZERO,
+                    Duration::ZERO,
+                    Duration::ZERO,
+                    acquire_started_at.elapsed(),
+                    Duration::ZERO,
+                    frame_started_at.elapsed(),
+                    false,
+                    true,
+                    TessellationStats::default(),
+                ));
+            }
+            wgpu::CurrentSurfaceTexture::Occluded => {
+                return Ok(render_report(
+                    RenderStatus::Skipped(RendererSurfaceStatus::Occluded),
+                    Duration::ZERO,
+                    Duration::ZERO,
+                    Duration::ZERO,
+                    acquire_started_at.elapsed(),
+                    Duration::ZERO,
+                    frame_started_at.elapsed(),
+                    false,
+                    true,
+                    TessellationStats::default(),
+                ));
+            }
+            wgpu::CurrentSurfaceTexture::Outdated => {
+                let _ = self.resize(self.config.width, self.config.height);
+                return Ok(render_report(
+                    RenderStatus::Skipped(RendererSurfaceStatus::Outdated),
+                    Duration::ZERO,
+                    Duration::ZERO,
+                    Duration::ZERO,
+                    acquire_started_at.elapsed(),
+                    Duration::ZERO,
+                    frame_started_at.elapsed(),
+                    false,
+                    true,
+                    TessellationStats::default(),
+                ));
+            }
+            wgpu::CurrentSurfaceTexture::Lost => {
+                return Err(RendererFrameError::Surface(RendererSurfaceStatus::Lost));
+            }
+            wgpu::CurrentSurfaceTexture::Validation => {
+                return Err(RendererFrameError::Surface(
+                    RendererSurfaceStatus::Validation,
+                ));
+            }
+        };
+        let surface_acquire = acquire_started_at.elapsed();
+        let upload_started_at = Instant::now();
+        let color_map_view = self.color_map_view(color_map);
+        let scalar_view = texture
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
         self.queue.write_buffer(
             &self.heatmap_uniform_buffer,
             0,
@@ -4386,63 +5423,6 @@ impl WgpuRenderer {
             ],
         });
         let upload = upload_started_at.elapsed();
-        let acquire_started_at = Instant::now();
-        let surface_texture = match self.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(texture)
-            | wgpu::CurrentSurfaceTexture::Suboptimal(texture) => texture,
-            wgpu::CurrentSurfaceTexture::Timeout => {
-                return Ok(render_report(
-                    RenderStatus::Skipped(RendererSurfaceStatus::Timeout),
-                    Duration::ZERO,
-                    upload,
-                    Duration::ZERO,
-                    acquire_started_at.elapsed(),
-                    Duration::ZERO,
-                    frame_started_at.elapsed(),
-                    false,
-                    true,
-                    TessellationStats::default(),
-                ));
-            }
-            wgpu::CurrentSurfaceTexture::Occluded => {
-                return Ok(render_report(
-                    RenderStatus::Skipped(RendererSurfaceStatus::Occluded),
-                    Duration::ZERO,
-                    upload,
-                    Duration::ZERO,
-                    acquire_started_at.elapsed(),
-                    Duration::ZERO,
-                    frame_started_at.elapsed(),
-                    false,
-                    true,
-                    TessellationStats::default(),
-                ));
-            }
-            wgpu::CurrentSurfaceTexture::Outdated => {
-                self.resize(self.config.width, self.config.height);
-                return Ok(render_report(
-                    RenderStatus::Skipped(RendererSurfaceStatus::Outdated),
-                    Duration::ZERO,
-                    upload,
-                    Duration::ZERO,
-                    acquire_started_at.elapsed(),
-                    Duration::ZERO,
-                    frame_started_at.elapsed(),
-                    false,
-                    true,
-                    TessellationStats::default(),
-                ));
-            }
-            wgpu::CurrentSurfaceTexture::Lost => {
-                return Err(RendererFrameError::Surface(RendererSurfaceStatus::Lost));
-            }
-            wgpu::CurrentSurfaceTexture::Validation => {
-                return Err(RendererFrameError::Surface(
-                    RendererSurfaceStatus::Validation,
-                ));
-            }
-        };
-        let surface_acquire = acquire_started_at.elapsed();
         let encode_started_at = Instant::now();
         let surface_view = surface_texture
             .texture
@@ -4591,6 +5571,63 @@ impl WgpuRenderer {
         background: Color,
         frame_started_at: Instant,
     ) -> Result<RenderReport, RendererFrameError> {
+        let acquire_started_at = Instant::now();
+        let surface_texture = match self.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(texture)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(texture) => texture,
+            wgpu::CurrentSurfaceTexture::Timeout => {
+                return Ok(render_report(
+                    RenderStatus::Skipped(RendererSurfaceStatus::Timeout),
+                    Duration::ZERO,
+                    Duration::ZERO,
+                    Duration::ZERO,
+                    acquire_started_at.elapsed(),
+                    Duration::ZERO,
+                    frame_started_at.elapsed(),
+                    false,
+                    true,
+                    TessellationStats::default(),
+                ));
+            }
+            wgpu::CurrentSurfaceTexture::Occluded => {
+                return Ok(render_report(
+                    RenderStatus::Skipped(RendererSurfaceStatus::Occluded),
+                    Duration::ZERO,
+                    Duration::ZERO,
+                    Duration::ZERO,
+                    acquire_started_at.elapsed(),
+                    Duration::ZERO,
+                    frame_started_at.elapsed(),
+                    false,
+                    true,
+                    TessellationStats::default(),
+                ));
+            }
+            wgpu::CurrentSurfaceTexture::Outdated => {
+                let _ = self.resize(self.config.width, self.config.height);
+                return Ok(render_report(
+                    RenderStatus::Skipped(RendererSurfaceStatus::Outdated),
+                    Duration::ZERO,
+                    Duration::ZERO,
+                    Duration::ZERO,
+                    acquire_started_at.elapsed(),
+                    Duration::ZERO,
+                    frame_started_at.elapsed(),
+                    false,
+                    true,
+                    TessellationStats::default(),
+                ));
+            }
+            wgpu::CurrentSurfaceTexture::Lost => {
+                return Err(RendererFrameError::Surface(RendererSurfaceStatus::Lost));
+            }
+            wgpu::CurrentSurfaceTexture::Validation => {
+                return Err(RendererFrameError::Surface(
+                    RendererSurfaceStatus::Validation,
+                ));
+            }
+        };
+        let surface_acquire = acquire_started_at.elapsed();
         let upload_started_at = Instant::now();
         self.queue.write_buffer(
             &self.composition_pipelines.uniform_buffer,
@@ -4615,63 +5652,6 @@ impl WgpuRenderer {
             ],
         });
         let upload = upload_started_at.elapsed();
-        let acquire_started_at = Instant::now();
-        let surface_texture = match self.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(texture)
-            | wgpu::CurrentSurfaceTexture::Suboptimal(texture) => texture,
-            wgpu::CurrentSurfaceTexture::Timeout => {
-                return Ok(render_report(
-                    RenderStatus::Skipped(RendererSurfaceStatus::Timeout),
-                    Duration::ZERO,
-                    upload,
-                    Duration::ZERO,
-                    acquire_started_at.elapsed(),
-                    Duration::ZERO,
-                    frame_started_at.elapsed(),
-                    false,
-                    true,
-                    TessellationStats::default(),
-                ));
-            }
-            wgpu::CurrentSurfaceTexture::Occluded => {
-                return Ok(render_report(
-                    RenderStatus::Skipped(RendererSurfaceStatus::Occluded),
-                    Duration::ZERO,
-                    upload,
-                    Duration::ZERO,
-                    acquire_started_at.elapsed(),
-                    Duration::ZERO,
-                    frame_started_at.elapsed(),
-                    false,
-                    true,
-                    TessellationStats::default(),
-                ));
-            }
-            wgpu::CurrentSurfaceTexture::Outdated => {
-                self.resize(self.config.width, self.config.height);
-                return Ok(render_report(
-                    RenderStatus::Skipped(RendererSurfaceStatus::Outdated),
-                    Duration::ZERO,
-                    upload,
-                    Duration::ZERO,
-                    acquire_started_at.elapsed(),
-                    Duration::ZERO,
-                    frame_started_at.elapsed(),
-                    false,
-                    true,
-                    TessellationStats::default(),
-                ));
-            }
-            wgpu::CurrentSurfaceTexture::Lost => {
-                return Err(RendererFrameError::Surface(RendererSurfaceStatus::Lost));
-            }
-            wgpu::CurrentSurfaceTexture::Validation => {
-                return Err(RendererFrameError::Surface(
-                    RendererSurfaceStatus::Validation,
-                ));
-            }
-        };
-        let surface_acquire = acquire_started_at.elapsed();
         let encode_started_at = Instant::now();
         let surface_view = surface_texture
             .texture
@@ -4903,6 +5883,7 @@ impl WgpuRenderer {
         let visibility_checked = instance_count.min(field.budget.max_visibility_checks_per_frame);
         if visibility_checked < instance_count {
             field.visible_instances.clear();
+            validate_particle_staging_capacity(&field.visible_instances, visibility_checked)?;
             for candidate_index in 0..visibility_checked {
                 let source_index =
                     uniformly_sampled_index(candidate_index, instance_count, visibility_checked);
@@ -4930,19 +5911,23 @@ impl WgpuRenderer {
                     selected
                 });
             }
-            field.statistics = particle_statistics_with_budget(
+            let statistics = particle_statistics_with_budget(
                 instance_count,
                 visibility_checked,
                 visible_count,
                 selected_count,
                 0,
             );
-            return self.upload_particle_draw(field, camera_uniform, selected_count);
+            return Ok(ParticleDrawPreparation {
+                camera_uniform,
+                visible_count: selected_count,
+                statistics,
+            });
         }
 
         let visible_count = visible_particle_count(&field.instances, camera_uniform, viewport)?;
         let selected_count = visible_count.min(field.budget.instance_limit());
-        field.statistics = particle_statistics_with_budget(
+        let statistics = particle_statistics_with_budget(
             instance_count,
             instance_count,
             visible_count,
@@ -4953,6 +5938,7 @@ impl WgpuRenderer {
             field.visible_instances.clear();
         } else {
             field.visible_instances.clear();
+            validate_particle_staging_capacity(&field.visible_instances, selected_count)?;
             let mut visible_index = 0;
             for instance in field.instances.iter().copied() {
                 if !instance.intersects_viewport(camera_uniform, viewport) {
@@ -4971,21 +5957,25 @@ impl WgpuRenderer {
                 visible_index += 1;
             }
         }
-        self.upload_particle_draw(field, camera_uniform, selected_count)
+        Ok(ParticleDrawPreparation {
+            camera_uniform,
+            visible_count: selected_count,
+            statistics,
+        })
     }
 
     fn upload_particle_draw(
         &self,
         field: &ParticleField2d,
-        camera_uniform: CameraUniform,
-        visible_count: usize,
-    ) -> Result<ParticleDrawPreparation, RendererFrameError> {
-        let visible_instances =
-            if field.visible_instances.is_empty() && visible_count == field.instances.len() {
-                field.instances.as_slice()
-            } else {
-                field.visible_instances.as_slice()
-            };
+        preparation: ParticleDrawPreparation,
+    ) -> (Duration, Duration) {
+        let visible_instances = if field.visible_instances.is_empty()
+            && preparation.visible_count == field.instances.len()
+        {
+            field.instances.as_slice()
+        } else {
+            field.visible_instances.as_slice()
+        };
         let upload_started_at = Instant::now();
         if !visible_instances.is_empty() {
             self.queue.write_buffer(
@@ -4999,15 +5989,10 @@ impl WgpuRenderer {
         self.queue.write_buffer(
             &self.camera_uniform_buffer,
             0,
-            bytemuck::bytes_of(&camera_uniform),
+            bytemuck::bytes_of(&preparation.camera_uniform),
         );
         let camera_uniform_upload = camera_uniform_upload_started_at.elapsed();
-
-        Ok(ParticleDrawPreparation {
-            visible_count,
-            upload,
-            camera_uniform_upload,
-        })
+        (upload, camera_uniform_upload)
     }
 
     fn draw_particle_field(
@@ -5017,18 +6002,21 @@ impl WgpuRenderer {
         camera: Camera2d,
         frame_started_at: Instant,
     ) -> Result<RenderReport, RendererFrameError> {
+        let preparation_started_at = Instant::now();
         let preparation = self.prepare_particle_draw(field, camera)?;
+        let preparation_duration = preparation_started_at.elapsed();
 
         let surface_acquire_started_at = Instant::now();
         let surface_texture = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(texture)
             | wgpu::CurrentSurfaceTexture::Suboptimal(texture) => texture,
             wgpu::CurrentSurfaceTexture::Timeout => {
+                field.statistics = preparation.statistics;
                 return Ok(render_report(
                     RenderStatus::Skipped(RendererSurfaceStatus::Timeout),
+                    preparation_duration,
                     Duration::ZERO,
-                    preparation.upload,
-                    preparation.camera_uniform_upload,
+                    Duration::ZERO,
                     surface_acquire_started_at.elapsed(),
                     Duration::ZERO,
                     frame_started_at.elapsed(),
@@ -5038,11 +6026,12 @@ impl WgpuRenderer {
                 ));
             }
             wgpu::CurrentSurfaceTexture::Occluded => {
+                field.statistics = preparation.statistics;
                 return Ok(render_report(
                     RenderStatus::Skipped(RendererSurfaceStatus::Occluded),
+                    preparation_duration,
                     Duration::ZERO,
-                    preparation.upload,
-                    preparation.camera_uniform_upload,
+                    Duration::ZERO,
                     surface_acquire_started_at.elapsed(),
                     Duration::ZERO,
                     frame_started_at.elapsed(),
@@ -5052,12 +6041,13 @@ impl WgpuRenderer {
                 ));
             }
             wgpu::CurrentSurfaceTexture::Outdated => {
-                self.resize(self.config.width, self.config.height);
+                let _ = self.resize(self.config.width, self.config.height);
+                field.statistics = preparation.statistics;
                 return Ok(render_report(
                     RenderStatus::Skipped(RendererSurfaceStatus::Outdated),
+                    preparation_duration,
                     Duration::ZERO,
-                    preparation.upload,
-                    preparation.camera_uniform_upload,
+                    Duration::ZERO,
                     surface_acquire_started_at.elapsed(),
                     Duration::ZERO,
                     frame_started_at.elapsed(),
@@ -5076,6 +6066,7 @@ impl WgpuRenderer {
             }
         };
         let surface_acquire = surface_acquire_started_at.elapsed();
+        let (upload, camera_uniform_upload) = self.upload_particle_draw(field, preparation);
         let encode_submit_present_started_at = Instant::now();
         let surface_view = surface_texture
             .texture
@@ -5117,12 +6108,15 @@ impl WgpuRenderer {
         self.queue.submit([encoder.finish()]);
         self.notify_before_present();
         self.queue.present(surface_texture);
-        field.statistics.rendered = preparation.visible_count;
+        field.statistics = ParticleStatistics {
+            rendered: preparation.visible_count,
+            ..preparation.statistics
+        };
         Ok(render_report(
             RenderStatus::Drawn,
-            Duration::ZERO,
-            preparation.upload,
-            preparation.camera_uniform_upload,
+            preparation_duration,
+            upload,
+            camera_uniform_upload,
             surface_acquire,
             encode_submit_present_started_at.elapsed(),
             frame_started_at.elapsed(),
@@ -5140,7 +6134,10 @@ impl WgpuRenderer {
         load: RenderTargetLoad,
         frame_started_at: Instant,
     ) -> Result<RenderReport, RendererFrameError> {
+        let preparation_started_at = Instant::now();
         let preparation = self.prepare_particle_draw(field, camera)?;
+        let preparation_duration = preparation_started_at.elapsed();
+        let (upload, camera_uniform_upload) = self.upload_particle_draw(field, preparation);
         let encode_started_at = Instant::now();
         let mut encoder = self
             .device
@@ -5179,12 +6176,15 @@ impl WgpuRenderer {
             }
         }
         self.queue.submit([encoder.finish()]);
-        field.statistics.rendered = preparation.visible_count;
+        field.statistics = ParticleStatistics {
+            rendered: preparation.visible_count,
+            ..preparation.statistics
+        };
         Ok(render_report(
             RenderStatus::Drawn,
-            Duration::ZERO,
-            preparation.upload,
-            preparation.camera_uniform_upload,
+            preparation_duration,
+            upload,
+            camera_uniform_upload,
             Duration::ZERO,
             encode_started_at.elapsed(),
             frame_started_at.elapsed(),
@@ -5228,14 +6228,15 @@ impl WgpuRenderer {
     }
 
     fn color_map_view(&mut self, color_map: &ColorMap) -> wgpu::TextureView {
+        let lut = color_map_lut(color_map);
         if let Some(cached) = self
             .color_map_cache
             .as_ref()
-            .filter(|cached| cached.source == *color_map)
+            .filter(|cached| cached.lut == lut)
         {
             return cached.view.clone();
         }
-        let cached = create_cached_color_map(&self.device, &self.queue, color_map);
+        let cached = create_cached_color_map(&self.device, &self.queue, lut);
         let view = cached.view.clone();
         self.color_map_cache = Some(cached);
         view
@@ -5305,12 +6306,20 @@ fn replace_dynamic_mesh_resources(
     if let Some(budget) = mesh.budget {
         validate_dynamic_mesh_budget(budget, vertices.len())?;
     }
-    let replacement_vertices = dynamic_vertices_to_gpu(vertices)?;
     let reallocated = vertices.len() > mesh.vertex_capacity;
-    let replacement = if reallocated {
+    let replacement_capacity = if reallocated {
         let capacity = dynamic_vertex_capacity(vertices.len())
             .filter(|capacity| buffer_capacity_fits::<DynamicGpu>(device, *capacity))
             .ok_or(DynamicMeshError::CapacityTooLarge)?;
+        Some(capacity)
+    } else {
+        None
+    };
+    let replacement_vertices = dynamic_vertices_to_gpu(vertices)?;
+    if let Some(budget) = mesh.budget {
+        validate_dynamic_retained_capacity(budget, &replacement_vertices)?;
+    }
+    let replacement = if let Some(capacity) = replacement_capacity {
         let buffer = Arc::new(create_dynamic_vertex_buffer(device, capacity));
         Some((buffer, capacity))
     } else {
@@ -5325,6 +6334,7 @@ fn replace_dynamic_mesh_resources(
             0,
             bytemuck::cast_slice(&replacement_vertices),
         );
+        submit_pending_uploads(queue);
     }
     if let Some((buffer, capacity)) = replacement {
         mesh.vertex_buffer = buffer;
@@ -5349,6 +6359,9 @@ fn validate_dynamic_mesh_budget(
     budget: DynamicMeshBudget,
     vertex_count: usize,
 ) -> Result<(), DynamicMeshError> {
+    if u32::try_from(vertex_count).is_err() {
+        return Err(DynamicMeshError::CapacityTooLarge);
+    }
     if vertex_count > budget.max_vertices {
         return Err(DynamicMeshError::BudgetExceeded {
             resource: DynamicMeshBudgetResource::Vertices,
@@ -5374,9 +6387,41 @@ fn validate_dynamic_mesh_budget(
     Ok(())
 }
 
+fn validate_dynamic_retained_capacity(
+    budget: DynamicMeshBudget,
+    vertices: &Vec<DynamicGpu>,
+) -> Result<(), DynamicMeshError> {
+    let actual = vertices
+        .capacity()
+        .checked_mul(std::mem::size_of::<DynamicGpu>())
+        .ok_or(DynamicMeshError::CapacityTooLarge)?;
+    if actual > budget.max_retained_bytes {
+        return Err(DynamicMeshError::BudgetExceeded {
+            resource: DynamicMeshBudgetResource::RetainedBytes,
+            limit: budget.max_retained_bytes,
+            actual,
+        });
+    }
+    Ok(())
+}
+
 fn validate_dynamic_vertices(vertices: &[DynamicVertex2d]) -> Result<(), DynamicMeshError> {
+    if u32::try_from(vertices.len()).is_err() {
+        return Err(DynamicMeshError::CapacityTooLarge);
+    }
     if !vertices.len().is_multiple_of(3) {
         return Err(DynamicMeshError::InvalidVertexCount);
+    }
+    if vertices.iter().any(|vertex| {
+        ![
+            vertex.world_position.x,
+            vertex.world_position.y,
+            vertex.depth,
+        ]
+        .into_iter()
+        .all(is_portable_shader_source)
+    }) {
+        return Err(DynamicMeshError::InvalidVertex);
     }
     // Private fields and the only public constructor make finiteness an
     // invariant of DynamicVertex2d. Keep the assertion in development without
@@ -5404,30 +6449,103 @@ fn dynamic_vertex_capacity(vertex_count: usize) -> Option<usize> {
 fn particle_instances_to_gpu(
     instances: &[ParticleInstance2d],
 ) -> Result<Vec<ParticleGpu>, ParticleFieldError> {
-    instances
-        .iter()
-        .copied()
-        .map(|instance| {
-            let world_position = instance.world_position();
-            let radius = instance.radius();
-            let color = instance.color();
-            let depth = instance.depth();
-            if !world_position.is_finite()
-                || !radius.is_finite()
-                || radius <= 0.0
-                || !color.is_normalized()
-                || !depth.is_finite()
-            {
-                return Err(ParticleFieldError::InvalidInstance);
-            }
-            Ok(ParticleGpu {
-                world_position: [world_position.x, world_position.y],
-                depth,
-                radius,
-                color: color.to_array(),
-            })
-        })
-        .collect()
+    if u32::try_from(instances.len()).is_err() {
+        return Err(ParticleFieldError::CapacityTooLarge);
+    }
+    let requested_bytes = instances
+        .len()
+        .checked_mul(std::mem::size_of::<ParticleGpu>())
+        .ok_or(ParticleFieldError::CapacityTooLarge)?;
+    if instances.iter().copied().any(|instance| {
+        let world_position = instance.world_position();
+        let radius = instance.radius();
+        let color = instance.color();
+        let depth = instance.depth();
+        ![world_position.x, world_position.y, radius, depth]
+            .into_iter()
+            .all(is_portable_shader_source)
+            || radius <= 0.0
+            || !color.is_normalized()
+    }) {
+        return Err(ParticleFieldError::InvalidInstance);
+    }
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(instances.len())
+        .map_err(|_| ParticleFieldError::AllocationFailed { requested_bytes })?;
+    output.extend(instances.iter().copied().map(|instance| {
+        let world_position = instance.world_position();
+        ParticleGpu {
+            world_position: [world_position.x, world_position.y],
+            depth: instance.depth(),
+            radius: instance.radius(),
+            color: instance.color().to_array(),
+        }
+    }));
+    Ok(output)
+}
+
+fn particle_retained_bytes(instance_count: usize) -> Option<usize> {
+    instance_count.checked_mul(std::mem::size_of::<ParticleGpu>())
+}
+
+fn validate_particle_retained_count(
+    instance_count: usize,
+    budget: ParticleRenderBudget,
+) -> Result<(), ParticleFieldError> {
+    let staging_count = particle_staging_target(instance_count, budget);
+    let retained_count = instance_count
+        .checked_add(staging_count)
+        .ok_or(ParticleFieldError::CapacityTooLarge)?;
+    let actual =
+        particle_retained_bytes(retained_count).ok_or(ParticleFieldError::CapacityTooLarge)?;
+    if actual > budget.max_retained_bytes {
+        return Err(ParticleFieldError::RetainedBudgetExceeded {
+            limit: budget.max_retained_bytes,
+            actual,
+        });
+    }
+    Ok(())
+}
+
+fn validate_particle_retained_capacities(
+    instance_capacity: usize,
+    staging_capacity: usize,
+    budget: ParticleRenderBudget,
+) -> Result<(), ParticleFieldError> {
+    let retained_capacity = instance_capacity
+        .checked_add(staging_capacity)
+        .ok_or(ParticleFieldError::CapacityTooLarge)?;
+    let actual =
+        particle_retained_bytes(retained_capacity).ok_or(ParticleFieldError::CapacityTooLarge)?;
+    if actual > budget.max_retained_bytes {
+        return Err(ParticleFieldError::RetainedBudgetExceeded {
+            limit: budget.max_retained_bytes,
+            actual,
+        });
+    }
+    Ok(())
+}
+
+fn compact_particle_instances(
+    source: &[ParticleGpu],
+    current_capacity: usize,
+    staging_capacity: usize,
+    budget: ParticleRenderBudget,
+) -> Result<Option<Vec<ParticleGpu>>, ParticleFieldError> {
+    validate_particle_retained_count(source.len(), budget)?;
+    if validate_particle_retained_capacities(current_capacity, staging_capacity, budget).is_ok() {
+        return Ok(None);
+    }
+    let requested_bytes =
+        particle_retained_bytes(source.len()).ok_or(ParticleFieldError::CapacityTooLarge)?;
+    let mut compact = Vec::new();
+    compact
+        .try_reserve_exact(source.len())
+        .map_err(|_| ParticleFieldError::AllocationFailed { requested_bytes })?;
+    compact.extend_from_slice(source);
+    validate_particle_retained_capacities(compact.capacity(), staging_capacity, budget)?;
+    Ok(Some(compact))
 }
 
 fn particle_instance_capacity(instance_count: usize) -> Option<usize> {
@@ -5443,6 +6561,30 @@ fn particle_budgeted_capacity(
     particle_instance_capacity(required).map(|capacity| capacity.min(limit))
 }
 
+fn allocate_particle_staging(
+    instance_count: usize,
+    budget: ParticleRenderBudget,
+) -> Result<Vec<ParticleGpu>, ParticleFieldError> {
+    let target = particle_staging_target(instance_count, budget);
+    let requested_bytes = target
+        .checked_mul(std::mem::size_of::<ParticleGpu>())
+        .ok_or(ParticleFieldError::CapacityTooLarge)?;
+    let mut staging = Vec::new();
+    staging
+        .try_reserve_exact(target)
+        .map_err(|_| ParticleFieldError::AllocationFailed { requested_bytes })?;
+    Ok(staging)
+}
+
+fn particle_staging_target(instance_count: usize, budget: ParticleRenderBudget) -> usize {
+    let visibility_checked = instance_count.min(budget.max_visibility_checks_per_frame);
+    if visibility_checked < instance_count {
+        visibility_checked
+    } else {
+        instance_count.min(budget.instance_limit())
+    }
+}
+
 fn buffer_allocation_bytes<T>(capacity: usize) -> Option<u64> {
     u64::try_from(capacity)
         .ok()?
@@ -5452,6 +6594,28 @@ fn buffer_allocation_bytes<T>(capacity: usize) -> Option<u64> {
 fn buffer_capacity_fits<T>(device: &wgpu::Device, capacity: usize) -> bool {
     buffer_allocation_bytes::<T>(capacity)
         .is_some_and(|bytes| bytes <= device.limits().max_buffer_size)
+}
+
+fn scene_estimate_fits_prepared_device(scene: &Scene, device: &wgpu::Device) -> bool {
+    buffer_capacity_fits::<Vertex>(
+        device,
+        scene.statistics().estimated_tessellated_vertices().max(1),
+    )
+}
+
+fn scene_estimate_fits_streaming_device(
+    scene: &Scene,
+    device: &wgpu::Device,
+    prefix: usize,
+    current_capacity: usize,
+) -> bool {
+    let Some(required) = prefix.checked_add(scene.statistics().estimated_tessellated_vertices())
+    else {
+        return false;
+    };
+    required <= current_capacity
+        || dynamic_vertex_capacity(required)
+            .is_some_and(|capacity| buffer_capacity_fits::<Vertex>(device, capacity))
 }
 
 fn particle_update_range(
@@ -5465,6 +6629,18 @@ fn particle_update_range(
     (end <= current_count)
         .then_some(first_instance..end)
         .ok_or(ParticleFieldError::UpdateRangeOutOfBounds)
+}
+
+fn validate_particle_staging_capacity(
+    instances: &Vec<ParticleGpu>,
+    target_len: usize,
+) -> Result<(), RendererFrameError> {
+    let requested_bytes = target_len
+        .checked_mul(std::mem::size_of::<ParticleGpu>())
+        .ok_or(RendererFrameError::GeometryCapacityTooLarge)?;
+    (instances.capacity() >= target_len)
+        .then_some(())
+        .ok_or(RendererFrameError::ParticleAllocationFailed { requested_bytes })
 }
 
 #[cfg(test)]
@@ -5515,6 +6691,19 @@ fn uniformly_sampled_index(sample_index: usize, source_count: usize, sample_coun
     (((sample_index as u128 + 1) * source_count as u128 - 1) / sample_count as u128) as usize
 }
 
+fn particle_idle_statistics(instance_count: usize) -> ParticleStatistics {
+    ParticleStatistics {
+        submitted: instance_count,
+        visibility_checked: 0,
+        visible: 0,
+        culled: 0,
+        budget_limited: 0,
+        dropped: 0,
+        rendered: 0,
+    }
+}
+
+#[cfg(test)]
 fn particle_statistics(
     instance_count: usize,
     visible: usize,
@@ -5549,19 +6738,31 @@ fn prepare_scene_resources(
     renderer_identity: Arc<()>,
     scene: &Scene,
 ) -> Result<PreparedScene, PreparedSceneError> {
+    if !scene_command_sources_are_portable(scene) {
+        return Err(PreparedSceneError::InvalidGeometrySources);
+    }
+    if !scene_estimate_fits_prepared_device(scene, device) {
+        return Err(PreparedSceneError::CapacityTooLarge);
+    }
     let mut vertices = Vec::new();
     let mut draw_batches = Vec::new();
     let tessellation = tessellate_scene(scene, &mut vertices, &mut draw_batches)?;
     let geometry_extents = GeometryExtents::from_vertices(&vertices);
+    if !geometry_sources_are_portable(GeometryValidationSource::Tessellated(&vertices)) {
+        return Err(PreparedSceneError::InvalidGeometrySources);
+    }
     if !buffer_capacity_fits::<Vertex>(device, vertices.len().max(1)) {
         return Err(PreparedSceneError::CapacityTooLarge);
     }
+    // Retain the tessellator allocation directly. Wrapping a Vec is O(1) and
+    // avoids an infallible caller-scale Vec -> Arc<[T]> copy after GPU writes.
+    let vertices = Arc::new(vertices);
     let vertex_buffer = Arc::new(create_vertex_buffer(device, vertices.len()));
     if !vertices.is_empty() {
         queue.write_buffer(&vertex_buffer, 0, bytemuck::cast_slice(&vertices));
+        submit_pending_uploads(queue);
     }
     let vertex_count = vertices.len();
-    let vertices: Arc<[Vertex]> = vertices.into();
 
     Ok(PreparedScene {
         renderer_identity,
@@ -5576,6 +6777,71 @@ fn prepare_scene_resources(
     })
 }
 
+fn scene_command_sources_are_portable(scene: &Scene) -> bool {
+    scene.commands().iter().all(|command| {
+        is_portable_shader_source(command.depth())
+            && command.screen_clip().is_none_or(|clip| {
+                portable_vec2(clip.min().to_vec2()) && portable_vec2(clip.max().to_vec2())
+            })
+            && match command.command() {
+                DrawCommand::Circle(circle) => {
+                    portable_vec2(circle.center())
+                        && is_portable_shader_source(circle.radius())
+                        && portable_shape_style(circle.style())
+                }
+                DrawCommand::Rect(rectangle) => {
+                    portable_vec2(rectangle.rect().min())
+                        && portable_vec2(rectangle.rect().max())
+                        && is_portable_shader_source(rectangle.corner_radius())
+                        && portable_shape_style(rectangle.style())
+                }
+                DrawCommand::Line(line) => {
+                    portable_vec2(line.from())
+                        && portable_vec2(line.to())
+                        && portable_stroke_style(line.stroke_style())
+                }
+                DrawCommand::Polyline(polyline) => {
+                    polyline.points().iter().copied().all(portable_vec2)
+                        && portable_stroke_style(polyline.stroke_style())
+                }
+            }
+    })
+}
+
+fn portable_vec2(value: Vec2) -> bool {
+    is_portable_shader_source(value.x) && is_portable_shader_source(value.y)
+}
+
+fn portable_shape_style(style: ShapeStyle) -> bool {
+    style
+        .stroke()
+        .is_none_or(|stroke| is_portable_shader_source(stroke.width()))
+        && style.shadow().is_none_or(|shadow| {
+            portable_vec2(shadow.offset().to_vec2()) && is_portable_shader_source(shadow.spread())
+        })
+}
+
+fn portable_stroke_style(style: crate::StrokeStyle2d) -> bool {
+    let stroke = style.stroke();
+    is_portable_shader_source(stroke.width())
+        && is_portable_shader_source(style.miter_limit())
+        && style.dash_pattern().is_none_or(|dash| {
+            dash.lengths()
+                .iter()
+                .copied()
+                .chain([dash.phase()])
+                .all(is_portable_shader_source)
+        })
+        && style.start_marker().is_none_or(|marker| {
+            is_portable_shader_source(marker.length().get())
+                && is_portable_shader_source(marker.width().get())
+        })
+        && style.end_marker().is_none_or(|marker| {
+            is_portable_shader_source(marker.length().get())
+                && is_portable_shader_source(marker.width().get())
+        })
+}
+
 fn restore_prepared_scene_resources(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -5585,6 +6851,19 @@ fn restore_prepared_scene_resources(
     if !buffer_capacity_fits::<Vertex>(device, source.vertices.len().max(1)) {
         return Err(PreparedSceneError::CapacityTooLarge);
     }
+    if !geometry_sources_are_portable(GeometryValidationSource::Tessellated(&source.vertices)) {
+        return Err(PreparedSceneError::InvalidGeometrySources);
+    }
+    let requested_bytes = source
+        .draw_batches
+        .len()
+        .checked_mul(std::mem::size_of::<PreparedDrawBatch>())
+        .ok_or(PreparedSceneError::CapacityTooLarge)?;
+    let mut draw_batches = Vec::new();
+    draw_batches
+        .try_reserve_exact(source.draw_batches.len())
+        .map_err(|_| PreparedSceneError::AllocationFailed { requested_bytes })?;
+    draw_batches.extend_from_slice(&source.draw_batches);
     let vertex_buffer = Arc::new(create_vertex_buffer(device, source.vertices.len()));
     if !source.vertices.is_empty() {
         queue.write_buffer(
@@ -5592,6 +6871,7 @@ fn restore_prepared_scene_resources(
             0,
             bytemuck::cast_slice(source.vertices.as_ref()),
         );
+        submit_pending_uploads(queue);
     }
 
     Ok(PreparedScene {
@@ -5602,7 +6882,7 @@ fn restore_prepared_scene_resources(
         command_count: source.command_count,
         vertex_count: source.vertex_count,
         geometry_extents: source.geometry_extents,
-        draw_batches: source.draw_batches.clone(),
+        draw_batches,
         tessellation: source.tessellation,
     })
 }
@@ -5625,9 +6905,13 @@ fn restore_dynamic_mesh_resources(
         .try_reserve_exact(source.vertices.len())
         .map_err(|_| DynamicMeshError::AllocationFailed { requested_bytes })?;
     vertices.extend_from_slice(&source.vertices);
+    if let Some(budget) = source.budget {
+        validate_dynamic_retained_capacity(budget, &vertices)?;
+    }
     let vertex_buffer = Arc::new(create_dynamic_vertex_buffer(device, source.vertex_capacity));
     if !vertices.is_empty() {
         queue.write_buffer(&vertex_buffer, 0, bytemuck::cast_slice(vertices.as_slice()));
+        submit_pending_uploads(queue);
     }
     Ok(DynamicMesh2d {
         renderer_identity,
@@ -5645,9 +6929,26 @@ fn restore_particle_field_resources(
     renderer_identity: Arc<()>,
     source: &ParticleField2d,
 ) -> Result<ParticleField2d, ParticleFieldError> {
+    validate_particle_retained_count(source.instances.len(), source.budget)?;
     if !buffer_capacity_fits::<ParticleGpu>(device, source.instance_capacity) {
         return Err(ParticleFieldError::CapacityTooLarge);
     }
+    let requested_bytes = source
+        .instances
+        .len()
+        .checked_mul(std::mem::size_of::<ParticleGpu>())
+        .ok_or(ParticleFieldError::CapacityTooLarge)?;
+    let mut instances = Vec::new();
+    instances
+        .try_reserve_exact(source.instances.len())
+        .map_err(|_| ParticleFieldError::AllocationFailed { requested_bytes })?;
+    instances.extend_from_slice(&source.instances);
+    let visible_instances = allocate_particle_staging(instances.len(), source.budget)?;
+    validate_particle_retained_capacities(
+        instances.capacity(),
+        visible_instances.capacity(),
+        source.budget,
+    )?;
     let instance_buffer = Arc::new(create_particle_instance_buffer(
         device,
         source.instance_capacity,
@@ -5655,11 +6956,11 @@ fn restore_particle_field_resources(
     Ok(ParticleField2d {
         renderer_identity,
         instance_buffer,
-        instances: source.instances.clone(),
-        visible_instances: Vec::new(),
+        instances,
+        visible_instances,
         instance_capacity: source.instance_capacity,
         budget: source.budget,
-        statistics: particle_statistics(source.instances.len(), source.instances.len(), 0),
+        statistics: particle_idle_statistics(source.instances.len()),
     })
 }
 
@@ -6231,12 +7532,88 @@ fn scalar_field_extent(field: &ScalarField) -> Result<wgpu::Extent3d, ScalarFiel
     })
 }
 
+fn clone_scalar_field_for_restore(
+    source: &ScalarField,
+) -> Result<ScalarField, ScalarFieldTextureError> {
+    let requested_bytes = source
+        .values()
+        .len()
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or(ScalarFieldTextureError::DimensionsTooLarge)?;
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(source.values().len())
+        .map_err(|_| ScalarFieldTextureError::AllocationFailed { requested_bytes })?;
+    values.extend_from_slice(source.values());
+    // The retained source already satisfies ScalarField's shape and finite
+    // invariants. Keep the impossible defensive branch structured.
+    ScalarField::new(source.width(), source.height(), values)
+        .map_err(|_| ScalarFieldTextureError::DimensionsTooLarge)
+}
+
 fn scalar_value_range_extent(minimum: f32, maximum: f32) -> Option<f32> {
-    if !minimum.is_finite() || !maximum.is_finite() || maximum <= minimum {
+    if !is_portable_shader_source(minimum)
+        || !is_portable_shader_source(maximum)
+        || maximum <= minimum
+    {
         return None;
     }
     let extent = maximum - minimum;
-    (extent.is_finite() && extent > 0.0).then_some(extent)
+    (is_portable_shader_source(extent) && extent > 0.0).then_some(extent)
+}
+
+fn scalar_field_sources_are_portable(field: &ScalarField) -> bool {
+    if field
+        .values()
+        .iter()
+        .copied()
+        .any(|value| !is_portable_shader_source(value))
+    {
+        return false;
+    }
+    let (minimum, maximum) = field.value_range();
+    let extent = f64::from(maximum) - f64::from(minimum);
+    extent.is_finite() && extent <= f64::from(MAX_PORTABLE_SHADER_VALUE)
+}
+
+fn scalar_normalization_is_portable(
+    texture: &ScalarFieldTexture,
+    minimum: f32,
+    value_extent: f32,
+) -> bool {
+    if !is_portable_shader_source(minimum)
+        || !is_portable_shader_source(value_extent)
+        || value_extent <= 0.0
+    {
+        return false;
+    }
+    let Some(numerator) = shader_interval_sum_range([
+        (
+            f64::from(texture.source_minimum),
+            f64::from(texture.source_maximum),
+        ),
+        (-f64::from(minimum), -f64::from(minimum)),
+    ]) else {
+        return false;
+    };
+    [numerator.0, numerator.1].into_iter().all(|value| {
+        let normalized = value / f64::from(value_extent);
+        normalized.is_finite() && normalized.abs() <= f64::from(MAX_PORTABLE_SHADER_VALUE)
+    })
+}
+
+fn compact_scalar_field_for_retention(
+    field: ScalarField,
+) -> Result<ScalarField, ScalarFieldTextureError> {
+    let requested_bytes = field
+        .values()
+        .len()
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or(ScalarFieldTextureError::DimensionsTooLarge)?;
+    if field.value_allocation_bytes() <= requested_bytes {
+        return Ok(field);
+    }
+    clone_scalar_field_for_restore(&field)
 }
 
 fn premultiplied_wgpu_color(color: Color) -> wgpu::Color {
@@ -6274,6 +7651,18 @@ fn create_scalar_field_texture(
     }))
 }
 
+fn validate_scalar_field_device_extent(
+    device: &wgpu::Device,
+    field: &ScalarField,
+) -> Result<wgpu::Extent3d, ScalarFieldTextureError> {
+    let extent = scalar_field_extent(field)?;
+    let limit = device.limits().max_texture_dimension_2d;
+    if extent.width > limit || extent.height > limit {
+        return Err(ScalarFieldTextureError::DimensionsTooLarge);
+    }
+    Ok(extent)
+}
+
 fn upload_scalar_field_texture(
     queue: &wgpu::Queue,
     texture: &wgpu::Texture,
@@ -6295,6 +7684,7 @@ fn upload_scalar_field_texture(
         },
         extent,
     );
+    submit_pending_uploads(queue);
     Ok(())
 }
 
@@ -6333,7 +7723,74 @@ fn upload_scalar_field_texture_region(
             depth_or_array_layers: 1,
         },
     );
+    submit_pending_uploads(queue);
     Ok(())
+}
+
+/// Submits deferred `Queue::write_*` transfers without waiting for GPU completion.
+///
+/// Native `wgpu` retains staging allocations until a queue submission starts
+/// their transfer. Standalone retained-resource mutations call this immediately;
+/// render paths instead combine their writes with the draw submission.
+pub(super) fn submit_pending_uploads(queue: &wgpu::Queue) {
+    let _ = queue.submit([]);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_scalar_field_texture_region(
+    texture_width: usize,
+    texture_height: usize,
+    x: usize,
+    y: usize,
+    width: usize,
+    height: usize,
+    value_count: usize,
+) -> Result<(), ScalarFieldTextureError> {
+    let expected = width
+        .checked_mul(height)
+        .ok_or(ScalarFieldTextureError::DimensionsTooLarge)?;
+    if value_count != expected {
+        return Err(ScalarFieldTextureError::InvalidUpdateValueCount);
+    }
+    if width == 0
+        || height == 0
+        || x.checked_add(width).is_none_or(|end| end > texture_width)
+        || y.checked_add(height).is_none_or(|end| end > texture_height)
+    {
+        return Err(ScalarFieldTextureError::UpdateRegionOutOfBounds);
+    }
+    for value in [x, y, width, height] {
+        u32::try_from(value).map_err(|_| ScalarFieldTextureError::DimensionsTooLarge)?;
+    }
+    u32::try_from(width)
+        .ok()
+        .and_then(|width| width.checked_mul(std::mem::size_of::<f32>() as u32))
+        .ok_or(ScalarFieldTextureError::DimensionsTooLarge)?;
+    Ok(())
+}
+
+fn scalar_region_result_range(
+    field: &ScalarField,
+    x: usize,
+    y: usize,
+    width: usize,
+    height: usize,
+    values: &[f32],
+) -> (f32, f32) {
+    let mut minimum = f32::INFINITY;
+    let mut maximum = f32::NEG_INFINITY;
+    for row in 0..field.height() {
+        for column in 0..field.width() {
+            let value = if (x..x + width).contains(&column) && (y..y + height).contains(&row) {
+                values[(row - y) * width + (column - x)]
+            } else {
+                field.values()[row * field.width() + column]
+            };
+            minimum = minimum.min(value);
+            maximum = maximum.max(value);
+        }
+    }
+    (minimum, maximum)
 }
 
 fn create_scalar_field_texture_resources(
@@ -6342,19 +7799,41 @@ fn create_scalar_field_texture_resources(
     renderer_identity: Arc<()>,
     field: ScalarField,
 ) -> Result<ScalarFieldTexture, ScalarFieldTextureError> {
+    validate_scalar_field_device_extent(device, &field)?;
+    if !scalar_field_sources_are_portable(&field) {
+        return Err(ScalarFieldTextureError::NonPortableValue);
+    }
+    let field = compact_scalar_field_for_retention(field)?;
+    let (source_minimum, source_maximum) = field.value_range();
     let texture = create_scalar_field_texture(device, &field)?;
     upload_scalar_field_texture(queue, &texture, &field)?;
     Ok(ScalarFieldTexture {
         renderer_identity,
         texture,
         field,
+        source_minimum,
+        source_maximum,
     })
+}
+
+fn color_map_lut(color_map: &ColorMap) -> [u8; COLOR_MAP_LUT_SIZE as usize * 4] {
+    let mut bytes = [0_u8; COLOR_MAP_LUT_SIZE as usize * 4];
+    for index in 0..COLOR_MAP_LUT_SIZE {
+        let color = color_map.sample_normalized(index as f32 / (COLOR_MAP_LUT_SIZE - 1) as f32);
+        let offset = index as usize * 4;
+        bytes[offset..offset + 4].copy_from_slice(
+            &color
+                .to_array()
+                .map(|channel| (channel * 255.0).round() as u8),
+        );
+    }
+    bytes
 }
 
 fn create_cached_color_map(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
-    color_map: &ColorMap,
+    lut: [u8; COLOR_MAP_LUT_SIZE as usize * 4],
 ) -> CachedColorMap {
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("sim-engine color map texture"),
@@ -6370,15 +7849,6 @@ fn create_cached_color_map(
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     });
-    let mut bytes = Vec::with_capacity(COLOR_MAP_LUT_SIZE as usize * 4);
-    for index in 0..COLOR_MAP_LUT_SIZE {
-        let color = color_map.sample_normalized(index as f32 / (COLOR_MAP_LUT_SIZE - 1) as f32);
-        bytes.extend(
-            color
-                .to_array()
-                .map(|channel| (channel * 255.0).round() as u8),
-        );
-    }
     queue.write_texture(
         wgpu::TexelCopyTextureInfo {
             texture: &texture,
@@ -6386,7 +7856,7 @@ fn create_cached_color_map(
             origin: wgpu::Origin3d::ZERO,
             aspect: wgpu::TextureAspect::All,
         },
-        &bytes,
+        &lut,
         wgpu::TexelCopyBufferLayout {
             offset: 0,
             bytes_per_row: Some(1024),
@@ -6400,13 +7870,16 @@ fn create_cached_color_map(
     );
     let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
     CachedColorMap {
-        source: color_map.clone(),
+        lut,
         _texture: texture,
         view,
     }
 }
 
-fn create_particle_unit_buffer(device: &wgpu::Device, queue: &wgpu::Queue) -> wgpu::Buffer {
+fn create_submitted_particle_unit_buffer(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+) -> wgpu::Buffer {
     let buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("sim-engine particle unit quad buffer"),
         size: (6 * std::mem::size_of::<ParticleUnitVertex>()) as wgpu::BufferAddress,
@@ -6434,6 +7907,7 @@ fn create_particle_unit_buffer(device: &wgpu::Device, queue: &wgpu::Queue) -> wg
         },
     ];
     queue.write_buffer(&buffer, 0, bytemuck::cast_slice(&unit_quad));
+    submit_pending_uploads(queue);
     buffer
 }
 
@@ -6455,7 +7929,7 @@ mod tessellation;
 mod visualization;
 use config::{
     MultisampleTarget, create_multisample_target, logical_to_physical_screen,
-    physical_to_logical_screen, validate_scale_factor,
+    physical_to_logical_screen, validate_scale_factor, validate_surface_dimensions,
 };
 pub use config::{RendererPresentMode, RendererSurfacePresentMode, WgpuRendererOptions};
 pub use frame::{
@@ -6467,8 +7941,8 @@ pub use glyph::{
     GlyphRunBounds, GlyphRunBudget, GlyphRunStatistics, GlyphUploadReport, PositionedGlyph2d,
 };
 pub use image::{
-    Image2d, ImageBatch2d, ImageBatchBudget, ImageBudget, ImageError, ImageSampling, ImageSprite2d,
-    ImageTexelRect, ImageUploadReport,
+    Image2d, ImageBatch2d, ImageBatchBudget, ImageBatchUploadReport, ImageBudget, ImageError,
+    ImageSampling, ImageSprite2d, ImageTexelRect, ImageUploadReport,
 };
 use image::{ImageRenderer, ImageUniform};
 use mesh3d::Mesh3dRenderer;
@@ -6480,7 +7954,9 @@ use tessellation::{
     logical_viewport_scissor, offset_scissor, screen_clip_to_scissor, tessellate_scene,
 };
 use visualization::{CachedColorMap, CompositionPipelines, create_composition_pipeline};
-pub use visualization::{LayeredVisualizationError, LayeredVisualizationOptions};
+pub use visualization::{
+    LayeredVisualizationError, LayeredVisualizationOptions, LayeredVisualizationReport,
+};
 
 #[cfg(test)]
 use tessellation::world_vertex;

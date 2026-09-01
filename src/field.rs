@@ -74,6 +74,13 @@ impl ScalarField {
         values
             .try_reserve_exact(len)
             .map_err(|_| ScalarFieldError::AllocationFailed { requested_bytes })?;
+        let actual_bytes = values.capacity().saturating_mul(std::mem::size_of::<f32>());
+        if actual_bytes > maximum_bytes {
+            return Err(ScalarFieldError::AllocationLimitExceeded {
+                requested_bytes: actual_bytes,
+                maximum_bytes,
+            });
+        }
         values.resize(len, value);
         Ok(Self {
             width,
@@ -95,6 +102,13 @@ impl ScalarField {
     /// Returns row-major scalar values.
     pub fn values(&self) -> &[f32] {
         &self.values
+    }
+
+    #[cfg(feature = "wgpu")]
+    pub(crate) fn value_allocation_bytes(&self) -> usize {
+        self.values
+            .capacity()
+            .saturating_mul(std::mem::size_of::<f32>())
     }
 
     /// Returns a cell value, or `None` outside field bounds.
@@ -329,6 +343,13 @@ impl ColorMap {
     /// Returns the immutable control points.
     pub fn stops(&self) -> &[ColorStop] {
         &self.stops
+    }
+
+    /// Returns CPU bytes currently allocated for retained color stops.
+    pub fn allocation_bytes(&self) -> usize {
+        self.stops
+            .capacity()
+            .saturating_mul(std::mem::size_of::<ColorStop>())
     }
 
     /// Samples the map, clamping a finite normalized input to its endpoints.

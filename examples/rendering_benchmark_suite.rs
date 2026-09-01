@@ -13,12 +13,16 @@ use std::{
 };
 
 use sim_engine::{
-    Camera2d, Color, FrameBudget, FramePassOptions, FrameReport, GlyphAtlasBudget, GlyphAtlasEntry,
+    BlendMode, Camera2d, Camera3d, Color, ColorMap, DynamicMeshBudget, DynamicVertex2d,
+    FrameBudget, FramePassOptions, FrameReport, FrameStatistics, GlyphAtlasBudget, GlyphAtlasEntry,
     GlyphId, GlyphRunBudget, ImageBatchBudget, ImageBudget, ImageSampling, ImageSprite2d,
-    ImageTexelRect, Layer, LogicalPixels, LogicalScreenPosition, LogicalScreenVector,
-    LogicalViewport, LogicalViewportRegion, PositionedGlyph2d, PreparedScreenScene, Rect,
-    RenderStatus, RendererSurfacePresentMode, Scene, SceneBudget, ScreenScene, ShapeStyle, Vec2,
-    WgpuRenderer, WgpuRendererOptions,
+    ImageTexelRect, Layer, LayeredVisualizationOptions, LayeredVisualizationReport, LogicalPixels,
+    LogicalScreenPosition, LogicalScreenVector, LogicalViewport, LogicalViewportRegion, Mesh3d,
+    Mesh3dRenderReport, MeshEdge3d, MeshStyle3d, ParticleInstance2d, ParticleRenderBudget,
+    ParticleStatistics, PositionedGlyph2d, PreparedScreenScene, Projection3d, Rect, RenderStatus,
+    RendererFrameMetrics, RendererSurfacePresentMode, Rotation3d, ScalarField, Scene, Scene3d,
+    SceneBudget, ScreenScene, ShapeStyle, SurfaceStyle3d, Transform3d, Vec2, Vec3, WgpuRenderer,
+    WgpuRendererOptions, WireframeStyle3d, WorldLength,
 };
 use winit::{
     application::ApplicationHandler,
@@ -40,6 +44,12 @@ const STREAMING_COMMANDS: usize = 1_000;
 const BENCHMARK_PHYSICAL_WIDTH: u32 = 1_280;
 const BENCHMARK_PHYSICAL_HEIGHT: u32 = 720;
 const BENCHMARK_SCALE_FACTOR: f64 = 1.0;
+const PARTICLE_FIELD_COUNT: usize = 16_384;
+const PARTICLE_VISIBLE_LIMIT: usize = 8_192;
+const SCALAR_FIELD_WIDTH: usize = 256;
+const SCALAR_FIELD_HEIGHT: usize = 144;
+const RETAINED_3D_OBJECTS: usize = 48;
+const DYNAMIC_TRIANGLES: usize = 4_096;
 
 #[derive(Clone, Copy)]
 struct GateThresholds {
@@ -66,6 +76,7 @@ fn gate_thresholds(fixture: &str) -> Option<GateThresholds> {
         // measured ceiling instead of weakening every retained workload.
         "ui_90_10" => 25.0,
         "dpi_reconfigure" => 10.0,
+        "particle_scalar" | "retained_3d" => 12.0,
         "ui_static_10k" | "four_viewports" | "image_atlas" | "scientific_text" => 5.0,
         _ => return None,
     };
@@ -106,7 +117,7 @@ fn parse_configuration() -> Result<BenchmarkConfiguration, Box<dyn Error>> {
             "--vsync" => vsync = true,
             "--help" | "-h" => {
                 println!(
-                    "Usage: rendering_benchmark_suite [--fixture adapter_probe|ui_static_10k|ui_90_10|four_viewports|image_atlas|scientific_text|dpi_reconfigure|hidpi_transition] [--gate] [--vsync]"
+                    "Usage: rendering_benchmark_suite [--fixture adapter_probe|ui_static_10k|ui_90_10|four_viewports|image_atlas|scientific_text|particle_scalar|retained_3d|dpi_reconfigure|hidpi_transition] [--gate] [--vsync]"
                 );
                 std::process::exit(0);
             }
@@ -154,16 +165,102 @@ type BenchmarkRender = Box<
     ) -> Result<BenchmarkFrame, Box<dyn Error>>,
 >;
 
+#[derive(Clone, Copy)]
 struct BenchmarkFrame {
-    report: FrameReport,
+    status: RenderStatus,
+    metrics: RendererFrameMetrics,
+    statistics: Option<FrameStatistics>,
+    layered_statistics: Option<LayeredFixtureStatistics>,
+    retained_3d_statistics: Option<Retained3dFixtureStatistics>,
     additional_renderer_work: Duration,
+}
+
+#[derive(Clone, Copy)]
+struct LayeredFixtureStatistics {
+    particles: ParticleStatistics,
+    scalar_width: usize,
+    scalar_height: usize,
+    target_width: u32,
+    target_height: u32,
+    pass_count: usize,
+    draw_calls: usize,
+    retained_cpu_bytes: usize,
+    retained_buffer_bytes: usize,
+    texture_bytes: usize,
+}
+
+#[derive(Clone, Copy)]
+struct Retained3dFixtureStatistics {
+    objects: usize,
+    triangles: usize,
+    edges: usize,
+    render_passes: usize,
+    draw_calls: usize,
+    retained_cpu_bytes: usize,
+    retained_buffer_bytes: usize,
+    texture_bytes: usize,
 }
 
 impl From<FrameReport> for BenchmarkFrame {
     fn from(report: FrameReport) -> Self {
         Self {
-            report,
+            status: report.status(),
+            metrics: report.metrics(),
+            statistics: Some(report.statistics()),
+            layered_statistics: None,
+            retained_3d_statistics: None,
             additional_renderer_work: Duration::ZERO,
+        }
+    }
+}
+
+impl BenchmarkFrame {
+    fn layered(report: LayeredVisualizationReport, statistics: LayeredFixtureStatistics) -> Self {
+        Self {
+            status: report.status(),
+            metrics: report.metrics(),
+            statistics: None,
+            layered_statistics: Some(statistics),
+            retained_3d_statistics: None,
+            additional_renderer_work: Duration::ZERO,
+        }
+    }
+
+    fn retained_3d(
+        report: FrameReport,
+        mesh3d_report: Mesh3dRenderReport,
+        retained_mesh_cpu_bytes: usize,
+        retained_mesh_gpu_bytes: usize,
+        depth_texture_bytes: usize,
+        additional_renderer_work: Duration,
+    ) -> Self {
+        let frame_statistics = report.statistics();
+        Self {
+            status: report.status(),
+            metrics: report.metrics(),
+            statistics: Some(frame_statistics),
+            layered_statistics: None,
+            retained_3d_statistics: Some(Retained3dFixtureStatistics {
+                objects: mesh3d_report.object_count(),
+                triangles: mesh3d_report.triangle_count(),
+                edges: mesh3d_report.edge_count(),
+                render_passes: mesh3d_report
+                    .render_pass_count()
+                    .saturating_add(report.render_pass_count()),
+                draw_calls: mesh3d_report
+                    .draw_call_count()
+                    .saturating_add(frame_statistics.draw_calls()),
+                retained_cpu_bytes: frame_statistics
+                    .retained_cpu_bytes()
+                    .saturating_add(retained_mesh_cpu_bytes),
+                retained_buffer_bytes: frame_statistics
+                    .retained_buffer_bytes()
+                    .saturating_add(retained_mesh_gpu_bytes),
+                texture_bytes: frame_statistics
+                    .texture_bytes()
+                    .saturating_add(depth_texture_bytes),
+            }),
+            additional_renderer_work,
         }
     }
 }
@@ -194,7 +291,7 @@ struct BenchmarkMeasurement {
     renderer_work_samples: Vec<f64>,
     acquire_samples: Vec<f64>,
     trial_fps: Vec<f64>,
-    last_report: Option<FrameReport>,
+    last_frame: Option<BenchmarkFrame>,
     discarded_measured_frames: usize,
 }
 
@@ -205,7 +302,7 @@ impl BenchmarkMeasurement {
             renderer_work_samples: Vec::with_capacity(MEASURED_FRAMES * GATE_TRIALS),
             acquire_samples: Vec::with_capacity(MEASURED_FRAMES * GATE_TRIALS),
             trial_fps: Vec::with_capacity(GATE_TRIALS),
-            last_report: None,
+            last_frame: None,
             discarded_measured_frames: 0,
         }
     }
@@ -218,7 +315,7 @@ impl BenchmarkMeasurement {
         self.renderer_work_samples.clear();
         self.acquire_samples.clear();
         self.trial_fps.clear();
-        self.last_report = None;
+        self.last_frame = None;
     }
 }
 
@@ -424,7 +521,7 @@ impl ApplicationHandler for BenchmarkApplication {
             match self.fixture.as_str() {
                 "adapter_probe" => write_surface_probe_evidence(&renderer),
                 "ui_static_10k" | "ui_90_10" | "four_viewports" | "image_atlas"
-                | "scientific_text" | "dpi_reconfigure" => {
+                | "scientific_text" | "particle_scalar" | "retained_3d" | "dpi_reconfigure" => {
                     let workload = prepare_benchmark_workload(&self.fixture, &mut renderer)?;
                     let surface_scale_factor = window.scale_factor();
                     window.request_redraw();
@@ -972,6 +1069,11 @@ mod tests {
         assert_eq!(retained.minimum_immediate_fps, 60.0);
         assert_eq!(retained.maximum_renderer_work_p95_ms, 5.0);
         assert_eq!(streaming.maximum_renderer_work_p95_ms, 25.0);
+        for fixture in ["particle_scalar", "retained_3d"] {
+            let threshold = gate_thresholds(fixture).expect("new heavy fixture is gated");
+            assert_eq!(threshold.minimum_immediate_fps, 60.0);
+            assert_eq!(threshold.maximum_renderer_work_p95_ms, 12.0);
+        }
         assert!(gate_thresholds("unknown").is_none());
     }
 
@@ -1334,6 +1436,7 @@ fn scene_budget() -> SceneBudget {
         2_000_000,
         128 * 1024 * 1024,
         128 * 1024 * 1024,
+        128 * 1024 * 1024,
         12_000,
     )
 }
@@ -1392,6 +1495,8 @@ fn prepare_benchmark_workload(
         "four_viewports" => prepare_four_viewports(renderer),
         "image_atlas" => prepare_image_atlas(renderer),
         "scientific_text" => prepare_scientific_text(renderer),
+        "particle_scalar" => prepare_particle_scalar(renderer),
+        "retained_3d" => prepare_retained_3d(renderer),
         "dpi_reconfigure" => prepare_dpi_reconfigure(renderer),
         fixture => Err(format!("unknown benchmark fixture: {fixture}").into()),
     }
@@ -1574,6 +1679,261 @@ fn prepare_scientific_text(
     })
 }
 
+fn prepare_particle_scalar(
+    renderer: &mut WgpuRenderer,
+) -> Result<BenchmarkWorkload, Box<dyn Error>> {
+    let started = Instant::now();
+    let mut values = Vec::with_capacity(SCALAR_FIELD_WIDTH * SCALAR_FIELD_HEIGHT);
+    for y in 0..SCALAR_FIELD_HEIGHT {
+        let vertical = y as f32 / (SCALAR_FIELD_HEIGHT - 1) as f32;
+        for x in 0..SCALAR_FIELD_WIDTH {
+            let horizontal = x as f32 / (SCALAR_FIELD_WIDTH - 1) as f32;
+            values.push((horizontal * 0.65 + vertical * 0.35).clamp(0.0, 1.0));
+        }
+    }
+    let scalar = renderer.create_scalar_field_texture(ScalarField::new(
+        SCALAR_FIELD_WIDTH,
+        SCALAR_FIELD_HEIGHT,
+        values,
+    )?)?;
+    let color_map = ColorMap::linear(Color::rgb8(7, 12, 34), Color::rgb8(255, 111, 24))?;
+
+    let mut instances = Vec::with_capacity(PARTICLE_FIELD_COUNT);
+    for index in 0..PARTICLE_FIELD_COUNT {
+        let column = index % 256;
+        let row = index / 256;
+        let position = Vec2::new(column as f32 * 6.0 - 765.0, row as f32 * 8.0 - 252.0);
+        let hot = (index % 97) as f32 / 96.0;
+        instances.push(ParticleInstance2d::new(
+            position,
+            1.25 + hot,
+            Color::rgba(1.0, 0.25 + hot * 0.55, 0.05, 0.45),
+            hot * 3.0,
+        )?);
+    }
+    let instance_bytes = ParticleRenderBudget::INSTANCE_BYTES;
+    let particle_budget = ParticleRenderBudget::new(
+        PARTICLE_VISIBLE_LIMIT,
+        (PARTICLE_FIELD_COUNT + PARTICLE_VISIBLE_LIMIT) * instance_bytes,
+        PARTICLE_VISIBLE_LIMIT * instance_bytes,
+        PARTICLE_VISIBLE_LIMIT * instance_bytes,
+    )?
+    .with_max_visibility_checks(PARTICLE_VISIBLE_LIMIT)?;
+    let mut particles = renderer.create_particle_field_with_budget(&instances, particle_budget)?;
+    let target = renderer.create_render_target(640, 360)?;
+    let camera = Camera2d::new(Vec2::ZERO, 1.0)?;
+    let options =
+        LayeredVisualizationOptions::new((0.0, 1.0), Color::rgb8(4, 7, 18), Color::BLACK)?;
+    Ok(BenchmarkWorkload {
+        name: "particle_scalar",
+        construction: started.elapsed(),
+        completion_note: Some(format!(
+            "particle_scalar_contract=retained:{PARTICLE_FIELD_COUNT},visibility_cap:{PARTICLE_VISIBLE_LIMIT},field:{SCALAR_FIELD_WIDTH}x{SCALAR_FIELD_HEIGHT},target:640x360"
+        )),
+        render: Box::new(move |renderer, _window, _, _, _| {
+            let report = renderer.render_layered_visualization(
+                &target,
+                &scalar,
+                &color_map,
+                &mut particles,
+                &camera,
+                options,
+            )?;
+            let retained_cpu_bytes = particles
+                .cpu_allocation_bytes()
+                .saturating_add(scalar.recovery_memory_bytes())
+                .saturating_add(color_map.allocation_bytes());
+            let retained_buffer_bytes = particles.gpu_allocation_bytes();
+            let texture_bytes = scalar
+                .gpu_allocation_bytes()
+                .saturating_add(target.allocation_bytes())
+                .saturating_add(256 * 4);
+            Ok(BenchmarkFrame::layered(
+                report,
+                LayeredFixtureStatistics {
+                    particles: particles.statistics(),
+                    scalar_width: scalar.width(),
+                    scalar_height: scalar.height(),
+                    target_width: target.width(),
+                    target_height: target.height(),
+                    pass_count: report.render_pass_count(),
+                    draw_calls: report.draw_call_count(),
+                    retained_cpu_bytes,
+                    retained_buffer_bytes,
+                    texture_bytes,
+                },
+            ))
+        }),
+    })
+}
+
+fn prepare_retained_3d(renderer: &mut WgpuRenderer) -> Result<BenchmarkWorkload, Box<dyn Error>> {
+    let started = Instant::now();
+    let mesh = renderer.create_mesh3d(benchmark_cube_mesh()?)?;
+    let retained_mesh_cpu_bytes = mesh.recovery_memory_bytes();
+    let retained_mesh_gpu_bytes = mesh.gpu_allocation_bytes();
+    let dynamic_vertices = benchmark_dynamic_vertices()?;
+    let dynamic_bytes = dynamic_vertices.len().saturating_mul(64);
+    let dynamic = renderer.create_dynamic_mesh_with_budget(
+        &dynamic_vertices,
+        DynamicMeshBudget::new(dynamic_vertices.len(), dynamic_bytes, dynamic_bytes)?,
+    )?;
+    let viewport = LogicalViewport::new(
+        BENCHMARK_PHYSICAL_WIDTH as f32,
+        BENCHMARK_PHYSICAL_HEIGHT as f32,
+    )?;
+    let target = renderer.create_render_target3d(
+        BENCHMARK_PHYSICAL_WIDTH,
+        BENCHMARK_PHYSICAL_HEIGHT,
+        viewport,
+    )?;
+    let depth_texture_bytes = target
+        .allocation_bytes()
+        .saturating_sub(target.color_target().allocation_bytes());
+    let wireframe =
+        WireframeStyle3d::visible(Color::rgb8(225, 238, 255), LogicalPixels::new(1.5)?)?
+            .with_hidden(
+                Color::rgb8(79, 101, 136),
+                LogicalPixels::new(1.0)?,
+                LogicalPixels::new(5.0)?,
+                LogicalPixels::new(3.0)?,
+            )?;
+    let style = MeshStyle3d::surface(SurfaceStyle3d::opaque(Color::rgb8(32, 107, 194))?)
+        .with_wireframe(wireframe);
+    let mut scene = Scene3d::new(Color::rgb8(4, 7, 18))?;
+    let mut object_ids = Vec::with_capacity(RETAINED_3D_OBJECTS);
+    for index in 0..RETAINED_3D_OBJECTS {
+        let translation = benchmark_3d_translation(index)?;
+        let transform = Transform3d::new(
+            translation,
+            Rotation3d::IDENTITY,
+            Vec3::new(0.34, 0.34, 0.34)?,
+        )?;
+        object_ids.push(scene.try_push(&mesh, transform, style)?);
+    }
+    let projection = Projection3d::orthographic(
+        WorldLength::new(18.0)?,
+        BENCHMARK_PHYSICAL_WIDTH as f32 / BENCHMARK_PHYSICAL_HEIGHT as f32,
+        WorldLength::new(0.1)?,
+        WorldLength::new(100.0)?,
+    )?;
+    let camera = Camera3d::look_at(Vec3::new(8.0, 7.0, 14.0)?, Vec3::ZERO, Vec3::Y, projection)?;
+    let dynamic_camera = Camera2d::new(Vec2::ZERO, 1.0)?;
+    Ok(BenchmarkWorkload {
+        name: "retained_3d",
+        construction: started.elapsed(),
+        completion_note: Some(format!(
+            "retained_3d_contract=objects:{RETAINED_3D_OBJECTS},triangles:{},edges:{},dynamic_triangles:{DYNAMIC_TRIANGLES}",
+            RETAINED_3D_OBJECTS * mesh.triangle_count(),
+            RETAINED_3D_OBJECTS * 12,
+        )),
+        render: Box::new(move |renderer, _window, frame_index, _, _| {
+            let update_started = Instant::now();
+            for (index, object_id) in object_ids.iter().copied().enumerate() {
+                let phase = frame_index as f32 * 0.0025 + index as f32 * 0.071;
+                let base = benchmark_3d_translation(index)?;
+                scene.set_transform(
+                    object_id,
+                    Transform3d::new(
+                        Vec3::new(
+                            base.x(),
+                            base.y() + phase.sin() * 0.04,
+                            base.z() + phase.cos() * 0.04,
+                        )?,
+                        Rotation3d::IDENTITY,
+                        Vec3::new(0.34, 0.34, 0.34)?,
+                    )?,
+                )?;
+            }
+            let transform_update = update_started.elapsed();
+            let mesh_report = renderer.render_scene3d_to_target(&target, &scene, camera)?;
+            let mut frame = renderer.begin_frame(Color::BLACK, FrameBudget::default())?;
+            frame.draw_dynamic_mesh(&dynamic, dynamic_camera, FramePassOptions::new(1))?;
+            frame.draw_render_target(
+                target.color_target(),
+                BlendMode::Replace,
+                1.0,
+                FramePassOptions::new(0),
+            )?;
+            let report = frame.present()?;
+            let additional_renderer_work = transform_update
+                .saturating_add(mesh_report.upload())
+                .saturating_add(mesh_report.encode_submit());
+            Ok(BenchmarkFrame::retained_3d(
+                report,
+                mesh_report,
+                retained_mesh_cpu_bytes,
+                retained_mesh_gpu_bytes,
+                depth_texture_bytes,
+                additional_renderer_work,
+            ))
+        }),
+    })
+}
+
+fn benchmark_3d_translation(index: usize) -> Result<Vec3, Box<dyn Error>> {
+    let column = index % 8;
+    let row = index / 8;
+    Ok(Vec3::new(
+        column as f32 * 1.75 - 6.125,
+        row as f32 * 1.35 - 3.375,
+        (index % 3) as f32 * 0.18 - 0.18,
+    )?)
+}
+
+fn benchmark_cube_mesh() -> Result<Mesh3d, Box<dyn Error>> {
+    let vertices = vec![
+        Vec3::new(-1.0, -1.0, -1.0)?,
+        Vec3::new(1.0, -1.0, -1.0)?,
+        Vec3::new(1.0, 1.0, -1.0)?,
+        Vec3::new(-1.0, 1.0, -1.0)?,
+        Vec3::new(-1.0, -1.0, 1.0)?,
+        Vec3::new(1.0, -1.0, 1.0)?,
+        Vec3::new(1.0, 1.0, 1.0)?,
+        Vec3::new(-1.0, 1.0, 1.0)?,
+    ];
+    let triangles = vec![
+        0, 2, 1, 0, 3, 2, 4, 5, 6, 4, 6, 7, 0, 1, 5, 0, 5, 4, 3, 7, 6, 3, 6, 2, 0, 4, 7, 0, 7, 3,
+        1, 2, 6, 1, 6, 5,
+    ];
+    let edge_indices = [
+        (0, 1),
+        (1, 2),
+        (2, 3),
+        (3, 0),
+        (4, 5),
+        (5, 6),
+        (6, 7),
+        (7, 4),
+        (0, 4),
+        (1, 5),
+        (2, 6),
+        (3, 7),
+    ];
+    let edges = edge_indices
+        .into_iter()
+        .map(|(start, end)| MeshEdge3d::new(start, end))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Mesh3d::with_display_edges(vertices, triangles, edges)?)
+}
+
+fn benchmark_dynamic_vertices() -> Result<Vec<DynamicVertex2d>, Box<dyn Error>> {
+    let mut vertices = Vec::with_capacity(DYNAMIC_TRIANGLES * 3);
+    for index in 0..DYNAMIC_TRIANGLES {
+        let column = index % 64;
+        let row = index / 64;
+        let x = column as f32 * 18.0 - 576.0;
+        let y = row as f32 * 10.0 - 315.0;
+        let color = Color::rgba(0.20, 0.85, 1.0, 0.32);
+        vertices.extend([
+            DynamicVertex2d::new(Vec2::new(x, y), 0.0, color)?,
+            DynamicVertex2d::new(Vec2::new(x + 8.0, y), 0.0, color)?,
+            DynamicVertex2d::new(Vec2::new(x, y + 6.0), 0.0, color)?,
+        ]);
+    }
+    Ok(vertices)
+}
+
 fn prepare_dpi_reconfigure(
     renderer: &mut WgpuRenderer,
 ) -> Result<BenchmarkWorkload, Box<dyn Error>> {
@@ -1591,10 +1951,9 @@ fn prepare_dpi_reconfigure(
             let reconfigure_work = reconfigure_started.elapsed();
             let mut composed = renderer.begin_frame(scene.background(), FrameBudget::default())?;
             composed.draw_prepared_screen_scene(&prepared, FramePassOptions::new(0))?;
-            Ok(BenchmarkFrame {
-                report: composed.present()?,
-                additional_renderer_work: reconfigure_work,
-            })
+            let mut frame: BenchmarkFrame = composed.present()?.into();
+            frame.additional_renderer_work = reconfigure_work;
+            Ok(frame)
         }),
     })
 }
@@ -1713,12 +2072,7 @@ fn advance_benchmark(
                 state.physical_width,
                 state.physical_height,
             )?;
-            require_drawn_frame(
-                state.workload.name,
-                "warmup",
-                next_frame,
-                frame.report.status(),
-            )?;
+            require_drawn_frame(state.workload.name, "warmup", next_frame, frame.status)?;
             if next_frame + 1 == WARMUP_FRAMES {
                 state.measurement.phase = BenchmarkMeasurementPhase::Trial {
                     trial: 0,
@@ -1755,9 +2109,9 @@ fn advance_benchmark(
                 state.workload.name,
                 "measurement",
                 absolute_frame,
-                frame.report.status(),
+                frame.status,
             )?;
-            let metrics = frame.report.metrics();
+            let metrics = frame.metrics;
             state.measurement.renderer_work_samples.push(
                 renderer_work_excluding_acquire(
                     metrics.total_cpu(),
@@ -1771,7 +2125,7 @@ fn advance_benchmark(
                 .measurement
                 .acquire_samples
                 .push(metrics.surface_acquire().as_secs_f64() * 1_000.0);
-            state.measurement.last_report = Some(frame.report);
+            state.measurement.last_frame = Some(frame);
 
             if next_frame + 1 == MEASURED_FRAMES {
                 state.renderer.wait_for_gpu_idle()?;
@@ -1823,14 +2177,12 @@ fn finish_benchmark(
         let index = ((samples.len() - 1) as f64 * fraction).round() as usize;
         samples[index]
     };
-    let report = state
+    let frame = state
         .measurement
-        .last_report
+        .last_frame
         .as_ref()
         .expect("measured frame count is non-zero");
-    let statistics = report.statistics();
-    validate_fixture_contract(name, statistics)?;
-    let sources = statistics.source_counts();
+    validate_fixture_contract(name, frame)?;
     let renderer_work_samples = &state.measurement.renderer_work_samples;
     let acquire_samples = &state.measurement.acquire_samples;
     let trial_fps = &state.measurement.trial_fps;
@@ -1872,24 +2224,66 @@ fn finish_benchmark(
         percentile(acquire_samples, 0.99),
         construction.as_secs_f64() * 1_000.0,
     );
-    println!(
-        "passes={} commands={} vertices={} streaming_vertices={} reused_vertices={} upload_bytes={} streaming_upload_bytes={} retained_cpu_bytes={} retained_buffer_bytes={} texture_bytes={} draw_calls={} sources[streaming={},prepared={},images={},glyphs={}]",
-        statistics.pass_count(),
-        statistics.command_count(),
-        statistics.vertex_count(),
-        statistics.streaming_vertex_count(),
-        statistics.reused_vertex_count(),
-        statistics.upload_bytes(),
-        statistics.streaming_upload_bytes(),
-        statistics.retained_cpu_bytes(),
-        statistics.retained_buffer_bytes(),
-        statistics.texture_bytes(),
-        statistics.draw_calls(),
-        sources.streaming_scenes(),
-        sources.prepared_scenes(),
-        sources.images(),
-        sources.glyph_runs(),
-    );
+    if let Some(statistics) = frame.statistics {
+        let sources = statistics.source_counts();
+        println!(
+            "passes={} commands={} vertices={} streaming_vertices={} reused_vertices={} upload_bytes={} streaming_upload_bytes={} retained_cpu_bytes={} retained_buffer_bytes={} texture_bytes={} draw_calls={} sources[streaming={},prepared={},dynamic={},particles={},scalars={},images={},glyphs={},targets={}]",
+            statistics.pass_count(),
+            statistics.command_count(),
+            statistics.vertex_count(),
+            statistics.streaming_vertex_count(),
+            statistics.reused_vertex_count(),
+            statistics.upload_bytes(),
+            statistics.streaming_upload_bytes(),
+            statistics.retained_cpu_bytes(),
+            statistics.retained_buffer_bytes(),
+            statistics.texture_bytes(),
+            statistics.draw_calls(),
+            sources.streaming_scenes(),
+            sources.prepared_scenes(),
+            sources.dynamic_meshes(),
+            sources.particle_fields(),
+            sources.scalar_fields(),
+            sources.images(),
+            sources.glyph_runs(),
+            sources.render_targets(),
+        );
+    }
+    if let Some(statistics) = frame.layered_statistics {
+        let particles = statistics.particles;
+        println!(
+            "layered[passes={},draw_calls={},scalar={}x{},target={}x{},retained_cpu_bytes={},retained_buffer_bytes={},texture_bytes={},particles_submitted={},particles_checked={},particles_visible={},particles_culled={},particles_budget_limited={},particles_dropped={},particles_rendered={}]",
+            statistics.pass_count,
+            statistics.draw_calls,
+            statistics.scalar_width,
+            statistics.scalar_height,
+            statistics.target_width,
+            statistics.target_height,
+            statistics.retained_cpu_bytes,
+            statistics.retained_buffer_bytes,
+            statistics.texture_bytes,
+            particles.submitted(),
+            particles.visibility_checked(),
+            particles.visible(),
+            particles.culled(),
+            particles.budget_limited(),
+            particles.dropped(),
+            particles.rendered(),
+        );
+    }
+    if let Some(statistics) = frame.retained_3d_statistics {
+        println!(
+            "retained_3d[objects={},triangles={},edges={},render_passes={},draw_calls={},retained_cpu_bytes={},retained_buffer_bytes={},texture_bytes={}]",
+            statistics.objects,
+            statistics.triangles,
+            statistics.edges,
+            statistics.render_passes,
+            statistics.draw_calls,
+            statistics.retained_cpu_bytes,
+            statistics.retained_buffer_bytes,
+            statistics.texture_bytes,
+        );
+    }
     if gate.enabled {
         let thresholds = gate_thresholds(name)
             .ok_or_else(|| format!("{name} does not define release-gate thresholds"))?;
@@ -2011,12 +2405,59 @@ fn validate_performance_gate(
     Ok(PerformanceGateKind::UncappedThroughput)
 }
 
-fn validate_fixture_contract(
-    name: &str,
-    statistics: sim_engine::FrameStatistics,
-) -> Result<(), Box<dyn Error>> {
+fn validate_fixture_contract(name: &str, frame: &BenchmarkFrame) -> Result<(), Box<dyn Error>> {
+    let valid = match (name, frame.statistics) {
+        ("particle_scalar", None) => frame.layered_statistics.is_some_and(|statistics| {
+            let particles = statistics.particles;
+            particles.submitted() == PARTICLE_FIELD_COUNT
+                && particles.visibility_checked() == PARTICLE_VISIBLE_LIMIT
+                && particles.visible() == 6_848
+                && particles.culled() == 1_344
+                && particles.rendered() == 6_848
+                && particles.budget_limited() == 8_192
+                && particles.dropped() == 0
+                && statistics.scalar_width == SCALAR_FIELD_WIDTH
+                && statistics.scalar_height == SCALAR_FIELD_HEIGHT
+                && statistics.target_width == 640
+                && statistics.target_height == 360
+                && statistics.pass_count == 3
+                && statistics.draw_calls == 3
+                && statistics.retained_cpu_bytes > 0
+                && statistics.retained_buffer_bytes > 0
+                && statistics.texture_bytes > 0
+        }),
+        ("retained_3d", Some(statistics)) => {
+            let sources = statistics.source_counts();
+            frame.retained_3d_statistics.is_some_and(|retained| {
+                retained.objects == RETAINED_3D_OBJECTS
+                    && retained.triangles == RETAINED_3D_OBJECTS * 12
+                    && retained.edges == RETAINED_3D_OBJECTS * 12
+                    && retained.render_passes == 2
+                    && retained.draw_calls == RETAINED_3D_OBJECTS * 3 + 2
+                    && retained.retained_cpu_bytes > 0
+                    && retained.retained_buffer_bytes > 0
+                    && retained.texture_bytes > 0
+                    && sources.dynamic_meshes() == 1
+                    && sources.render_targets() == 1
+                    && statistics.command_count() == 2
+                    && statistics.vertex_count() == DYNAMIC_TRIANGLES * 3 + 6
+                    && statistics.draw_calls() == 2
+                    && statistics.retained_buffer_bytes() > 0
+            })
+        }
+        (_, Some(statistics)) => validate_composed_fixture_contract(name, statistics),
+        _ => false,
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(format!("{name} no longer matches its deterministic source/count contract").into())
+    }
+}
+
+fn validate_composed_fixture_contract(name: &str, statistics: FrameStatistics) -> bool {
     let sources = statistics.source_counts();
-    let valid = match name {
+    match name {
         "ui_static_10k" => {
             statistics.command_count() == 10_000
                 && sources.prepared_scenes() == 1
@@ -2038,13 +2479,5 @@ fn validate_fixture_contract(
         "scientific_text" => sources.glyph_runs() == 1 && statistics.command_count() == 1,
         "dpi_reconfigure" => statistics.command_count() == 2_500 && sources.prepared_scenes() == 1,
         _ => false,
-    };
-    if valid {
-        Ok(())
-    } else {
-        Err(format!(
-            "{name} no longer matches its deterministic source/count contract: {statistics:?}"
-        )
-        .into())
     }
 }

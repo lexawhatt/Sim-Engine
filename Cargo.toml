@@ -13,11 +13,6 @@ categories = ["graphics", "rendering", "science"]
 include = [
     "/src/**",
     "/examples/**",
-    "/scripts/linux_release_gate.sh",
-    "/scripts/release_snapshot_gate.sh",
-    "/scripts/rendering_benchmark_matrix.sh",
-    "/scripts/hidpi_transition_gate.sh",
-    "/scripts/hidpi_transition_controller.sh",
     "/Cargo.toml",
     "/README.md",
     "/DOCUMENTATION.md",

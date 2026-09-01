@@ -198,6 +198,22 @@ pub(super) fn validate_scale_factor(scale_factor: f64) -> Result<(), RendererCon
     }
 }
 
+pub(super) fn validate_surface_dimensions(
+    width: u32,
+    height: u32,
+    limit: u32,
+) -> Result<(), RendererConfigurationError> {
+    if width <= limit && height <= limit {
+        Ok(())
+    } else {
+        Err(RendererConfigurationError::SurfaceDimensionsTooLarge {
+            width,
+            height,
+            limit,
+        })
+    }
+}
+
 pub(super) fn physical_to_logical_screen(
     position: PhysicalScreenPosition,
     scale_factor: f32,
@@ -222,10 +238,15 @@ impl WgpuRenderer {
     /// Requests a replacement logical device for the existing surface and
     /// recreates all renderer-owned transient pipelines and buffers.
     ///
-    /// External prepared, dynamic, particle, scalar, target, and trail
-    /// resources deliberately retain the previous renderer identity. Recreate
-    /// them with the matching `restore_*` methods after this call succeeds.
-    /// Targets and trails restore empty and must be redrawn.
+    /// Every external retained GPU resource deliberately keeps the previous
+    /// renderer identity and is rejected until restored after this succeeds.
+    /// Restore prepared and prepared-screen scenes, dynamic meshes, particle
+    /// fields, scalar fields, 2D targets, and trails with their matching
+    /// `restore_*` methods. Restore images before dependent image batches;
+    /// glyph atlases before dependent glyph runs; and retained 3D meshes/scenes
+    /// before their empty 3D target. Both 2D/3D targets and trails restore
+    /// without prior pixels and must be redrawn. See each resource's
+    /// `WgpuRenderer::restore_*` method for its exact retained-state contract.
     ///
     /// Replaced logical devices enter a bounded quarantine until this renderer
     /// is dropped. Some native swapchain drivers crash if a healthy previous
@@ -242,6 +263,11 @@ impl WgpuRenderer {
                 limit: self.max_quarantined_devices,
             });
         }
+        self.retired_devices.try_reserve(1).map_err(|_| {
+            RendererInitError::RecoveryAllocationFailed {
+                requested_bytes: std::mem::size_of::<RetiredDevice>(),
+            }
+        })?;
         let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
         let adapter = self
             ._instance
@@ -265,6 +291,14 @@ impl WgpuRenderer {
             })
             .await
             .map_err(RendererInitError::RequestDevice)?;
+        let dimension_limit = device.limits().max_texture_dimension_2d;
+        if self.config.width > dimension_limit || self.config.height > dimension_limit {
+            return Err(RendererInitError::SurfaceDimensionsTooLarge {
+                width: self.config.width,
+                height: self.config.height,
+                limit: dimension_limit,
+            });
+        }
         let mut config = self
             .surface
             .get_default_config(&adapter, self.config.width, self.config.height)
@@ -293,7 +327,7 @@ impl WgpuRenderer {
             heatmap_bind_group_layout,
         } = create_pipeline(&device, config.format, sample_count);
         let vertex_buffer = Arc::new(create_vertex_buffer(&device, INITIAL_VERTEX_CAPACITY));
-        let particle_unit_buffer = create_particle_unit_buffer(&device, &queue);
+        let particle_unit_buffer = create_submitted_particle_unit_buffer(&device, &queue);
         let multisample_target = create_multisample_target(&device, &config, sample_count);
         let image_renderer = ImageRenderer::new(&device, config.format, sample_count);
         let mesh3d_renderer = Mesh3dRenderer::new(&device, config.format);

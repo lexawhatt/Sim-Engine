@@ -42,7 +42,9 @@ cargo clippy --all-targets --no-default-features -- -D warnings
 cargo clippy --all-targets --all-features -- -D warnings
 
 echo "[7/11] public documentation"
+cargo test --doc --no-default-features
 cargo test --doc --all-features
+RUSTDOCFLAGS="-D warnings" cargo doc --no-default-features --no-deps
 RUSTDOCFLAGS="-D warnings" cargo doc --all-features --no-deps
 
 echo "[8/11] strict Linux Vulkan semantics"

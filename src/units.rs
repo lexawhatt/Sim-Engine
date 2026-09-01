@@ -29,7 +29,8 @@ impl LogicalPixels {
 pub struct WorldLength(f32);
 
 impl WorldLength {
-    /// Labels a positive finite scalar as a 3D world-space distance.
+    /// Labels a positive finite scalar as a caller-defined 2D or 3D
+    /// world-space distance.
     pub fn new(value: f32) -> Result<Self, UnitError> {
         positive_finite(value)
             .then_some(Self(value))

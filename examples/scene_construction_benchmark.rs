@@ -45,6 +45,9 @@ fn run() -> Result<(), String> {
         0,
         vertices,
         command_count.saturating_mul(per_command.retained_bytes()),
+        command_count
+            .saturating_mul(per_command.retained_bytes())
+            .saturating_mul(2),
         command_count.saturating_mul(per_command.estimated_upload_bytes()),
         command_count.saturating_mul(per_command.estimated_draw_batches()),
     );

@@ -31,6 +31,12 @@ fn dynamic_mesh_vertices_require_complete_finite_triangles() {
         DynamicVertex2d::new(Vec2::ZERO, 0.0, Color::rgb(1.01, 0.0, 0.0)),
         Err(DynamicMeshError::InvalidVertex)
     );
+    let subnormal =
+        DynamicVertex2d::new(Vec2::new(f32::from_bits(1), 0.0), 0.0, Color::WHITE).unwrap();
+    assert_eq!(
+        dynamic_vertices_to_gpu(&[subnormal; 3]),
+        Err(DynamicMeshError::InvalidVertex)
+    );
 
     let vertices = dynamic_vertices_to_gpu(&[vertex; 3]).unwrap();
     assert_eq!(vertices.len(), 3);
@@ -69,17 +75,40 @@ fn particle_gpu_instances_preserve_counts_and_capacity_contract() {
     assert_eq!(statistics.culled(), 0);
     assert_eq!(statistics.dropped(), 0);
     assert_eq!(statistics.rendered(), 1);
+    let subnormal =
+        ParticleInstance2d::new(Vec2::new(f32::from_bits(1), 0.0), 1.0, Color::WHITE, 0.0).unwrap();
+    assert!(matches!(
+        particle_instances_to_gpu(&[subnormal]),
+        Err(ParticleFieldError::InvalidInstance)
+    ));
 }
 
 #[test]
 fn particle_budget_caps_memory_upload_and_samples_evenly() {
     let instance_bytes = std::mem::size_of::<ParticleGpu>();
     assert_eq!(
-        ParticleRenderBudget::new(0, instance_bytes, instance_bytes),
+        ParticleRenderBudget::new(0, instance_bytes * 2, instance_bytes, instance_bytes),
         Err(ParticleBudgetError::InvalidLimit)
     );
-    let budget = ParticleRenderBudget::new(30, instance_bytes * 20, instance_bytes * 12)
-        .expect("budget fits at least one instance");
+    assert_eq!(
+        ParticleRenderBudget::new(1, instance_bytes * 2 - 1, instance_bytes, instance_bytes,),
+        Err(ParticleBudgetError::InvalidLimit)
+    );
+    let minimum_budget =
+        ParticleRenderBudget::new(1, instance_bytes * 2, instance_bytes, instance_bytes).unwrap();
+    assert_eq!(validate_particle_retained_count(1, minimum_budget), Ok(()));
+    assert_eq!(
+        validate_particle_retained_capacities(1, 1, minimum_budget),
+        Ok(())
+    );
+    let budget = ParticleRenderBudget::new(
+        30,
+        instance_bytes * 112,
+        instance_bytes * 20,
+        instance_bytes * 12,
+    )
+    .expect("budget fits at least one instance");
+    assert_eq!(budget.max_retained_bytes(), instance_bytes * 112);
     assert_eq!(budget.instance_limit(), 12);
     assert_eq!(particle_budgeted_capacity(100, budget), Some(12));
     assert_eq!(
@@ -88,6 +117,17 @@ fn particle_budget_caps_memory_upload_and_samples_evenly() {
     );
     let bounded_checks = budget.with_max_visibility_checks(12).unwrap();
     assert_eq!(bounded_checks.max_visibility_checks_per_frame(), 12);
+    assert_eq!(
+        validate_particle_retained_count(100, bounded_checks),
+        Ok(())
+    );
+    assert_eq!(
+        validate_particle_retained_count(101, bounded_checks),
+        Err(ParticleFieldError::RetainedBudgetExceeded {
+            limit: instance_bytes * 112,
+            actual: instance_bytes * 113,
+        })
+    );
 
     let selected: Vec<_> = (0..100)
         .filter(|index| particle_visible_index_is_selected(*index, 100, 12))
@@ -140,6 +180,11 @@ fn layered_visualization_options_reject_invalid_composition_contracts() {
         options.with_composition(BlendMode::Alpha, f32::NAN),
         Err(LayeredVisualizationError::InvalidOpacity)
     );
+    let minimum = -8.707_754e19_f32;
+    let maximum = 2.625_617_7e19_f32;
+    let exact =
+        LayeredVisualizationOptions::new((minimum, maximum), Color::BLACK, Color::BLACK).unwrap();
+    assert_eq!(exact.value_range(), (minimum, maximum));
 }
 
 #[test]
@@ -159,7 +204,7 @@ fn particle_culling_keeps_circles_that_intersect_the_logical_viewport() {
         radius: 6.0,
         color: Color::WHITE.to_array(),
     };
-    assert!(visible.is_safe_for(uniform));
+    assert!(visible.is_safe_for(uniform, viewport));
     assert!(visible.intersects_viewport(uniform, viewport));
     assert!(!culled.intersects_viewport(uniform, viewport));
 }
@@ -176,7 +221,7 @@ fn particle_safety_includes_radius_in_final_clip_arithmetic() {
         color: Color::WHITE.to_array(),
     };
 
-    assert!(!particle.is_safe_for(uniform));
+    assert!(!particle.is_safe_for(uniform, viewport));
 }
 
 #[test]
@@ -194,11 +239,11 @@ fn visible_particle_rejects_backend_dependent_dot_overflow() {
     };
 
     assert!(particle.screen_position(uniform).is_finite());
-    assert!(!particle.is_safe_for(uniform));
+    assert!(!particle.is_safe_for(uniform, viewport));
 }
 
 #[test]
-fn particle_validation_propagates_dot_rounding_into_clip_and_culling() {
+fn particle_validation_rejects_extreme_camera_clip_configuration() {
     let depth = 0.9 * f32::MAX;
     let tilt = std::f32::consts::FRAC_PI_4;
     let particle = ParticleGpu {
@@ -211,14 +256,8 @@ fn particle_validation_propagates_dot_rounding_into_clip_and_culling() {
     camera.set_projection(crate::Projection2d::new(tilt, 1.0).unwrap());
     let tiny_extent = 8.0 / f32::MAX;
     let viewport = LogicalViewport::new(tiny_extent, tiny_extent).unwrap();
-    let uniform = CameraUniform::new(camera, viewport).unwrap();
-
-    // The fixed CPU fold cancels to a finite point, but another legal GPU
-    // association leaves a residual which overflows in screen-to-clip.
-    assert!(particle.screen_position(uniform).is_finite());
-    assert!(!particle.is_safe_for(uniform));
-    // Invalid arithmetic must never turn into a silent CPU cull.
-    assert!(particle.intersects_viewport(uniform, viewport));
+    assert!(CameraUniform::new(camera, viewport).is_none());
+    assert!(particle.world_position.into_iter().all(f32::is_finite));
 }
 
 #[test]
@@ -536,6 +575,38 @@ fn dash_phase_and_every_cap_join_combination_are_deterministic() {
 }
 
 #[test]
+fn logical_join_shader_branches_accept_right_angles_and_reject_threshold_angles() {
+    let viewport = LogicalViewport::new(128.0, 128.0).unwrap();
+    let uniform = CameraUniform::new(Camera2d::default(), viewport).unwrap();
+    let style =
+        crate::StrokeStyle2d::logical(crate::LogicalPixels::new(4.0).unwrap(), Color::WHITE)
+            .with_cap(crate::StrokeCap2d::Butt)
+            .with_join(crate::StrokeJoin2d::Round);
+
+    let mut right_angle = Scene::new(Color::BLACK).unwrap();
+    right_angle
+        .try_styled_polyline(vec![Vec2::ZERO, Vec2::X, Vec2::new(1.0, 1.0)], style)
+        .unwrap();
+    let (vertices, _) = tessellate_for_test(&right_angle);
+    assert!(geometry_is_safe_for(
+        GeometryExtents::from_vertices(&vertices),
+        GeometryValidationSource::Tessellated(&vertices),
+        uniform,
+    ));
+
+    let mut threshold_angle = Scene::new(Color::BLACK).unwrap();
+    threshold_angle
+        .try_styled_polyline(vec![Vec2::ZERO, Vec2::X, Vec2::new(2.0, 0.000_05)], style)
+        .unwrap();
+    let (vertices, _) = tessellate_for_test(&threshold_angle);
+    assert!(!geometry_is_safe_for(
+        GeometryExtents::from_vertices(&vertices),
+        GeometryValidationSource::Tessellated(&vertices),
+        uniform,
+    ));
+}
+
+#[test]
 fn styled_strokes_preserve_clip_and_bound_miter_extrusion() {
     let clip = ScreenClipRect::from_min_size(
         LogicalScreenPosition::new(10.0, 12.0),
@@ -682,9 +753,8 @@ fn world_width_stroke_preserves_width_below_large_base_ulp() {
         .unwrap();
     let (overflow_vertices, _) = tessellate_for_test(&overflow_scene);
     let tiny_viewport = LogicalViewport::new(1.0e-38, 1.0).unwrap();
-    let tiny_uniform =
-        CameraUniform::new(Camera2d::new(center, 1.0).unwrap(), tiny_viewport).unwrap();
-    assert!(!GeometryExtents::from_vertices(&overflow_vertices).is_safe_for(tiny_uniform));
+    assert!(CameraUniform::new(Camera2d::new(center, 1.0).unwrap(), tiny_viewport).is_none());
+    assert!(!overflow_vertices.is_empty());
 }
 
 #[test]
@@ -838,7 +908,7 @@ fn projected_circle_follows_camera_tilt() {
 
 #[test]
 fn scene_budget_estimate_bounds_actual_tessellation_and_upload() {
-    let budget = crate::SceneBudget::new(4, 4, 2_000, 16_000, 120_000, 4);
+    let budget = crate::SceneBudget::new(4, 4, 2_000, 16_000, 16_000, 120_000, 4);
     let mut scene = Scene::with_budget(Color::BLACK, budget).unwrap();
     scene
         .try_circle(
@@ -1054,8 +1124,8 @@ fn sub_epsilon_closed_strokes_remain_drawable_at_large_zoom() {
 #[test]
 fn ftz_sensitive_world_geometry_is_rejected_before_gpu_submission() {
     let largest_subnormal = f32::from_bits(0x007f_ffff);
-    let camera = Camera2d::new(Vec2::ZERO, f32::MAX).unwrap();
-    let viewport = LogicalViewport::new(64.0, 64.0).unwrap();
+    let camera = Camera2d::new(Vec2::ZERO, 1.0).unwrap();
+    let viewport = LogicalViewport::new(100.0, 100.0).unwrap();
     let uniform = CameraUniform::new(camera, viewport).unwrap();
 
     let mut circle_scene = Scene::new(Color::BLACK).unwrap();
@@ -1097,7 +1167,7 @@ fn ftz_sensitive_world_geometry_is_rejected_before_gpu_submission() {
         radius: 1.0,
         color: Color::WHITE.to_array(),
     };
-    assert!(!particle.is_safe_for(uniform));
+    assert!(!particle.is_safe_for(uniform, viewport));
     assert!(
         particle
             .validated_viewport_intersection(uniform, viewport)
@@ -1106,28 +1176,19 @@ fn ftz_sensitive_world_geometry_is_rejected_before_gpu_submission() {
 }
 
 #[test]
-fn ftz_validation_rejects_only_subnormal_operands_that_affect_geometry() {
+fn portability_envelope_rejects_subnormal_camera_operands() {
     let largest_subnormal = f32::from_bits(0x007f_ffff);
     let viewport = LogicalViewport::new(64.0, 64.0).unwrap();
     let empty_camera = Camera2d::new(Vec2::splat(largest_subnormal), 1.0).unwrap();
-    let empty_uniform = CameraUniform::new(empty_camera, viewport).unwrap();
-    assert!(GeometryExtents::empty(true).is_safe_for(empty_uniform));
+    assert!(CameraUniform::new(empty_camera, viewport).is_none());
 
     let mut tiny_projection = Camera2d::new(Vec2::ZERO, 1.0).unwrap();
     tiny_projection.set_projection(crate::Projection2d::new(0.5, largest_subnormal).unwrap());
-    let tiny_projection_uniform = CameraUniform::new(tiny_projection, viewport).unwrap();
-    let vertex = DynamicGpu {
-        world_position: [0.0, 0.0],
-        depth: f32::MAX,
-        color: Color::WHITE.to_array(),
-    };
-    assert!(
-        !GeometryExtents::from_dynamic_vertices(&[vertex]).is_safe_for(tiny_projection_uniform)
-    );
+    assert!(CameraUniform::new(tiny_projection, viewport).is_none());
 }
 
 #[test]
-fn dynamic_geometry_accepts_subnormal_position_absorbed_by_screen_translation() {
+fn dynamic_geometry_rejects_subnormal_position_even_when_translation_absorbs_it() {
     let vertices = [
         DynamicGpu {
             world_position: [f32::from_bits(1), 0.0],
@@ -1152,12 +1213,332 @@ fn dynamic_geometry_accepts_subnormal_position_absorbed_by_screen_translation() 
     .unwrap();
     let extents = GeometryExtents::from_dynamic_vertices(&vertices);
 
-    assert!(!extents.is_safe_for(uniform));
-    assert!(geometry_is_safe_for(
+    // Extents alone intentionally describe arithmetic range, while the exact
+    // retained-source scan below rejects the backend-dependent subnormal.
+    assert!(extents.is_safe_for(uniform));
+    assert!(!geometry_is_safe_for(
         extents,
         GeometryValidationSource::Dynamic(&vertices),
         uniform,
     ));
+}
+
+#[test]
+fn dynamic_triangle_rejects_backend_dependent_ftz_collapse_at_high_zoom() {
+    let largest_subnormal = f32::from_bits(0x007f_ffff);
+    let vertices = [
+        DynamicGpu {
+            world_position: [0.0, 0.0],
+            depth: 0.0,
+            color: Color::WHITE.to_array(),
+        },
+        DynamicGpu {
+            world_position: [largest_subnormal, 0.0],
+            depth: 0.0,
+            color: Color::WHITE.to_array(),
+        },
+        DynamicGpu {
+            world_position: [0.0, largest_subnormal],
+            depth: 0.0,
+            color: Color::WHITE.to_array(),
+        },
+    ];
+    let camera = Camera2d::new(Vec2::ZERO, 2.0_f32.powi(119)).unwrap();
+    let uniform = CameraUniform::new(camera, LogicalViewport::new(64.0, 64.0).unwrap()).unwrap();
+    let extents = GeometryExtents::from_dynamic_vertices(&vertices);
+
+    assert!(!geometry_is_safe_for(
+        extents,
+        GeometryValidationSource::Dynamic(&vertices),
+        uniform,
+    ));
+}
+
+#[test]
+fn dynamic_triangle_rejects_association_dependent_projected_collapse() {
+    let vertices = [
+        DynamicGpu {
+            world_position: [f32::from_bits(0xe1b5_00f9), f32::from_bits(0xe27f_fa60)],
+            depth: f32::from_bits(0x627f_fa61),
+            color: Color::WHITE.to_array(),
+        },
+        DynamicGpu {
+            world_position: [f32::from_bits(0xe1b5_01e8), f32::from_bits(0xe27f_fbb3)],
+            depth: f32::from_bits(0x627f_fbb3),
+            color: Color::WHITE.to_array(),
+        },
+        DynamicGpu {
+            world_position: [f32::from_bits(0xe1b5_0e07), f32::from_bits(0xe280_066b)],
+            depth: f32::from_bits(0x6280_066b),
+            color: Color::WHITE.to_array(),
+        },
+    ];
+    let viewport_extent = f32::from_bits(0x5680_0000);
+    let viewport = LogicalViewport::new(viewport_extent, viewport_extent).unwrap();
+    let mut camera = Camera2d::new(Vec2::ZERO, 1.0).unwrap();
+    camera.set_projection(crate::Projection2d::new(std::f32::consts::FRAC_PI_4, 1.0).unwrap());
+    let uniform = CameraUniform::new(camera, viewport).unwrap();
+    let half_viewport = viewport_extent * 0.5;
+
+    let fixed = vertices.map(|vertex| {
+        uniform.world_to_screen(
+            Vec2::new(vertex.world_position[0], vertex.world_position[1]),
+            vertex.depth,
+        )
+    });
+    assert_eq!(fixed, [Vec2::splat(half_viewport); 3]);
+
+    let fused = vertices.map(|vertex| {
+        Vec2::new(
+            uniform.world_to_screen_x[2].mul_add(vertex.depth, vertex.world_position[0])
+                + uniform.world_to_screen_x[3],
+            uniform.world_to_screen_y[2].mul_add(
+                vertex.depth,
+                uniform.world_to_screen_y[1] * vertex.world_position[1],
+            ) + uniform.world_to_screen_y[3],
+        )
+    });
+    let fused_area = f64::from(fused[1].x - fused[0].x) * f64::from(fused[2].y - fused[0].y)
+        - f64::from(fused[1].y - fused[0].y) * f64::from(fused[2].x - fused[0].x);
+    assert!(fused_area.is_finite() && fused_area != 0.0);
+
+    let extents = GeometryExtents::from_dynamic_vertices(&vertices);
+    assert!(geometry_sources_are_portable(
+        GeometryValidationSource::Dynamic(&vertices)
+    ));
+    assert!(!geometry_is_safe_for(
+        extents,
+        GeometryValidationSource::Dynamic(&vertices),
+        uniform,
+    ));
+}
+
+#[test]
+fn dynamic_triangle_frustum_branches_are_explicit() {
+    let uniform = CameraUniform::new(
+        Camera2d::default(),
+        LogicalViewport::new(100.0, 100.0).unwrap(),
+    )
+    .unwrap();
+    let vertex = |x, y| DynamicGpu {
+        world_position: [x, y],
+        depth: 0.0,
+        color: Color::WHITE.to_array(),
+    };
+    let inside = [vertex(-10.0, -10.0), vertex(10.0, -10.0), vertex(0.0, 10.0)];
+    assert!(dynamic_triangle_topology_is_portable(&inside, uniform));
+
+    let crossing = [vertex(-10.0, -10.0), vertex(60.0, -10.0), vertex(0.0, 10.0)];
+    assert!(!dynamic_triangle_topology_is_portable(&crossing, uniform));
+
+    let outside = [vertex(60.0, -10.0), vertex(80.0, -10.0), vertex(70.0, 10.0)];
+    assert!(dynamic_triangle_topology_is_portable(&outside, uniform));
+}
+
+#[test]
+fn tessellated_fill_preserves_local_offsets_at_large_world_anchor() {
+    let anchor = 2.0_f32.powi(30);
+    let mut scene = Scene::new(Color::BLACK).unwrap();
+    scene
+        .try_circle(Vec2::splat(anchor), 1.0, ShapeStyle::filled(Color::WHITE))
+        .unwrap();
+    let (vertices, _) = tessellate_for_test(&scene);
+    let triangle = [vertices[0], vertices[1], vertices[2]];
+    let camera = Camera2d::new(Vec2::splat(anchor), 100.0).unwrap();
+    let viewport = LogicalViewport::new(1_000.0, 1_000.0).unwrap();
+    let uniform = CameraUniform::new(camera, viewport).unwrap();
+
+    let fixed = triangle.map(|vertex| {
+        let relative = Vec2::new(
+            (vertex.world_position[0] - uniform.camera_center[0]) + vertex.world_offset[0],
+            (vertex.world_position[1] - uniform.camera_center[1]) + vertex.world_offset[1],
+        );
+        Vec2::new(
+            uniform.world_to_screen_x[0] * relative.x
+                + uniform.world_to_screen_x[1] * relative.y
+                + uniform.world_to_screen_x[2] * vertex.depth
+                + uniform.world_to_screen_x[3]
+                + vertex.screen_offset[0],
+            uniform.world_to_screen_y[0] * relative.x
+                + uniform.world_to_screen_y[1] * relative.y
+                + uniform.world_to_screen_y[2] * vertex.depth
+                + uniform.world_to_screen_y[3]
+                + vertex.screen_offset[1],
+        )
+    });
+    let fixed_area = f64::from(fixed[1].x - fixed[0].x) * f64::from(fixed[2].y - fixed[0].y)
+        - f64::from(fixed[1].y - fixed[0].y) * f64::from(fixed[2].x - fixed[0].x);
+    assert!(fixed_area.abs() > 500.0);
+
+    let reassociated = triangle.map(|vertex| {
+        let relative = Vec2::new(
+            vertex.world_position[0] + (vertex.world_offset[0] - uniform.camera_center[0]),
+            vertex.world_position[1] + (vertex.world_offset[1] - uniform.camera_center[1]),
+        );
+        Vec2::new(
+            uniform.world_to_screen_x[0] * relative.x
+                + uniform.world_to_screen_x[1] * relative.y
+                + uniform.world_to_screen_x[2] * vertex.depth
+                + uniform.world_to_screen_x[3]
+                + vertex.screen_offset[0],
+            uniform.world_to_screen_y[0] * relative.x
+                + uniform.world_to_screen_y[1] * relative.y
+                + uniform.world_to_screen_y[2] * vertex.depth
+                + uniform.world_to_screen_y[3]
+                + vertex.screen_offset[1],
+        )
+    });
+    assert_eq!(reassociated, [Vec2::splat(500.0); 3]);
+    let extents = GeometryExtents::from_vertices(&vertices);
+    assert!(geometry_sources_are_portable(
+        GeometryValidationSource::Tessellated(&vertices)
+    ));
+    assert!(geometry_vertex_centers_are_portable(
+        GeometryValidationSource::Tessellated(&vertices),
+        uniform,
+    ));
+    for (index, triangle) in vertices.chunks_exact(3).enumerate() {
+        let clip = [
+            tessellated_vertex_clip_ranges(triangle[0], uniform).unwrap(),
+            tessellated_vertex_clip_ranges(triangle[1], uniform).unwrap(),
+            tessellated_vertex_clip_ranges(triangle[2], uniform).unwrap(),
+        ];
+        assert!(
+            clip_triangle_is_wholly_outside(clip)
+                || clip_triangle_has_stable_signed_area(clip, f64::from(f32::MIN_POSITIVE)),
+            "triangle {index}: {clip:?}"
+        );
+    }
+    assert!(tessellated_triangle_topology_is_portable(
+        &vertices, uniform
+    ));
+    assert!(extents.is_safe_for(uniform));
+    assert!(geometry_is_safe_for(
+        extents,
+        GeometryValidationSource::Tessellated(&vertices),
+        uniform,
+    ));
+}
+
+#[test]
+fn prepared_scene_preflight_rejects_nonportable_sources_without_tessellation() {
+    let mut scene = Scene::new(Color::BLACK).unwrap();
+    for index in 0..256 {
+        scene
+            .try_circle(
+                Vec2::new(2.0_f32.powi(121), index as f32),
+                1.0,
+                ShapeStyle::filled(Color::WHITE),
+            )
+            .unwrap();
+    }
+
+    assert_eq!(scene.command_count(), 256);
+    assert!(!scene_command_sources_are_portable(&scene));
+}
+
+#[test]
+fn particle_rejects_backend_dependent_viewport_classification() {
+    let viewport_extent = 2.0_f32.powi(45);
+    let viewport = LogicalViewport::new(viewport_extent, viewport_extent).unwrap();
+    let mut camera = Camera2d::new(Vec2::ZERO, 1.0).unwrap();
+    camera.set_projection(crate::Projection2d::new(std::f32::consts::FRAC_PI_4, 1.0).unwrap());
+    let uniform = CameraUniform::new(camera, viewport).unwrap();
+    let particle = ParticleGpu {
+        world_position: [f32::from_bits(0xe1b5_00f9), f32::from_bits(0xe27f_fa60)],
+        depth: f32::from_bits(0x627f_fa61),
+        radius: 2.0_f32.powi(43),
+        color: Color::WHITE.to_array(),
+    };
+
+    assert_eq!(
+        particle.screen_position(uniform),
+        Vec2::splat(viewport_extent * 0.5)
+    );
+    let fused = Vec2::new(
+        uniform.world_to_screen_x[2].mul_add(
+            particle.depth,
+            uniform.world_to_screen_x[0] * particle.world_position[0]
+                + uniform.world_to_screen_x[1] * particle.world_position[1],
+        ) + uniform.world_to_screen_x[3],
+        uniform.world_to_screen_y[2].mul_add(
+            particle.depth,
+            uniform.world_to_screen_y[0] * particle.world_position[0]
+                + uniform.world_to_screen_y[1] * particle.world_position[1],
+        ) + uniform.world_to_screen_y[3],
+    );
+    assert!(fused.y + particle.radius < 0.0);
+    assert!(!particle.is_safe_for(uniform, viewport));
+    assert_eq!(
+        particle.validated_viewport_intersection(uniform, viewport),
+        None
+    );
+}
+
+#[test]
+fn logical_stroke_rejects_backend_dependent_clip_classification() {
+    let depth = f32::from_bits(0x627f_fa61);
+    let from = Vec2::new(f32::from_bits(0xe1b5_00f9), f32::from_bits(0xe27f_fa60));
+    let to = Vec2::new(f32::from_bits(0xe1b5_00e9), f32::from_bits(0xe27f_fa60));
+    let viewport_extent = 2.0_f32.powi(45);
+    let viewport = LogicalViewport::new(viewport_extent, viewport_extent).unwrap();
+    let mut camera = Camera2d::new(Vec2::ZERO, 1.0).unwrap();
+    camera.set_projection(crate::Projection2d::new(std::f32::consts::FRAC_PI_4, 1.0).unwrap());
+    let uniform = CameraUniform::new(camera, viewport).unwrap();
+
+    let fixed = [from, to].map(|point| uniform.world_to_screen(point, depth));
+    assert_eq!(fixed[0], Vec2::splat(viewport_extent * 0.5));
+    assert!(fixed[1].x > viewport_extent && fixed[1].y == fixed[0].y);
+    let fused_y = uniform.world_to_screen_y[2].mul_add(
+        depth,
+        uniform.world_to_screen_y[0] * from.x + uniform.world_to_screen_y[1] * from.y,
+    ) + uniform.world_to_screen_y[3];
+    assert!(fused_y + 10.0 < 0.0);
+
+    let mut scene = Scene::new(Color::BLACK).unwrap();
+    scene.try_set_depth(depth).unwrap();
+    scene
+        .try_styled_line(
+            from,
+            to,
+            crate::StrokeStyle2d::logical(crate::LogicalPixels::new(20.0).unwrap(), Color::WHITE)
+                .with_cap(crate::StrokeCap2d::Butt),
+        )
+        .unwrap();
+    let (vertices, _) = tessellate_for_test(&scene);
+    assert!(!geometry_is_safe_for(
+        GeometryExtents::from_vertices(&vertices),
+        GeometryValidationSource::Tessellated(&vertices),
+        uniform,
+    ));
+}
+
+#[test]
+fn particle_quad_rejects_unrepresentable_large_viewport_origin() {
+    let local_viewport = LogicalViewport::new(100.0, 100.0).unwrap();
+    let target_extent = 2.0_f32.powi(45);
+    let target_viewport = LogicalViewport::new(target_extent, target_extent).unwrap();
+    let origin = Vec2::new(target_extent * 0.5, 100.0);
+    let uniform =
+        CameraUniform::new_in_region(Camera2d::default(), local_viewport, origin, target_viewport)
+            .unwrap();
+    let particle = ParticleGpu {
+        world_position: [0.0, 0.0],
+        depth: 0.0,
+        radius: 20.0,
+        color: Color::WHITE.to_array(),
+    };
+    let center = particle.screen_position(uniform);
+    assert_eq!(center.x + particle.radius, center.x);
+    let clip_center = center
+        .x
+        .mul_add(uniform.screen_to_clip[0], uniform.screen_to_clip[2]);
+    let clip_radius = particle.radius * uniform.screen_to_clip[0];
+    assert!(clip_radius.is_normal() && clip_center + clip_radius != clip_center);
+    // The vertical center is near clip +1, where the same tiny radius cannot
+    // produce two distinct f32 positions. Reject the whole quad rather than
+    // letting one axis collapse backend-dependently.
+    assert!(!particle.is_safe_for(uniform, target_viewport));
 }
 
 #[test]
@@ -1448,7 +1829,7 @@ fn geometry_extents_reject_dot_product_overflow_hidden_by_cancellation() {
 }
 
 #[test]
-fn geometry_validation_preserves_actual_world_depth_correlation() {
+fn geometry_validation_rejects_extreme_world_depth_correlation() {
     let depth = 0.9 * f32::MAX;
     let tilt = std::f32::consts::FRAC_PI_4;
     let horizontal = depth * tilt.sin() * 0.5;
@@ -1476,7 +1857,7 @@ fn geometry_validation_preserves_actual_world_depth_correlation() {
         )
     );
     assert!(!extents.is_safe_for(uniform));
-    assert!(geometry_is_safe_for(
+    assert!(!geometry_is_safe_for(
         extents,
         GeometryValidationSource::Dynamic(&vertices),
         uniform,
@@ -1484,7 +1865,7 @@ fn geometry_validation_preserves_actual_world_depth_correlation() {
 }
 
 #[test]
-fn geometry_validation_preserves_actual_direction_tuples() {
+fn camera_uniform_rejects_extreme_direction_projection_scale() {
     let mut horizontal = world_vertex(Vec2::ZERO, Vec2::ZERO, Color::WHITE);
     horizontal.previous_direction = [1.0, 0.0];
     horizontal.next_direction = [1.0, 0.0];
@@ -1496,15 +1877,8 @@ fn geometry_validation_preserves_actual_direction_tuples() {
     let vertices = [horizontal, vertical];
     let mut camera = Camera2d::new(Vec2::ZERO, f32::MAX).unwrap();
     camera.set_rotation(std::f32::consts::FRAC_PI_4).unwrap();
-    let uniform = CameraUniform::new(camera, LogicalViewport::new(1.0, 1.0).unwrap()).unwrap();
-    let extents = GeometryExtents::from_vertices(&vertices);
-
-    assert!(!extents.is_safe_for(uniform));
-    assert!(geometry_is_safe_for(
-        extents,
-        GeometryValidationSource::Tessellated(&vertices),
-        uniform,
-    ));
+    assert!(CameraUniform::new(camera, LogicalViewport::new(1.0, 1.0).unwrap()).is_none());
+    assert_eq!(vertices.len(), 2);
 }
 
 #[test]
@@ -1522,15 +1896,15 @@ fn geometry_validation_propagates_dot_rounding_into_final_clip() {
     let uniform = CameraUniform::new(
         camera,
         LogicalViewport::new(tiny_extent, tiny_extent).unwrap(),
-    )
-    .unwrap();
+    );
 
-    assert!(!GeometryExtents::from_dynamic_vertices(&[vertex]).is_safe_for(uniform));
+    assert!(uniform.is_none());
+    assert!(vertex.world_position.into_iter().all(f32::is_finite));
 }
 
 #[test]
-fn shader_dot_envelope_allows_safe_opposing_terms() {
-    assert!(shader_interval_sum_is_safe([
+fn shader_dot_envelope_rejects_terms_outside_portability_envelope() {
+    assert!(!shader_interval_sum_is_safe([
         (-1.47e38, -1.47e38),
         (0.83e38, 0.83e38),
         (1.70e38, 1.70e38),
@@ -1543,7 +1917,7 @@ fn shader_dot_envelope_allows_safe_opposing_terms() {
 }
 
 #[test]
-fn shader_dot_envelope_keeps_exact_identity_at_f32_maximum() {
+fn shader_dot_envelope_rejects_identity_outside_portability_envelope() {
     assert_eq!(
         shader_interval_sum_range([
             (f64::from(f32::MAX), f64::from(f32::MAX)),
@@ -1551,12 +1925,12 @@ fn shader_dot_envelope_keeps_exact_identity_at_f32_maximum() {
             (0.0, 0.0),
             (0.0, 0.0),
         ]),
-        Some((f64::from(f32::MAX), f64::from(f32::MAX)))
+        None
     );
 }
 
 #[test]
-fn shader_dot_envelope_accepts_exact_maximum_from_two_products() {
+fn shader_dot_envelope_rejects_extreme_sources_before_two_product_dot() {
     let mut camera = Camera2d::new(Vec2::ZERO, f32::from_bits(0x3f35_04f4)).unwrap();
     camera.set_rotation(-std::f32::consts::FRAC_PI_4).unwrap();
     let uniform = CameraUniform::new(camera, LogicalViewport::new(2.0, 2.0).unwrap()).unwrap();
@@ -1567,11 +1941,16 @@ fn shader_dot_envelope_accepts_exact_maximum_from_two_products() {
     };
 
     assert_eq!(uniform.world_to_screen_x, [0.5, 0.5, 0.0, 1.0]);
-    assert!(GeometryExtents::from_dynamic_vertices(&[vertex]).is_safe_for(uniform));
+    let extents = GeometryExtents::from_dynamic_vertices(&[vertex]);
+    assert!(!geometry_is_safe_for(
+        extents,
+        GeometryValidationSource::Dynamic(&[vertex]),
+        uniform,
+    ));
 }
 
 #[test]
-fn shader_dot_envelope_preserves_single_exact_interval_term() {
+fn shader_dot_envelope_rejects_single_extreme_interval_term() {
     let previous = f32::from_bits(f32::MAX.to_bits() - 1);
 
     assert_eq!(
@@ -1581,39 +1960,64 @@ fn shader_dot_envelope_preserves_single_exact_interval_term() {
             (0.0, 0.0),
             (-0.0, -0.0),
         ]),
-        Some((-f64::from(f32::MAX), -f64::from(previous)))
+        None
     );
 }
 
 #[test]
-fn exact_shader_dot_preserves_permitted_ftz_intermediate() {
+fn interval_shader_dot_bounds_cancellation_across_zero() {
     let minimum_normal = f32::MIN_POSITIVE;
     let adjacent_normal = f32::from_bits(minimum_normal.to_bits() + 1);
 
-    assert_eq!(
-        shader_interval_sum_range([
-            (f64::from(adjacent_normal), f64::from(adjacent_normal)),
-            (-f64::from(minimum_normal), -f64::from(minimum_normal)),
-        ]),
-        Some((0.0, f64::from(f32::from_bits(1))))
-    );
+    let range = shader_interval_sum_range([
+        (f64::from(adjacent_normal), f64::from(adjacent_normal)),
+        (-f64::from(minimum_normal), -f64::from(minimum_normal)),
+    ])
+    .unwrap();
+    assert!(range.0 < 0.0 && range.1 > 0.0);
 }
 
 #[test]
-fn maximum_target_scale_keeps_one_texel_camera_translation_normal() {
+fn actual_vertex_scan_rejects_interior_ftz_product_hidden_by_extrema() {
+    let vertices = [
+        DynamicGpu {
+            world_position: [-2.0, 0.0],
+            depth: 0.0,
+            color: Color::WHITE.to_array(),
+        },
+        DynamicGpu {
+            world_position: [0.5, 0.0],
+            depth: 0.0,
+            color: Color::WHITE.to_array(),
+        },
+        DynamicGpu {
+            world_position: [2.0, 0.0],
+            depth: 0.0,
+            color: Color::WHITE.to_array(),
+        },
+    ];
+    let uniform = CameraUniform {
+        camera_center: [0.0; 4],
+        world_to_screen_x: [f32::MIN_POSITIVE, 0.0, 0.0, 1.0],
+        world_to_screen_y: [0.0, 1.0, 0.0, 1.0],
+        screen_to_clip: [1.0, 1.0, 0.0, 0.0],
+    };
+    let extents = GeometryExtents::from_dynamic_vertices(&vertices);
+
+    assert!(extents.is_safe_for(uniform));
+    assert!(!geometry_is_safe_for(
+        extents,
+        GeometryValidationSource::Dynamic(&vertices),
+        uniform,
+    ));
+}
+
+#[test]
+fn maximum_target_scale_is_outside_gpu_portability_envelope() {
     let scale = 0.5 / f32::MIN_POSITIVE;
     let extent = 1.0 / scale;
     let viewport = LogicalViewport::new(extent, extent).unwrap();
-    let uniform = CameraUniform::new(Camera2d::default(), viewport).unwrap();
-    let vertex = DynamicGpu {
-        world_position: [0.0, 0.0],
-        depth: 0.0,
-        color: Color::WHITE.to_array(),
-    };
-
-    assert!(uniform.world_to_screen_x[3].is_normal());
-    assert!(uniform.world_to_screen_y[3].is_normal());
-    assert!(GeometryExtents::from_dynamic_vertices(&[vertex]).is_safe_for(uniform));
+    assert!(CameraUniform::new(Camera2d::default(), viewport).is_none());
 }
 
 #[test]
@@ -1625,11 +2029,12 @@ fn geometry_extents_reject_world_offset_overflow_before_camera_scale() {
     let (vertices, _) = tessellate_for_test(&scene);
     let camera = Camera2d::new(Vec2::splat(-2.0e38), 0.000_1).unwrap();
     let viewport = LogicalViewport::new(64.0, 64.0).unwrap();
-    let uniform = CameraUniform::new(camera, viewport).unwrap();
+    let uniform = CameraUniform::new(camera, viewport);
 
     // The projected f64 envelope is small after zoom, but WGSL first adds
     // 2e38 + 2e38 in f32. Validation must reject that intermediate overflow.
-    assert!(!GeometryExtents::from_vertices(&vertices).is_safe_for(uniform));
+    assert!(uniform.is_none());
+    assert!(!vertices.is_empty());
 }
 
 #[test]
@@ -1654,7 +2059,27 @@ fn geometry_extents_reject_final_screen_to_clip_overflow() {
 }
 
 #[test]
-fn geometry_validation_recovers_base_offset_correlation_between_commands() {
+fn logical_stroke_rejects_screen_overflow_hidden_by_tiny_clip_scale() {
+    let maximum = MAX_PORTABLE_SHADER_VALUE;
+    let world_screen = (f64::from(maximum * 0.75), f64::from(maximum * 0.75));
+
+    // A sufficiently small clip multiplier could make the final value look
+    // harmless, but WGSL must first add the projected center and extrusion in
+    // f32 screen space. That intermediate is outside the shared envelope.
+    assert!(shader_clip_interval_is_safe(
+        world_screen.0,
+        world_screen.1,
+        2.0_f32.powi(-119),
+        0.0
+    ));
+    assert_eq!(
+        shader_stroke_screen_bounds(world_screen, 0.0, maximum * 0.5, 0.0, 1.0),
+        None
+    );
+}
+
+#[test]
+fn geometry_validation_rejects_extreme_base_offset_correlation_between_commands() {
     let mut scene = Scene::new(Color::BLACK).unwrap();
     scene
         .try_circle(
@@ -1673,7 +2098,7 @@ fn geometry_validation_recovers_base_offset_correlation_between_commands() {
 
     let extents = GeometryExtents::from_vertices(&vertices);
     assert!(!extents.is_safe_for(uniform));
-    assert!(geometry_is_safe_for(
+    assert!(!geometry_is_safe_for(
         extents,
         GeometryValidationSource::Tessellated(&vertices),
         uniform,
@@ -1709,13 +2134,13 @@ fn relative_bounds_cover_rounding_reordered_base_offset_pairs() {
             .unwrap();
 
     for (base, offset) in pairs {
-        let actual = (base - center) + offset;
+        let actual = f64::from((base - center) + offset);
         assert!(actual >= bounds.0 && actual <= bounds.1);
     }
 }
 
 #[test]
-fn geometry_extents_accept_valid_geometry_relative_to_large_camera_center() {
+fn renderer_uniform_rejects_camera_center_outside_portability_envelope() {
     let center = Vec2::new(2.0e38, 0.0);
     let world = Vec2::new(center.x + 1.0e33, 0.0);
     let vertices = [world_vertex(world, Vec2::ZERO, Color::WHITE)];
@@ -1726,12 +2151,8 @@ fn geometry_extents_accept_valid_geometry_relative_to_large_camera_center() {
     let Ok(viewport) = LogicalViewport::new(800.0, 600.0) else {
         panic!("test viewport should be valid");
     };
-    let Some(uniform) = CameraUniform::new(camera, viewport) else {
-        panic!("relative camera uniform should remain finite");
-    };
-
-    assert!(uniform.world_to_screen(world, 0.0).is_finite());
-    assert!(extents.is_safe_for(uniform));
+    assert!(CameraUniform::new(camera, viewport).is_none());
+    assert!(!extents.empty);
 }
 
 #[test]
@@ -2761,7 +3182,8 @@ fn offscreen_gpu_readback_verifies_camera_depth_and_clip_contract() {
         assert_eq!(restored.vertex_count(), prepared.vertex_count());
         assert_eq!(
             restored.recovery_memory_bytes(),
-            restored.vertex_count() * std::mem::size_of::<Vertex>()
+            restored.vertices.capacity() * std::mem::size_of::<Vertex>()
+                + restored.draw_batches.capacity() * std::mem::size_of::<PreparedDrawBatch>()
         );
         assert!(Arc::ptr_eq(&restored.vertices, &prepared.vertices));
         let recovery_identity = Arc::new(());
@@ -2894,7 +3316,8 @@ fn offscreen_gpu_readback_verifies_camera_depth_and_clip_contract() {
             scalar_texture.field().values()
         );
         let heatmap_color_map = ColorMap::linear(Color::BLACK, Color::WHITE).unwrap();
-        let heatmap_lut = create_cached_color_map(&device, &queue, &heatmap_color_map);
+        let heatmap_lut =
+            create_cached_color_map(&device, &queue, color_map_lut(&heatmap_color_map));
         let heatmap_scalar_view = scalar_texture
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
@@ -2965,7 +3388,7 @@ fn offscreen_gpu_readback_verifies_camera_depth_and_clip_contract() {
             0,
             bytemuck::bytes_of(&camera_uniform),
         );
-        let particle_unit_buffer = create_particle_unit_buffer(&device, &queue);
+        let particle_unit_buffer = create_submitted_particle_unit_buffer(&device, &queue);
         let particle_instances = [
             ParticleGpu {
                 world_position: [18.0, -18.0],
@@ -3009,7 +3432,7 @@ fn offscreen_gpu_readback_verifies_camera_depth_and_clip_contract() {
         ));
         assert_eq!(
             recovered_particles_on_another_device.statistics(),
-            particle_statistics(2, 2, 0),
+            particle_idle_statistics(2),
             "recovery must not preserve stale culling or draw statistics"
         );
 
@@ -3849,8 +4272,8 @@ fn offscreen_gpu_readback_verifies_camera_depth_and_clip_contract() {
         let linear_target = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("sim-engine offscreen linear heatmap target"),
             size: wgpu::Extent3d {
-                width: 2,
-                height: 2,
+                width: 8,
+                height: 8,
                 depth_or_array_layers: 1,
             },
             mip_level_count: 1,
@@ -3863,7 +4286,7 @@ fn offscreen_gpu_readback_verifies_camera_depth_and_clip_contract() {
         let linear_view = linear_target.create_view(&wgpu::TextureViewDescriptor::default());
         let linear_readback = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("sim-engine offscreen linear heatmap readback"),
-            size: 512,
+            size: 2048,
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
@@ -3903,12 +4326,12 @@ fn offscreen_gpu_readback_verifies_camera_depth_and_clip_contract() {
                 layout: wgpu::TexelCopyBufferLayout {
                     offset: 0,
                     bytes_per_row: Some(256),
-                    rows_per_image: Some(2),
+                    rows_per_image: Some(8),
                 },
             },
             wgpu::Extent3d {
-                width: 2,
-                height: 2,
+                width: 8,
+                height: 8,
                 depth_or_array_layers: 1,
             },
         );
@@ -3932,18 +4355,21 @@ fn offscreen_gpu_readback_verifies_camera_depth_and_clip_contract() {
             .get_mapped_range()
             .expect("offscreen linear heatmap bytes");
         let linear_pixel = |x: usize, y: usize| &linear_bytes[y * 256 + x * 4..y * 256 + x * 4 + 4];
-        assert!(linear_pixel(0, 0)[0] < 8, "top-left texel moved vertically");
         assert!(
-            linear_pixel(1, 0)[0] > 130 && linear_pixel(1, 0)[0] < 145,
-            "top-right texel moved vertically"
+            linear_pixel(0, 0)[0] < 8,
+            "linear clamp-to-edge mixed the top-left corner with a neighbour"
         );
         assert!(
-            linear_pixel(0, 1)[0] > 180 && linear_pixel(0, 1)[0] < 195,
-            "bottom-left texel moved vertically"
+            linear_pixel(7, 0)[0] > 130 && linear_pixel(7, 0)[0] < 145,
+            "linear clamp-to-edge mixed the top-right corner vertically"
         );
         assert!(
-            linear_pixel(1, 1)[0] > 247,
-            "bottom-right texel moved vertically"
+            linear_pixel(0, 7)[0] > 180 && linear_pixel(0, 7)[0] < 195,
+            "linear clamp-to-edge mixed the bottom-left corner horizontally"
+        );
+        assert!(
+            linear_pixel(7, 7)[0] > 247,
+            "linear clamp-to-edge changed the bottom-right corner"
         );
         drop(linear_bytes);
         linear_readback.unmap();
@@ -4322,6 +4748,19 @@ fn renderer_options_reject_invalid_scale_factor() {
         WgpuRendererOptions::new(RendererPresentMode::Vsync, f32::MAX as f64),
         Err(RendererConfigurationError::InvalidScaleFactor { .. })
     ));
+}
+
+#[test]
+fn surface_dimensions_are_rejected_before_configuration() {
+    assert_eq!(validate_surface_dimensions(8_192, 4_096, 8_192), Ok(()));
+    assert_eq!(
+        validate_surface_dimensions(8_193, 4_096, 8_192),
+        Err(RendererConfigurationError::SurfaceDimensionsTooLarge {
+            width: 8_193,
+            height: 4_096,
+            limit: 8_192,
+        })
+    );
 }
 
 #[test]

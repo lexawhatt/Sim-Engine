@@ -135,29 +135,27 @@ logical-screen shadows. Colors are straight linear RGBA internally.
 boundaries require every channel in `0.0..=1.0`; animation may overshoot, but
 the host must call `Color::clamp` explicitly before inserting that value.
 Generated local offsets remain separate from their world anchors through the
-GPU camera transform. A circle radius, rounded corner, or world-unit stroke
+GPU camera transform: the anchor and local offset are projected independently
+before their logical-screen results are added. A circle radius, rounded corner, or world-unit stroke
 width that is meaningful under the active zoom therefore does not disappear
 merely because adding it to a large source coordinate would round back to the
 same `f32`. Fill, stroke, joins/caps, shadow/spread, and gradient sampling share
 that representation. Any positive normal `f32` radial range remains a real
 range rather than being treated as zero by an epsilon threshold. Nonzero
-subnormal operands are not portable across WGSL backends: when they could
-affect a GPU transform, rendering returns `InvalidGeometryTransform` instead
-of accepting a primitive that another driver may silently flush to zero.
+subnormal coordinate, length, direction, camera, and transform operands are not
+portable across WGSL backends, so every GPU geometry path rejects them even
+when one translation would hide the difference. Normalized linear color
+channels are not part of that geometric envelope and may include subnormal
+values; their contribution is below current normalized-target precision.
 Display and offscreen pixel scales are bounded so even a one-texel target has
 normal finite logical dimensions, half-viewport camera translations, and clip
-coefficients. Retained 3D validation also rejects extreme transforms whose
-legal shader associations disagree about a vertex's frustum-plane side or a
-display edge's collapsed/extruded classification. Edge clipping also rejects
-homogeneously scaled plane distances whose sign can change under permitted
-subnormal flushing or separate component rounding. Exact candidate states keep
-clip components correlated with the edge pair's maximum and reciprocal scale.
-Exact row operations which only select or negate an already-rounded component
-retain that component's interval without an additional arithmetic margin.
-Exact subnormal dot sources are exhaustively evaluated in both preserved and
-flush-to-zero states. Interval-valued subnormal sources remain conservatively
-rejected when their provenance is no longer available. Dynamic 2D vertices use
-the same per-vertex preserved/FTZ evaluation through camera and clip rows.
+coefficients. Transform sources are restricted to normal finite values with
+magnitude at most `2^120`, keeping reciprocals inside WGSL's specified
+division-accuracy domain. Directed-rounding intervals include legal
+association/FMA error. Retained 3D validation rejects any conservative range
+that cannot prove stable frustum-plane and edge classification. Likewise,
+logical joins near reversal, straight/miter, or extrusion thresholds are
+rejected instead of allowing backend-dependent topology.
 
 #### Rich bounded strokes
 
@@ -195,7 +193,8 @@ units for `Scene`, logical coordinate units for `ScreenScene`. A visible dash
 continues across polyline vertices and receives the configured join. Width is
 independent: `StrokeStyle2d::logical` stays constant under camera zoom, while
 `StrokeStyle2d::world` uses a validated `WorldLength` and scales with the
-camera. Endpoint markers always use logical pixels so annotations remain
+camera. `ScreenScene` rejects `StrokeStyle2d::world`; its styled path widths
+must also use `LogicalPixels`. Endpoint markers always use logical pixels so annotations remain
 readable. A marker's base is the path endpoint and its tip extends outward;
 the marked body endpoint is forced to a butt boundary. Marker length therefore
 cannot invert a short body or collide with a terminal join. Exact or
@@ -218,9 +217,9 @@ derived extrusion would overflow are rejected as `InvalidStroke`.
 #### Bounded scenes
 
 Production adapters that translate externally sized visual state should use
-`Scene::with_budget`. All six limits are hard upper bounds; zero is valid for a
-background-only scene. Rejection is structured and leaves retained commands
-unchanged.
+`Scene::with_budget`. All seven limits are hard bounds on committed scene state;
+zero is valid for a background-only scene. Rejection is structured and leaves
+retained commands unchanged.
 
 ```rust
 use sim_engine::{Color, DrawCommand, Layer, Scene, SceneBudget, ShapeStyle, Vec2};
@@ -230,6 +229,7 @@ let budget = SceneBudget::new(
     100_000,
     2_000_000,
     16 * 1024 * 1024,
+    32 * 1024 * 1024,
     64 * 1024 * 1024,
     20_000,
 );
@@ -243,6 +243,21 @@ scene.try_extend_to_layers([(Layer::DEFAULT, circle)])?;
 assert_eq!(scene.statistics().accepted_commands(), 1);
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
+
+The fourth limit is logical retained command payload; the fifth is the committed
+command-vector plus owned-polyline allocation ceiling, including spare `Vec`
+capacity kept for reuse. Budgeted insertion grows staging and replacement
+vectors transactionally, validates allocator-reported capacity before taking
+ownership, and rejects above the fifth limit without changing the scene.
+`Scene::allocation_bytes()` exposes the same committed byte definition.
+
+Atomic replacement temporarily coexists with the old store. One-command growth
+can therefore require up to twice the committed allocation allowance; batch
+growth may momentarily hold the current, old staging, and replacement staging
+command buffers, up to three times that allowance (owned polyline buffers are
+moved, not cloned). A host with a strict process-wide ceiling should reserve
+that headroom, scale the fifth limit accordingly, or use incremental insertion
+during a controlled construction phase.
 
 Use `try_extend_to_layers` for large alternating/mixed-layer batches. It
 validates the transaction before replacing the ordered command store, then
@@ -339,7 +354,16 @@ ratios are rejected at construction or resize.
 `LogicalPixels` geometry. Its top-left origin and downward y axis match UI hit
 coordinates. `WgpuRenderer::render_screen_scene` derives the fixed camera
 internally, while `PreparedScreenScene` prevents a world camera from being
-supplied to prepared UI geometry.
+supplied to prepared UI geometry. The internal Y-flipped ordinary `Scene`
+commands are deliberately not exposed; use `command_count`, `statistics`, and
+`allocation_bytes` for introspection until a typed screen-command view is
+introduced. Rectangle sizes must have positive X and Y components, so `min`
+always remains the declared top-left. Linear/radial gradient coordinates in a
+`ShapeStyle` are interpreted in the same top-left/downward-Y space and converted
+exactly once at insertion; the `ScreenScene::linear_gradient` and
+`ScreenScene::radial_gradient` helpers make that context explicit. Use
+`try_square_rect` for an exact zero-radius UI rectangle; `try_rect` takes a
+strictly positive typed corner radius.
 
 ```rust,ignore
 let mut ui = ScreenScene::with_budget(Color::BLACK, ui_budget)?;
@@ -402,7 +426,10 @@ renderer generation. A retained 3D result participates through
 `RenderTarget3d::color_target()`.
 
 `FrameBudget` limits passes, referenced commands, vertices, uniform/streaming
-uploads, referenced texture bytes, and conservative draw calls. Additions are
+uploads, referenced nominal texel-storage bytes, and conservative draw calls.
+Texture byte counters use tightly packed format payload and deliberately exclude
+opaque backend alignment, tiling, allocation pages, and metadata; they are a
+stable engine budget metric, not a driver-memory oracle. Additions are
 atomic, and actual post-tessellation work is checked again before GPU upload or
 surface acquisition. `FrameStatistics` separates streaming vertices/uploads
 from retained vertices reused without a per-frame geometry upload.
@@ -412,7 +439,7 @@ surface frame.
 
 Images and glyph runs use the same ordering rule and clip/viewport
 intersection as geometry. Referencing the same atlas several times counts its
-texture allocation once toward the frame texture budget. Atlas pixels and
+nominal texel payload once toward the frame texture budget. Atlas pixels and
 retained instances are not uploaded again merely because the frame draws them.
 
 ### 7. Cameras and motion
@@ -513,7 +540,17 @@ diagnostic. Renderer-work/acquire percentiles use all 360 drawn samples.
 `RendererFrameMetrics`
 contains CPU wall-clock durations for tessellation, upload, camera-uniform
 upload, surface acquisition, encode/submit/present dispatch, and total call
-time. `total_cpu()` includes `surface_acquire()`; subtract it when comparing
+time. The historical `tessellation()` name is the common pre-upload visual
+preparation stage: in addition to streamed triangle generation it includes
+camera/source validation and particle visibility selection in particle,
+layered-visualization, and heterogeneous composer paths. A skipped surface
+report retains CPU preparation that already completed. It performs no queue
+writes, camera-uniform upload, encoding, submission, or presentation, and its
+actual upload-byte counters are zero. The ordinary streaming path can still
+show a non-zero `upload()` duration when pre-acquire transient GPU-buffer
+capacity creation already occurred; that duration does not claim a queue
+upload.
+`total_cpu()` includes `surface_acquire()`; subtract it when comparing
 engine-side CPU work and report acquisition separately because FIFO/compositor
 back-pressure normally appears there. These metrics do not measure display
 scanout; the bounded matrix additionally uses completed wall throughput as its
@@ -527,13 +564,16 @@ APIs and hosts should surface a non-zero dropped count in diagnostics.
 
 For heterogeneous frames, `FrameStatistics::source_counts` separates
 streaming scenes, prepared scenes, dynamic meshes, particles, scalar fields,
-images, glyph runs, and targets. `retained_cpu_bytes`,
-`retained_buffer_bytes`, and `texture_bytes` count unique referenced resource
-allocations: drawing one prepared scene in several viewports does not multiply
-its memory. Work counts still count every draw. This makes the prepared/static
-invariant directly observable: after warm-up,
-`streaming_vertex_count` and `streaming_upload_bytes` must include only sources
-that actually changed.
+images, glyph runs, and targets. `retained_cpu_bytes` and
+`retained_buffer_bytes` count unique referenced allocations, while
+`texture_bytes` counts unique nominal tightly packed texel payloads: drawing
+one prepared scene in several viewports does not multiply either metric. Work
+counts still count every draw. This makes the prepared/static
+invariant directly observable: after warm-up, unchanged prepared scenes,
+images, atlases, and glyph runs do not re-enter streaming geometry counters.
+Dynamic meshes remain caller-uploaded resources, while particle fields are
+culled, compacted, and uploaded on every drawn frame even when their retained
+source instances did not change; their bytes correctly remain streaming.
 
 Error-handling rules:
 
@@ -567,7 +607,11 @@ let report = renderer.render_prepared_with_metrics(&prepared, &camera)?;
 
 Preparation captures geometry, background, clips, draw batches, and a CPU
 recovery snapshot. Any geometry, style, order, or clip change requires a new
-prepared scene. A prepared resource belongs to the renderer that created it.
+prepared scene. A zero-allocation command-source preflight rejects inputs
+outside the portable GPU envelope before tessellation can reserve
+caller-sized staging; derived vertices receive a second portability check
+before retained GPU allocation or upload. A prepared resource belongs to the
+renderer that created it.
 
 #### Dynamic triangle geometry
 
@@ -577,6 +621,15 @@ by three. Full updates replace the list; triangle-aligned range updates reuse
 the existing allocation. Update reports expose upload time and reallocation.
 
 Use this path for ready visual triangles, not as a new simulation data model.
+At draw time, every potentially visible dynamic triangle must be fully inside
+the full render-target clip volume and retain one normal projected signed-area
+direction across legal shader association/FMA choices. A triangle wholly
+outside one common clip plane remains a deterministic raster no-op. Crossing a
+full-target hardware clip plane or having an ambiguous projected orientation returns
+`RendererFrameError::InvalidGeometryTransform`; split such geometry at a
+host-controlled boundary before submission. An item's positioned viewport and
+logical clip use a scissor rectangle after projection, so they may safely trim
+an otherwise portable triangle.
 
 Externally sized triangle input should use an explicit `DynamicMeshBudget`:
 
@@ -653,7 +706,11 @@ scaled asset intentionally filters near an outer edge.
 and atlas bounds before updating both GPU pixels and the CPU recovery snapshot.
 `replace_image_rgba8` is atomic and creates a new resource identity, so batches
 against the previous packing must be rebuilt. No implicit atlas eviction
-occurs.
+occurs. Texture mutation returns `ImageUploadReport`, whose byte count is RGBA
+texture data and whose replacement flag refers only to the texture.
+`replace_image_batch` instead returns `ImageBatchUploadReport`; its byte count
+and replacement flag refer only to the instance buffer, never to the atlas
+texture.
 
 #### Host-shaped glyph runs
 
@@ -686,12 +743,16 @@ let run = renderer.create_glyph_run(
 let logical_bounds = run.bounds().region();
 ```
 
-One successful run becomes one instanced draw and one retained quad per glyph.
+One non-empty successful run becomes one instanced draw and one retained quad
+per glyph. An empty run is valid and emits no draw call.
 Missing glyphs return `GlyphError::MissingGlyph` with identity and run index;
 they are never silently replaced. `upload_glyph` can fill a bounded atlas
 region and register new sorted metadata. Reusing an identity with a different
-rectangle is rejected so old retained runs cannot begin sampling unrelated
-pixels.
+rectangle is rejected, as is any rectangle that overlaps texels owned by a
+different identity, so old retained runs cannot begin sampling unrelated
+pixels. Initial and restored atlases validate overlap in `O(N log N)` bounded
+scratch work; one incremental insertion checks the retained entry set before
+any texture write.
 
 A run references one atlas. Mixed fallback fonts are explicit multiple runs at
 the same frame order; stable insertion order preserves the host's chosen
@@ -710,6 +771,7 @@ use sim_engine::ParticleRenderBudget;
 
 let budget = ParticleRenderBudget::new(
     30_000,          // maximum visible instances
+    6 * 1024 * 1024, // maximum retained + visibility-staging CPU bytes
     2 * 1024 * 1024, // maximum GPU instance bytes
     2 * 1024 * 1024, // maximum upload bytes per frame
 )?
@@ -724,9 +786,21 @@ samples candidates uniformly rather than pretending that every instance was
 classified. Inspect `ParticleStatistics`: submitted, visibility-checked,
 visible, culled, budget-limited, dropped, and rendered counts are distinct.
 
+The retained-byte ceiling includes both the exact recovery snapshot and the
+worst visibility-staging allocation. `ParticleRenderBudget::INSTANCE_BYTES`
+lets a host derive a byte limit from its chosen source and staging counts.
 Memory observability is explicit through `cpu_allocation_bytes`,
-`gpu_allocation_bytes`, and `recovery_memory_bytes`. Use those limits so
-rendering leaves capacity for the simulation itself.
+`gpu_allocation_bytes`, and `recovery_memory_bytes`; successful bounded fields
+always report `cpu_allocation_bytes() <= budget.max_retained_bytes()`. Use those
+limits so rendering leaves capacity for the simulation itself.
+
+The ceiling is a committed steady-state bound. Full updates and budget changes
+are atomic: the old field and a completely validated replacement coexist until
+commit, so transient CPU and replacement-buffer peaks are at most the sum of
+the old and new field budgets. Hosts with a strict process-wide memory ceiling
+must reserve that update headroom (normally twice the steady-state field
+allowance), update smaller ranges in place, or recreate during a controlled
+loading phase.
 
 ### 12. Scalar fields and color maps
 
@@ -755,7 +829,10 @@ renderer.update_scalar_field_texture_region(
 `ColorMap::sample` is piecewise-linear on the CPU. The renderer deliberately
 quantizes a color map to a 256-entry RGBA8 lookup texture. Closely spaced stops
 or HDR distinctions below that resolution cannot be preserved by the GPU
-heatmap path.
+heatmap path. Composed-frame upload and texture statistics mirror the
+renderer's one-entry LUT cache after stable pass ordering: adjacent equal maps
+reuse one LUT, while `A, B, A` creates and reports three allocations whose
+views remain alive through submission.
 
 Use `ScalarFieldSampling::Nearest` for exact texels and `Linear` for manual,
 deterministic bilinear scalar sampling. Value-range endpoints and their
@@ -779,6 +856,9 @@ only after successful submission. Source/destination aliasing is rejected.
 For a scalar field with a particle overlay, prefer
 `render_layered_visualization`. It encodes heatmap, budgeted particles, and
 surface composition with one command encoder and one queue submission.
+`LayeredVisualizationReport` exposes status/timings plus the render passes and
+draw calls actually encoded; skipped surface frames report zero for both work
+counters.
 
 ### 14. Retained 3D stereometry
 
@@ -868,17 +948,29 @@ visible edge is shortened; a fully clipped edge emits no fragments without
 rejecting the rest of the frame. Before submission, model and camera dot
 products are bounded independently of backend association/FMA choices, and the
 possible model-dot result interval becomes the input to camera validation. The
-edge validator then mirrors the remaining shader order through physical-width
+surface validator also proves that each potentially visible triangle is fully
+inside the frustum and has one stable, normal projected signed-area direction
+across those legal arithmetic choices. A triangle wholly outside one common
+frustum plane remains in the submitted index buffer and report count but is a
+deterministic raster no-op. A surface triangle crossing a frustum plane is
+rejected with `UnportableSurfaceTopology` in v0.2; this fail-closed boundary
+avoids relying on backend-dependent clipped topology until an interval polygon
+clipper becomes part of the public contract. Keep the retained surface inside
+the camera frustum, split it at an application-controlled clipping boundary, or
+use explicit display edges when only a crossing construction line is required.
+The edge validator then mirrors the remaining shader order through physical-width
 expansion, logical-distance and dash-phase calculation, NDC extrusion,
 homogeneous scaling, and final clip-coordinate addition. Hidden dash division
 is additionally bounded by the complete clipped viewport diagonal so it does
 not depend on one CPU association of the transform. Any overflow is
 reported as `InvalidGeometryTransform` or `InvalidEdgeProjection`; it is never
-submitted as non-finite clip geometry. Transform checks use a constant-cost
-bounding-box envelope on the common path, then fall back to actual retained
-vertices if an uncorrelated synthetic corner fails. Edge expansion uses the
-actual projected normal component per axis, so a zero component is not replaced
-by a pessimistic full-width bound.
+submitted as non-finite clip geometry. Transform checks scan every actual
+vertex of every visible retained instance; an AABB-only proof is not used
+because it can miss interior cancellation and flush-to-zero cases. Frustum
+intersection and perspective division propagate conservative intervals.
+Edge expansion then uses a deliberately conservative full-axis component bound
+for its normalized screen direction, so backend approximation cannot escape
+the proven envelope.
 
 Current 3D scope is deliberately focused: opaque surfaces, retained transforms,
 hardware depth, solid visible edges, and dashed hidden edges. Translucent or
@@ -894,6 +986,7 @@ resources from the previous identity are rejected until restored.
 | Resource | Restore method | Result |
 | --- | --- | --- |
 | `PreparedScene` | `restore_prepared_scene` | exact retained geometry |
+| `PreparedScreenScene` | `restore_prepared_screen_scene` | exact retained fixed-screen geometry |
 | `DynamicMesh2d` | `restore_dynamic_mesh` | exact retained vertices/capacity |
 | `Image2d` | `restore_image` | exact sRGB RGBA pixels and limits |
 | `ImageBatch2d` | `restore_image_batch` | exact sprite instances against the restored image |
@@ -950,13 +1043,16 @@ A display-limited frame rate is not renderer throughput. Surface acquisition
 can wait for FIFO or compositor pacing while renderer CPU work remains small.
 The current public metrics do not include GPU timestamp queries.
 
-The named release-mode matrix is:
+From a clean Sim;Engine repository checkout, the named release-mode matrix is:
 
 ```bash
 ./scripts/rendering_benchmark_matrix.sh
 ```
 
-The release wrapper, standalone matrix, and standalone HiDPI script fail before
+These release scripts are repository tooling and are intentionally excluded
+from the crates.io source archive, which has no Git metadata from which to
+produce revision-bound evidence. The release wrapper, standalone matrix, and
+standalone HiDPI script fail before
 collecting evidence when the worktree is dirty. A common launcher creates a
 read-only detached worktree at the captured revision and gives it a separate
 Cargo target directory; compilation and execution never consume files from the
@@ -977,13 +1073,36 @@ The real compositor fixture requires the Linux executables
 `dbus-run-session`, `kwin_wayland`, and `kscreen-doctor`. Their absence is a
 hard gate failure, not a skipped test.
 
-It runs `ui_static_10k`, `ui_90_10`, `four_viewports`, `image_atlas`,
-`scientific_text`, `mixed_layers`, `budget_rejection`, `dpi_reconfigure`, and
-`recovery_frame`. The viewport fixture owns four distinct prepared world
-scenes and four distinct cameras. Surface fixtures print p50/p95/p99 renderer
+Its named surface fixtures are `ui_static_10k`, `ui_90_10`,
+`four_viewports`, `image_atlas`, `scientific_text`, `particle_scalar`,
+`retained_3d`, and `dpi_reconfigure`. `particle_scalar` exercises the fused
+bounded scalar/particle presentation path with 16,384 retained instances, an
+8,192-instance visibility/upload cap, and a 256×144 scalar field.
+`retained_3d` updates 48 independent transforms, validates and renders opaque
+cube surfaces plus visible/hidden mathematical edges into a retained depth
+target, composes that target to the surface, and validates 4,096 budgeted
+dynamic triangles in the same frame. Its machine-checked compound report merges
+the offscreen retained-3D pass with the composed surface frame: two actual
+render passes, 146 actual draw calls, unique retained mesh/dynamic CPU and GPU
+buffer bytes, and both color-target and depth-target texel bytes.
+The same matrix covers mixed-layer construction through
+`scene_construction_benchmark`, atomic budget rejection through its exact core
+regression, retained-resource recovery through the semantic GPU oracle, and a
+transactional real-compositor HiDPI transition through the nested-KWin gate.
+Mixed-layer construction, budget rejection, and recovery are not accepted
+`--fixture` values of `rendering_benchmark_suite`; `adapter_probe` and
+`hidpi_transition` are accepted non-performance utility fixtures used by the
+release tooling. The viewport fixture owns four distinct prepared world scenes
+and four distinct cameras. Every surface fixture prints p50/p95/p99 renderer
 work excluding acquire, separate acquire percentiles, observed wall
-throughput, construction time, physical surface extent, scale factor, source
-counts, vertices, uploads, unique retained memory, textures, and draw calls.
+throughput, construction time, physical surface extent, and scale factor.
+Composed `FrameReport` fixtures additionally print source counts, vertices,
+uploads, unique retained memory, textures, and draw calls. The fused
+`particle_scalar` path instead emits and machine-checks its three passes, three
+draw calls, scalar/target dimensions, retained CPU/buffer/texture bytes, and
+submitted/checked/visible/culled/budget-limited/dropped/rendered particle
+counters from `LayeredVisualizationReport`; that specialized result exposes
+the passes and draw calls actually encoded by the fused renderer path.
 Gated performance fixtures require exactly `1280x720` physical pixels at scale
 `1.0`; a compositor resize, minimization, or scale change cannot turn the
 release workload into a cheaper raster test. A production-surface probe first
@@ -995,10 +1114,11 @@ uses the probed production format/MSAA contract. A nested compositor's own
 surface format may legitimately differ, so HiDPI pins the physical adapter but
 records rather than equates that separate surface contract. Renderer-work p95
 is capped at 5 ms for retained UI, four-camera,
-image, and glyph workloads, 10 ms for repeated DPI reconfiguration, and 25 ms
-for `ui_90_10`, which deliberately rebuilds and tessellates one thousand
-commands per frame. These fixture-specific ceilings keep a streaming baseline
-from weakening the retained-path oracle. If the selected surface mode is
+image, and glyph workloads, 10 ms for repeated DPI reconfiguration, 12 ms for
+the bounded particle/scalar and retained-3D paths, and 25 ms for `ui_90_10`,
+which deliberately rebuilds and tessellates one thousand commands per frame.
+These fixture-specific ceilings keep a streaming baseline from weakening the
+retained-path oracle. If the selected surface mode is
 Immediate, the gate additionally requires at least 60 observed FPS. Mailbox
 and FIFO must sustain 95% of the confirmed current monitor's reported refresh
 rate after clamping that release reference to 30-60 Hz. Before measuring, the
@@ -1079,7 +1199,7 @@ cargo run --release --example rendering_benchmark_suite -- --fixture ui_90_10
 # Interactive pixel-level gallery for caps, joins, alpha, dashes, and markers
 cargo run --release --example stroke_gallery -- --uncapped
 
-# Complete named performance/contract matrix
+# Complete named performance/contract matrix (repository checkout only)
 ./scripts/rendering_benchmark_matrix.sh
 
 # Independently rotating cube and octahedron with hidden edges
@@ -1089,8 +1209,10 @@ cargo run --release --example stereometry_3d -- --uncapped
 cargo run --release --example cylinder_derivation_3d -- --uncapped --benchmark
 ```
 
-Interactive controls and benchmark flags are printed by each example at
-startup.
+The interactive 3D, gallery, and stress examples print their controls at
+startup. `rendering_benchmark_suite --help` lists its fixture and gate flags;
+the minimal `demo` and menu-driven `ui_demo` do not print a universal help
+banner.
 
 ## Part II: Engineering Reference
 
@@ -1148,22 +1270,20 @@ world position + pseudo-depth
 
 The vertex shader receives compact camera rows mapping relative world X/Y and
 scalar depth into logical screen X/Y. Generated circle vertices carry a world
-anchor and local offset separately, so the subtraction from the camera happens
-before a small radius is added. CPU validation checks both components against
-the same arithmetic envelope before submission. It also requires every
-camera-row product and every backend-permitted dot-product accumulation order
-to remain finite. The validator also propagates a rounding/FMA output interval
-through the final screen-to-clip operation; a mathematically finite CPU
-cancellation cannot hide a backend-dependent residual that overflows later.
-Particle visibility uses the same complete projected interval, so culling
-keeps every particle that can intersect the viewport under a permitted GPU
-association instead of relying on one CPU fold.
-The constant-cost scene envelope is the common path. If independent extrema
-form a nonexistent world/depth/direction combination, validation falls back to
-the actual tessellated or dynamic vertex tuples, including the distinct
-previous and next stroke directions. Base and local-offset bounds are kept
-independent in that fast envelope because rounding the shader's intermediate
-`base - camera_center` can reorder otherwise equal exact sums by one ULP.
+anchor and local offset separately; it projects the small offset independently
+instead of adding it to a much larger relative coordinate first. Particle
+radius is likewise converted directly to a clip-space offset after projecting
+the center. CPU validation uses a conservative envelope
+for directed f32 rounding, reassociation, and FMA effects through the final
+screen-to-clip operation. The accepted GPU numeric domain excludes subnormal
+sources and magnitudes above `2^120`; values outside it return a structured
+transform error even when one CPU evaluation is finite. Particle projection,
+quad expansion, viewport classification, and culling use the same envelope.
+Base and local-offset bounds remain independent. Aggregate bounds provide the
+first conservative proof, and exact source scans then cover per-vertex FTZ,
+triangle orientation, visibility, direction, and stroke-branch hazards that
+extrema cannot represent. Failure at either layer returns a structured
+transform error before queue mutation.
 Lines retain logical-pixel width by
 carrying a screen-extrusion direction separately from world position.
 
@@ -1180,10 +1300,13 @@ model point
 The 3D convention is right-handed with positive Y up. Cameras look along local
 negative Z; exposed view depth is positive distance forward. Large finite
 vector operations use wider intermediates before checked `f32` output. GPU
-model/view/projection dot products additionally bound every same-sign partial
-sum and carry the complete rounding/FMA result interval from the model dot into
-the camera dot. No legal first-stage association can therefore overflow only
-after the second transform behind a finite CPU left-fold result.
+model/view/projection dot products are validated for every visible retained
+mesh vertex with a directed-rounding error envelope. This deliberate per-frame
+scan catches interior cancellation and flush-to-zero behavior that an AABB
+alone cannot prove. Frustum clipping, homogeneous division, and edge extrusion
+propagate conservative intervals and enforce the normal denominator domain
+required for portable WGSL division. Values which cannot be proven inside
+those bounds are rejected before staging growth, upload, or submission.
 
 ### 21. Color and alpha model
 
@@ -1213,8 +1336,11 @@ The general scene path tessellates on the CPU:
 
 - circles become triangle fans;
 - rectangles become fans or rounded sectors;
-- lines become screen-extruded strips with round caps;
-- polylines share joins and emit only two end caps;
+- lines become screen-extruded strips with the configured butt, square, or
+  round endpoint caps;
+- connected polyline segments share configured joins; each visible dashed run
+  receives its configured caps, while only actual path endpoints are eligible
+  for arrow markers;
 - gradients are sampled at generated vertices;
 - shadows generate separate offset geometry.
 
@@ -1242,8 +1368,9 @@ validate first and replace retained state only after all checks pass.
 
 The renderer clears and reuses its previous transient CPU allocation,
 tessellates commands directly into that upload payload, validates
-camera/geometry arithmetic, grows the GPU vertex buffer when required, uploads
-vertices, acquires the surface, encodes clipped batches, submits, and presents.
+camera/geometry arithmetic, and grows the GPU vertex buffer when required. It
+then acquires the surface; only a successful acquisition uploads vertices and
+camera data before clipped batches are encoded, submitted, and presented.
 Circle and rounded-corner unit samples are immutable process-wide lookup data;
 per-command positions still receive the exact documented segment counts but do
 not recalculate the same trigonometric samples every frame. Circle and rounded
@@ -1273,14 +1400,16 @@ are recomputed after mutation.
 Images use an `Rgba8UnormSrgb` sampled texture and exact retained source bytes.
 Single logical or world images draw one shader-generated quad. Atlas and glyph
 batches store logical destination, UV-center bounds, and straight-linear tint
-in one retained instance buffer and issue one instanced draw. Glyph metadata is
-kept sorted for deterministic allocation-free lookup while runs are built.
+in one retained instance buffer and issue one instanced draw when non-empty.
+Empty batches and runs are valid and issue no draw. Glyph metadata is kept
+sorted for deterministic allocation-free lookup while runs are built.
 
 #### Particle fields
 
 All validated instances stay on the CPU. Rendering tests circle/viewport
 intersection, uniformly samples candidates when visibility checks are capped,
-compacts the selected list, performs one upload, and issues one instanced draw.
+and compacts the selected list. A non-empty selection performs one instance
+upload and one instanced draw; an empty or fully culled field performs neither.
 GPU allocation and upload are proportional to the budget rather than the full
 host population.
 
@@ -1330,6 +1459,12 @@ visual state before it silently becomes different pixels.
 The renderer is designed to be owned by the host render/event-loop thread.
 Initialization and recovery are async because adapter and device requests are
 async. Ordinary resource mutations and drawing are synchronous submissions.
+Each standalone retained-resource mutation starts its queued transfer with an
+empty submission but does not wait for GPU completion; this bounds native
+`wgpu` staging lifetime even while a window is occluded. Surface rendering
+finishes all fallible CPU preparation first, acquires the surface, and only then
+enqueues per-frame writes. `Timeout`, `Occluded`, and `Outdated` therefore
+return `Skipped` with no deferred queue uploads.
 
 The engine does not create a simulation scheduler or background render thread.
 Async simulation is useful only when snapshot and synchronization cost is
@@ -1381,7 +1516,8 @@ automation are repeatable.
 
 ### 29. Verification and contribution gate
 
-The complete local Linux release gate is:
+From a clean Sim;Engine repository checkout, the complete local Linux release
+gate is:
 
 ```bash
 ./scripts/linux_release_gate.sh

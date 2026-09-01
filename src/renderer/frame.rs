@@ -11,7 +11,7 @@ pub enum FrameBudgetResource {
     Vertices,
     /// Bytes uploaded while preparing the frame.
     UploadBytes,
-    /// Retained texture bytes referenced by images, fields, or targets.
+    /// Nominal retained texel-storage bytes referenced by images, fields, or targets.
     TextureBytes,
     /// Conservative number of GPU draw calls encoded by the frame.
     DrawCalls,
@@ -72,7 +72,7 @@ impl FrameBudget {
         self.max_upload_bytes
     }
 
-    /// Returns the maximum referenced retained texture allocation bytes.
+    /// Returns the maximum referenced nominal texel-storage bytes.
     pub const fn max_texture_bytes(self) -> usize {
         self.max_texture_bytes
     }
@@ -351,7 +351,7 @@ impl From<RendererFrameError> for FrameComposerError {
     }
 }
 
-/// Bounded work and unique retained allocations referenced by one composed frame.
+/// Bounded work and retained allocations referenced by one composed frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct FrameStatistics {
     pass_count: usize,
@@ -404,11 +404,14 @@ impl FrameStatistics {
         self.streaming_upload_bytes
     }
 
-    /// Returns retained texture bytes referenced by frame items.
+    /// Returns nominal retained texel-storage bytes referenced by frame items.
     ///
     /// Repeated image, scalar-field, and render-target identities are
-    /// deduplicated. Per-draw transient color-map LUT work remains counted per
-    /// item because each item owns a distinct upload/allocation operation.
+    /// deduplicated. Opaque backend alignment, tiling, page allocation, and
+    /// metadata are excluded because wgpu does not expose them. Color-map LUT
+    /// bytes follow the renderer's one-entry cache:
+    /// adjacent equal LUTs share one allocation, while an `A, B, A` sequence
+    /// keeps three views/allocations alive until submission.
     pub const fn texture_bytes(self) -> usize {
         self.texture_bytes
     }
@@ -462,6 +465,12 @@ impl FrameStatistics {
             draw_calls: self.draw_calls.saturating_add(other.draw_calls),
             source_counts: self.source_counts.adding(other.source_counts),
         }
+    }
+
+    fn without_uploads(mut self) -> Self {
+        self.upload_bytes = 0;
+        self.streaming_upload_bytes = 0;
+        self
     }
 }
 
@@ -534,8 +543,16 @@ pub struct FrameComposer<'frame> {
     budget: FrameBudget,
     items: Vec<FrameItem<'frame>>,
     retained_resources: Vec<RetainedResourceKey>,
+    scalar_luts: Vec<ScalarLutPlan>,
+    scalar_lut_upload_count: usize,
+    scalar_lut_allocation_count: usize,
     planned: FrameStatistics,
     next_insertion: usize,
+}
+
+struct ScalarLutPlan {
+    sort_key: (i32, usize),
+    lut: [u8; COLOR_MAP_LUT_SIZE as usize * 4],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -604,6 +621,35 @@ fn account_new_retained_resources(
     (work, missing)
 }
 
+fn scalar_lut_counts_with_inserted(
+    planned: &[ScalarLutPlan],
+    insertion: usize,
+    inserted: &[u8; COLOR_MAP_LUT_SIZE as usize * 4],
+    initial_cache: Option<&[u8; COLOR_MAP_LUT_SIZE as usize * 4]>,
+) -> (usize, usize) {
+    debug_assert!(insertion <= planned.len());
+    let mut previous: Option<&[u8; COLOR_MAP_LUT_SIZE as usize * 4]> = None;
+    let mut allocation_count = 0usize;
+    let mut first_matches_initial = false;
+    for merged_index in 0..=planned.len() {
+        let current = if merged_index == insertion {
+            inserted
+        } else {
+            let source_index = merged_index - usize::from(merged_index > insertion);
+            &planned[source_index].lut
+        };
+        if previous.is_none() {
+            first_matches_initial = initial_cache == Some(current);
+        }
+        if previous != Some(current) {
+            allocation_count = allocation_count.saturating_add(1);
+        }
+        previous = Some(current);
+    }
+    let upload_count = allocation_count.saturating_sub(usize::from(first_matches_initial));
+    (upload_count, allocation_count)
+}
+
 enum FrameItem<'frame> {
     Scene {
         scene: &'frame Scene,
@@ -643,6 +689,7 @@ enum FrameItem<'frame> {
         texture: &'frame ScalarFieldTexture,
         color_map: &'frame ColorMap,
         minimum: f32,
+        maximum: f32,
         value_extent: f32,
         sampling: ScalarFieldSampling,
         options: FramePassOptions,
@@ -739,6 +786,9 @@ impl WgpuRenderer {
             budget,
             items: Vec::new(),
             retained_resources: Vec::new(),
+            scalar_luts: Vec::new(),
+            scalar_lut_upload_count: 0,
+            scalar_lut_allocation_count: 0,
             planned: FrameStatistics::default(),
             next_insertion: 0,
         })
@@ -773,7 +823,7 @@ impl<'frame> FrameComposer<'frame> {
         self.push_accounted_item(
             &[RetainedResourceAccounting::new(
                 retained_key(scene, 1),
-                statistics.retained_bytes(),
+                scene.allocation_bytes(),
                 0,
                 0,
             )],
@@ -813,7 +863,7 @@ impl<'frame> FrameComposer<'frame> {
         self.push_accounted_item(
             &[RetainedResourceAccounting::new(
                 retained_key(scene, 2),
-                statistics.retained_bytes(),
+                scene.allocation_bytes(),
                 0,
                 0,
             )],
@@ -853,15 +903,35 @@ impl<'frame> FrameComposer<'frame> {
             source_counts: FrameSourceStatistics::single(FrameSourceKind::PreparedScene),
         };
         self.push_accounted_item(
-            &[RetainedResourceAccounting::new(
-                retained_arc_key(&scene.vertex_buffer, 3),
-                scene.recovery_memory_bytes(),
-                scene
-                    .vertex_count
-                    .max(1)
-                    .saturating_mul(std::mem::size_of::<Vertex>()),
-                0,
-            )],
+            &[
+                RetainedResourceAccounting::new(
+                    retained_arc_key(&scene.vertices, 13),
+                    scene
+                        .vertices
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<Vertex>()),
+                    0,
+                    0,
+                ),
+                RetainedResourceAccounting::new(
+                    retained_arc_key(&scene.vertex_buffer, 3),
+                    0,
+                    scene
+                        .vertex_count
+                        .max(1)
+                        .saturating_mul(std::mem::size_of::<Vertex>()),
+                    0,
+                ),
+                RetainedResourceAccounting::new(
+                    retained_key(&scene.draw_batches, 14),
+                    scene
+                        .draw_batches
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<PreparedDrawBatch>()),
+                    0,
+                    0,
+                ),
+            ],
             work,
             FrameItem::Prepared {
                 scene,
@@ -901,16 +971,38 @@ impl<'frame> FrameComposer<'frame> {
             source_counts: FrameSourceStatistics::single(FrameSourceKind::PreparedScene),
         };
         self.push_accounted_item(
-            &[RetainedResourceAccounting::new(
-                retained_arc_key(&scene.scene.vertex_buffer, 3),
-                scene.recovery_memory_bytes(),
-                scene
-                    .scene
-                    .vertex_count
-                    .max(1)
-                    .saturating_mul(std::mem::size_of::<Vertex>()),
-                0,
-            )],
+            &[
+                RetainedResourceAccounting::new(
+                    retained_arc_key(&scene.scene.vertices, 13),
+                    scene
+                        .scene
+                        .vertices
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<Vertex>()),
+                    0,
+                    0,
+                ),
+                RetainedResourceAccounting::new(
+                    retained_arc_key(&scene.scene.vertex_buffer, 3),
+                    0,
+                    scene
+                        .scene
+                        .vertex_count
+                        .max(1)
+                        .saturating_mul(std::mem::size_of::<Vertex>()),
+                    0,
+                ),
+                RetainedResourceAccounting::new(
+                    retained_key(&scene.scene.draw_batches, 14),
+                    scene
+                        .scene
+                        .draw_batches
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<PreparedDrawBatch>()),
+                    0,
+                    0,
+                ),
+            ],
             work,
             FrameItem::PreparedScreen {
                 scene,
@@ -921,6 +1013,11 @@ impl<'frame> FrameComposer<'frame> {
     }
 
     /// Adds retained dynamic triangles through their own world camera.
+    ///
+    /// Camera-dependent topology is validated by [`FrameComposer::present`],
+    /// which rejects triangles crossing the full target clip volume or having
+    /// an ambiguous projected orientation. Item viewport/scissor clipping is
+    /// axis-aligned fragment clipping and remains supported.
     pub fn draw_dynamic_mesh(
         &mut self,
         mesh: &'frame DynamicMesh2d,
@@ -984,7 +1081,7 @@ impl<'frame> FrameComposer<'frame> {
         self.push_accounted_item(
             &[RetainedResourceAccounting::new(
                 retained_arc_key(&field.instance_buffer, 5),
-                field.recovery_memory_bytes(),
+                field.cpu_allocation_bytes(),
                 field.gpu_allocation_bytes(),
                 0,
             )],
@@ -1034,23 +1131,59 @@ impl<'frame> FrameComposer<'frame> {
         }
         let value_extent = scalar_value_range_extent(minimum, maximum)
             .ok_or(FrameComposerError::InvalidValueRange { minimum, maximum })?;
+        if !scalar_normalization_is_portable(texture, minimum, value_extent) {
+            return Err(FrameComposerError::InvalidValueRange { minimum, maximum });
+        }
         let color_map_bytes = COLOR_MAP_LUT_SIZE as usize * 4;
+        let scalar_lut = ScalarLutPlan {
+            sort_key: (options.order(), self.next_insertion),
+            lut: color_map_lut(color_map),
+        };
+        self.scalar_luts
+            .try_reserve(1)
+            .map_err(|_| FrameComposerError::AllocationFailed {
+                requested_bytes: std::mem::size_of::<ScalarLutPlan>(),
+            })?;
+        let insertion = self
+            .scalar_luts
+            .partition_point(|planned| planned.sort_key < scalar_lut.sort_key);
+        let (lut_upload_count, lut_allocation_count) = scalar_lut_counts_with_inserted(
+            &self.scalar_luts,
+            insertion,
+            &scalar_lut.lut,
+            self.renderer
+                .color_map_cache
+                .as_ref()
+                .map(|cached| &cached.lut),
+        );
+        let additional_lut_uploads = lut_upload_count.saturating_sub(self.scalar_lut_upload_count);
+        let additional_lut_allocations =
+            lut_allocation_count.saturating_sub(self.scalar_lut_allocation_count);
         self.push_accounted_item(
-            &[RetainedResourceAccounting::new(
-                retained_key(&texture.texture, 6),
-                texture.recovery_memory_bytes(),
-                0,
-                texture.gpu_allocation_bytes(),
-            )],
+            &[
+                RetainedResourceAccounting::new(
+                    retained_key(&texture.texture, 6),
+                    texture.recovery_memory_bytes(),
+                    0,
+                    texture.gpu_allocation_bytes(),
+                ),
+                RetainedResourceAccounting::new(
+                    retained_key(color_map, 15),
+                    color_map.allocation_bytes(),
+                    0,
+                    0,
+                ),
+            ],
             FrameStatistics {
                 pass_count: 1,
                 command_count: 1,
                 vertex_count: 6,
                 streaming_vertex_count: 0,
                 reused_vertex_count: 0,
-                upload_bytes: std::mem::size_of::<HeatmapUniform>().saturating_add(color_map_bytes),
+                upload_bytes: std::mem::size_of::<HeatmapUniform>()
+                    .saturating_add(additional_lut_uploads.saturating_mul(color_map_bytes)),
                 streaming_upload_bytes: 0,
-                texture_bytes: color_map_bytes,
+                texture_bytes: additional_lut_allocations.saturating_mul(color_map_bytes),
                 retained_cpu_bytes: 0,
                 retained_buffer_bytes: 0,
                 draw_calls: 1,
@@ -1060,12 +1193,17 @@ impl<'frame> FrameComposer<'frame> {
                 texture,
                 color_map,
                 minimum,
+                maximum,
                 value_extent,
                 sampling,
                 options,
                 insertion: self.next_insertion,
             },
-        )
+        )?;
+        self.scalar_luts.insert(insertion, scalar_lut);
+        self.scalar_lut_upload_count = lut_upload_count;
+        self.scalar_lut_allocation_count = lut_allocation_count;
+        Ok(())
     }
 
     /// Adds one image or atlas region scaled into the optional viewport.
@@ -1200,7 +1338,8 @@ impl<'frame> FrameComposer<'frame> {
         )
     }
 
-    /// Adds a retained atlas batch as one instanced draw call.
+    /// Adds a retained atlas batch as one instanced draw when non-empty.
+    /// Empty batches are valid frame items and emit no draw call.
     pub fn draw_image_batch(
         &mut self,
         image: &'frame Image2d,
@@ -1216,11 +1355,11 @@ impl<'frame> FrameComposer<'frame> {
         self.push_retained_image_batch(image, batch, sampling, options, FrameSourceKind::Image)
     }
 
-    /// Adds one host-shaped retained glyph run as one instanced draw call.
+    /// Adds one host-shaped retained glyph run as one instanced draw when non-empty.
     ///
     /// Positions are local logical pixels. Mixed font fallback is represented
     /// by multiple runs submitted at the same order; stable insertion order is
-    /// preserved between them.
+    /// preserved between them. An empty run is valid and emits no draw call.
     pub fn draw_glyph_run(
         &mut self,
         atlas: &'frame GlyphAtlas2d,
@@ -1458,6 +1597,8 @@ enum ReadyItem<'frame> {
     Particle {
         field: &'frame mut ParticleField2d,
         visible_count: usize,
+        pending_statistics: ParticleStatistics,
+        initial_cpu_allocation_bytes: usize,
         camera_uniform: CameraUniform,
         viewport: ResolvedViewport,
     },
@@ -1500,6 +1641,9 @@ fn present_frame(composer: FrameComposer<'_>) -> Result<FrameReport, FrameCompos
         budget,
         items,
         retained_resources: _,
+        scalar_luts: _,
+        scalar_lut_upload_count: _,
+        scalar_lut_allocation_count: _,
         planned,
         next_insertion: _,
     } = composer;
@@ -1534,6 +1678,7 @@ fn present_frame_with_vertices<'frame>(
         .logical_viewport()
         .map_err(|_| RendererFrameError::InvalidViewport)?;
     let tessellation_started_at = Instant::now();
+    preflight_frame_items(renderer, target_viewport, &items)?;
     let mut ready = Vec::new();
     ready
         .try_reserve(items.len())
@@ -1546,6 +1691,7 @@ fn present_frame_with_vertices<'frame>(
     let mut tessellation_stats = TessellationStats::default();
     let mut geometry_reused = false;
     let mut geometry_streamed = false;
+    let mut simulated_color_map_lut = renderer.color_map_cache.as_ref().map(|cache| cache.lut);
 
     for item in items {
         match item {
@@ -1554,31 +1700,49 @@ fn present_frame_with_vertices<'frame>(
                 camera,
                 options,
                 ..
-            } => prepare_streaming_scene(
-                scene,
-                camera,
-                options,
-                renderer,
-                target_viewport,
-                &mut *streaming_vertices,
-                &mut ready,
-                &mut statistics,
-                &mut tessellation_stats,
-            )?,
-            FrameItem::ScreenScene { scene, options, .. } => {
-                let viewport = resolve_viewport(renderer, target_viewport, options)?;
-                let camera = screen_camera(viewport.viewport)
-                    .map_err(|_| RendererFrameError::InvalidGeometryTransform)?;
-                prepare_streaming_scene_resolved(
-                    scene.as_scene(),
+            } => {
+                prepare_streaming_scene(
+                    scene,
                     camera,
-                    viewport,
+                    options,
+                    renderer,
                     target_viewport,
                     &mut *streaming_vertices,
                     &mut ready,
                     &mut statistics,
                     &mut tessellation_stats,
                 )?;
+                geometry_streamed = true;
+            }
+            FrameItem::ScreenScene { scene, options, .. } => {
+                let viewport = resolve_viewport(renderer, target_viewport, options)?;
+                let camera = screen_camera(viewport.viewport)
+                    .map_err(|_| RendererFrameError::InvalidGeometryTransform)?;
+                let camera_uniform = CameraUniform::new_in_region(
+                    camera,
+                    viewport.viewport,
+                    viewport.origin,
+                    target_viewport,
+                )
+                .ok_or(RendererFrameError::InvalidGeometryTransform)?;
+                if !scene_estimate_fits_streaming_device(
+                    scene.as_scene(),
+                    &renderer.device,
+                    streaming_vertices.len(),
+                    renderer.vertex_capacity,
+                ) {
+                    return Err(RendererFrameError::GeometryCapacityTooLarge.into());
+                }
+                prepare_streaming_scene_resolved(
+                    scene.as_scene(),
+                    camera_uniform,
+                    viewport,
+                    &mut *streaming_vertices,
+                    &mut ready,
+                    &mut statistics,
+                    &mut tessellation_stats,
+                )?;
+                geometry_streamed = true;
             }
             FrameItem::Prepared {
                 scene,
@@ -1632,19 +1796,16 @@ fn present_frame_with_vertices<'frame>(
                 ..
             } => {
                 let viewport = resolve_viewport(renderer, target_viewport, options)?;
-                let batches = (!mesh.vertices.is_empty())
-                    .then_some(PreparedDrawBatch {
-                        vertex_range: 0..mesh.vertices.len() as u32,
-                        screen_clip: None,
-                    })
-                    .into_iter()
-                    .collect::<Vec<_>>();
+                let batch = (!mesh.vertices.is_empty()).then_some(PreparedDrawBatch {
+                    vertex_range: 0..mesh.vertices.len() as u32,
+                    screen_clip: None,
+                });
                 prepare_retained_geometry(
                     ReadySource::Dynamic(&mesh.vertex_buffer),
                     mesh.vertices.len(),
                     mesh.geometry_extents,
                     GeometryValidationSource::Dynamic(&mesh.vertices),
-                    &batches,
+                    batch.as_slice(),
                     usize::from(!mesh.vertices.is_empty()),
                     TessellationStats::default(),
                     camera,
@@ -1677,11 +1838,15 @@ fn present_frame_with_vertices<'frame>(
                 texture,
                 color_map,
                 minimum,
+                maximum,
                 value_extent,
                 sampling,
                 options,
                 ..
             } => {
+                if !scalar_normalization_is_portable(texture, minimum, value_extent) {
+                    return Err(FrameComposerError::InvalidValueRange { minimum, maximum });
+                }
                 let viewport = resolve_viewport(renderer, target_viewport, options)?;
                 let region = LogicalViewportRegion::new(
                     LogicalScreenPosition::from_vec2(viewport.origin),
@@ -1698,6 +1863,13 @@ fn present_frame_with_vertices<'frame>(
                 .in_region(region, target_viewport)
                 .ok_or(RendererFrameError::InvalidGeometryTransform)?;
                 let color_map_bytes = COLOR_MAP_LUT_SIZE as usize * 4;
+                let lut = color_map_lut(color_map);
+                let color_map_upload_bytes = if simulated_color_map_lut == Some(lut) {
+                    0
+                } else {
+                    simulated_color_map_lut = Some(lut);
+                    color_map_bytes
+                };
                 statistics = statistics.adding(FrameStatistics {
                     pass_count: 1,
                     command_count: 1,
@@ -1705,11 +1877,9 @@ fn present_frame_with_vertices<'frame>(
                     streaming_vertex_count: 0,
                     reused_vertex_count: 0,
                     upload_bytes: std::mem::size_of::<HeatmapUniform>()
-                        .saturating_add(color_map_bytes),
+                        .saturating_add(color_map_upload_bytes),
                     streaming_upload_bytes: 0,
-                    texture_bytes: texture
-                        .gpu_allocation_bytes()
-                        .saturating_add(color_map_bytes),
+                    texture_bytes: 0,
                     retained_cpu_bytes: 0,
                     retained_buffer_bytes: 0,
                     draw_calls: 1,
@@ -1815,7 +1985,7 @@ fn present_frame_with_vertices<'frame>(
                             camera_uniform.screen_to_clip[3],
                         ),
                     );
-                    if !clip.is_finite() {
+                    if ![clip.x, clip.y].into_iter().all(is_portable_shader_source) {
                         return Err(RendererFrameError::InvalidGeometryTransform.into());
                     }
                 }
@@ -1955,13 +2125,123 @@ fn present_frame_with_vertices<'frame>(
             }
         }
     }
-    let tessellation = tessellation_started_at.elapsed();
     statistics.texture_bytes = planned.texture_bytes;
-    statistics.retained_cpu_bytes = planned.retained_cpu_bytes;
+    let (particle_cpu_before, particle_cpu_after) =
+        ready
+            .iter()
+            .fold((0usize, 0usize), |(before, after), item| match item {
+                ReadyItem::Particle {
+                    field,
+                    initial_cpu_allocation_bytes,
+                    ..
+                } => (
+                    before.saturating_add(*initial_cpu_allocation_bytes),
+                    after.saturating_add(field.cpu_allocation_bytes()),
+                ),
+                _ => (before, after),
+            });
+    statistics.retained_cpu_bytes = planned
+        .retained_cpu_bytes
+        .saturating_sub(particle_cpu_before)
+        .saturating_add(particle_cpu_after);
     statistics.retained_buffer_bytes = planned.retained_buffer_bytes;
     statistics.source_counts = planned.source_counts;
     validate_frame_budget(budget, statistics)?;
     renderer.ensure_vertex_capacity(streaming_vertices.len())?;
+
+    let mut bindings = Vec::new();
+    bindings
+        .try_reserve(ready.len())
+        .map_err(|_| FrameComposerError::AllocationFailed {
+            requested_bytes: ready
+                .len()
+                .saturating_mul(std::mem::size_of::<FrameBinding>()),
+        })?;
+    let tessellation = tessellation_started_at.elapsed();
+
+    // Surface availability is resolved after all fallible CPU preparation but
+    // before bind-group creation or queue writes. Repeated skipped frames must
+    // not accumulate wgpu's deferred upload staging allocations.
+    let acquire_started_at = Instant::now();
+    let surface_texture = match renderer.surface.get_current_texture() {
+        wgpu::CurrentSurfaceTexture::Success(texture)
+        | wgpu::CurrentSurfaceTexture::Suboptimal(texture) => texture,
+        wgpu::CurrentSurfaceTexture::Timeout => {
+            set_particle_rendered(&mut ready, false);
+            return Ok(frame_report(
+                RenderStatus::Skipped(RendererSurfaceStatus::Timeout),
+                statistics.without_uploads(),
+                tessellation,
+                Duration::ZERO,
+                Duration::ZERO,
+                acquire_started_at.elapsed(),
+                Duration::ZERO,
+                frame_started_at.elapsed(),
+                geometry_reused,
+                geometry_streamed,
+                tessellation_stats,
+            ));
+        }
+        wgpu::CurrentSurfaceTexture::Occluded => {
+            set_particle_rendered(&mut ready, false);
+            return Ok(frame_report(
+                RenderStatus::Skipped(RendererSurfaceStatus::Occluded),
+                statistics.without_uploads(),
+                tessellation,
+                Duration::ZERO,
+                Duration::ZERO,
+                acquire_started_at.elapsed(),
+                Duration::ZERO,
+                frame_started_at.elapsed(),
+                geometry_reused,
+                geometry_streamed,
+                tessellation_stats,
+            ));
+        }
+        wgpu::CurrentSurfaceTexture::Outdated => {
+            let _ = renderer.resize(renderer.config.width, renderer.config.height);
+            set_particle_rendered(&mut ready, false);
+            return Ok(frame_report(
+                RenderStatus::Skipped(RendererSurfaceStatus::Outdated),
+                statistics.without_uploads(),
+                tessellation,
+                Duration::ZERO,
+                Duration::ZERO,
+                acquire_started_at.elapsed(),
+                Duration::ZERO,
+                frame_started_at.elapsed(),
+                geometry_reused,
+                geometry_streamed,
+                tessellation_stats,
+            ));
+        }
+        wgpu::CurrentSurfaceTexture::Lost => {
+            return Err(RendererFrameError::Surface(RendererSurfaceStatus::Lost).into());
+        }
+        wgpu::CurrentSurfaceTexture::Validation => {
+            return Err(RendererFrameError::Surface(RendererSurfaceStatus::Validation).into());
+        }
+    };
+    let surface_acquire = acquire_started_at.elapsed();
+
+    let mut binding_upload = Duration::ZERO;
+    let mut camera_uniform_upload = Duration::ZERO;
+    for item in &ready {
+        let binding_started_at = Instant::now();
+        bindings.push(create_frame_binding(renderer, item));
+        let elapsed = binding_started_at.elapsed();
+        match item {
+            ReadyItem::Geometry(_) | ReadyItem::Particle { .. } => {
+                camera_uniform_upload += elapsed;
+            }
+            ReadyItem::Scalar { .. }
+            | ReadyItem::Image { .. }
+            | ReadyItem::ImageBatch { .. }
+            | ReadyItem::Target { .. } => {
+                binding_upload += elapsed;
+            }
+        }
+    }
 
     let upload_started_at = Instant::now();
     if !streaming_vertices.is_empty() {
@@ -1993,93 +2273,7 @@ fn present_frame_with_vertices<'frame>(
             }
         }
     }
-    let mut upload = upload_started_at.elapsed();
-    let mut camera_uniform_upload = Duration::ZERO;
-    let mut bindings = Vec::new();
-    bindings
-        .try_reserve(ready.len())
-        .map_err(|_| FrameComposerError::AllocationFailed {
-            requested_bytes: ready
-                .len()
-                .saturating_mul(std::mem::size_of::<FrameBinding>()),
-        })?;
-    for item in &ready {
-        let binding_started_at = Instant::now();
-        bindings.push(create_frame_binding(renderer, item));
-        let elapsed = binding_started_at.elapsed();
-        match item {
-            ReadyItem::Geometry(_) | ReadyItem::Particle { .. } => {
-                camera_uniform_upload += elapsed;
-            }
-            ReadyItem::Scalar { .. }
-            | ReadyItem::Image { .. }
-            | ReadyItem::ImageBatch { .. }
-            | ReadyItem::Target { .. } => {
-                upload += elapsed;
-            }
-        }
-    }
-    let acquire_started_at = Instant::now();
-    let surface_texture = match renderer.surface.get_current_texture() {
-        wgpu::CurrentSurfaceTexture::Success(texture)
-        | wgpu::CurrentSurfaceTexture::Suboptimal(texture) => texture,
-        wgpu::CurrentSurfaceTexture::Timeout => {
-            set_particle_rendered(&mut ready, false);
-            return Ok(frame_report(
-                RenderStatus::Skipped(RendererSurfaceStatus::Timeout),
-                statistics,
-                tessellation,
-                upload,
-                camera_uniform_upload,
-                acquire_started_at.elapsed(),
-                Duration::ZERO,
-                frame_started_at.elapsed(),
-                geometry_reused,
-                geometry_streamed,
-                tessellation_stats,
-            ));
-        }
-        wgpu::CurrentSurfaceTexture::Occluded => {
-            set_particle_rendered(&mut ready, false);
-            return Ok(frame_report(
-                RenderStatus::Skipped(RendererSurfaceStatus::Occluded),
-                statistics,
-                tessellation,
-                upload,
-                camera_uniform_upload,
-                acquire_started_at.elapsed(),
-                Duration::ZERO,
-                frame_started_at.elapsed(),
-                geometry_reused,
-                geometry_streamed,
-                tessellation_stats,
-            ));
-        }
-        wgpu::CurrentSurfaceTexture::Outdated => {
-            renderer.resize(renderer.config.width, renderer.config.height);
-            set_particle_rendered(&mut ready, false);
-            return Ok(frame_report(
-                RenderStatus::Skipped(RendererSurfaceStatus::Outdated),
-                statistics,
-                tessellation,
-                upload,
-                camera_uniform_upload,
-                acquire_started_at.elapsed(),
-                Duration::ZERO,
-                frame_started_at.elapsed(),
-                geometry_reused,
-                geometry_streamed,
-                tessellation_stats,
-            ));
-        }
-        wgpu::CurrentSurfaceTexture::Lost => {
-            return Err(RendererFrameError::Surface(RendererSurfaceStatus::Lost).into());
-        }
-        wgpu::CurrentSurfaceTexture::Validation => {
-            return Err(RendererFrameError::Surface(RendererSurfaceStatus::Validation).into());
-        }
-    };
-    let surface_acquire = acquire_started_at.elapsed();
+    let upload = upload_started_at.elapsed() + binding_upload;
     let encode_started_at = Instant::now();
     let surface_view = surface_texture
         .texture
@@ -2134,32 +2328,274 @@ fn present_frame_with_vertices<'frame>(
     ))
 }
 
+fn preflight_frame_items(
+    renderer: &WgpuRenderer,
+    target_viewport: LogicalViewport,
+    items: &[FrameItem<'_>],
+) -> Result<(), FrameComposerError> {
+    for item in items {
+        match item {
+            FrameItem::Scene {
+                camera, options, ..
+            } => {
+                let viewport = resolve_viewport(renderer, target_viewport, *options)?;
+                CameraUniform::new_in_region(
+                    *camera,
+                    viewport.viewport,
+                    viewport.origin,
+                    target_viewport,
+                )
+                .ok_or(RendererFrameError::InvalidGeometryTransform)?;
+            }
+            FrameItem::ScreenScene { options, .. } => {
+                let viewport = resolve_viewport(renderer, target_viewport, *options)?;
+                let camera = screen_camera(viewport.viewport)
+                    .map_err(|_| RendererFrameError::InvalidGeometryTransform)?;
+                CameraUniform::new_in_region(
+                    camera,
+                    viewport.viewport,
+                    viewport.origin,
+                    target_viewport,
+                )
+                .ok_or(RendererFrameError::InvalidGeometryTransform)?;
+            }
+            FrameItem::Prepared {
+                scene,
+                camera,
+                options,
+                ..
+            } => {
+                let viewport = resolve_viewport(renderer, target_viewport, *options)?;
+                let uniform = CameraUniform::new_in_region(
+                    *camera,
+                    viewport.viewport,
+                    viewport.origin,
+                    target_viewport,
+                )
+                .ok_or(RendererFrameError::InvalidGeometryTransform)?;
+                if !geometry_is_safe_for(
+                    scene.geometry_extents,
+                    GeometryValidationSource::Tessellated(&scene.vertices),
+                    uniform,
+                ) {
+                    return Err(RendererFrameError::InvalidGeometryTransform.into());
+                }
+            }
+            FrameItem::PreparedScreen { scene, options, .. } => {
+                let viewport = resolve_viewport(renderer, target_viewport, *options)?;
+                let camera = screen_camera(viewport.viewport)
+                    .map_err(|_| RendererFrameError::InvalidGeometryTransform)?;
+                let uniform = CameraUniform::new_in_region(
+                    camera,
+                    viewport.viewport,
+                    viewport.origin,
+                    target_viewport,
+                )
+                .ok_or(RendererFrameError::InvalidGeometryTransform)?;
+                if !geometry_is_safe_for(
+                    scene.scene.geometry_extents,
+                    GeometryValidationSource::Tessellated(&scene.scene.vertices),
+                    uniform,
+                ) {
+                    return Err(RendererFrameError::InvalidGeometryTransform.into());
+                }
+            }
+            FrameItem::Dynamic {
+                mesh,
+                camera,
+                options,
+                ..
+            } => {
+                let viewport = resolve_viewport(renderer, target_viewport, *options)?;
+                let uniform = CameraUniform::new_in_region(
+                    *camera,
+                    viewport.viewport,
+                    viewport.origin,
+                    target_viewport,
+                )
+                .ok_or(RendererFrameError::InvalidGeometryTransform)?;
+                if !geometry_is_safe_for(
+                    mesh.geometry_extents,
+                    GeometryValidationSource::Dynamic(&mesh.vertices),
+                    uniform,
+                ) {
+                    return Err(RendererFrameError::InvalidGeometryTransform.into());
+                }
+            }
+            FrameItem::Particle {
+                camera, options, ..
+            } => {
+                let viewport = resolve_viewport(renderer, target_viewport, *options)?;
+                CameraUniform::new(*camera, viewport.viewport)
+                    .ok_or(RendererFrameError::InvalidGeometryTransform)?;
+                CameraUniform::new_in_region(
+                    *camera,
+                    viewport.viewport,
+                    viewport.origin,
+                    target_viewport,
+                )
+                .ok_or(RendererFrameError::InvalidGeometryTransform)?;
+            }
+            FrameItem::Scalar {
+                texture,
+                minimum,
+                maximum,
+                value_extent,
+                sampling,
+                options,
+                ..
+            } => {
+                if !scalar_normalization_is_portable(texture, *minimum, *value_extent) {
+                    return Err(FrameComposerError::InvalidValueRange {
+                        minimum: *minimum,
+                        maximum: *maximum,
+                    });
+                }
+                let viewport = resolve_viewport(renderer, target_viewport, *options)?;
+                let region = LogicalViewportRegion::new(
+                    LogicalScreenPosition::from_vec2(viewport.origin),
+                    viewport.viewport,
+                )
+                .map_err(|_| RendererFrameError::InvalidViewport)?;
+                HeatmapUniform::new(
+                    *minimum,
+                    *value_extent,
+                    texture.width(),
+                    texture.height(),
+                    *sampling,
+                )
+                .in_region(region, target_viewport)
+                .ok_or(RendererFrameError::InvalidGeometryTransform)?;
+            }
+            FrameItem::Image { options, .. } => {
+                let viewport = resolve_viewport(renderer, target_viewport, *options)?;
+                let region = LogicalViewportRegion::new(
+                    LogicalScreenPosition::from_vec2(viewport.origin),
+                    viewport.viewport,
+                )
+                .map_err(|_| RendererFrameError::InvalidViewport)?;
+                CompositeUniform::in_region(1.0, region, target_viewport)
+                    .ok_or(RendererFrameError::InvalidGeometryTransform)?;
+            }
+            FrameItem::Target {
+                opacity, options, ..
+            } => {
+                let viewport = resolve_viewport(renderer, target_viewport, *options)?;
+                let region = LogicalViewportRegion::new(
+                    LogicalScreenPosition::from_vec2(viewport.origin),
+                    viewport.viewport,
+                )
+                .map_err(|_| RendererFrameError::InvalidViewport)?;
+                CompositeUniform::in_region(*opacity, region, target_viewport)
+                    .ok_or(RendererFrameError::InvalidGeometryTransform)?;
+            }
+            FrameItem::WorldImage {
+                rectangle,
+                depth,
+                camera,
+                options,
+                ..
+            } => {
+                let viewport = resolve_viewport(renderer, target_viewport, *options)?;
+                let camera_uniform = CameraUniform::new_in_region(
+                    *camera,
+                    viewport.viewport,
+                    viewport.origin,
+                    target_viewport,
+                )
+                .ok_or(RendererFrameError::InvalidGeometryTransform)?;
+                let minimum = rectangle.min();
+                let maximum = rectangle.max();
+                for world in [
+                    Vec2::new(minimum.x, maximum.y),
+                    maximum,
+                    minimum,
+                    Vec2::new(maximum.x, minimum.y),
+                ] {
+                    let screen = camera_uniform.world_to_screen(world, *depth);
+                    let clip = Vec2::new(
+                        screen.x.mul_add(
+                            camera_uniform.screen_to_clip[0],
+                            camera_uniform.screen_to_clip[2],
+                        ),
+                        screen.y.mul_add(
+                            camera_uniform.screen_to_clip[1],
+                            camera_uniform.screen_to_clip[3],
+                        ),
+                    );
+                    if ![clip.x, clip.y].into_iter().all(is_portable_shader_source) {
+                        return Err(RendererFrameError::InvalidGeometryTransform.into());
+                    }
+                }
+            }
+            FrameItem::ImageBatch { batch, options, .. } => {
+                let viewport = resolve_viewport(renderer, target_viewport, *options)?;
+                let clip_transform = [
+                    2.0 / target_viewport.width(),
+                    -2.0 / target_viewport.height(),
+                    -1.0,
+                    1.0,
+                ];
+                if !image_sprites_are_safe_for_target(
+                    batch.sprites(),
+                    viewport.origin,
+                    clip_transform,
+                ) {
+                    return Err(RendererFrameError::InvalidGeometryTransform.into());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn image_sprites_are_safe_for_target(
     sprites: &[ImageSprite2d],
     viewport_origin: Vec2,
     clip_transform: [f32; 4],
 ) -> bool {
-    if !viewport_origin.is_finite() || !clip_transform.into_iter().all(f32::is_finite) {
+    if ![viewport_origin.x, viewport_origin.y]
+        .into_iter()
+        .chain(clip_transform)
+        .all(is_portable_shader_source)
+    {
         return false;
     }
     sprites.iter().all(|sprite| {
         let destination = sprite.destination();
-        let minimum = viewport_origin + destination.origin().to_vec2();
-        let maximum = minimum + destination.viewport().size();
-        minimum.is_finite()
-            && maximum.is_finite()
-            && shader_clip_interval_is_safe(
-                f64::from(minimum.x),
-                f64::from(maximum.x),
+        let origin = destination.origin().to_vec2();
+        let size = destination.viewport().size();
+        if ![origin.x, origin.y, size.x, size.y]
+            .into_iter()
+            .all(is_portable_shader_source)
+        {
+            return false;
+        }
+        let horizontal = shader_interval_sum_range([
+            (f64::from(viewport_origin.x), f64::from(viewport_origin.x)),
+            (f64::from(origin.x), f64::from(origin.x)),
+            (0.0, f64::from(size.x)),
+        ]);
+        let vertical = shader_interval_sum_range([
+            (f64::from(viewport_origin.y), f64::from(viewport_origin.y)),
+            (f64::from(origin.y), f64::from(origin.y)),
+            (0.0, f64::from(size.y)),
+        ]);
+        horizontal.is_some_and(|horizontal| {
+            shader_clip_interval_is_safe(
+                horizontal.0,
+                horizontal.1,
                 clip_transform[0],
                 clip_transform[2],
             )
-            && shader_clip_interval_is_safe(
-                f64::from(minimum.y),
-                f64::from(maximum.y),
+        }) && vertical.is_some_and(|vertical| {
+            shader_clip_interval_is_safe(
+                vertical.0,
+                vertical.1,
                 clip_transform[1],
                 clip_transform[3],
             )
+        })
     })
 }
 
@@ -2168,14 +2604,18 @@ fn set_particle_rendered(items: &mut [ReadyItem<'_>], presented: bool) {
         if let ReadyItem::Particle {
             field,
             visible_count,
+            pending_statistics,
             viewport,
             ..
         } = item
         {
-            field.statistics.rendered = if presented && !viewport.item_clipped_out {
-                *visible_count
-            } else {
-                0
+            field.statistics = ParticleStatistics {
+                rendered: if presented && !viewport.item_clipped_out {
+                    *visible_count
+                } else {
+                    0
+                },
+                ..*pending_statistics
             };
         }
     }
@@ -2190,6 +2630,7 @@ fn prepare_particle_item<'frame>(
     ready: &mut Vec<ReadyItem<'frame>>,
     statistics: &mut FrameStatistics,
 ) -> Result<(), FrameComposerError> {
+    let initial_cpu_allocation_bytes = field.cpu_allocation_bytes();
     let local_uniform = CameraUniform::new(camera, viewport.viewport)
         .ok_or(RendererFrameError::InvalidGeometryTransform)?;
     let target_uniform =
@@ -2200,19 +2641,20 @@ fn prepare_particle_item<'frame>(
 
     let (visible_count, selected_count) = if visibility_checked < instance_count {
         field.visible_instances.clear();
+        validate_particle_staging_capacity(&field.visible_instances, visibility_checked)?;
         for candidate_index in 0..visibility_checked {
             let source_index =
                 uniformly_sampled_index(candidate_index, instance_count, visibility_checked);
             let instance = field.instances[source_index];
-            if !instance.is_safe_for(target_uniform) {
+            if !instance.is_safe_for(target_uniform, target_viewport) {
                 return Err(RendererFrameError::InvalidGeometryTransform.into());
             }
-            if instance
-                .projected_screen_bounds(local_uniform)
-                .is_none_or(|bounds| {
-                    ParticleGpu::screen_bounds_intersect_viewport(bounds, viewport.viewport)
-                })
-            {
+            let Some(intersects) =
+                instance.validated_viewport_intersection(local_uniform, viewport.viewport)
+            else {
+                return Err(RendererFrameError::InvalidGeometryTransform.into());
+            };
+            if intersects {
                 field.visible_instances.push(instance);
             }
         }
@@ -2237,12 +2679,14 @@ fn prepare_particle_item<'frame>(
             local_uniform,
             target_uniform,
             viewport.viewport,
+            target_viewport,
         )?;
         let selected_count = visible_count.min(field.budget.instance_limit());
         if selected_count == field.instances.len() {
             field.visible_instances.clear();
         } else {
             field.visible_instances.clear();
+            validate_particle_staging_capacity(&field.visible_instances, selected_count)?;
             let mut visible_index = 0;
             for instance in field.instances.iter().copied() {
                 if !instance.intersects_viewport(local_uniform, viewport.viewport) {
@@ -2263,7 +2707,7 @@ fn prepare_particle_item<'frame>(
         }
         (visible_count, selected_count)
     };
-    field.statistics = particle_statistics_with_budget(
+    let pending_statistics = particle_statistics_with_budget(
         instance_count,
         visibility_checked,
         visible_count,
@@ -2289,6 +2733,8 @@ fn prepare_particle_item<'frame>(
     ready.push(ReadyItem::Particle {
         field,
         visible_count: selected_count,
+        pending_statistics,
+        initial_cpu_allocation_bytes,
         camera_uniform: target_uniform,
         viewport,
     });
@@ -2300,6 +2746,7 @@ fn visible_particle_count_for_frame(
     local_camera: CameraUniform,
     target_camera: CameraUniform,
     viewport: LogicalViewport,
+    target_viewport: LogicalViewport,
 ) -> Result<usize, RendererFrameError> {
     let mut visible = 0;
     for instance in instances {
@@ -2307,7 +2754,7 @@ fn visible_particle_count_for_frame(
         else {
             return Err(RendererFrameError::InvalidGeometryTransform);
         };
-        if !instance.is_safe_for(target_camera) {
+        if !instance.is_safe_for(target_camera, target_viewport) {
             return Err(RendererFrameError::InvalidGeometryTransform);
         }
         visible += usize::from(intersects);
@@ -2328,11 +2775,21 @@ fn prepare_streaming_scene<'frame>(
     aggregate: &mut TessellationStats,
 ) -> Result<(), FrameComposerError> {
     let viewport = resolve_viewport(renderer, target_viewport, options)?;
+    let camera_uniform =
+        CameraUniform::new_in_region(camera, viewport.viewport, viewport.origin, target_viewport)
+            .ok_or(RendererFrameError::InvalidGeometryTransform)?;
+    if !scene_estimate_fits_streaming_device(
+        scene,
+        &renderer.device,
+        streaming_vertices.len(),
+        renderer.vertex_capacity,
+    ) {
+        return Err(RendererFrameError::GeometryCapacityTooLarge.into());
+    }
     prepare_streaming_scene_resolved(
         scene,
-        camera,
+        camera_uniform,
         viewport,
-        target_viewport,
         streaming_vertices,
         ready,
         statistics,
@@ -2343,9 +2800,8 @@ fn prepare_streaming_scene<'frame>(
 #[allow(clippy::too_many_arguments)]
 fn prepare_streaming_scene_resolved<'frame>(
     scene: &Scene,
-    camera: Camera2d,
+    camera_uniform: CameraUniform,
     viewport: ResolvedViewport,
-    target_viewport: LogicalViewport,
     streaming_vertices: &mut Vec<Vertex>,
     ready: &mut Vec<ReadyItem<'frame>>,
     statistics: &mut FrameStatistics,
@@ -2357,14 +2813,12 @@ fn prepare_streaming_scene_resolved<'frame>(
         .map_err(RendererFrameError::from)?;
     let vertices = &streaming_vertices[vertex_start..];
     let extents = GeometryExtents::from_vertices(vertices);
-    let camera_uniform =
-        CameraUniform::new_in_region(camera, viewport.viewport, viewport.origin, target_viewport)
-            .ok_or(RendererFrameError::InvalidGeometryTransform)?;
     if !geometry_is_safe_for(
         extents,
         GeometryValidationSource::Tessellated(vertices),
         camera_uniform,
     ) {
+        streaming_vertices.truncate(vertex_start);
         return Err(RendererFrameError::InvalidGeometryTransform.into());
     }
     *statistics = statistics.adding(FrameStatistics {
@@ -2891,6 +3345,36 @@ mod tests {
     use super::*;
 
     #[test]
+    fn scalar_lut_accounting_matches_one_entry_cache_runs() {
+        const BYTES: usize = COLOR_MAP_LUT_SIZE as usize * 4;
+        let a = [1; BYTES];
+        let b = [2; BYTES];
+        let adjacent = vec![
+            ScalarLutPlan {
+                sort_key: (0, 0),
+                lut: a,
+            },
+            ScalarLutPlan {
+                sort_key: (0, 2),
+                lut: a,
+            },
+        ];
+        assert_eq!(
+            scalar_lut_counts_with_inserted(&adjacent, 1, &a, Some(&a)),
+            (0, 1)
+        );
+        assert_eq!(
+            scalar_lut_counts_with_inserted(&adjacent, 1, &b, Some(&a)),
+            (2, 3),
+            "A, B, A performs two uploads and keeps three LUT allocations alive"
+        );
+        assert_eq!(
+            scalar_lut_counts_with_inserted(&adjacent[..1], 1, &b, None),
+            (2, 2)
+        );
+    }
+
+    #[test]
     fn image_and_glyph_sprite_bounds_include_final_clip_arithmetic() {
         let source = ImageTexelRect::new(0, 0, 1, 1).unwrap();
         let safe = ImageSprite2d::new(
@@ -3045,6 +3529,17 @@ mod tests {
         assert_eq!(skipped.render_pass_count(), 0);
         assert_eq!(skipped.queue_submission_count(), 0);
         assert_eq!(skipped.surface_present_count(), 0);
+
+        let planned = FrameStatistics {
+            upload_bytes: 128,
+            streaming_upload_bytes: 96,
+            vertex_count: 12,
+            ..FrameStatistics::default()
+        };
+        let skipped_statistics = planned.without_uploads();
+        assert_eq!(skipped_statistics.upload_bytes(), 0);
+        assert_eq!(skipped_statistics.streaming_upload_bytes(), 0);
+        assert_eq!(skipped_statistics.vertex_count(), 12);
     }
 
     #[test]
@@ -3076,6 +3571,57 @@ mod tests {
             items.iter().map(FrameItem::sort_key).collect::<Vec<_>>(),
             vec![(-1, 1), (4, 0), (4, 2)]
         );
+    }
+
+    #[test]
+    fn late_streaming_transform_rejection_rolls_back_appended_vertices() {
+        let mut scene = Scene::new(Color::BLACK).unwrap();
+        scene
+            .try_line(
+                Vec2::new(1.0e30, 0.0),
+                Vec2::new(1.1e30, 0.0),
+                1.0,
+                Color::WHITE,
+            )
+            .unwrap();
+        let viewport = LogicalViewport::new(64.0, 64.0).unwrap();
+        let camera = Camera2d::new(Vec2::ZERO, 1.0e10).unwrap();
+        let uniform = CameraUniform::new_in_region(camera, viewport, Vec2::ZERO, viewport).unwrap();
+        let resolved = ResolvedViewport {
+            viewport,
+            origin: Vec2::ZERO,
+            scissor: ScissorRect {
+                x: 0,
+                y: 0,
+                width: 64,
+                height: 64,
+            },
+            item_clip: None,
+            item_clipped_out: false,
+        };
+        let mut vertices = Vec::new();
+        let mut ready = Vec::new();
+        let mut statistics = FrameStatistics::default();
+        let mut aggregate = TessellationStats::default();
+
+        assert_eq!(
+            prepare_streaming_scene_resolved(
+                &scene,
+                uniform,
+                resolved,
+                &mut vertices,
+                &mut ready,
+                &mut statistics,
+                &mut aggregate,
+            ),
+            Err(FrameComposerError::Frame(
+                RendererFrameError::InvalidGeometryTransform
+            ))
+        );
+        assert!(vertices.is_empty());
+        assert!(ready.is_empty());
+        assert_eq!(statistics, FrameStatistics::default());
+        assert_eq!(aggregate, TessellationStats::default());
     }
 
     #[test]

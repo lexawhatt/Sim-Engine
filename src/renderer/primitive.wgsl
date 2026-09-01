@@ -58,27 +58,47 @@ fn same_side(left: f32, right: f32) -> bool {
 
 @vertex
 fn vs_main(input: VertexIn) -> VertexOut {
-    let relative_world = (input.world_position - camera.camera_center.xy) + input.world_offset;
-    var screen = vec2<f32>(
+    let relative_world = input.world_position - camera.camera_center.xy;
+    let projected_world = vec2<f32>(
         dot(camera.world_to_screen_x.xyz, vec3<f32>(relative_world, input.depth)) + camera.world_to_screen_x.w,
         dot(camera.world_to_screen_y.xyz, vec3<f32>(relative_world, input.depth)) + camera.world_to_screen_y.w,
     );
+    // Keep tessellator-generated local geometry separate from its possibly
+    // huge world anchor until after projection. Folding the offset into the
+    // anchor first can round every circle/rounded-corner vertex back onto the
+    // anchor even though the projected offset is many logical pixels.
+    let projected_world_offset = vec2<f32>(
+        dot(camera.world_to_screen_x.xy, input.world_offset),
+        dot(camera.world_to_screen_y.xy, input.world_offset),
+    );
+    var screen = projected_world + projected_world_offset;
 
     if abs(input.normal_distance) > 0.0 || abs(input.tangent_distance) > 0.0 {
         let previous_screen = vec2<f32>(
             dot(camera.world_to_screen_x.xy, input.previous_direction),
             dot(camera.world_to_screen_y.xy, input.previous_direction),
         );
-        let next_screen = vec2<f32>(
+        var next_screen = vec2<f32>(
             dot(camera.world_to_screen_x.xy, input.next_direction),
             dot(camera.world_to_screen_y.xy, input.next_direction),
         );
+        let source_directions_equal = all(input.previous_direction == input.next_direction);
+        if source_directions_equal {
+            // Reuse the exact projected value. Two independently lowered dot
+            // expressions may otherwise select different legal rounding/FMA
+            // results and manufacture a turn from identical source vectors.
+            next_screen = previous_screen;
+        }
         let previous_normal = safe_normal(previous_screen);
-        let next_normal = safe_normal(next_screen);
+        var next_normal = safe_normal(next_screen);
         let previous_tangent = safe_unit(previous_screen);
-        let next_tangent = safe_unit(next_screen);
+        var next_tangent = safe_unit(next_screen);
+        if source_directions_equal {
+            next_normal = previous_normal;
+            next_tangent = previous_tangent;
+        }
         let combined_normal = previous_normal + next_normal;
-        let turn = cross_2d(previous_tangent, next_tangent);
+        let turn = select(cross_2d(previous_tangent, next_tangent), 0.0, source_directions_equal);
         let reverses = abs(turn) <= 0.000001 && dot(previous_tangent, next_tangent) < 0.0;
         let side = sign(input.normal_distance);
         let outer_side = -sign(turn);
@@ -145,13 +165,12 @@ fn vs_main(input: VertexIn) -> VertexOut {
             } else if input.stroke_role == 8.0 {
                 let start = previous_normal * candidate_side;
                 let finish = next_normal * candidate_side;
-                let angle = atan2(cross_2d(start, finish), dot(start, finish));
-                let amount_angle = angle * input.stroke_parameter;
-                let rotated = vec2<f32>(
-                    start.x * cos(amount_angle) - start.y * sin(amount_angle),
-                    start.x * sin(amount_angle) + start.y * cos(amount_angle),
-                );
-                extrusion = rotated * abs(input.normal_distance);
+                // Normalized interpolation traces the same circular arc while
+                // avoiding atan2's undefined-accuracy zero-dot domain and the
+                // backend-dependent trigonometric error envelope. Source
+                // reversals are rejected before submission.
+                let arc_direction = safe_unit(mix(start, finish, input.stroke_parameter));
+                extrusion = arc_direction * abs(input.normal_distance);
             } else if input.stroke_parameter < 0.0 {
                 extrusion = previous_normal * input.normal_distance;
             } else {
@@ -220,11 +239,15 @@ fn particle_vs_main(input: ParticleIn) -> VertexOut {
         dot(camera.world_to_screen_x.xyz, vec3<f32>(relative_world, input.depth)) + camera.world_to_screen_x.w,
         dot(camera.world_to_screen_y.xyz, vec3<f32>(relative_world, input.depth)) + camera.world_to_screen_y.w,
     );
-    let screen = projected_screen + input.unit_direction * input.radius;
-    let clip = vec2<f32>(
-        screen.x * camera.screen_to_clip.x + camera.screen_to_clip.z,
-        screen.y * camera.screen_to_clip.y + camera.screen_to_clip.w,
+    let clip_center = vec2<f32>(
+        projected_screen.x * camera.screen_to_clip.x + camera.screen_to_clip.z,
+        projected_screen.y * camera.screen_to_clip.y + camera.screen_to_clip.w,
     );
+    // Project the unit quad offset independently. Adding a logical radius to
+    // a huge positioned-viewport origin first can round both horizontal sides
+    // onto the same f32 screen coordinate.
+    let clip_offset = input.unit_direction * input.radius * camera.screen_to_clip.xy;
+    let clip = clip_center + clip_offset;
     var output: VertexOut;
     output.position = vec4<f32>(clip, 0.0, 1.0);
     output.color = input.color;
@@ -256,6 +279,23 @@ struct HeatmapOut {
     @location(0) uv: vec2<f32>,
 };
 
+const MIN_NORMAL_F32: f32 = 1.1754943508222875e-38;
+
+fn portable_scalar(value: f32) -> f32 {
+    if value != 0.0 && abs(value) < MIN_NORMAL_F32 {
+        return 0.0;
+    }
+    return value;
+}
+
+fn portable_scalar_mix(start_value: f32, end_value: f32, amount: f32) -> f32 {
+    let start = portable_scalar(start_value);
+    let finish = portable_scalar(end_value);
+    let delta = portable_scalar(finish - start);
+    let contribution = portable_scalar(delta * amount);
+    return portable_scalar(start + contribution);
+}
+
 @vertex
 fn heatmap_vs_main(@builtin(vertex_index) index: u32) -> HeatmapOut {
     var positions = array<vec2<f32>, 6>(
@@ -277,18 +317,21 @@ fn heatmap_vs_main(@builtin(vertex_index) index: u32) -> HeatmapOut {
 fn heatmap_fs_main(input: HeatmapOut) -> @location(0) vec4<f32> {
     let dimensions = max(heatmap.dimensions.xy, vec2<u32>(1u, 1u));
     let texel = min(vec2<u32>(input.uv * vec2<f32>(dimensions)), dimensions - vec2<u32>(1u, 1u));
-    var scalar = textureLoad(scalar_field, vec2<i32>(i32(texel.x), i32(texel.y)), 0).x;
+    var scalar = portable_scalar(textureLoad(scalar_field, vec2<i32>(i32(texel.x), i32(texel.y)), 0).x);
     if heatmap.dimensions.z == 1u {
         let source = input.uv * vec2<f32>(dimensions) - vec2<f32>(0.5, 0.5);
         let base = floor(source);
         let amount = fract(source);
-        let low = vec2<i32>(max(base, vec2<f32>(0.0, 0.0)));
-        let high = min(low + vec2<i32>(1, 1), vec2<i32>(i32(dimensions.x) - 1, i32(dimensions.y) - 1));
-        let top = mix(textureLoad(scalar_field, low, 0).x, textureLoad(scalar_field, vec2<i32>(high.x, low.y), 0).x, amount.x);
-        let bottom = mix(textureLoad(scalar_field, vec2<i32>(low.x, high.y), 0).x, textureLoad(scalar_field, vec2<i32>(high.x, high.y), 0).x, amount.x);
-        scalar = mix(top, bottom, amount.y);
+        let maximum = vec2<i32>(i32(dimensions.x) - 1, i32(dimensions.y) - 1);
+        let raw_low = vec2<i32>(base);
+        let low = clamp(raw_low, vec2<i32>(0, 0), maximum);
+        let high = clamp(raw_low + vec2<i32>(1, 1), vec2<i32>(0, 0), maximum);
+        let top = portable_scalar_mix(textureLoad(scalar_field, low, 0).x, textureLoad(scalar_field, vec2<i32>(high.x, low.y), 0).x, amount.x);
+        let bottom = portable_scalar_mix(textureLoad(scalar_field, vec2<i32>(low.x, high.y), 0).x, textureLoad(scalar_field, vec2<i32>(high.x, high.y), 0).x, amount.x);
+        scalar = portable_scalar_mix(top, bottom, amount.y);
     }
-    let normalized = clamp((scalar - heatmap.value_range.x) / heatmap.value_range.y, 0.0, 1.0);
+    let numerator = portable_scalar(scalar - heatmap.value_range.x);
+    let normalized = clamp(portable_scalar(numerator / heatmap.value_range.y), 0.0, 1.0);
     let color_index = min(u32(round(normalized * 255.0)), 255u);
     return textureLoad(color_map, vec2<i32>(i32(color_index), 0), 0);
 }

@@ -10,8 +10,8 @@ use std::{
 };
 
 use sim_engine::{
-    Camera2d, Color, ColorMap, ColorStop, LayeredVisualizationOptions, ParticleField2d,
-    ParticleInstance2d, ParticleRenderBudget, RenderReport, RenderTarget2d, RendererPresentMode,
+    Camera2d, Color, ColorMap, ColorStop, LayeredVisualizationOptions, LayeredVisualizationReport,
+    ParticleField2d, ParticleInstance2d, ParticleRenderBudget, RenderTarget2d, RendererPresentMode,
     ScalarField, ScalarFieldTexture, Vec2, WgpuRenderer, WgpuRendererOptions,
 };
 use winit::{
@@ -238,9 +238,13 @@ impl ApplicationHandler for StarRemnantApp {
             .map(|index| ejecta_particle(index, 0.0))
             .collect();
         instances.push(black_hole_particle());
-        let instance_bytes = std::mem::size_of::<[f32; 8]>();
+        let instance_bytes = ParticleRenderBudget::INSTANCE_BYTES;
         let budget = ParticleRenderBudget::new(
             self.visible_budget,
+            instances
+                .len()
+                .saturating_add(self.visible_budget)
+                .saturating_mul(instance_bytes),
             self.visible_budget * instance_bytes,
             self.visible_budget * instance_bytes,
         )
@@ -305,8 +309,10 @@ impl ApplicationHandler for StarRemnantApp {
                 }
             }
             WindowEvent::Resized(size) => {
-                if let Some(renderer) = self.renderer.as_mut() {
-                    renderer.resize(size.width, size.height);
+                if let Some(renderer) = self.renderer.as_mut()
+                    && let Err(error) = renderer.resize(size.width, size.height)
+                {
+                    eprintln!("resize rejected: {error}");
                 }
                 self.recreate_target(size.width, size.height);
                 window.request_redraw();
@@ -420,7 +426,7 @@ impl StressMetrics {
         now: Instant,
         gas_update: Duration,
         particle_update: Duration,
-        report: RenderReport,
+        report: LayeredVisualizationReport,
         resources: (&ParticleField2d, &ScalarFieldTexture, &RenderTarget2d),
     ) -> Option<String> {
         let (particles, gas, target) = resources;

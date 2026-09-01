@@ -45,6 +45,8 @@ pub enum SceneBudgetResource {
     TessellatedVertices,
     /// Command payload bytes retained by the scene.
     RetainedBytes,
+    /// Committed command-vector and owned polyline allocation bytes.
+    AllocationBytes,
     /// Bytes uploaded for generated scene vertices.
     UploadBytes,
     /// Draw batches caused by ordering and clip changes.
@@ -54,8 +56,10 @@ pub enum SceneBudgetResource {
 /// Explicit upper bounds for engine-owned ordinary-scene work.
 ///
 /// Limits may be zero to construct a background-only scene. Retained bytes
-/// count command values and owned polyline storage, excluding allocator
-/// bookkeeping. Vertex and upload limits use the renderer's conservative
+/// count logical command values and owned polyline storage. Allocation bytes
+/// additionally bound committed spare command-vector capacity; allocator
+/// bookkeeping and transactional replacement overlap are excluded. Vertex and
+/// upload limits use the renderer's conservative
 /// triangle-list estimate, which is checked again after tessellation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SceneBudget {
@@ -63,6 +67,7 @@ pub struct SceneBudget {
     max_points: usize,
     max_tessellated_vertices: usize,
     max_retained_bytes: usize,
+    max_allocation_bytes: usize,
     max_upload_bytes: usize,
     max_draw_batches: usize,
 }
@@ -74,6 +79,7 @@ impl SceneBudget {
         max_points: usize,
         max_tessellated_vertices: usize,
         max_retained_bytes: usize,
+        max_allocation_bytes: usize,
         max_upload_bytes: usize,
         max_draw_batches: usize,
     ) -> Self {
@@ -82,6 +88,7 @@ impl SceneBudget {
             max_points,
             max_tessellated_vertices,
             max_retained_bytes,
+            max_allocation_bytes,
             max_upload_bytes,
             max_draw_batches,
         }
@@ -105,6 +112,11 @@ impl SceneBudget {
     /// Returns the maximum retained command payload bytes.
     pub const fn max_retained_bytes(self) -> usize {
         self.max_retained_bytes
+    }
+
+    /// Returns the maximum committed command and polyline allocation bytes.
+    pub const fn max_allocation_bytes(self) -> usize {
+        self.max_allocation_bytes
     }
 
     /// Returns the maximum generated vertex upload bytes.
@@ -320,7 +332,12 @@ pub enum SceneError {
     },
     /// Engine-owned command storage could not be reserved without mutation.
     AllocationFailed {
-        /// Minimum additional payload bytes associated with the insertion.
+        /// Conservative byte estimate associated with the failed reservation.
+        ///
+        /// Depending on the transactional path, this can describe one
+        /// command's retained payload or the total replacement/staging
+        /// allocation that could not be reserved. It is diagnostic context,
+        /// not a delta suitable for allocator accounting.
         requested_bytes: usize,
     },
 }
@@ -410,6 +427,65 @@ impl Scene {
     /// Returns the number of accepted render commands.
     pub fn command_count(&self) -> usize {
         self.commands.len()
+    }
+
+    /// Returns CPU allocation bytes currently owned by command and polyline storage.
+    ///
+    /// Unlike [`SceneStatistics::retained_bytes`], which is the budgeted payload
+    /// of accepted commands, this includes spare `Vec` capacity retained for
+    /// reuse after insertion or [`Scene::clear`]. Allocator bookkeeping is not
+    /// included.
+    pub fn allocation_bytes(&self) -> usize {
+        self.commands
+            .capacity()
+            .saturating_mul(size_of::<SceneCommand>())
+            .saturating_add(
+                self.commands
+                    .iter()
+                    .map(|command| match command.command() {
+                        DrawCommand::Polyline(polyline) => {
+                            polyline.points.capacity().saturating_mul(size_of::<Vec2>())
+                        }
+                        DrawCommand::Circle(_) | DrawCommand::Rect(_) | DrawCommand::Line(_) => 0,
+                    })
+                    .fold(0usize, usize::saturating_add),
+            )
+    }
+
+    pub(crate) fn preflight_command_storage(
+        &self,
+        additional_commands: usize,
+        additional_owned_bytes: usize,
+    ) -> Result<(), SceneError> {
+        let Some(budget) = self.budget else {
+            return Ok(());
+        };
+        let retained_bytes = self
+            .statistics
+            .retained_bytes
+            .saturating_add(additional_commands.saturating_mul(size_of::<SceneCommand>()))
+            .saturating_add(additional_owned_bytes);
+        if retained_bytes > budget.max_retained_bytes {
+            return Err(SceneError::BudgetExceeded {
+                resource: SceneBudgetResource::RetainedBytes,
+                limit: budget.max_retained_bytes,
+                requested: retained_bytes,
+            });
+        }
+        let required_len = self.commands.len().saturating_add(additional_commands);
+        let owned_payload_bytes =
+            scene_owned_payload_bytes(&self.commands).saturating_add(additional_owned_bytes);
+        let capacity = if required_len <= self.commands.capacity() {
+            self.commands.capacity()
+        } else {
+            budgeted_command_capacity(
+                budget,
+                self.commands.capacity(),
+                required_len,
+                owned_payload_bytes,
+            )?
+        };
+        validate_scene_allocation_budget(budget, capacity, owned_payload_bytes)
     }
 
     /// Returns the explicit work budget, or `None` for an unbounded scene.
@@ -520,8 +596,9 @@ impl Scene {
 
     /// Appends a valid command to the default layer.
     ///
-    /// Returns `false` and leaves the scene unchanged when the primitive contains
-    /// non-finite coordinates, invalid dimensions, or no drawable geometry.
+    /// Returns `false` without changing commands, ordering, or retained
+    /// allocation when the primitive is invalid. Requested/rejected diagnostic
+    /// counters still advance for the attempted command.
     pub fn push(&mut self, command: DrawCommand) -> bool {
         self.try_push(command).is_ok()
     }
@@ -535,7 +612,9 @@ impl Scene {
     ///
     /// Lower layer values are drawn first. Commands on the same layer preserve
     /// insertion order.
-    /// Returns `false` and leaves ordering unchanged when `command` is invalid.
+    /// Returns `false` without changing commands, ordering, or retained
+    /// allocation when `command` is invalid. Requested/rejected diagnostic
+    /// counters still advance for the attempted command.
     pub fn push_to_layer(&mut self, layer: Layer, command: DrawCommand) -> bool {
         self.try_push_to_layer(layer, command).is_ok()
     }
@@ -573,6 +652,8 @@ impl Scene {
         let mut attempted = 0usize;
         let mut attempted_by_primitive = PrimitiveCommandCounts::default();
         let mut next_order = self.next_order;
+        let existing_owned_payload_bytes = scene_owned_payload_bytes(&self.commands);
+        let mut staged_owned_payload_bytes = 0usize;
 
         for (layer, command) in commands {
             let primitive = command.primitive();
@@ -599,7 +680,83 @@ impl Scene {
                 self.record_batch_rejection(attempted, attempted_by_primitive);
                 return Err(error);
             }
-            if staged.try_reserve(1).is_err() {
+            let command_owned_payload_bytes = command.owned_allocation_bytes();
+            let prospective_owned_payload_bytes = existing_owned_payload_bytes
+                .saturating_add(staged_owned_payload_bytes)
+                .saturating_add(command_owned_payload_bytes);
+            if let Some(budget) = self.budget {
+                let required_total = self
+                    .commands
+                    .len()
+                    .saturating_add(staged.len())
+                    .saturating_add(1);
+                let final_capacity = if required_total <= self.commands.capacity() {
+                    self.commands.capacity()
+                } else {
+                    match budgeted_command_capacity(
+                        budget,
+                        self.commands.capacity(),
+                        required_total,
+                        prospective_owned_payload_bytes,
+                    ) {
+                        Ok(capacity) => capacity,
+                        Err(error) => {
+                            self.record_batch_rejection(attempted, attempted_by_primitive);
+                            return Err(error);
+                        }
+                    }
+                };
+                if let Err(error) = validate_scene_allocation_budget(
+                    budget,
+                    final_capacity,
+                    prospective_owned_payload_bytes,
+                ) {
+                    self.record_batch_rejection(attempted, attempted_by_primitive);
+                    return Err(error);
+                }
+
+                if staged.len() == staged.capacity() {
+                    let staging_capacity = match budgeted_command_capacity(
+                        budget,
+                        staged.capacity(),
+                        staged.len().saturating_add(1),
+                        prospective_owned_payload_bytes,
+                    ) {
+                        Ok(capacity) => capacity,
+                        Err(error) => {
+                            self.record_batch_rejection(attempted, attempted_by_primitive);
+                            return Err(error);
+                        }
+                    };
+                    let mut replacement = Vec::new();
+                    if replacement.try_reserve_exact(staging_capacity).is_err() {
+                        self.record_batch_rejection(attempted, attempted_by_primitive);
+                        return Err(SceneError::AllocationFailed {
+                            requested_bytes: scene_allocation_bytes(
+                                staging_capacity,
+                                prospective_owned_payload_bytes,
+                            ),
+                        });
+                    }
+                    if let Err(error) = validate_scene_allocation_budget(
+                        budget,
+                        replacement.capacity(),
+                        prospective_owned_payload_bytes,
+                    ) {
+                        self.record_batch_rejection(attempted, attempted_by_primitive);
+                        return Err(error);
+                    }
+                    replacement.append(&mut staged);
+                    staged = replacement;
+                } else if let Err(error) = validate_scene_allocation_budget(
+                    budget,
+                    staged.capacity(),
+                    prospective_owned_payload_bytes,
+                ) {
+                    self.record_batch_rejection(attempted, attempted_by_primitive);
+                    return Err(error);
+                }
+            } else if staged.try_reserve(1).is_err() {
                 self.record_batch_rejection(attempted, attempted_by_primitive);
                 return Err(SceneError::AllocationFailed {
                     requested_bytes: command.retained_bytes(),
@@ -612,6 +769,8 @@ impl Scene {
                 screen_clip: self.current_screen_clip,
                 command,
             });
+            staged_owned_payload_bytes =
+                staged_owned_payload_bytes.saturating_add(command_owned_payload_bytes);
             next_order = next_order.saturating_add(1);
         }
 
@@ -619,17 +778,48 @@ impl Scene {
             return Ok(());
         }
         let total = self.commands.len().saturating_add(staged.len());
-        let mut merged = Vec::new();
-        if merged.try_reserve(total).is_err() {
+        let owned_payload_bytes =
+            existing_owned_payload_bytes.saturating_add(staged_owned_payload_bytes);
+        let requested_capacity = if let Some(budget) = self.budget {
+            if total <= self.commands.capacity() {
+                self.commands.capacity()
+            } else {
+                match budgeted_command_capacity(
+                    budget,
+                    self.commands.capacity(),
+                    total,
+                    owned_payload_bytes,
+                ) {
+                    Ok(capacity) => capacity,
+                    Err(error) => {
+                        self.record_batch_rejection(attempted, attempted_by_primitive);
+                        return Err(error);
+                    }
+                }
+            }
+        } else {
+            total
+        };
+        if staged.capacity() < requested_capacity
+            && staged
+                .try_reserve_exact(requested_capacity.saturating_sub(staged.len()))
+                .is_err()
+        {
             self.record_batch_rejection(attempted, attempted_by_primitive);
             return Err(SceneError::AllocationFailed {
-                requested_bytes: total.saturating_mul(size_of::<SceneCommand>()),
+                requested_bytes: scene_allocation_bytes(requested_capacity, owned_payload_bytes),
             });
         }
-        merged.append(&mut self.commands);
-        merged.append(&mut staged);
-        merged.sort_unstable_by_key(|command| (command.layer, command.order));
-        self.commands = merged;
+        if let Some(budget) = self.budget
+            && let Err(error) =
+                validate_scene_allocation_budget(budget, staged.capacity(), owned_payload_bytes)
+        {
+            self.record_batch_rejection(attempted, attempted_by_primitive);
+            return Err(error);
+        }
+        staged.append(&mut self.commands);
+        staged.sort_unstable_by_key(|command| (command.layer, command.order));
+        self.commands = staged;
         self.next_order = next_order;
         self.statistics = requested;
         Ok(())
@@ -674,16 +864,57 @@ impl Scene {
         }
 
         let command_retained_bytes = command.retained_bytes();
+        let owned_payload_bytes = scene_owned_payload_bytes(&self.commands)
+            .saturating_add(command.owned_allocation_bytes());
         let requested = self.statistics.with_command(&command);
         if let Some(budget) = self.budget {
             validate_scene_budget(budget, requested)?;
         }
 
-        self.commands
-            .try_reserve(1)
-            .map_err(|_| SceneError::AllocationFailed {
-                requested_bytes: command_retained_bytes,
-            })?;
+        let replacement = if self.commands.len() == self.commands.capacity() {
+            if let Some(budget) = self.budget {
+                let required_len = self.commands.len().saturating_add(1);
+                let capacity = budgeted_command_capacity(
+                    budget,
+                    self.commands.capacity(),
+                    required_len,
+                    owned_payload_bytes,
+                )?;
+                let mut replacement = Vec::new();
+                replacement.try_reserve_exact(capacity).map_err(|_| {
+                    SceneError::AllocationFailed {
+                        requested_bytes: scene_allocation_bytes(capacity, owned_payload_bytes),
+                    }
+                })?;
+                validate_scene_allocation_budget(
+                    budget,
+                    replacement.capacity(),
+                    owned_payload_bytes,
+                )?;
+                Some(replacement)
+            } else {
+                self.commands
+                    .try_reserve(1)
+                    .map_err(|_| SceneError::AllocationFailed {
+                        requested_bytes: command_retained_bytes,
+                    })?;
+                None
+            }
+        } else {
+            if let Some(budget) = self.budget {
+                validate_scene_allocation_budget(
+                    budget,
+                    self.commands.capacity(),
+                    owned_payload_bytes,
+                )?;
+            }
+            None
+        };
+
+        if let Some(mut replacement) = replacement {
+            replacement.append(&mut self.commands);
+            self.commands = replacement;
+        }
 
         let order = self.next_order;
         let scene_command = SceneCommand {
@@ -896,8 +1127,9 @@ impl Scene {
 
     /// Appends connected stroked segments through world-space points.
     ///
-    /// `width` is in logical screen pixels. Empty, single-point, fully degenerate, and
-    /// non-finite input returns `false` without adding a command.
+    /// `width` is in logical screen pixels. Empty, single-point, non-finite,
+    /// repeated-adjacent, or numerically reversing input returns `false`
+    /// without adding a command; every consecutive segment must be drawable.
     pub fn polyline(&mut self, points: Vec<Vec2>, width: f32, color: Color) -> bool {
         self.try_polyline(points, width, color).is_ok()
     }
@@ -914,8 +1146,9 @@ impl Scene {
 
     /// Appends connected stroked segments through world-space points to a layer.
     ///
-    /// `width` is in logical screen pixels. Empty, single-point, fully degenerate, and
-    /// non-finite input returns `false` without adding a command.
+    /// `width` is in logical screen pixels. Empty, single-point, non-finite,
+    /// repeated-adjacent, or numerically reversing input returns `false`
+    /// without adding a command; every consecutive segment must be drawable.
     pub fn polyline_on_layer(
         &mut self,
         layer: Layer,
@@ -1242,28 +1475,7 @@ impl DrawCommand {
                 Ok(())
             }
             Self::Polyline(polyline) => {
-                if !polyline.points.iter().all(|point| point.is_finite()) {
-                    return Err(SceneError::NonFiniteGeometry(ScenePrimitive::Polyline));
-                }
-                if polyline
-                    .points
-                    .windows(2)
-                    .any(|pair| !(pair[1] - pair[0]).is_finite())
-                {
-                    return Err(SceneError::NonFiniteGeometry(ScenePrimitive::Polyline));
-                }
-                if polyline.points.len() < 2
-                    || !polyline
-                        .points
-                        .windows(2)
-                        .any(|pair| drawable_segment(pair[0], pair[1]))
-                {
-                    return Err(SceneError::DegenerateGeometry(ScenePrimitive::Polyline));
-                }
-                if !polyline.style.is_valid() {
-                    return Err(SceneError::InvalidStroke(ScenePrimitive::Polyline));
-                }
-                validate_stroke_path(&polyline.points, polyline.style, ScenePrimitive::Polyline)?;
+                validate_styled_polyline(polyline.points.iter().copied(), polyline.style)?;
                 Ok(())
             }
         }
@@ -1277,13 +1489,16 @@ impl DrawCommand {
     }
 
     fn retained_bytes(&self) -> usize {
-        let point_bytes = match self {
+        size_of::<SceneCommand>().saturating_add(self.owned_allocation_bytes())
+    }
+
+    fn owned_allocation_bytes(&self) -> usize {
+        match self {
             Self::Polyline(polyline) => {
                 polyline.points.capacity().saturating_mul(size_of::<Vec2>())
             }
             Self::Circle(_) | Self::Rect(_) | Self::Line(_) => 0,
-        };
-        size_of::<SceneCommand>().saturating_add(point_bytes)
+        }
     }
 
     fn estimated_tessellated_vertices(&self) -> usize {
@@ -1330,15 +1545,96 @@ fn validate_stroke_path(
     style: StrokeStyle2d,
     primitive: ScenePrimitive,
 ) -> Result<(), SceneError> {
-    if points
-        .windows(2)
-        .any(|pair| !drawable_segment(pair[0], pair[1]))
-    {
+    validate_stroke_path_iter(points.iter().copied(), style, primitive)
+}
+
+fn validate_stroke_path_iter<I>(
+    points: I,
+    style: StrokeStyle2d,
+    primitive: ScenePrimitive,
+) -> Result<(), SceneError>
+where
+    I: Iterator<Item = Vec2> + Clone,
+{
+    let maximum_offset = f64::from(style.stroke.width) * 0.5 * f64::from(style.miter_limit);
+    if !maximum_offset.is_finite() || maximum_offset > f64::from(f32::MAX) {
+        return Err(SceneError::InvalidStroke(primitive));
+    }
+    if style.width_mode == StrokeWidthMode2d::WorldUnits {
+        let extent = Vec2::splat(maximum_offset as f32);
+        if points
+            .clone()
+            .any(|point| !(point + extent).is_finite() || !(point - extent).is_finite())
+        {
+            return Err(SceneError::NonFiniteGeometry(primitive));
+        }
+    }
+    if let Some(dash) = style.dash {
+        let required = dash_subsegment_count_iter(points, dash, Some(dash.max_subsegments))
+            .ok_or(SceneError::UnrepresentableStrokePattern(primitive))?;
+        if required > dash.max_subsegments {
+            return Err(SceneError::StrokeExpansionLimitExceeded {
+                primitive,
+                limit: dash.max_subsegments,
+                required,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Validates caller-owned polyline coordinates without allocating or copying them.
+///
+/// Screen-space adapters use this before reserving their converted point buffer,
+/// so an invalid leading point or segment cannot force work proportional to the
+/// rest of a caller-sized slice.
+pub(crate) fn validate_polyline_geometry<I>(points: I) -> Result<(), SceneError>
+where
+    I: Iterator<Item = Vec2> + Clone,
+{
+    let primitive = ScenePrimitive::Polyline;
+    if !points.clone().all(|point| point.is_finite()) {
+        return Err(SceneError::NonFiniteGeometry(primitive));
+    }
+
+    let mut deltas = points.clone();
+    let Some(mut previous) = deltas.next() else {
+        return Err(SceneError::DegenerateGeometry(primitive));
+    };
+    let mut segment_count = 0usize;
+    for point in deltas {
+        let delta = point - previous;
+        if !delta.is_finite() {
+            return Err(SceneError::NonFiniteGeometry(primitive));
+        }
+        previous = point;
+        segment_count = segment_count.saturating_add(1);
+    }
+    if segment_count == 0 {
         return Err(SceneError::DegenerateGeometry(primitive));
     }
-    for (index, window) in points.windows(3).enumerate() {
-        let incoming = window[1] - window[0];
-        let outgoing = window[2] - window[1];
+
+    let mut segments = points.clone();
+    let mut previous = segments
+        .next()
+        .expect("a non-empty path was established above");
+    for point in segments {
+        if !drawable_segment(previous, point) {
+            return Err(SceneError::DegenerateGeometry(primitive));
+        }
+        previous = point;
+    }
+
+    let mut turns = points;
+    let mut first = turns
+        .next()
+        .expect("a drawable segment was established above");
+    let mut second = turns
+        .next()
+        .expect("a drawable segment was established above");
+    for (index, third) in turns.enumerate() {
+        let incoming = second - first;
+        let outgoing = third - second;
         let cross = f64::from(incoming.x) * f64::from(outgoing.y)
             - f64::from(incoming.y) * f64::from(outgoing.x);
         let dot = f64::from(incoming.x) * f64::from(outgoing.x)
@@ -1352,32 +1648,22 @@ fn validate_stroke_path(
                 vertex_index: index + 1,
             });
         }
-    }
-    let maximum_offset = f64::from(style.stroke.width) * 0.5 * f64::from(style.miter_limit);
-    if !maximum_offset.is_finite() || maximum_offset > f64::from(f32::MAX) {
-        return Err(SceneError::InvalidStroke(primitive));
-    }
-    if style.width_mode == StrokeWidthMode2d::WorldUnits {
-        let extent = Vec2::splat(maximum_offset as f32);
-        if points
-            .iter()
-            .any(|point| !(*point + extent).is_finite() || !(*point - extent).is_finite())
-        {
-            return Err(SceneError::NonFiniteGeometry(primitive));
-        }
-    }
-    if let Some(dash) = style.dash {
-        let required = dash_subsegment_count(points, dash, Some(dash.max_subsegments))
-            .ok_or(SceneError::UnrepresentableStrokePattern(primitive))?;
-        if required > dash.max_subsegments {
-            return Err(SceneError::StrokeExpansionLimitExceeded {
-                primitive,
-                limit: dash.max_subsegments,
-                required,
-            });
-        }
+        first = second;
+        second = third;
     }
     Ok(())
+}
+
+/// Validates a complete styled polyline without taking ownership of its points.
+pub(crate) fn validate_styled_polyline<I>(points: I, style: StrokeStyle2d) -> Result<(), SceneError>
+where
+    I: Iterator<Item = Vec2> + Clone,
+{
+    validate_polyline_geometry(points.clone())?;
+    if !style.is_valid() {
+        return Err(SceneError::InvalidStroke(ScenePrimitive::Polyline));
+    }
+    validate_stroke_path_iter(points, style, ScenePrimitive::Polyline)
 }
 
 fn estimate_stroke_vertices(points: &[Vec2], style: StrokeStyle2d) -> usize {
@@ -1429,6 +1715,17 @@ fn dash_subsegment_count(
     dash: StrokeDashPattern2d,
     stop_after: Option<usize>,
 ) -> Option<usize> {
+    dash_subsegment_count_iter(points.iter().copied(), dash, stop_after)
+}
+
+fn dash_subsegment_count_iter<I>(
+    points: I,
+    dash: StrokeDashPattern2d,
+    stop_after: Option<usize>,
+) -> Option<usize>
+where
+    I: Iterator<Item = Vec2>,
+{
     let lengths = dash.lengths();
     let total: f64 = lengths.iter().map(|length| f64::from(*length)).sum();
     let mut phase = f64::from(dash.phase).rem_euclid(total);
@@ -1440,8 +1737,10 @@ fn dash_subsegment_count(
     let mut pattern_remaining = f64::from(lengths[pattern_index]) - phase;
     let mut count = 0usize;
 
-    for pair in points.windows(2) {
-        let delta = pair[1] - pair[0];
+    let mut points = points;
+    let mut previous = points.next()?;
+    for point in points {
+        let delta = point - previous;
         let segment_length = f64::from(delta.x).hypot(f64::from(delta.y));
         let mut segment_remaining = segment_length;
         while segment_remaining > 0.0 {
@@ -1458,8 +1757,8 @@ fn dash_subsegment_count(
             }
             let amount_start = 1.0 - segment_remaining / segment_length;
             let amount_end = 1.0 - next_remaining / segment_length;
-            if dash_segment_point(pair[0], pair[1], amount_start)
-                == dash_segment_point(pair[0], pair[1], amount_end)
+            if dash_segment_point(previous, point, amount_start)
+                == dash_segment_point(previous, point, amount_end)
             {
                 return None;
             }
@@ -1470,6 +1769,7 @@ fn dash_subsegment_count(
                 pattern_remaining = f64::from(lengths[pattern_index]);
             }
         }
+        previous = point;
     }
     Some(count)
 }
@@ -1506,6 +1806,8 @@ fn validate_scene_budget(
             budget.max_retained_bytes,
             requested.retained_bytes,
         ),
+        // Actual allocation capacity is validated transactionally at the
+        // insertion boundary, once the prospective Vec capacity is known.
         (
             SceneBudgetResource::UploadBytes,
             budget.max_upload_bytes,
@@ -1527,6 +1829,59 @@ fn validate_scene_budget(
         }
     }
     Ok(())
+}
+
+fn scene_owned_payload_bytes(commands: &[SceneCommand]) -> usize {
+    commands
+        .iter()
+        .map(|command| command.command.owned_allocation_bytes())
+        .fold(0usize, usize::saturating_add)
+}
+
+fn scene_allocation_bytes(command_capacity: usize, owned_payload_bytes: usize) -> usize {
+    command_capacity
+        .saturating_mul(size_of::<SceneCommand>())
+        .saturating_add(owned_payload_bytes)
+}
+
+fn validate_scene_allocation_budget(
+    budget: SceneBudget,
+    command_capacity: usize,
+    owned_payload_bytes: usize,
+) -> Result<(), SceneError> {
+    let requested = scene_allocation_bytes(command_capacity, owned_payload_bytes);
+    if requested > budget.max_allocation_bytes {
+        return Err(SceneError::BudgetExceeded {
+            resource: SceneBudgetResource::AllocationBytes,
+            limit: budget.max_allocation_bytes,
+            requested,
+        });
+    }
+    Ok(())
+}
+
+fn budgeted_command_capacity(
+    budget: SceneBudget,
+    current_capacity: usize,
+    required_len: usize,
+    owned_payload_bytes: usize,
+) -> Result<usize, SceneError> {
+    let available = budget
+        .max_allocation_bytes
+        .saturating_sub(owned_payload_bytes);
+    let maximum_capacity = available / size_of::<SceneCommand>();
+    if required_len > maximum_capacity {
+        return Err(SceneError::BudgetExceeded {
+            resource: SceneBudgetResource::AllocationBytes,
+            limit: budget.max_allocation_bytes,
+            requested: scene_allocation_bytes(required_len, owned_payload_bytes),
+        });
+    }
+    Ok(current_capacity
+        .max(1)
+        .saturating_mul(2)
+        .max(required_len)
+        .min(maximum_capacity))
 }
 
 fn drawable_segment(from: Vec2, to: Vec2) -> bool {
@@ -2306,8 +2661,8 @@ mod tests {
     use crate::{
         Color, DrawCommand, Fill, Layer, LinearGradient, LogicalScreenPosition,
         LogicalScreenVector, RadialGradient, Rect, Scene, SceneBudget, SceneBudgetResource,
-        SceneError, ScenePrimitive, ScreenClipRect, ShapeStyle, StrokeCap2d, StrokeDashPattern2d,
-        StrokeJoin2d, StrokeMarker2d, StrokeStyle2d, StrokeStyleError, Vec2,
+        SceneCommand, SceneError, ScenePrimitive, ScreenClipRect, ShapeStyle, StrokeCap2d,
+        StrokeDashPattern2d, StrokeJoin2d, StrokeMarker2d, StrokeStyle2d, StrokeStyleError, Vec2,
     };
     use crate::{LogicalPixels, WorldLength};
 
@@ -2326,6 +2681,7 @@ mod tests {
             points,
             vertices,
             retained_bytes,
+            UNLIMITED,
             upload_bytes,
             batches,
         )
@@ -2501,6 +2857,84 @@ mod tests {
         assert_eq!(scene.budget(), Some(budget));
         assert_eq!(scene.statistics(), Default::default());
         assert_eq!(scene.command_count(), 0);
+    }
+
+    #[test]
+    fn scene_allocation_budget_bounds_spare_command_capacity_atomically() {
+        let command_bytes = size_of::<SceneCommand>();
+        let too_small = SceneBudget::new(
+            1,
+            UNLIMITED,
+            UNLIMITED,
+            command_bytes,
+            command_bytes - 1,
+            UNLIMITED,
+            UNLIMITED,
+        );
+        let mut rejected = Scene::with_budget(Color::BLACK, too_small).unwrap();
+        let error = rejected
+            .try_circle(Vec2::ZERO, 1.0, ShapeStyle::filled(Color::WHITE))
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            SceneError::BudgetExceeded {
+                resource: SceneBudgetResource::AllocationBytes,
+                limit,
+                requested,
+            } if limit == command_bytes - 1 && requested >= command_bytes
+        ));
+        assert_eq!(rejected.command_count(), 0);
+        assert_eq!(rejected.allocation_bytes(), 0);
+
+        let bounded = SceneBudget::new(
+            4,
+            UNLIMITED,
+            UNLIMITED,
+            4 * command_bytes,
+            4 * command_bytes,
+            UNLIMITED,
+            UNLIMITED,
+        );
+        let mut scene = Scene::with_budget(Color::BLACK, bounded).unwrap();
+        scene
+            .try_circle(Vec2::ZERO, 1.0, ShapeStyle::filled(Color::WHITE))
+            .unwrap();
+        assert!(scene.allocation_bytes() <= bounded.max_allocation_bytes());
+        scene.clear();
+        assert!(scene.allocation_bytes() <= bounded.max_allocation_bytes());
+    }
+
+    #[test]
+    fn batch_allocation_budget_rejects_before_consuming_unbounded_input() {
+        let budget = SceneBudget::new(
+            usize::MAX,
+            UNLIMITED,
+            UNLIMITED,
+            UNLIMITED,
+            1,
+            UNLIMITED,
+            UNLIMITED,
+        );
+        let mut scene = Scene::with_budget(Color::BLACK, budget).unwrap();
+        let consumed = std::cell::Cell::new(0usize);
+        let command =
+            DrawCommand::circle(Vec2::ZERO, 1.0, ShapeStyle::filled(Color::WHITE)).unwrap();
+        let commands = std::iter::from_fn(|| {
+            consumed.set(consumed.get().saturating_add(1));
+            Some((Layer::DEFAULT, command.clone()))
+        });
+
+        assert!(matches!(
+            scene.try_extend_to_layers(commands),
+            Err(SceneError::BudgetExceeded {
+                resource: SceneBudgetResource::AllocationBytes,
+                limit: 1,
+                ..
+            })
+        ));
+        assert_eq!(consumed.get(), 1);
+        assert_eq!(scene.command_count(), 0);
+        assert_eq!(scene.allocation_bytes(), 0);
     }
 
     #[test]
@@ -2896,6 +3330,27 @@ mod tests {
 
         assert_eq!(scene.commands()[0].depth(), 4.0);
         assert_eq!(scene.commands()[1].depth(), 0.0);
+    }
+
+    #[test]
+    fn allocation_bytes_preserve_spare_command_capacity_after_clear() {
+        let mut scene = Scene::new(Color::BLACK).unwrap();
+        scene
+            .try_polyline(
+                vec![Vec2::ZERO, Vec2::X, Vec2::new(1.0, 1.0)],
+                1.0,
+                Color::WHITE,
+            )
+            .unwrap();
+        let allocated = scene.allocation_bytes();
+        assert!(allocated >= size_of::<SceneCommand>() + 3 * size_of::<Vec2>());
+        scene.clear();
+        assert_eq!(scene.statistics().retained_bytes(), 0);
+        assert_eq!(
+            scene.allocation_bytes(),
+            scene.commands.capacity() * size_of::<SceneCommand>()
+        );
+        assert!(scene.allocation_bytes() > 0);
     }
 
     #[test]

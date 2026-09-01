@@ -101,10 +101,9 @@ fn clip_edge_to_frustum(start_clip: vec4<f32>, end_clip: vec4<f32>) -> ClippedEd
     let start_max = max(max(abs(start_clip.x), abs(start_clip.y)), max(abs(start_clip.z), abs(start_clip.w)));
     let end_max = max(max(abs(end_clip.x), abs(end_clip.y)), max(abs(end_clip.z), abs(end_clip.w)));
     let pair_max = max(start_max, end_max);
-    // Keep the common homogeneous scale normal. Some Vulkan implementations
-    // flush subnormal reciprocals of f32::MAX to zero, which would erase the
-    // segment even though uniform homogeneous scaling is valid.
-    let homogeneous_scale = max(1.0 / max(pair_max, 1.0), 1.17549435e-38);
+    // CPU validation caps clip components at 2^120, inside WGSL's specified
+    // division-accuracy domain, so this reciprocal stays normal and portable.
+    let homogeneous_scale = 1.0 / max(pair_max, 1.0);
     let normalized_start = start_clip * homogeneous_scale;
     let normalized_end = end_clip * homogeneous_scale;
     let start_distances = array<f32, 6>(

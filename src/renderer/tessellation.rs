@@ -1270,13 +1270,16 @@ fn rounded_rect_points(
         .min(rect.height().abs() * 0.5);
 
     if radius <= 0.0 {
-        return Ok(vec![
+        let mut points = Vec::new();
+        reserve_items(&mut points, 5)?;
+        points.extend([
             WorldPoint::absolute(Vec2::new(rect.max.x, rect.min.y)),
             WorldPoint::absolute(Vec2::new(rect.max.x, rect.max.y)),
             WorldPoint::absolute(Vec2::new(rect.min.x, rect.max.y)),
             WorldPoint::absolute(Vec2::new(rect.min.x, rect.min.y)),
             WorldPoint::absolute(Vec2::new(rect.max.x, rect.min.y)),
         ]);
+        return Ok(points);
     }
 
     // Keep each exact rectangle corner as a base and carry the rounded arc as
