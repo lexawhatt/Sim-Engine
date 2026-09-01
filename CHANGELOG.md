@@ -115,6 +115,13 @@ composed frames, fixed-screen UI, retained images, and host-shaped text.
 - Camera-row validation now bounds every WGSL dot-product term and every
   permitted accumulation order. Extreme finite world/depth cancellation can
   no longer hide an overflowing `f32` product and reach the GPU as `Inf`/`NaN`.
+- Particle projection applies the same association-independent camera-row
+  envelope before a visible instance can reach the GPU.
+- Retained 3D model and camera dot products now reject every backend-dependent
+  overflowing association, even when the CPU's left fold remains finite.
+- Retained 3D edge validation mirrors the complete post-projection shader
+  arithmetic, including doubled raster width, logical-distance and dash phase,
+  NDC extrusion, homogeneous scaling, and the final clip-coordinate addition.
 - Streaming composition returns its reusable transient vertex allocation to
   the renderer on every structured error path, preserving steady-state memory
   behavior after a rejected frame.

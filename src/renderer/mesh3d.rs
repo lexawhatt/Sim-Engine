@@ -1477,13 +1477,19 @@ fn validate_edge_projection(
 ) -> Result<(), Mesh3dRenderError> {
     let pixels_per_logical = PhysicalPerLogical::new(viewport[2])
         .map_err(|_| Mesh3dRenderError::InvalidEdgeProjection)?;
-    if edge_physical_half_width(style.visible_width(), pixels_per_logical).is_none() {
-        return Err(Mesh3dRenderError::InvalidEdgeProjection);
-    }
-    if let (Some(hidden_width), Some((dash, gap))) = (style.hidden_width(), style.hidden_pattern())
-        && (edge_physical_half_width(hidden_width, pixels_per_logical).is_none()
-            || !(dash.get() + gap.get()).is_finite())
-    {
+    let visible_raster = edge_raster_envelope(style.visible_width(), pixels_per_logical)
+        .ok_or(Mesh3dRenderError::InvalidEdgeProjection)?;
+    let hidden_raster = match style.hidden_width() {
+        Some(width) => Some(
+            edge_raster_envelope(width, pixels_per_logical)
+                .ok_or(Mesh3dRenderError::InvalidEdgeProjection)?,
+        ),
+        None => None,
+    };
+    let hidden_period = style
+        .hidden_pattern()
+        .map(|(dash, gap)| dash.get() + gap.get());
+    if hidden_period.is_some_and(|period| !period.is_finite()) {
         return Err(Mesh3dRenderError::InvalidEdgeProjection);
     }
 
@@ -1527,6 +1533,17 @@ fn validate_edge_projection(
             || !(delta_x * delta_x + delta_y * delta_y).is_finite()
         {
             return Err(Mesh3dRenderError::InvalidEdgeProjection);
+        }
+        let screen_length = (delta_x * delta_x + delta_y * delta_y).sqrt();
+        validate_edge_shader_arithmetic(clipped, screen_length, viewport, visible_raster, None)?;
+        if let Some(hidden_raster) = hidden_raster {
+            validate_edge_shader_arithmetic(
+                clipped,
+                screen_length,
+                viewport,
+                hidden_raster,
+                hidden_period,
+            )?;
         }
     }
     Ok(())
@@ -1639,15 +1656,85 @@ fn shader_lerp_clip(
     Ok(output)
 }
 
-fn edge_physical_half_width(
+#[derive(Debug, Clone, Copy)]
+struct EdgeRasterEnvelope {
+    physical_half_width: f32,
+    raster_half_width: f32,
+}
+
+fn edge_raster_envelope(
     logical_width: LogicalPixels,
     pixels_per_logical: PhysicalPerLogical,
-) -> Option<f32> {
-    let width = logical_width.get() * pixels_per_logical.get() * 0.5;
-    (width.is_finite() && width > 0.0).then_some(width)
+) -> Option<EdgeRasterEnvelope> {
+    let physical_half_width = logical_width.get() * pixels_per_logical.get() * 0.5;
+    let raster_half_width = (physical_half_width + 0.5).max(1.0);
+    let doubled_raster_width = raster_half_width * 2.0;
+    (physical_half_width.is_finite()
+        && physical_half_width > 0.0
+        && raster_half_width.is_finite()
+        && doubled_raster_width.is_finite())
+    .then_some(EdgeRasterEnvelope {
+        physical_half_width,
+        raster_half_width,
+    })
+}
+
+fn validate_edge_shader_arithmetic(
+    clipped: [[f32; 4]; 2],
+    screen_length: f32,
+    viewport: [f32; 4],
+    raster: EdgeRasterEnvelope,
+    dash_period: Option<f32>,
+) -> Result<(), Mesh3dRenderError> {
+    let logical_distance = screen_length / viewport[2];
+    if !logical_distance.is_finite()
+        || !(raster.physical_half_width + 0.5).is_finite()
+        || !(raster.raster_half_width * 2.0).is_finite()
+    {
+        return Err(Mesh3dRenderError::InvalidEdgeProjection);
+    }
+    if let Some(period) = dash_period {
+        let repetition = logical_distance / period;
+        let repeated_distance = repetition.floor() * period;
+        let within_period = logical_distance - repeated_distance;
+        if !period.is_finite()
+            || period <= 0.0
+            || !repetition.is_finite()
+            || !repeated_distance.is_finite()
+            || !within_period.is_finite()
+        {
+            return Err(Mesh3dRenderError::InvalidEdgeProjection);
+        }
+    }
+
+    let dimensions = [viewport[0].max(1.0), viewport[1].max(1.0)];
+    let doubled_raster_width = raster.raster_half_width * 2.0;
+    for axis in 0..2 {
+        let ndc_offset_max_abs = doubled_raster_width / dimensions[axis];
+        if !ndc_offset_max_abs.is_finite() {
+            return Err(Mesh3dRenderError::InvalidEdgeProjection);
+        }
+        for endpoint in clipped {
+            let clip_offset_max_abs = ndc_offset_max_abs * endpoint[3].abs();
+            if !clip_offset_max_abs.is_finite()
+                || !(endpoint[axis] + clip_offset_max_abs).is_finite()
+                || !(endpoint[axis] - clip_offset_max_abs).is_finite()
+            {
+                return Err(Mesh3dRenderError::InvalidEdgeProjection);
+            }
+        }
+    }
+    Ok(())
 }
 
 fn shader_dot(row: [f32; 4], point: [f32; 4]) -> Result<f32, Mesh3dRenderError> {
+    let terms: [(f64, f64); 4] = std::array::from_fn(|axis| {
+        let product = f64::from(row[axis]) * f64::from(point[axis]);
+        (product, product)
+    });
+    if !shader_interval_sum_is_safe(terms) {
+        return Err(Mesh3dRenderError::InvalidGeometryTransform);
+    }
     let mut result = 0.0_f32;
     for axis in 0..4 {
         let product = row[axis] * point[axis];
@@ -2561,6 +2648,163 @@ mod tests {
     }
 
     #[test]
+    fn shader_transform_rejects_pairwise_dot_overflow_after_finite_cpu_transform() {
+        let maximum = f32::MAX;
+        let angle = 0.5_f32.acos();
+        let model_x = -0.2 * maximum;
+        let model_z = (0.51 * maximum) / angle.sin();
+        let mesh = Mesh3d::with_display_edges(
+            vec![
+                Vec3::new(model_x, -1.0e30, model_z).unwrap(),
+                Vec3::new(model_x, 1.0e30, model_z).unwrap(),
+            ],
+            Vec::new(),
+            vec![MeshEdge3d::new(0, 1).unwrap()],
+        )
+        .unwrap();
+        let transform = Transform3d::new(
+            Vec3::new(0.51 * maximum, 0.0, 0.0).unwrap(),
+            Rotation3d::from_axis_angle(Vec3::Y, angle).unwrap(),
+            Vec3::new(1.0, 1.0, 1.0).unwrap(),
+        )
+        .unwrap();
+        let model_center = Vec3::new(model_x, 0.0, model_z).unwrap();
+        let world_center = transform.transform_point(model_center).unwrap();
+        assert!(
+            world_center.x().is_finite()
+                && world_center.y().is_finite()
+                && world_center.z().is_finite()
+        );
+
+        let camera = Camera3d::look_at(
+            Vec3::new(
+                world_center.x(),
+                world_center.y(),
+                world_center.z() - 1.0e32,
+            )
+            .unwrap(),
+            world_center,
+            Vec3::Y,
+            Projection3d::perspective(2.8, 1.0, world(1.0e30), world(1.0e34)).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            camera
+                .project_world(world_center, LogicalViewport::new(64.0, 64.0).unwrap())
+                .unwrap()
+                .inside_view()
+        );
+        assert_eq!(
+            validate_shader_transform(
+                &mesh,
+                transform.model_rows().unwrap(),
+                camera.world_to_clip_rows().unwrap(),
+            ),
+            Err(Mesh3dRenderError::InvalidGeometryTransform)
+        );
+    }
+
+    #[test]
+    fn edge_projection_rejects_post_width_shader_overflow() {
+        let mesh = Mesh3d::with_display_edges(
+            vec![
+                Vec3::new(-0.5, 0.0, 0.0).unwrap(),
+                Vec3::new(0.5, 0.0, 0.0).unwrap(),
+            ],
+            Vec::new(),
+            vec![MeshEdge3d::new(0, 1).unwrap()],
+        )
+        .unwrap();
+        let style = WireframeStyle3d::visible(Color::WHITE, logical(1_048_576.0)).unwrap();
+        let camera = Camera3d::look_at(
+            Vec3::new(0.0, 0.0, 2.0).unwrap(),
+            Vec3::ZERO,
+            Vec3::Y,
+            Projection3d::orthographic(world(2.0), 1.0, world(0.1), world(10.0)).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            validate_edge_projection(
+                &mesh,
+                Transform3d::IDENTITY.model_rows().unwrap(),
+                camera.world_to_clip_rows().unwrap(),
+                style,
+                [1.0, 1.0, 5.0e32, 0.0],
+            ),
+            Err(Mesh3dRenderError::InvalidEdgeProjection)
+        );
+    }
+
+    #[test]
+    fn edge_projection_rejects_logical_distance_overflow() {
+        let mesh = Mesh3d::with_display_edges(
+            vec![
+                Vec3::new(-0.5, 0.0, 0.0).unwrap(),
+                Vec3::new(0.5, 0.0, 0.0).unwrap(),
+            ],
+            Vec::new(),
+            vec![MeshEdge3d::new(0, 1).unwrap()],
+        )
+        .unwrap();
+        let style = WireframeStyle3d::visible(Color::WHITE, logical(1_048_576.0)).unwrap();
+        let camera = Camera3d::look_at(
+            Vec3::new(0.0, 0.0, 2.0).unwrap(),
+            Vec3::ZERO,
+            Vec3::Y,
+            Projection3d::orthographic(world(2.0), 1.0, world(0.1), world(10.0)).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            validate_edge_projection(
+                &mesh,
+                Transform3d::IDENTITY.model_rows().unwrap(),
+                camera.world_to_clip_rows().unwrap(),
+                style,
+                [1_024.0, 1_024.0, f32::MIN_POSITIVE, 0.0],
+            ),
+            Err(Mesh3dRenderError::InvalidEdgeProjection)
+        );
+    }
+
+    #[test]
+    fn edge_projection_rejects_hidden_dash_phase_overflow() {
+        let mesh = Mesh3d::with_display_edges(
+            vec![
+                Vec3::new(-0.5, 0.0, 0.0).unwrap(),
+                Vec3::new(0.5, 0.0, 0.0).unwrap(),
+            ],
+            Vec::new(),
+            vec![MeshEdge3d::new(0, 1).unwrap()],
+        )
+        .unwrap();
+        let smallest = logical(f32::MIN_POSITIVE);
+        let style = WireframeStyle3d::visible(Color::WHITE, logical(1.0))
+            .unwrap()
+            .with_hidden(Color::WHITE, logical(1.0), smallest, smallest)
+            .unwrap();
+        let camera = Camera3d::look_at(
+            Vec3::new(0.0, 0.0, 2.0).unwrap(),
+            Vec3::ZERO,
+            Vec3::Y,
+            Projection3d::orthographic(world(2.0), 1.0, world(0.1), world(10.0)).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            validate_edge_projection(
+                &mesh,
+                Transform3d::IDENTITY.model_rows().unwrap(),
+                camera.world_to_clip_rows().unwrap(),
+                style,
+                [1_024.0, 1_024.0, 1.0, 0.0],
+            ),
+            Err(Mesh3dRenderError::InvalidEdgeProjection)
+        );
+    }
+
+    #[test]
     fn scene3d_rejects_out_of_range_clear_colors() {
         assert!(matches!(
             Scene3d::new(Color::rgb(1.01, 0.0, 0.0)),
@@ -2688,8 +2932,10 @@ mod tests {
     fn logical_edge_width_is_equal_for_native_and_half_resolution_target() {
         let logical_width = logical(1.0);
         for pixels_per_logical in [physical_per_logical(2.0), physical_per_logical(0.5)] {
-            let physical_width =
-                edge_physical_half_width(logical_width, pixels_per_logical).unwrap() * 2.0;
+            let physical_width = edge_raster_envelope(logical_width, pixels_per_logical)
+                .unwrap()
+                .physical_half_width
+                * 2.0;
             assert_eq!(
                 physical_width / pixels_per_logical.get(),
                 logical_width.get()

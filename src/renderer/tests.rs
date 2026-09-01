@@ -180,6 +180,25 @@ fn particle_safety_includes_radius_in_final_clip_arithmetic() {
 }
 
 #[test]
+fn visible_particle_rejects_backend_dependent_dot_overflow() {
+    let viewport = LogicalViewport::new(f32::MAX, f32::MAX).unwrap();
+    let mut camera = Camera2d::new(Vec2::ZERO, 3.830_149e16).unwrap();
+    camera.set_rotation(1.378_629).unwrap();
+    camera.set_projection(crate::Projection2d::new(-0.124_491_87, -1.0).unwrap());
+    let uniform = CameraUniform::new(camera, viewport).unwrap();
+    let particle = ParticleGpu {
+        world_position: [4.914_133_7e21, 5.089_416e21],
+        depth: -7.576_658e22,
+        radius: 1.0,
+        color: Color::WHITE.to_array(),
+    };
+
+    assert!(particle.screen_position(uniform).is_finite());
+    assert!(particle.intersects_viewport(uniform, viewport));
+    assert!(!particle.is_safe_for(uniform));
+}
+
+#[test]
 fn particle_partial_updates_require_an_existing_contiguous_range() {
     assert_eq!(particle_update_range(2, 3, 5), Ok(2..5));
     assert_eq!(particle_update_range(5, 0, 5), Ok(5..5));
@@ -1294,6 +1313,20 @@ fn geometry_extents_reject_dot_product_overflow_hidden_by_cancellation() {
     // WGSL evaluates each dot-product term in f32. Both camera rows contain
     // products above f32::MAX even though their mathematical sums cancel.
     assert!(!GeometryExtents::from_vertices(&vertices).is_safe_for(uniform));
+}
+
+#[test]
+fn shader_dot_envelope_allows_safe_opposing_terms() {
+    assert!(shader_interval_sum_is_safe([
+        (-1.47e38, -1.47e38),
+        (0.83e38, 0.83e38),
+        (1.70e38, 1.70e38),
+    ]));
+    assert!(!shader_interval_sum_is_safe([
+        (2.0e38, 2.0e38),
+        (-2.0e38, -2.0e38),
+        (2.0e38, 2.0e38),
+    ]));
 }
 
 #[test]

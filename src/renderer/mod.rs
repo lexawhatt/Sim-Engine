@@ -394,6 +394,20 @@ impl ParticleGpu {
     fn is_safe_for(self, camera: CameraUniform) -> bool {
         let relative_x = self.world_position[0] - camera.camera_center[0];
         let relative_y = self.world_position[1] - camera.camera_center[1];
+        let relative = [relative_x, relative_y];
+        let dot_products_are_safe = shader_world_dot_is_safe(
+            camera.world_to_screen_x,
+            relative,
+            relative,
+            self.depth,
+            self.depth,
+        ) && shader_world_dot_is_safe(
+            camera.world_to_screen_y,
+            relative,
+            relative,
+            self.depth,
+            self.depth,
+        );
         let screen = self.screen_position(camera);
         let screen_x = screen.x;
         let screen_y = screen.y;
@@ -405,6 +419,7 @@ impl ParticleGpu {
         let screen_max_y = screen_y + self.radius;
         relative_x.is_finite()
             && relative_y.is_finite()
+            && dot_products_are_safe
             && screen_x.is_finite()
             && screen_y.is_finite()
             && (screen_x + self.radius).is_finite()
@@ -825,18 +840,25 @@ fn shader_direction_dot_is_safe(row: [f32; 4], minimum: Vec2, maximum: Vec2) -> 
 
 fn shader_interval_sum_is_safe<const N: usize>(terms: [(f64, f64); N]) -> bool {
     // WGSL's `dot` may be lowered with a backend-selected association or FMA
-    // pattern. Requiring every product and the sum of their maximum magnitudes
-    // to fit in f32 keeps all permitted evaluation orders finite. Merely
-    // checking the final f64 cancellation would allow `-Inf + Inf` on the GPU.
+    // pattern. Requiring every product and every same-sign partial sum to fit
+    // in f32 keeps all permitted evaluation orders finite. Positive and
+    // negative envelopes are accumulated separately so a safe cancellation is
+    // not rejected merely because its total absolute magnitude exceeds f32.
+    // Checking only the final f64 result would allow `-Inf + Inf` on the GPU.
     let maximum = f64::from(f32::MAX);
-    let mut maximum_sum = 0.0;
+    let mut positive_sum = 0.0;
+    let mut negative_sum = 0.0;
     for term in terms {
-        let magnitude = interval_max_abs(term);
-        if !magnitude.is_finite() || magnitude > maximum {
+        if !term.0.is_finite() || !term.1.is_finite() || term.0 < -maximum || term.1 > maximum {
             return false;
         }
-        maximum_sum += magnitude;
-        if !maximum_sum.is_finite() || maximum_sum > maximum {
+        positive_sum += term.1.max(0.0);
+        negative_sum += term.0.min(0.0);
+        if !positive_sum.is_finite()
+            || positive_sum > maximum
+            || !negative_sum.is_finite()
+            || negative_sum < -maximum
+        {
             return false;
         }
     }

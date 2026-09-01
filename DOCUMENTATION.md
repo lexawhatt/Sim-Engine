@@ -846,7 +846,13 @@ keeps edge width stable for native, downsampled, and supersampled targets.
 Display-edge segments are homogeneously clipped against all six frustum planes
 before shader perspective division and screen-space expansion. A partially
 visible edge is shortened; a fully clipped edge emits no fragments without
-rejecting the rest of the frame.
+rejecting the rest of the frame. Before submission, model and camera dot
+products are bounded independently of backend association/FMA choices. The
+edge validator then mirrors the remaining shader order through physical-width
+expansion, logical-distance and dash-phase calculation, NDC extrusion,
+homogeneous scaling, and final clip-coordinate addition. Any overflow is
+reported as `InvalidGeometryTransform` or `InvalidEdgeProjection`; it is never
+submitted as non-finite clip geometry.
 
 Current 3D scope is deliberately focused: opaque surfaces, retained transforms,
 hardware depth, solid visible edges, and dashed hidden edges. Translucent or
@@ -1136,7 +1142,9 @@ model point
 
 The 3D convention is right-handed with positive Y up. Cameras look along local
 negative Z; exposed view depth is positive distance forward. Large finite
-vector operations use wider intermediates before checked `f32` output.
+vector operations use wider intermediates before checked `f32` output. GPU
+model/view/projection dot products additionally bound every same-sign partial
+sum, so no legal shader association can overflow behind a finite CPU result.
 
 ### 21. Color and alpha model
 
