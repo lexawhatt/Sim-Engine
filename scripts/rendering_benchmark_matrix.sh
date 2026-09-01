@@ -26,7 +26,9 @@ if [ "${SIM_ENGINE_MATRIX_COMPOSITOR:-0}" != 1 ]; then
             exit 1
         fi
     done
-    compositor_root=$(mktemp -d "$output_dir/.matrix-compositor.XXXXXX")
+    # Keep the runtime path short enough for Wayland's 108-byte Unix socket
+    # limit even when the release evidence path itself is deeply nested.
+    compositor_root=$(mktemp -d)
     cleanup_compositor() {
         rm -rf -- "$compositor_root"
     }
