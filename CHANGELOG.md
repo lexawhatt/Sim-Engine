@@ -112,6 +112,9 @@ composed frames, fixed-screen UI, retained images, and host-shaped text.
   commands and rejects both pre-transform relative-coordinate overflow and
   final screen-to-clip overflow, including particle-radius extrusion and
   retained image/glyph sprite bounds.
+- Camera-row validation now bounds every WGSL dot-product term and every
+  permitted accumulation order. Extreme finite world/depth cancellation can
+  no longer hide an overflowing `f32` product and reach the GPU as `Inf`/`NaN`.
 - Streaming composition returns its reusable transient vertex allocation to
   the renderer on every structured error path, preserving steady-state memory
   behavior after a rejected frame.

@@ -1118,8 +1118,11 @@ The vertex shader receives compact camera rows mapping relative world X/Y and
 scalar depth into logical screen X/Y. Generated circle vertices carry a world
 anchor and local offset separately, so the subtraction from the camera happens
 before a small radius is added. CPU validation checks both components against
-the same arithmetic envelope before submission. Lines retain logical-pixel
-width by carrying a screen-extrusion direction separately from world position.
+the same arithmetic envelope before submission. It also requires every
+camera-row product and every backend-permitted dot-product accumulation order
+to remain finite; a mathematically finite cancellation is rejected when its
+individual GPU `f32` terms would overflow. Lines retain logical-pixel width by
+carrying a screen-extrusion direction separately from world position.
 
 The retained 3D transform is explicit:
 

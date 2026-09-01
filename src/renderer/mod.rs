@@ -653,17 +653,42 @@ impl GeometryExtents {
         ) else {
             return false;
         };
+        let relative_minimum = [relative_horizontal.0, relative_vertical.0];
+        let relative_maximum = [relative_horizontal.1, relative_vertical.1];
+        if !shader_world_dot_is_safe(
+            uniform.world_to_screen_x,
+            relative_minimum,
+            relative_maximum,
+            self.depth_min,
+            self.depth_max,
+        ) || !shader_world_dot_is_safe(
+            uniform.world_to_screen_y,
+            relative_minimum,
+            relative_maximum,
+            self.depth_min,
+            self.depth_max,
+        ) || !shader_direction_dot_is_safe(
+            uniform.world_to_screen_x,
+            self.direction_min,
+            self.direction_max,
+        ) || !shader_direction_dot_is_safe(
+            uniform.world_to_screen_y,
+            self.direction_min,
+            self.direction_max,
+        ) {
+            return false;
+        }
         let world_horizontal = transformed_world_interval(
             uniform.world_to_screen_x,
-            [relative_horizontal.0, relative_vertical.0],
-            [relative_horizontal.1, relative_vertical.1],
+            relative_minimum,
+            relative_maximum,
             self.depth_min,
             self.depth_max,
         );
         let world_vertical = transformed_world_interval(
             uniform.world_to_screen_y,
-            [relative_horizontal.0, relative_vertical.0],
-            [relative_horizontal.1, relative_vertical.1],
+            relative_minimum,
+            relative_maximum,
             self.depth_min,
             self.depth_max,
         );
@@ -774,6 +799,48 @@ fn exact_f32_sum_parts(first: f32, second: f32) -> (f64, f64) {
     let second_virtual = sum - first;
     let error = (first - (sum - second_virtual)) + (second - second_virtual);
     (sum, error)
+}
+
+fn shader_world_dot_is_safe(
+    row: [f32; 4],
+    minimum: [f32; 2],
+    maximum: [f32; 2],
+    depth_minimum: f32,
+    depth_maximum: f32,
+) -> bool {
+    shader_interval_sum_is_safe([
+        interval_products(row[0], minimum[0], maximum[0]),
+        interval_products(row[1], minimum[1], maximum[1]),
+        interval_products(row[2], depth_minimum, depth_maximum),
+        (f64::from(row[3]), f64::from(row[3])),
+    ])
+}
+
+fn shader_direction_dot_is_safe(row: [f32; 4], minimum: Vec2, maximum: Vec2) -> bool {
+    shader_interval_sum_is_safe([
+        interval_products(row[0], minimum.x, maximum.x),
+        interval_products(row[1], minimum.y, maximum.y),
+    ])
+}
+
+fn shader_interval_sum_is_safe<const N: usize>(terms: [(f64, f64); N]) -> bool {
+    // WGSL's `dot` may be lowered with a backend-selected association or FMA
+    // pattern. Requiring every product and the sum of their maximum magnitudes
+    // to fit in f32 keeps all permitted evaluation orders finite. Merely
+    // checking the final f64 cancellation would allow `-Inf + Inf` on the GPU.
+    let maximum = f64::from(f32::MAX);
+    let mut maximum_sum = 0.0;
+    for term in terms {
+        let magnitude = interval_max_abs(term);
+        if !magnitude.is_finite() || magnitude > maximum {
+            return false;
+        }
+        maximum_sum += magnitude;
+        if !maximum_sum.is_finite() || maximum_sum > maximum {
+            return false;
+        }
+    }
+    true
 }
 
 fn transformed_world_interval(

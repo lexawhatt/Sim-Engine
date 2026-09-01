@@ -1265,6 +1265,38 @@ fn geometry_extents_reject_shader_arithmetic_overflow() {
 }
 
 #[test]
+fn geometry_extents_reject_dot_product_overflow_hidden_by_cancellation() {
+    let depth = 3.0e37;
+    let tilt = std::f32::consts::FRAC_PI_4;
+    let lifted_sine = depth * tilt.sin();
+    let center = Vec2::new(-lifted_sine * 0.5, -lifted_sine / tilt.cos());
+    let viewport = LogicalViewport::new(64.0, 64.0).unwrap();
+    let mut camera = Camera2d::new(Vec2::ZERO, 100.0).unwrap();
+    camera.set_projection(crate::Projection2d::new(tilt, 1.0).unwrap());
+
+    assert!(
+        camera
+            .projected_world_to_screen(center, depth, viewport)
+            .is_ok(),
+        "the public camera formula remains mathematically finite"
+    );
+
+    let mut scene = Scene::new(Color::BLACK).unwrap();
+    scene
+        .with_depth(depth, |scene| {
+            scene.try_circle(center, 1.0, ShapeStyle::filled(Color::WHITE))
+        })
+        .unwrap()
+        .unwrap();
+    let (vertices, _) = tessellate_for_test(&scene);
+    let uniform = CameraUniform::new(camera, viewport).unwrap();
+
+    // WGSL evaluates each dot-product term in f32. Both camera rows contain
+    // products above f32::MAX even though their mathematical sums cancel.
+    assert!(!GeometryExtents::from_vertices(&vertices).is_safe_for(uniform));
+}
+
+#[test]
 fn geometry_extents_reject_world_offset_overflow_before_camera_scale() {
     let mut scene = Scene::new(Color::BLACK).unwrap();
     scene
