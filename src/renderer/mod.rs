@@ -670,53 +670,38 @@ impl GeometryExtents {
         };
         let relative_minimum = [relative_horizontal.0, relative_vertical.0];
         let relative_maximum = [relative_horizontal.1, relative_vertical.1];
-        if !shader_world_dot_is_safe(
+        let Some(world_horizontal) = shader_world_dot_range(
             uniform.world_to_screen_x,
             relative_minimum,
             relative_maximum,
             self.depth_min,
             self.depth_max,
-        ) || !shader_world_dot_is_safe(
-            uniform.world_to_screen_y,
-            relative_minimum,
-            relative_maximum,
-            self.depth_min,
-            self.depth_max,
-        ) || !shader_direction_dot_is_safe(
-            uniform.world_to_screen_x,
-            self.direction_min,
-            self.direction_max,
-        ) || !shader_direction_dot_is_safe(
-            uniform.world_to_screen_y,
-            self.direction_min,
-            self.direction_max,
-        ) {
+        ) else {
             return false;
-        }
-        let world_horizontal = transformed_world_interval(
-            uniform.world_to_screen_x,
-            relative_minimum,
-            relative_maximum,
-            self.depth_min,
-            self.depth_max,
-        );
-        let world_vertical = transformed_world_interval(
+        };
+        let Some(world_vertical) = shader_world_dot_range(
             uniform.world_to_screen_y,
             relative_minimum,
             relative_maximum,
             self.depth_min,
             self.depth_max,
-        );
-        let direction_horizontal = transformed_direction_interval(
+        ) else {
+            return false;
+        };
+        let Some(direction_horizontal) = shader_direction_dot_range(
             uniform.world_to_screen_x,
             self.direction_min,
             self.direction_max,
-        );
-        let direction_vertical = transformed_direction_interval(
+        ) else {
+            return false;
+        };
+        let Some(direction_vertical) = shader_direction_dot_range(
             uniform.world_to_screen_y,
             self.direction_min,
             self.direction_max,
-        );
+        ) else {
+            return false;
+        };
         let maximum_miter = self.normal_distance_max_abs as f64 * self.miter_limit_max as f64;
         let horizontal_limit = interval_max_abs(world_horizontal)
             + self.screen_offset_max_abs.x as f64
@@ -758,25 +743,60 @@ impl GeometryExtents {
     }
 }
 
+#[derive(Clone, Copy)]
+enum GeometryValidationSource<'a> {
+    Tessellated(&'a [Vertex]),
+    Dynamic(&'a [DynamicGpu]),
+}
+
+fn geometry_is_safe_for(
+    extents: GeometryExtents,
+    source: GeometryValidationSource<'_>,
+    uniform: CameraUniform,
+) -> bool {
+    if extents.is_safe_for(uniform) {
+        return true;
+    }
+
+    match source {
+        GeometryValidationSource::Tessellated(vertices) => vertices
+            .iter()
+            .copied()
+            .all(|vertex| tessellated_vertex_is_safe_for(vertex, uniform)),
+        GeometryValidationSource::Dynamic(vertices) => vertices.iter().copied().all(|vertex| {
+            GeometryExtents::from_dynamic_vertices(std::slice::from_ref(&vertex))
+                .is_safe_for(uniform)
+        }),
+    }
+}
+
+fn tessellated_vertex_is_safe_for(vertex: Vertex, uniform: CameraUniform) -> bool {
+    let mut extents = GeometryExtents::from_vertices(std::slice::from_ref(&vertex));
+    // `previous_direction` and `next_direction` are two independent shader
+    // dots. Do not synthesize a direction by mixing components from the two
+    // tuples when the scene-wide envelope needs its exact fallback.
+    for direction in [vertex.previous_direction, vertex.next_direction] {
+        let direction = Vec2::new(direction[0], direction[1]);
+        extents.direction_min = direction;
+        extents.direction_max = direction;
+        if !extents.is_safe_for(uniform) {
+            return false;
+        }
+    }
+    true
+}
+
 fn shader_clip_interval_is_safe(
     screen_minimum: f64,
     screen_maximum: f64,
     scale: f32,
     offset: f32,
 ) -> bool {
-    let first_product = screen_minimum * f64::from(scale);
-    let second_product = screen_maximum * f64::from(scale);
-    let minimum_product = first_product.min(second_product);
-    let maximum_product = first_product.max(second_product);
-    let maximum = f64::from(f32::MAX);
-    [
-        first_product,
-        second_product,
-        minimum_product + f64::from(offset),
-        maximum_product + f64::from(offset),
-    ]
-    .into_iter()
-    .all(|value| value.is_finite() && value.abs() <= maximum)
+    shader_interval_sum_range([
+        interval_products_f64(scale, screen_minimum, screen_maximum),
+        (f64::from(offset), f64::from(offset)),
+    ])
+    .is_some()
 }
 
 fn shader_relative_component_bounds(
@@ -816,14 +836,14 @@ fn exact_f32_sum_parts(first: f32, second: f32) -> (f64, f64) {
     (sum, error)
 }
 
-fn shader_world_dot_is_safe(
+fn shader_world_dot_range(
     row: [f32; 4],
     minimum: [f32; 2],
     maximum: [f32; 2],
     depth_minimum: f32,
     depth_maximum: f32,
-) -> bool {
-    shader_interval_sum_is_safe([
+) -> Option<(f64, f64)> {
+    shader_interval_sum_range([
         interval_products(row[0], minimum[0], maximum[0]),
         interval_products(row[1], minimum[1], maximum[1]),
         interval_products(row[2], depth_minimum, depth_maximum),
@@ -831,65 +851,86 @@ fn shader_world_dot_is_safe(
     ])
 }
 
-fn shader_direction_dot_is_safe(row: [f32; 4], minimum: Vec2, maximum: Vec2) -> bool {
-    shader_interval_sum_is_safe([
-        interval_products(row[0], minimum.x, maximum.x),
-        interval_products(row[1], minimum.y, maximum.y),
-    ])
-}
-
-fn shader_interval_sum_is_safe<const N: usize>(terms: [(f64, f64); N]) -> bool {
-    // WGSL's `dot` may be lowered with a backend-selected association or FMA
-    // pattern. Requiring every product and every same-sign partial sum to fit
-    // in f32 keeps all permitted evaluation orders finite. Positive and
-    // negative envelopes are accumulated separately so a safe cancellation is
-    // not rejected merely because its total absolute magnitude exceeds f32.
-    // Checking only the final f64 result would allow `-Inf + Inf` on the GPU.
-    let maximum = f64::from(f32::MAX);
-    let mut positive_sum = 0.0;
-    let mut negative_sum = 0.0;
-    for term in terms {
-        if !term.0.is_finite() || !term.1.is_finite() || term.0 < -maximum || term.1 > maximum {
-            return false;
-        }
-        positive_sum += term.1.max(0.0);
-        negative_sum += term.0.min(0.0);
-        if !positive_sum.is_finite()
-            || positive_sum > maximum
-            || !negative_sum.is_finite()
-            || negative_sum < -maximum
-        {
-            return false;
-        }
-    }
-    true
-}
-
-fn transformed_world_interval(
+fn shader_world_dot_is_safe(
     row: [f32; 4],
     minimum: [f32; 2],
     maximum: [f32; 2],
     depth_minimum: f32,
     depth_maximum: f32,
-) -> (f64, f64) {
-    let horizontal = interval_products(row[0], minimum[0], maximum[0]);
-    let vertical = interval_products(row[1], minimum[1], maximum[1]);
-    let depth = interval_products(row[2], depth_minimum, depth_maximum);
-    (
-        horizontal.0 + vertical.0 + depth.0 + row[3] as f64,
-        horizontal.1 + vertical.1 + depth.1 + row[3] as f64,
-    )
+) -> bool {
+    shader_world_dot_range(row, minimum, maximum, depth_minimum, depth_maximum).is_some()
 }
 
-fn transformed_direction_interval(row: [f32; 4], minimum: Vec2, maximum: Vec2) -> (f64, f64) {
-    let horizontal = interval_products(row[0], minimum.x, maximum.x);
-    let vertical = interval_products(row[1], minimum.y, maximum.y);
-    (horizontal.0 + vertical.0, horizontal.1 + vertical.1)
+fn shader_direction_dot_range(row: [f32; 4], minimum: Vec2, maximum: Vec2) -> Option<(f64, f64)> {
+    shader_interval_sum_range([
+        interval_products(row[0], minimum.x, maximum.x),
+        interval_products(row[1], minimum.y, maximum.y),
+    ])
+}
+
+#[cfg(test)]
+fn shader_interval_sum_is_safe<const N: usize>(terms: [(f64, f64); N]) -> bool {
+    shader_interval_sum_range(terms).is_some()
+}
+
+fn shader_interval_sum_range<const N: usize>(terms: [(f64, f64); N]) -> Option<(f64, f64)> {
+    // WGSL's `dot` may be lowered with a backend-selected association or FMA
+    // pattern. Bound all multiplication/addition rounding as well as every
+    // same-sign partial sum, then return the complete finite output interval.
+    // Keeping that interval is essential when a later shader stage multiplies
+    // a cancellation residual by another large coefficient.
+    let maximum = f64::from(f32::MAX);
+    let mut positive_sum = 0.0;
+    let mut negative_sum = 0.0;
+    let mut minimum_sum = 0.0;
+    let mut maximum_sum = 0.0;
+    let mut magnitude_sum = 0.0;
+    for term in terms {
+        if !term.0.is_finite() || !term.1.is_finite() || term.0 < -maximum || term.1 > maximum {
+            return None;
+        }
+        positive_sum += term.1.max(0.0);
+        negative_sum += term.0.min(0.0);
+        minimum_sum += term.0;
+        maximum_sum += term.1;
+        magnitude_sum += term.0.abs().max(term.1.abs());
+    }
+
+    // A four-term dot has at most four product roundings and three addition
+    // roundings. Use one extra operation of margin for backend contraction and
+    // reassociation choices. FMA can only reduce this worst-case envelope.
+    let operation_count = N.saturating_mul(2).max(1) as f64;
+    let unit_roundoff = 2.0_f64.powi(-24);
+    let gamma = operation_count * unit_roundoff / (1.0 - operation_count * unit_roundoff);
+    let subnormal_margin = if magnitude_sum > 0.0 {
+        operation_count * f64::from(f32::MIN_POSITIVE)
+    } else {
+        0.0
+    };
+    let rounding_margin = gamma * magnitude_sum + subnormal_margin;
+    let minimum_output = minimum_sum - rounding_margin;
+    let maximum_output = maximum_sum + rounding_margin;
+    if !positive_sum.is_finite()
+        || !negative_sum.is_finite()
+        || !minimum_output.is_finite()
+        || !maximum_output.is_finite()
+        || positive_sum + rounding_margin > maximum
+        || negative_sum - rounding_margin < -maximum
+        || minimum_output < -maximum
+        || maximum_output > maximum
+    {
+        return None;
+    }
+    Some((minimum_output, maximum_output))
 }
 
 fn interval_products(coefficient: f32, minimum: f32, maximum: f32) -> (f64, f64) {
-    let first = coefficient as f64 * minimum as f64;
-    let second = coefficient as f64 * maximum as f64;
+    interval_products_f64(coefficient, f64::from(minimum), f64::from(maximum))
+}
+
+fn interval_products_f64(coefficient: f32, minimum: f64, maximum: f64) -> (f64, f64) {
+    let first = f64::from(coefficient) * minimum;
+    let second = f64::from(coefficient) * maximum;
     (first.min(second), first.max(second))
 }
 
@@ -2728,7 +2769,11 @@ impl WgpuRenderer {
                 RenderTargetError::Frame(RendererFrameError::InvalidGeometryTransform),
             )?;
         let extents = GeometryExtents::from_vertices(&self.vertices);
-        if !extents.is_safe_for(camera_uniform) {
+        if !geometry_is_safe_for(
+            extents,
+            GeometryValidationSource::Tessellated(&self.vertices),
+            camera_uniform,
+        ) {
             return Err(RenderTargetError::Frame(
                 RendererFrameError::InvalidGeometryTransform,
             ));
@@ -2833,12 +2878,14 @@ impl WgpuRenderer {
 
         let vertex_buffer = Arc::clone(&self.vertex_buffer);
         let draw_batches = std::mem::take(&mut self.draw_batches);
-        let geometry_extents = GeometryExtents::from_vertices(&self.vertices);
+        let vertices = std::mem::take(&mut self.vertices);
+        let geometry_extents = GeometryExtents::from_vertices(&vertices);
         let result = self.draw_geometry(
             scene.background(),
             &vertex_buffer,
-            self.vertices.len(),
+            vertices.len(),
             geometry_extents,
+            GeometryValidationSource::Tessellated(&vertices),
             &draw_batches,
             *camera,
             tessellation,
@@ -2849,6 +2896,7 @@ impl WgpuRenderer {
             frame_started_at,
             viewport,
         );
+        self.vertices = vertices;
         self.draw_batches = draw_batches;
         result
     }
@@ -3078,6 +3126,7 @@ impl WgpuRenderer {
             &mesh.vertex_buffer,
             mesh.vertices.len(),
             mesh.geometry_extents,
+            GeometryValidationSource::Dynamic(&mesh.vertices),
             draw_batches.as_slice(),
             *camera,
             Duration::ZERO,
@@ -3710,6 +3759,7 @@ impl WgpuRenderer {
             &scene.vertex_buffer,
             scene.vertex_count,
             scene.geometry_extents,
+            GeometryValidationSource::Tessellated(&scene.vertices),
             &scene.draw_batches,
             *camera,
             Duration::ZERO,
@@ -3730,6 +3780,7 @@ impl WgpuRenderer {
         vertex_buffer: &wgpu::Buffer,
         vertex_count: usize,
         geometry_extents: GeometryExtents,
+        geometry_validation: GeometryValidationSource<'_>,
         draw_batches: &[PreparedDrawBatch],
         camera: Camera2d,
         tessellation: Duration,
@@ -3771,7 +3822,7 @@ impl WgpuRenderer {
         else {
             return Err(RendererFrameError::InvalidGeometryTransform);
         };
-        if !geometry_extents.is_safe_for(camera_uniform) {
+        if !geometry_is_safe_for(geometry_extents, geometry_validation, camera_uniform) {
             return Err(RendererFrameError::InvalidGeometryTransform);
         }
         self.queue.write_buffer(

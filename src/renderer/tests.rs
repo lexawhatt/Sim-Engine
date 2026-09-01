@@ -1316,6 +1316,87 @@ fn geometry_extents_reject_dot_product_overflow_hidden_by_cancellation() {
 }
 
 #[test]
+fn geometry_validation_preserves_actual_world_depth_correlation() {
+    let depth = 0.9 * f32::MAX;
+    let tilt = std::f32::consts::FRAC_PI_4;
+    let horizontal = depth * tilt.sin() * 0.5;
+    let vertical = depth * tilt.sin() / tilt.cos();
+    let vertices = [
+        DynamicGpu {
+            world_position: [-horizontal, -vertical],
+            depth,
+            color: Color::WHITE.to_array(),
+        },
+        DynamicGpu {
+            world_position: [horizontal, vertical],
+            depth: -depth,
+            color: Color::WHITE.to_array(),
+        },
+    ];
+    let mut camera = Camera2d::new(Vec2::ZERO, 1.0).unwrap();
+    camera.set_projection(crate::Projection2d::new(tilt, 1.0).unwrap());
+    let uniform = CameraUniform::new(camera, LogicalViewport::new(1.0, 1.0).unwrap()).unwrap();
+    let extents = GeometryExtents::from_dynamic_vertices(&vertices);
+
+    assert!(
+        vertices.iter().all(
+            |vertex| Vec2::new(vertex.world_position[0], vertex.world_position[1]).is_finite()
+        )
+    );
+    assert!(!extents.is_safe_for(uniform));
+    assert!(geometry_is_safe_for(
+        extents,
+        GeometryValidationSource::Dynamic(&vertices),
+        uniform,
+    ));
+}
+
+#[test]
+fn geometry_validation_preserves_actual_direction_tuples() {
+    let mut horizontal = world_vertex(Vec2::ZERO, Vec2::ZERO, Color::WHITE);
+    horizontal.previous_direction = [1.0, 0.0];
+    horizontal.next_direction = [1.0, 0.0];
+    horizontal.normal_distance = 1.0;
+    let mut vertical = world_vertex(Vec2::ZERO, Vec2::ZERO, Color::WHITE);
+    vertical.previous_direction = [0.0, -1.0];
+    vertical.next_direction = [0.0, -1.0];
+    vertical.normal_distance = 1.0;
+    let vertices = [horizontal, vertical];
+    let mut camera = Camera2d::new(Vec2::ZERO, f32::MAX).unwrap();
+    camera.set_rotation(std::f32::consts::FRAC_PI_4).unwrap();
+    let uniform = CameraUniform::new(camera, LogicalViewport::new(1.0, 1.0).unwrap()).unwrap();
+    let extents = GeometryExtents::from_vertices(&vertices);
+
+    assert!(!extents.is_safe_for(uniform));
+    assert!(geometry_is_safe_for(
+        extents,
+        GeometryValidationSource::Tessellated(&vertices),
+        uniform,
+    ));
+}
+
+#[test]
+fn geometry_validation_propagates_dot_rounding_into_final_clip() {
+    let depth = 0.9 * f32::MAX;
+    let tilt = std::f32::consts::FRAC_PI_4;
+    let vertex = DynamicGpu {
+        world_position: [-depth * tilt.sin() * 0.5, -depth * tilt.sin() / tilt.cos()],
+        depth,
+        color: Color::WHITE.to_array(),
+    };
+    let mut camera = Camera2d::new(Vec2::ZERO, 1.0).unwrap();
+    camera.set_projection(crate::Projection2d::new(tilt, 1.0).unwrap());
+    let tiny_extent = 8.0 / f32::MAX;
+    let uniform = CameraUniform::new(
+        camera,
+        LogicalViewport::new(tiny_extent, tiny_extent).unwrap(),
+    )
+    .unwrap();
+
+    assert!(!GeometryExtents::from_dynamic_vertices(&[vertex]).is_safe_for(uniform));
+}
+
+#[test]
 fn shader_dot_envelope_allows_safe_opposing_terms() {
     assert!(shader_interval_sum_is_safe([
         (-1.47e38, -1.47e38),

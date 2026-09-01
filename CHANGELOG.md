@@ -115,6 +115,14 @@ composed frames, fixed-screen UI, retained images, and host-shaped text.
 - Camera-row validation now bounds every WGSL dot-product term and every
   permitted accumulation order. Extreme finite world/depth cancellation can
   no longer hide an overflowing `f32` product and reach the GPU as `Inf`/`NaN`.
+- Dot-product validation now carries a conservative rounding/FMA output range
+  into the next shader operation. A finite cancellation can no longer become
+  an overflowing 2D screen-to-clip multiplication or an overflowing retained-
+  3D camera product after a different legal GPU association.
+- The constant-cost 2D geometry envelope now falls back to actual tessellated
+  or dynamic vertex tuples when independent scene-wide world/depth/direction
+  extrema form a nonexistent combination. Safe correlated extreme geometry is
+  accepted without adding a scan to ordinary frames.
 - Particle projection applies the same association-independent camera-row
   envelope before a visible instance can reach the GPU.
 - Retained 3D model and camera dot products now reject every backend-dependent

@@ -1591,6 +1591,7 @@ fn present_frame_with_vertices<'frame>(
                     ReadySource::Prepared(&scene.vertex_buffer),
                     scene.vertex_count,
                     scene.geometry_extents,
+                    GeometryValidationSource::Tessellated(&scene.vertices),
                     &scene.draw_batches,
                     scene.command_count,
                     scene.tessellation,
@@ -1611,6 +1612,7 @@ fn present_frame_with_vertices<'frame>(
                     ReadySource::Prepared(&scene.scene.vertex_buffer),
                     scene.scene.vertex_count,
                     scene.scene.geometry_extents,
+                    GeometryValidationSource::Tessellated(&scene.scene.vertices),
                     &scene.scene.draw_batches,
                     scene.scene.command_count,
                     scene.scene.tessellation,
@@ -1641,6 +1643,7 @@ fn present_frame_with_vertices<'frame>(
                     ReadySource::Dynamic(&mesh.vertex_buffer),
                     mesh.vertices.len(),
                     mesh.geometry_extents,
+                    GeometryValidationSource::Dynamic(&mesh.vertices),
                     &batches,
                     usize::from(!mesh.vertices.is_empty()),
                     TessellationStats::default(),
@@ -2348,7 +2351,11 @@ fn prepare_streaming_scene_resolved<'frame>(
     let camera_uniform =
         CameraUniform::new_in_region(camera, viewport.viewport, viewport.origin, target_viewport)
             .ok_or(RendererFrameError::InvalidGeometryTransform)?;
-    if !extents.is_safe_for(camera_uniform) {
+    if !geometry_is_safe_for(
+        extents,
+        GeometryValidationSource::Tessellated(vertices),
+        camera_uniform,
+    ) {
         return Err(RendererFrameError::InvalidGeometryTransform.into());
     }
     *statistics = statistics.adding(FrameStatistics {
@@ -2383,6 +2390,7 @@ fn prepare_retained_geometry<'frame>(
     source: ReadySource<'frame>,
     vertex_count: usize,
     extents: GeometryExtents,
+    geometry_validation: GeometryValidationSource<'_>,
     batches: &[PreparedDrawBatch],
     command_count: usize,
     source_stats: TessellationStats,
@@ -2396,7 +2404,7 @@ fn prepare_retained_geometry<'frame>(
     let camera_uniform =
         CameraUniform::new_in_region(camera, viewport.viewport, viewport.origin, target_viewport)
             .ok_or(RendererFrameError::InvalidGeometryTransform)?;
-    if !extents.is_safe_for(camera_uniform) {
+    if !geometry_is_safe_for(extents, geometry_validation, camera_uniform) {
         return Err(RendererFrameError::InvalidGeometryTransform.into());
     }
     let mut owned_batches = Vec::new();

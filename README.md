@@ -70,6 +70,12 @@ color targets under one frame budget and one surface presentation.
 `DynamicMeshBudget` limits caller-provided filled triangles and makes full
 updates allocation-fallible and atomic.
 
+GPU transform validation accounts for backend-legal floating-point
+reassociation/FMA results across chained 2D and 3D stages. Fast scene-wide
+envelopes remain the common path; correlated extreme vertices receive an exact
+tuple fallback instead of being rejected because of a nonexistent min/max
+combination.
+
 Translucent section materials, hatching, projected 3D anchors, and 3D picking
 are not part of v0.2.0.
 

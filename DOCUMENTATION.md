@@ -847,7 +847,8 @@ Display-edge segments are homogeneously clipped against all six frustum planes
 before shader perspective division and screen-space expansion. A partially
 visible edge is shortened; a fully clipped edge emits no fragments without
 rejecting the rest of the frame. Before submission, model and camera dot
-products are bounded independently of backend association/FMA choices. The
+products are bounded independently of backend association/FMA choices, and the
+possible model-dot result interval becomes the input to camera validation. The
 edge validator then mirrors the remaining shader order through physical-width
 expansion, logical-distance and dash-phase calculation, NDC extrusion,
 homogeneous scaling, and final clip-coordinate addition. Any overflow is
@@ -1130,8 +1131,13 @@ anchor and local offset separately, so the subtraction from the camera happens
 before a small radius is added. CPU validation checks both components against
 the same arithmetic envelope before submission. It also requires every
 camera-row product and every backend-permitted dot-product accumulation order
-to remain finite; a mathematically finite cancellation is rejected when its
-individual GPU `f32` terms would overflow. Lines retain logical-pixel width by
+to remain finite. The validator also propagates a rounding/FMA output interval
+through the final screen-to-clip operation; a mathematically finite CPU
+cancellation cannot hide a backend-dependent residual that overflows later.
+The constant-cost scene envelope is the common path. If independent extrema
+form a nonexistent world/depth/direction combination, validation falls back to
+the actual tessellated or dynamic vertex tuples, including the distinct
+previous and next stroke directions. Lines retain logical-pixel width by
 carrying a screen-extrusion direction separately from world position.
 
 The retained 3D transform is explicit:
@@ -1148,7 +1154,9 @@ The 3D convention is right-handed with positive Y up. Cameras look along local
 negative Z; exposed view depth is positive distance forward. Large finite
 vector operations use wider intermediates before checked `f32` output. GPU
 model/view/projection dot products additionally bound every same-sign partial
-sum, so no legal shader association can overflow behind a finite CPU result.
+sum and carry the complete rounding/FMA result interval from the model dot into
+the camera dot. No legal first-stage association can therefore overflow only
+after the second transform behind a finite CPU left-fold result.
 
 ### 21. Color and alpha model
 

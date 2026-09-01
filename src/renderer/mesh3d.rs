@@ -1474,15 +1474,15 @@ fn validate_shader_point(
     model_rows: [[f32; 4]; 3],
     camera_rows: [[f32; 4]; 4],
 ) -> Result<(), Mesh3dRenderError> {
-    let model_point = [point.x(), point.y(), point.z(), 1.0];
+    let model_point = [point.x(), point.y(), point.z(), 1.0].map(ShaderValueRange::exact);
     let world = [
-        shader_dot(model_rows[0], model_point)?,
-        shader_dot(model_rows[1], model_point)?,
-        shader_dot(model_rows[2], model_point)?,
-        1.0,
+        shader_dot_range(model_rows[0], model_point)?,
+        shader_dot_range(model_rows[1], model_point)?,
+        shader_dot_range(model_rows[2], model_point)?,
+        ShaderValueRange::exact(1.0),
     ];
     for row in camera_rows {
-        let _ = shader_dot(row, world)?;
+        let _ = shader_dot_range(row, world)?;
     }
     Ok(())
 }
@@ -1766,23 +1766,49 @@ fn validate_edge_shader_arithmetic(
     Ok(())
 }
 
-fn shader_dot(row: [f32; 4], point: [f32; 4]) -> Result<f32, Mesh3dRenderError> {
-    let terms: [(f64, f64); 4] = std::array::from_fn(|axis| {
-        let product = f64::from(row[axis]) * f64::from(point[axis]);
-        (product, product)
-    });
-    if !shader_interval_sum_is_safe(terms) {
-        return Err(Mesh3dRenderError::InvalidGeometryTransform);
+#[derive(Debug, Clone, Copy)]
+struct ShaderValueRange {
+    fixed: f32,
+    minimum: f64,
+    maximum: f64,
+}
+
+impl ShaderValueRange {
+    fn exact(value: f32) -> Self {
+        Self {
+            fixed: value,
+            minimum: f64::from(value),
+            maximum: f64::from(value),
+        }
     }
+}
+
+fn shader_dot_range(
+    row: [f32; 4],
+    point: [ShaderValueRange; 4],
+) -> Result<ShaderValueRange, Mesh3dRenderError> {
+    let terms: [(f64, f64); 4] = std::array::from_fn(|axis| {
+        interval_products_f64(row[axis], point[axis].minimum, point[axis].maximum)
+    });
+    let (minimum, maximum) =
+        shader_interval_sum_range(terms).ok_or(Mesh3dRenderError::InvalidGeometryTransform)?;
     let mut result = 0.0_f32;
     for axis in 0..4 {
-        let product = row[axis] * point[axis];
+        let product = row[axis] * point[axis].fixed;
         result += product;
         if !product.is_finite() || !result.is_finite() {
             return Err(Mesh3dRenderError::InvalidGeometryTransform);
         }
     }
-    Ok(result)
+    Ok(ShaderValueRange {
+        fixed: result,
+        minimum,
+        maximum,
+    })
+}
+
+fn shader_dot(row: [f32; 4], point: [f32; 4]) -> Result<f32, Mesh3dRenderError> {
+    shader_dot_range(row, point.map(ShaderValueRange::exact)).map(|value| value.fixed)
 }
 
 fn bounds_corners(minimum: Vec3, maximum: Vec3) -> [Vec3; 8] {
@@ -2739,6 +2765,39 @@ mod tests {
                 transform.model_rows().unwrap(),
                 camera.world_to_clip_rows().unwrap(),
             ),
+            Err(Mesh3dRenderError::InvalidGeometryTransform)
+        );
+    }
+
+    #[test]
+    fn shader_transform_propagates_model_association_range_into_camera_dot() {
+        let point = Vec3::new(-6.593_279_5e37, 2.460_645_7e38, 9.006_588e37).unwrap();
+        let mesh = Mesh3d::with_display_edges(
+            vec![point, point.checked_scale(0.5).unwrap()],
+            Vec::new(),
+            vec![MeshEdge3d::new(0, 1).unwrap()],
+        )
+        .unwrap();
+        let axis = Vec3::new(1.0, 1.0, 1.0).unwrap().normalized().unwrap();
+        let transform = Transform3d::new(
+            Vec3::ZERO,
+            Rotation3d::from_axis_angle(axis, std::f32::consts::FRAC_PI_2).unwrap(),
+            Vec3::new(1.0, 1.0, 1.0).unwrap(),
+        )
+        .unwrap();
+        let camera = Camera3d::look_at(
+            Vec3::new(0.0, 0.0, -1.0e37).unwrap(),
+            Vec3::ZERO,
+            Vec3::Y,
+            Projection3d::orthographic(world(2.0 / 7.0e7), 1.0, world(1.0), world(3.0e38)).unwrap(),
+        )
+        .unwrap();
+        let model_rows = transform.model_rows().unwrap();
+        let model_point = [point.x(), point.y(), point.z(), 1.0];
+
+        assert_eq!(shader_dot(model_rows[0], model_point), Ok(0.0));
+        assert_eq!(
+            validate_shader_transform(&mesh, model_rows, camera.world_to_clip_rows().unwrap()),
             Err(Mesh3dRenderError::InvalidGeometryTransform)
         );
     }
