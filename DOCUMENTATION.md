@@ -144,6 +144,20 @@ range rather than being treated as zero by an epsilon threshold. Nonzero
 subnormal operands are not portable across WGSL backends: when they could
 affect a GPU transform, rendering returns `InvalidGeometryTransform` instead
 of accepting a primitive that another driver may silently flush to zero.
+Display and offscreen pixel scales are bounded so even a one-texel target has
+normal finite logical dimensions, half-viewport camera translations, and clip
+coefficients. Retained 3D validation also rejects extreme transforms whose
+legal shader associations disagree about a vertex's frustum-plane side or a
+display edge's collapsed/extruded classification. Edge clipping also rejects
+homogeneously scaled plane distances whose sign can change under permitted
+subnormal flushing or separate component rounding. Exact candidate states keep
+clip components correlated with the edge pair's maximum and reciprocal scale.
+Exact row operations which only select or negate an already-rounded component
+retain that component's interval without an additional arithmetic margin.
+Exact subnormal dot sources are exhaustively evaluated in both preserved and
+flush-to-zero states. Interval-valued subnormal sources remain conservatively
+rejected when their provenance is no longer available. Dynamic 2D vertices use
+the same per-vertex preserved/FTZ evaluation through camera and clip rows.
 
 #### Rich bounded strokes
 

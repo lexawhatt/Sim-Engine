@@ -51,13 +51,17 @@ pub struct PhysicalPerLogical(f32);
 
 pub(crate) const MIN_STABLE_PHYSICAL_PER_LOGICAL: f64 =
     u32::MAX as f64 * f32::MIN_POSITIVE as f64 / 2.0;
-pub(crate) const MAX_STABLE_PHYSICAL_PER_LOGICAL: f64 = 1.0 / f32::MIN_POSITIVE as f64;
+// A one-texel viewport has a half-width/half-height translation in the camera
+// uniform. Keep that translation normal as well as the viewport dimension and
+// reciprocal clip scale.
+pub(crate) const MAX_STABLE_PHYSICAL_PER_LOGICAL: f64 = 0.5 / f32::MIN_POSITIVE as f64;
 
 impl PhysicalPerLogical {
     /// Labels a backend-stable physical-to-logical pixel ratio.
     ///
     /// The bounded range keeps logical dimensions and their reciprocal clip
-    /// scales normal (not subnormal) for every non-empty `u32` target.
+    /// scales and half-viewport translations normal (not subnormal) for every
+    /// non-empty `u32` target.
     pub fn new(value: f32) -> Result<Self, UnitError> {
         stable_physical_per_logical(f64::from(value))
             .then_some(Self(value))
@@ -156,5 +160,16 @@ mod tests {
             PhysicalPerLogical::new(f32::MAX),
             Err(UnitError::InvalidPhysicalPerLogical { .. })
         ));
+    }
+
+    #[test]
+    fn physical_per_logical_keeps_one_texel_half_viewport_normal() {
+        let maximum = 0.5 / f32::MIN_POSITIVE;
+        let scale = PhysicalPerLogical::new(maximum).unwrap().get();
+        let logical_extent = 1.0_f32 / scale;
+
+        assert!(logical_extent.is_normal());
+        assert!((logical_extent * 0.5).is_normal());
+        assert!(PhysicalPerLogical::new(f32::from_bits(maximum.to_bits() + 1)).is_err());
     }
 }

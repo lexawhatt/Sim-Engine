@@ -109,15 +109,36 @@ composed frames, fixed-screen UI, retained images, and host-shaped text.
   radii/ranges remain nonzero; closed-stroke deduplication no longer erases
   geometry merely because its squared length is below `f32::EPSILON`.
 - GPU-transform validation rejects nonzero subnormal operands that a conforming
-  WGSL backend may flush to zero. This includes world/local geometry,
-  particles, camera rows, and screen-to-clip values, so extreme zoom cannot
-  turn a silently collapsed primitive into a backend-specific result.
+  WGSL backend may flush to zero whenever those operands affect world/local
+  geometry, particles, camera rows, or screen-to-clip output. Extreme zoom
+  therefore cannot turn a silently collapsed primitive into a backend-specific
+  result, while irrelevant zero-multiplied camera components remain valid.
 - Display and render-target pixel scales are bounded so all non-empty `u32`
-  target dimensions and reciprocal clip coefficients remain normal finite
-  `f32` values.
+  target dimensions, half-viewport translations, and reciprocal clip
+  coefficients remain normal finite `f32` values.
+- Exact fixed-coordinate shader dots enumerate legal f32 association and FMA
+  results rather than applying a coarse error margin. Safe maximum-magnitude
+  sums remain accepted, while retained 3D vertices whose clip-plane
+  classification varies by legal backend association are rejected before GPU
+  submission.
 - Hidden 3D dash arithmetic is validated against the complete clipped viewport
   diagonal. A fixed CPU dot-product fold can no longer hide dash-phase overflow
   available to another legal GPU association.
+- Retained 3D display-edge validation propagates transform association ranges
+  through perspective division and rejects edges whose screen length crosses
+  the shader's extrusion threshold or whose direction can reverse. A legal GPU
+  association can no longer collapse a line that another backend renders.
+  Frustum-side checks follow the shader's common homogeneous scaling and reject
+  negative plane distances that can flush to the inclusive `-0` boundary or
+  change side when scaled clip components are rounded separately. Exact clip
+  candidate states retain their correlation with the pair maximum and
+  reciprocal homogeneous scale, avoiding invented boundary crossings.
+  Exact component-selection rows preserve finite association envelopes at the
+  `f32` limit instead of adding a spurious generic rounding margin.
+  Exact subnormal dot operands are evaluated through both preserved and
+  flushed states, so an ordinary translation may safely absorb an irrelevant
+  FTZ difference without rejecting the object. The same exact fallback covers
+  dynamic 2D vertices before screen translation.
 - Camera/geometry validation preserves base/offset correlation between
   commands and rejects both pre-transform relative-coordinate overflow and
   final screen-to-clip overflow, including particle-radius extrusion and

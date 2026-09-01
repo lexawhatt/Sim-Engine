@@ -1127,6 +1127,40 @@ fn ftz_validation_rejects_only_subnormal_operands_that_affect_geometry() {
 }
 
 #[test]
+fn dynamic_geometry_accepts_subnormal_position_absorbed_by_screen_translation() {
+    let vertices = [
+        DynamicGpu {
+            world_position: [f32::from_bits(1), 0.0],
+            depth: 0.0,
+            color: Color::WHITE.to_array(),
+        },
+        DynamicGpu {
+            world_position: [0.5, 0.0],
+            depth: 0.0,
+            color: Color::WHITE.to_array(),
+        },
+        DynamicGpu {
+            world_position: [0.0, 0.5],
+            depth: 0.0,
+            color: Color::WHITE.to_array(),
+        },
+    ];
+    let uniform = CameraUniform::new(
+        Camera2d::new(Vec2::ZERO, 1.0).unwrap(),
+        LogicalViewport::new(100.0, 100.0).unwrap(),
+    )
+    .unwrap();
+    let extents = GeometryExtents::from_dynamic_vertices(&vertices);
+
+    assert!(!extents.is_safe_for(uniform));
+    assert!(geometry_is_safe_for(
+        extents,
+        GeometryValidationSource::Dynamic(&vertices),
+        uniform,
+    ));
+}
+
+#[test]
 fn sub_ulp_rounded_corner_keeps_its_local_arc_offsets() {
     let mut scene = Scene::new(Color::BLACK).unwrap();
     scene
@@ -1519,6 +1553,67 @@ fn shader_dot_envelope_keeps_exact_identity_at_f32_maximum() {
         ]),
         Some((f64::from(f32::MAX), f64::from(f32::MAX)))
     );
+}
+
+#[test]
+fn shader_dot_envelope_accepts_exact_maximum_from_two_products() {
+    let mut camera = Camera2d::new(Vec2::ZERO, f32::from_bits(0x3f35_04f4)).unwrap();
+    camera.set_rotation(-std::f32::consts::FRAC_PI_4).unwrap();
+    let uniform = CameraUniform::new(camera, LogicalViewport::new(2.0, 2.0).unwrap()).unwrap();
+    let vertex = DynamicGpu {
+        world_position: [f32::MAX, f32::MAX],
+        depth: 0.0,
+        color: Color::WHITE.to_array(),
+    };
+
+    assert_eq!(uniform.world_to_screen_x, [0.5, 0.5, 0.0, 1.0]);
+    assert!(GeometryExtents::from_dynamic_vertices(&[vertex]).is_safe_for(uniform));
+}
+
+#[test]
+fn shader_dot_envelope_preserves_single_exact_interval_term() {
+    let previous = f32::from_bits(f32::MAX.to_bits() - 1);
+
+    assert_eq!(
+        shader_interval_sum_range([
+            (-f64::from(f32::MAX), -f64::from(previous)),
+            (0.0, 0.0),
+            (0.0, 0.0),
+            (-0.0, -0.0),
+        ]),
+        Some((-f64::from(f32::MAX), -f64::from(previous)))
+    );
+}
+
+#[test]
+fn exact_shader_dot_preserves_permitted_ftz_intermediate() {
+    let minimum_normal = f32::MIN_POSITIVE;
+    let adjacent_normal = f32::from_bits(minimum_normal.to_bits() + 1);
+
+    assert_eq!(
+        shader_interval_sum_range([
+            (f64::from(adjacent_normal), f64::from(adjacent_normal)),
+            (-f64::from(minimum_normal), -f64::from(minimum_normal)),
+        ]),
+        Some((0.0, f64::from(f32::from_bits(1))))
+    );
+}
+
+#[test]
+fn maximum_target_scale_keeps_one_texel_camera_translation_normal() {
+    let scale = 0.5 / f32::MIN_POSITIVE;
+    let extent = 1.0 / scale;
+    let viewport = LogicalViewport::new(extent, extent).unwrap();
+    let uniform = CameraUniform::new(Camera2d::default(), viewport).unwrap();
+    let vertex = DynamicGpu {
+        world_position: [0.0, 0.0],
+        depth: 0.0,
+        color: Color::WHITE.to_array(),
+    };
+
+    assert!(uniform.world_to_screen_x[3].is_normal());
+    assert!(uniform.world_to_screen_y[3].is_normal());
+    assert!(GeometryExtents::from_dynamic_vertices(&[vertex]).is_safe_for(uniform));
 }
 
 #[test]

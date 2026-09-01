@@ -734,23 +734,29 @@ impl GeometryExtents {
         {
             return false;
         }
-        let horizontal_limit = interval_max_abs(world_horizontal)
-            + self.screen_offset_max_abs.x as f64
+        let horizontal_padding = self.screen_offset_max_abs.x as f64
             + maximum_miter
             + self.tangent_distance_max_abs as f64;
-        let vertical_limit = interval_max_abs(world_vertical)
-            + self.screen_offset_max_abs.y as f64
+        let vertical_padding = self.screen_offset_max_abs.y as f64
             + maximum_miter
             + self.tangent_distance_max_abs as f64;
+        let horizontal_bounds = (
+            world_horizontal.0 - horizontal_padding,
+            world_horizontal.1 + horizontal_padding,
+        );
+        let vertical_bounds = (
+            world_vertical.0 - vertical_padding,
+            world_vertical.1 + vertical_padding,
+        );
 
         if !shader_clip_interval_is_safe(
-            -horizontal_limit,
-            horizontal_limit,
+            horizontal_bounds.0,
+            horizontal_bounds.1,
             uniform.screen_to_clip[0],
             uniform.screen_to_clip[2],
         ) || !shader_clip_interval_is_safe(
-            -vertical_limit,
-            vertical_limit,
+            vertical_bounds.0,
+            vertical_bounds.1,
             uniform.screen_to_clip[1],
             uniform.screen_to_clip[3],
         ) {
@@ -766,8 +772,10 @@ impl GeometryExtents {
             direction_horizontal.1,
             direction_vertical.0,
             direction_vertical.1,
-            horizontal_limit,
-            vertical_limit,
+            horizontal_bounds.0,
+            horizontal_bounds.1,
+            vertical_bounds.0,
+            vertical_bounds.1,
         ]
         .into_iter()
         .all(|value| value.is_finite() && value.abs() <= f32::MAX as f64)
@@ -794,11 +802,111 @@ fn geometry_is_safe_for(
             .iter()
             .copied()
             .all(|vertex| tessellated_vertex_is_safe_for(vertex, uniform)),
-        GeometryValidationSource::Dynamic(vertices) => vertices.iter().copied().all(|vertex| {
-            GeometryExtents::from_dynamic_vertices(std::slice::from_ref(&vertex))
-                .is_safe_for(uniform)
-        }),
+        GeometryValidationSource::Dynamic(vertices) => vertices
+            .iter()
+            .copied()
+            .all(|vertex| dynamic_vertex_is_safe_for(vertex, uniform)),
     }
+}
+
+fn dynamic_vertex_is_safe_for(vertex: DynamicGpu, uniform: CameraUniform) -> bool {
+    let Some((horizontal, vertical)) =
+        exact_2d_screen_ranges(vertex.world_position, [0.0, 0.0], vertex.depth, uniform)
+    else {
+        return false;
+    };
+    exact_clip_interval_is_safe(
+        horizontal.0,
+        horizontal.1,
+        uniform.screen_to_clip[0],
+        uniform.screen_to_clip[2],
+    ) && exact_clip_interval_is_safe(
+        vertical.0,
+        vertical.1,
+        uniform.screen_to_clip[1],
+        uniform.screen_to_clip[3],
+    )
+}
+
+fn exact_clip_interval_is_safe(
+    screen_minimum: f64,
+    screen_maximum: f64,
+    scale: f32,
+    offset: f32,
+) -> bool {
+    f64::from(screen_minimum as f32) == screen_minimum
+        && f64::from(screen_maximum as f32) == screen_maximum
+        && [screen_minimum as f32, screen_maximum as f32]
+            .into_iter()
+            .all(|screen| {
+                exact_shader_dot_source_range([scale, offset, 0.0, 0.0], [screen, 1.0, 0.0, 0.0])
+                    .is_some()
+            })
+}
+
+fn exact_2d_screen_ranges(
+    world: [f32; 2],
+    world_offset: [f32; 2],
+    depth: f32,
+    uniform: CameraUniform,
+) -> Option<((f64, f64), (f64, f64))> {
+    let mut relative = [(0.0_f32, 0.0_f32); 2];
+    for axis in 0..2 {
+        let subtracted =
+            exact_shader_binary_source_range(world[axis], uniform.camera_center[axis], true)?;
+        let first = exact_shader_binary_source_range(subtracted.0, world_offset[axis], false)?;
+        let second = exact_shader_binary_source_range(subtracted.1, world_offset[axis], false)?;
+        relative[axis] = (first.0.min(second.0), first.1.max(second.1));
+    }
+
+    let mut output = [(f64::INFINITY, f64::NEG_INFINITY); 2];
+    for relative_x in distinct_range_endpoints(relative[0]) {
+        for relative_y in distinct_range_endpoints(relative[1]) {
+            let point = [relative_x, relative_y, depth, 1.0];
+            for (axis, row) in [uniform.world_to_screen_x, uniform.world_to_screen_y]
+                .into_iter()
+                .enumerate()
+            {
+                let range = exact_shader_dot_source_range(row, point)?;
+                output[axis].0 = output[axis].0.min(range.0);
+                output[axis].1 = output[axis].1.max(range.1);
+            }
+        }
+    }
+    output
+        .into_iter()
+        .all(|range| range.0.is_finite() && range.1.is_finite())
+        .then_some((output[0], output[1]))
+}
+
+fn distinct_range_endpoints(range: (f32, f32)) -> impl Iterator<Item = f32> {
+    [Some(range.0), (range.1 != range.0).then_some(range.1)]
+        .into_iter()
+        .flatten()
+}
+
+fn exact_shader_binary_source_range(left: f32, right: f32, subtract: bool) -> Option<(f32, f32)> {
+    let left_values = [left, 0.0];
+    let right_values = [right, 0.0];
+    let left_len = if is_nonzero_subnormal(left) { 2 } else { 1 };
+    let right_len = if is_nonzero_subnormal(right) { 2 } else { 1 };
+    let mut minimum = f32::INFINITY;
+    let mut maximum = f32::NEG_INFINITY;
+    for &left in &left_values[..left_len] {
+        for &right in &right_values[..right_len] {
+            let result = if subtract { left - right } else { left + right };
+            if !result.is_finite() {
+                return None;
+            }
+            minimum = minimum.min(result);
+            maximum = maximum.max(result);
+            if is_nonzero_subnormal(result) {
+                minimum = minimum.min(0.0);
+                maximum = maximum.max(0.0);
+            }
+        }
+    }
+    Some((minimum, maximum))
 }
 
 fn tessellated_vertex_is_safe_for(vertex: Vertex, uniform: CameraUniform) -> bool {
@@ -917,6 +1025,10 @@ fn shader_interval_sum_range<const N: usize>(terms: [(f64, f64); N]) -> Option<(
     // same-sign partial sum, then return the complete finite output interval.
     // Keeping that interval is essential when a later shader stage multiplies
     // a cancellation residual by another large coefficient.
+    if terms.iter().all(|term| term.0 == term.1) {
+        return exact_shader_sum_range(terms);
+    }
+
     let maximum = f64::from(f32::MAX);
     let mut positive_sum = 0.0;
     let mut negative_sum = 0.0;
@@ -951,6 +1063,23 @@ fn shader_interval_sum_range<const N: usize>(terms: [(f64, f64); N]) -> Option<(
         .iter()
         .filter(|term| term.0 != 0.0 || term.1 != 0.0)
         .count();
+    if active_terms == 1 {
+        let term = terms
+            .into_iter()
+            .find(|term| term.0 != 0.0 || term.1 != 0.0)?;
+        // A single interval term has no association ambiguity. When both
+        // endpoints are already representable f32 values, they also prove
+        // that the producing multiply rounded exactly at the extrema; adding
+        // the remaining exact zero terms cannot enlarge the range. This is
+        // important for a later dot row which merely selects or negates one
+        // component from an earlier association envelope.
+        if [term.0, term.1]
+            .into_iter()
+            .all(|value| f64::from(value as f32) == value)
+        {
+            return Some(term);
+        }
+    }
     let inexact_products = terms
         .iter()
         .filter(|term| {
@@ -983,6 +1112,173 @@ fn shader_interval_sum_range<const N: usize>(terms: [(f64, f64); N]) -> Option<(
     Some((minimum_output, maximum_output))
 }
 
+#[derive(Clone, Copy, Debug)]
+struct ExactShaderCandidates {
+    values: [f32; 64],
+    len: usize,
+}
+
+impl ExactShaderCandidates {
+    const EMPTY: Self = Self {
+        values: [0.0; 64],
+        len: 0,
+    };
+
+    fn singleton(value: f32) -> Self {
+        let mut candidates = Self::EMPTY;
+        candidates.values[0] = value;
+        candidates.len = 1;
+        candidates
+    }
+
+    fn insert(&mut self, value: f32) -> Option<()> {
+        if !value.is_finite() {
+            return None;
+        }
+        // WGSL permits every subnormal intermediate to be flushed before a
+        // later add/FMA. Preserve both outcomes in the association set;
+        // downstream validation can decide whether the difference matters.
+        if is_nonzero_subnormal(value) {
+            self.insert_distinct(0.0)?;
+        }
+        self.insert_distinct(value)
+    }
+
+    fn insert_distinct(&mut self, value: f32) -> Option<()> {
+        if self.as_slice().contains(&value) {
+            return Some(());
+        }
+        if self.len == self.values.len() {
+            return None;
+        }
+        self.values[self.len] = value;
+        self.len += 1;
+        Some(())
+    }
+
+    fn extend(&mut self, other: Self) -> Option<()> {
+        for &value in other.as_slice() {
+            self.insert_distinct(value)?;
+        }
+        Some(())
+    }
+
+    fn as_slice(&self) -> &[f32] {
+        &self.values[..self.len]
+    }
+
+    fn range(self) -> Option<(f64, f64)> {
+        let minimum = self.as_slice().iter().copied().reduce(f32::min)?;
+        let maximum = self.as_slice().iter().copied().reduce(f32::max)?;
+        Some((f64::from(minimum), f64::from(maximum)))
+    }
+}
+
+fn exact_shader_sum_range<const N: usize>(terms: [(f64, f64); N]) -> Option<(f64, f64)> {
+    exact_shader_sum_candidates(terms)?.range()
+}
+
+fn exact_shader_sum_candidates<const N: usize>(
+    terms: [(f64, f64); N],
+) -> Option<ExactShaderCandidates> {
+    if N > 4 || terms.iter().any(|term| term.0 != term.1) {
+        return None;
+    }
+
+    let mut active = [0.0_f64; 4];
+    let mut active_len = 0;
+    for &(term, _) in &terms {
+        if term != 0.0 {
+            active[active_len] = term;
+            active_len += 1;
+        }
+    }
+    if active_len == 0 {
+        return Some(ExactShaderCandidates::singleton(0.0));
+    }
+
+    // Exhaustively evaluate every binary association of separately rounded
+    // products plus every nested FMA contraction. Four terms is the largest
+    // shader dot used by the renderer, so this fixed-size oracle is both tight
+    // at f32::MAX and bounded in steady-state validation.
+    let mut candidates = [ExactShaderCandidates::EMPTY; 16];
+    let complete_mask = (1_usize << active_len) - 1;
+    for mask in 1..=complete_mask {
+        if mask.is_power_of_two() {
+            let index = mask.trailing_zeros() as usize;
+            candidates[mask].insert(active[index] as f32)?;
+        }
+
+        let mut left = (mask - 1) & mask;
+        while left != 0 {
+            let right = mask ^ left;
+            if right != 0 && left < right {
+                let left_candidates = candidates[left];
+                let right_candidates = candidates[right];
+                for &left_value in &left_candidates.values[..left_candidates.len] {
+                    for &right_value in &right_candidates.values[..right_candidates.len] {
+                        candidates[mask].insert(left_value + right_value)?;
+                    }
+                }
+            }
+            left = (left - 1) & mask;
+        }
+
+        if !mask.is_power_of_two() {
+            for (index, &active_term) in active.iter().take(active_len).enumerate() {
+                let term_mask = 1_usize << index;
+                if mask & term_mask == 0 {
+                    continue;
+                }
+                let rest = mask ^ term_mask;
+                let rest_candidates = candidates[rest];
+                for &rest_value in &rest_candidates.values[..rest_candidates.len] {
+                    candidates[mask].insert((active_term + f64::from(rest_value)) as f32)?;
+                }
+            }
+        }
+    }
+
+    Some(candidates[complete_mask])
+}
+
+fn exact_shader_dot_source_range(row: [f32; 4], point: [f32; 4]) -> Option<(f64, f64)> {
+    exact_shader_dot_source_candidates(row, point)?.range()
+}
+
+fn exact_shader_dot_source_candidates(
+    row: [f32; 4],
+    point: [f32; 4],
+) -> Option<ExactShaderCandidates> {
+    let terms =
+        std::array::from_fn::<_, 4, _>(|axis| f64::from(row[axis]) * f64::from(point[axis]));
+    let source_ftz_mask = (0..4).fold(0_u8, |mask, axis| {
+        if terms[axis] != 0.0
+            && (is_nonzero_subnormal(row[axis]) || is_nonzero_subnormal(point[axis]))
+        {
+            mask | (1 << axis)
+        } else {
+            mask
+        }
+    });
+    let mut output = ExactShaderCandidates::EMPTY;
+    for flushed in 0_u8..16 {
+        if flushed & !source_ftz_mask != 0 {
+            continue;
+        }
+        let selected: [(f64, f64); 4] = std::array::from_fn(|axis| {
+            let value = if flushed & (1 << axis) == 0 {
+                terms[axis]
+            } else {
+                0.0
+            };
+            (value, value)
+        });
+        output.extend(exact_shader_sum_candidates(selected)?)?;
+    }
+    (output.len > 0).then_some(output)
+}
+
 fn is_nonzero_subnormal(value: f32) -> bool {
     value != 0.0 && value.abs() < f32::MIN_POSITIVE
 }
@@ -1003,10 +1299,6 @@ fn interval_products_f64(coefficient: f32, minimum: f64, maximum: f64) -> (f64, 
     let first = f64::from(coefficient) * minimum;
     let second = f64::from(coefficient) * maximum;
     (first.min(second), first.max(second))
-}
-
-fn interval_max_abs(interval: (f64, f64)) -> f64 {
-    interval.0.abs().max(interval.1.abs())
 }
 
 /// Result of attempting to draw a frame.
