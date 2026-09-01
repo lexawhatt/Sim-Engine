@@ -20,6 +20,9 @@ use config::select_surface_present_mode;
 const INITIAL_VERTEX_CAPACITY: usize = 4096;
 const PREFERRED_SAMPLE_COUNT: u32 = 4;
 const COLOR_MAP_LUT_SIZE: u32 = 256;
+// Below 2^-102 adjacent normal f32 values can differ by a subnormal amount.
+// Such sources require exact tuple validation after camera-relative subtraction.
+const FTZ_SENSITIVE_SOURCE_LIMIT: f32 = f32::MIN_POSITIVE * 16_777_216.0;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
@@ -177,6 +180,8 @@ struct GeometryExtents {
     normal_distance_max_abs: f32,
     tangent_distance_max_abs: f32,
     miter_limit_max: f32,
+    vertex_count: usize,
+    requires_ftz_fallback: bool,
     empty: bool,
 }
 
@@ -523,7 +528,7 @@ impl CameraUniform {
             .chain(self.world_to_screen_x.iter())
             .chain(self.world_to_screen_y.iter())
             .chain(self.screen_to_clip.iter())
-            .all(|value| value.is_finite())
+            .all(|value| value.is_finite() && !is_nonzero_subnormal(*value))
     }
 
     fn world_to_screen(self, world: Vec2, depth: f32) -> Vec2 {
@@ -564,25 +569,33 @@ impl GeometryExtents {
             normal_distance_max_abs: 0.0,
             tangent_distance_max_abs: 0.0,
             miter_limit_max: 1.0,
+            vertex_count: 0,
+            requires_ftz_fallback: false,
             empty: is_empty,
         }
     }
 
     fn include(&mut self, vertex: Vertex) {
+        self.vertex_count += 1;
         let world = Vec2::new(vertex.world_position[0], vertex.world_position[1]);
         self.world_min.x = self.world_min.x.min(world.x);
         self.world_min.y = self.world_min.y.min(world.y);
         self.world_max.x = self.world_max.x.max(world.x);
         self.world_max.y = self.world_max.y.max(world.y);
         let world_offset = Vec2::new(vertex.world_offset[0], vertex.world_offset[1]);
+        self.requires_ftz_fallback |= [world.x, world.y, world_offset.x, world_offset.y]
+            .into_iter()
+            .any(is_ftz_sensitive_source);
         self.world_offset_min.x = self.world_offset_min.x.min(world_offset.x);
         self.world_offset_min.y = self.world_offset_min.y.min(world_offset.y);
         self.world_offset_max.x = self.world_offset_max.x.max(world_offset.x);
         self.world_offset_max.y = self.world_offset_max.y.max(world_offset.y);
         self.depth_min = self.depth_min.min(vertex.depth);
         self.depth_max = self.depth_max.max(vertex.depth);
+        self.requires_ftz_fallback |= is_nonzero_subnormal(vertex.depth);
 
         for direction in [vertex.previous_direction, vertex.next_direction] {
+            self.requires_ftz_fallback |= direction.into_iter().any(is_nonzero_subnormal);
             self.direction_min.x = self.direction_min.x.min(direction[0]);
             self.direction_min.y = self.direction_min.y.min(direction[1]);
             self.direction_max.x = self.direction_max.x.max(direction[0]);
@@ -597,6 +610,7 @@ impl GeometryExtents {
             .screen_offset_max_abs
             .y
             .max(vertex.screen_offset[1].abs());
+        self.requires_ftz_fallback |= vertex.screen_offset.into_iter().any(is_nonzero_subnormal);
         self.normal_distance_max_abs = self
             .normal_distance_max_abs
             .max(vertex.normal_distance.abs());
@@ -604,10 +618,15 @@ impl GeometryExtents {
             .tangent_distance_max_abs
             .max(vertex.tangent_distance.abs());
         self.miter_limit_max = self.miter_limit_max.max(vertex.miter_limit);
+        self.requires_ftz_fallback |= is_nonzero_subnormal(vertex.normal_distance)
+            || is_nonzero_subnormal(vertex.tangent_distance);
     }
 
     fn include_dynamic(&mut self, vertex: DynamicGpu) {
+        self.vertex_count += 1;
         let world = Vec2::new(vertex.world_position[0], vertex.world_position[1]);
+        self.requires_ftz_fallback |= [world.x, world.y].into_iter().any(is_ftz_sensitive_source)
+            || is_nonzero_subnormal(vertex.depth);
         self.world_min.x = self.world_min.x.min(world.x);
         self.world_min.y = self.world_min.y.min(world.y);
         self.world_max.x = self.world_max.x.max(world.x);
@@ -640,6 +659,9 @@ impl GeometryExtents {
     fn is_safe_for(self, uniform: CameraUniform) -> bool {
         if self.empty {
             return true;
+        }
+        if self.vertex_count > 1 && self.requires_ftz_fallback {
+            return false;
         }
 
         let center = Vec2::new(uniform.camera_center[0], uniform.camera_center[1]);
@@ -701,6 +723,17 @@ impl GeometryExtents {
             return false;
         };
         let maximum_miter = self.normal_distance_max_abs as f64 * self.miter_limit_max as f64;
+        if [
+            self.screen_offset_max_abs.x,
+            self.screen_offset_max_abs.y,
+            self.normal_distance_max_abs,
+            self.tangent_distance_max_abs,
+        ]
+        .into_iter()
+        .any(is_nonzero_subnormal)
+        {
+            return false;
+        }
         let horizontal_limit = interval_max_abs(world_horizontal)
             + self.screen_offset_max_abs.x as f64
             + maximum_miter
@@ -790,6 +823,11 @@ fn shader_clip_interval_is_safe(
     scale: f32,
     offset: f32,
 ) -> bool {
+    if (is_nonzero_subnormal_f64(screen_minimum) || is_nonzero_subnormal_f64(screen_maximum))
+        && scale != 0.0
+    {
+        return false;
+    }
     shader_interval_sum_range([
         interval_products_f64(scale, screen_minimum, screen_maximum),
         (f64::from(offset), f64::from(offset)),
@@ -818,7 +856,11 @@ fn shader_relative_component_bounds(
     // per-vertex fallback in `geometry_is_safe_for`.
     let minimum = relative_minimum + offset_minimum;
     let maximum = relative_maximum + offset_maximum;
-    if !minimum.is_finite() || !maximum.is_finite() {
+    if !minimum.is_finite()
+        || !maximum.is_finite()
+        || is_nonzero_subnormal(minimum)
+        || is_nonzero_subnormal(maximum)
+    {
         return None;
     }
     Some((minimum, maximum))
@@ -831,6 +873,13 @@ fn shader_world_dot_range(
     depth_minimum: f32,
     depth_maximum: f32,
 ) -> Option<(f64, f64)> {
+    if ((is_nonzero_subnormal(minimum[0]) || is_nonzero_subnormal(maximum[0])) && row[0] != 0.0)
+        || ((is_nonzero_subnormal(minimum[1]) || is_nonzero_subnormal(maximum[1])) && row[1] != 0.0)
+        || ((is_nonzero_subnormal(depth_minimum) || is_nonzero_subnormal(depth_maximum))
+            && row[2] != 0.0)
+    {
+        return None;
+    }
     shader_interval_sum_range([
         interval_products(row[0], minimum[0], maximum[0]),
         interval_products(row[1], minimum[1], maximum[1]),
@@ -840,6 +889,11 @@ fn shader_world_dot_range(
 }
 
 fn shader_direction_dot_range(row: [f32; 4], minimum: Vec2, maximum: Vec2) -> Option<(f64, f64)> {
+    if ((is_nonzero_subnormal(minimum.x) || is_nonzero_subnormal(maximum.x)) && row[0] != 0.0)
+        || ((is_nonzero_subnormal(minimum.y) || is_nonzero_subnormal(maximum.y)) && row[1] != 0.0)
+    {
+        return None;
+    }
     shader_interval_sum_range([
         interval_products(row[0], minimum.x, maximum.x),
         interval_products(row[1], minimum.y, maximum.y),
@@ -864,7 +918,16 @@ fn shader_interval_sum_range<const N: usize>(terms: [(f64, f64); N]) -> Option<(
     let mut maximum_sum = 0.0;
     let mut magnitude_sum = 0.0;
     for term in terms {
-        if !term.0.is_finite() || !term.1.is_finite() || term.0 < -maximum || term.1 > maximum {
+        // WGSL permits implementations to flush subnormal arithmetic to zero.
+        // A flushed product can become visually significant after a later
+        // large camera or clip multiplier, so reject it structurally.
+        if is_nonzero_subnormal_f64(term.0)
+            || is_nonzero_subnormal_f64(term.1)
+            || !term.0.is_finite()
+            || !term.1.is_finite()
+            || term.0 < -maximum
+            || term.1 > maximum
+        {
             return None;
         }
         positive_sum += term.1.max(0.0);
@@ -874,10 +937,22 @@ fn shader_interval_sum_range<const N: usize>(terms: [(f64, f64); N]) -> Option<(
         magnitude_sum += term.0.abs().max(term.1.abs());
     }
 
-    // A four-term dot has at most four product roundings and three addition
-    // roundings. Use one extra operation of margin for backend contraction and
-    // reassociation choices. FMA can only reduce this worst-case envelope.
-    let operation_count = N.saturating_mul(2).max(1) as f64;
+    // Exact zero terms do not participate in any association, and an isolated
+    // exactly representable product needs no rounding allowance. This keeps
+    // identity rows valid at `f32::MAX` while retaining a conservative margin
+    // for every product/addition which can actually round.
+    let active_terms = terms
+        .iter()
+        .filter(|term| term.0 != 0.0 || term.1 != 0.0)
+        .count();
+    let inexact_products = terms
+        .iter()
+        .filter(|term| {
+            term.0 != term.1 || !term.0.is_finite() || f64::from(term.0 as f32) != term.0
+        })
+        .count();
+    let operation_count = inexact_products + active_terms.saturating_sub(1);
+    let operation_count = operation_count as f64;
     let unit_roundoff = 2.0_f64.powi(-24);
     let gamma = operation_count * unit_roundoff / (1.0 - operation_count * unit_roundoff);
     let subnormal_margin = if magnitude_sum > 0.0 {
@@ -900,6 +975,18 @@ fn shader_interval_sum_range<const N: usize>(terms: [(f64, f64); N]) -> Option<(
         return None;
     }
     Some((minimum_output, maximum_output))
+}
+
+fn is_nonzero_subnormal(value: f32) -> bool {
+    value != 0.0 && value.abs() < f32::MIN_POSITIVE
+}
+
+fn is_nonzero_subnormal_f64(value: f64) -> bool {
+    value != 0.0 && value.abs() < f64::from(f32::MIN_POSITIVE)
+}
+
+fn is_ftz_sensitive_source(value: f32) -> bool {
+    value != 0.0 && value.abs() < FTZ_SENSITIVE_SOURCE_LIMIT
 }
 
 fn interval_products(coefficient: f32, minimum: f32, maximum: f32) -> (f64, f64) {
@@ -1129,7 +1216,7 @@ impl Error for RendererInitError {}
 /// Invalid runtime or initialization configuration for [`WgpuRenderer`].
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum RendererConfigurationError {
-    /// Logical-to-physical scale must produce finite logical dimensions for every supported surface.
+    /// Logical-to-physical scale must keep all surface transforms normal and finite.
     InvalidScaleFactor {
         /// Rejected physical pixels per logical screen pixel.
         scale_factor: f64,
@@ -1146,7 +1233,7 @@ impl fmt::Display for RendererConfigurationError {
         match self {
             Self::InvalidScaleFactor { scale_factor } => write!(
                 formatter,
-                "renderer scale factor must be finite, positive, representable as f32, and keep a u32 surface finite in logical pixels, got {scale_factor}"
+                "renderer scale factor must be finite, representable as f32, and keep every u32 surface transform in the normal f32 range, got {scale_factor}"
             ),
             Self::InvalidRecoveryLimit { limit } => write!(
                 formatter,

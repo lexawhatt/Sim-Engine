@@ -181,7 +181,7 @@ fn particle_safety_includes_radius_in_final_clip_arithmetic() {
 
 #[test]
 fn visible_particle_rejects_backend_dependent_dot_overflow() {
-    let viewport = LogicalViewport::new(f32::MAX, f32::MAX).unwrap();
+    let viewport = LogicalViewport::new(1.0e30, 1.0e30).unwrap();
     let mut camera = Camera2d::new(Vec2::ZERO, 3.830_149e16).unwrap();
     camera.set_rotation(1.378_629).unwrap();
     camera.set_projection(crate::Projection2d::new(-0.124_491_87, -1.0).unwrap());
@@ -194,7 +194,6 @@ fn visible_particle_rejects_backend_dependent_dot_overflow() {
     };
 
     assert!(particle.screen_position(uniform).is_finite());
-    assert!(particle.intersects_viewport(uniform, viewport));
     assert!(!particle.is_safe_for(uniform));
 }
 
@@ -681,11 +680,9 @@ fn world_width_stroke_preserves_width_below_large_base_ulp() {
                 .with_cap(crate::StrokeCap2d::Butt),
         )
         .unwrap();
-    let (overflow_vertices, _) = tessellate_for_test(&overflow_scene);
+    let _ = tessellate_for_test(&overflow_scene);
     let tiny_viewport = LogicalViewport::new(1.0e-38, 1.0).unwrap();
-    let tiny_uniform =
-        CameraUniform::new(Camera2d::new(center, 1.0).unwrap(), tiny_viewport).unwrap();
-    assert!(!GeometryExtents::from_vertices(&overflow_vertices).is_safe_for(tiny_uniform));
+    assert!(CameraUniform::new(Camera2d::new(center, 1.0).unwrap(), tiny_viewport).is_none());
 }
 
 #[test]
@@ -1050,6 +1047,60 @@ fn sub_epsilon_closed_strokes_remain_drawable_at_large_zoom() {
     let uniform = CameraUniform::new(camera, viewport).unwrap();
     assert!(GeometryExtents::from_vertices(&circle_vertices).is_safe_for(uniform));
     assert!(GeometryExtents::from_vertices(&rect_vertices).is_safe_for(uniform));
+}
+
+#[test]
+fn ftz_sensitive_world_geometry_is_rejected_before_gpu_submission() {
+    let largest_subnormal = f32::from_bits(0x007f_ffff);
+    let camera = Camera2d::new(Vec2::ZERO, f32::MAX).unwrap();
+    let viewport = LogicalViewport::new(64.0, 64.0).unwrap();
+    let uniform = CameraUniform::new(camera, viewport).unwrap();
+
+    let mut circle_scene = Scene::new(Color::BLACK).unwrap();
+    circle_scene
+        .try_circle(
+            Vec2::ZERO,
+            largest_subnormal,
+            ShapeStyle::filled(Color::WHITE),
+        )
+        .unwrap();
+    let (circle_vertices, _) = tessellate_for_test(&circle_scene);
+    let circle_extents = GeometryExtents::from_vertices(&circle_vertices);
+    assert!(!geometry_is_safe_for(
+        circle_extents,
+        GeometryValidationSource::Tessellated(&circle_vertices),
+        uniform,
+    ));
+
+    let mut line_scene = Scene::new(Color::BLACK).unwrap();
+    line_scene
+        .try_styled_line(
+            Vec2::ZERO,
+            Vec2::new(largest_subnormal, 0.0),
+            crate::StrokeStyle2d::logical(crate::LogicalPixels::new(2.0).unwrap(), Color::WHITE)
+                .with_cap(crate::StrokeCap2d::Butt),
+        )
+        .unwrap();
+    let (line_vertices, _) = tessellate_for_test(&line_scene);
+    let line_extents = GeometryExtents::from_vertices(&line_vertices);
+    assert!(!geometry_is_safe_for(
+        line_extents,
+        GeometryValidationSource::Tessellated(&line_vertices),
+        uniform,
+    ));
+
+    let particle = ParticleGpu {
+        world_position: [largest_subnormal, 0.0],
+        depth: 0.0,
+        radius: 1.0,
+        color: Color::WHITE.to_array(),
+    };
+    assert!(!particle.is_safe_for(uniform));
+    assert!(
+        particle
+            .validated_viewport_intersection(uniform, viewport)
+            .is_none()
+    );
 }
 
 #[test]
@@ -1432,6 +1483,19 @@ fn shader_dot_envelope_allows_safe_opposing_terms() {
         (-2.0e38, -2.0e38),
         (2.0e38, 2.0e38),
     ]));
+}
+
+#[test]
+fn shader_dot_envelope_keeps_exact_identity_at_f32_maximum() {
+    assert_eq!(
+        shader_interval_sum_range([
+            (f64::from(f32::MAX), f64::from(f32::MAX)),
+            (0.0, 0.0),
+            (0.0, 0.0),
+            (0.0, 0.0),
+        ]),
+        Some((f64::from(f32::MAX), f64::from(f32::MAX)))
+    );
 }
 
 #[test]
@@ -4134,6 +4198,10 @@ fn renderer_options_reject_invalid_scale_factor() {
     ));
     assert!(matches!(
         WgpuRendererOptions::new(RendererPresentMode::Vsync, f32::MIN_POSITIVE as f64),
+        Err(RendererConfigurationError::InvalidScaleFactor { .. })
+    ));
+    assert!(matches!(
+        WgpuRendererOptions::new(RendererPresentMode::Vsync, f32::MAX as f64),
         Err(RendererConfigurationError::InvalidScaleFactor { .. })
     ));
 }

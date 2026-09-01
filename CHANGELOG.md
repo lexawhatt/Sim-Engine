@@ -105,9 +105,19 @@ composed frames, fixed-screen UI, retained images, and host-shaped text.
   scene estimates, upload budgets, recovery memory, and diagnostics reflect
   that exact payload.
 - Rounded-corner arcs and world-unit stroke bodies, joins, and caps use the
-  same anchor-plus-local-offset representation. Any positive representable
-  radius/range remains nonzero; closed-stroke deduplication no longer erases
+  same anchor-plus-local-offset representation. Positive normal `f32`
+  radii/ranges remain nonzero; closed-stroke deduplication no longer erases
   geometry merely because its squared length is below `f32::EPSILON`.
+- GPU-transform validation rejects nonzero subnormal operands that a conforming
+  WGSL backend may flush to zero. This includes world/local geometry,
+  particles, camera rows, and screen-to-clip values, so extreme zoom cannot
+  turn a silently collapsed primitive into a backend-specific result.
+- Display and render-target pixel scales are bounded so all non-empty `u32`
+  target dimensions and reciprocal clip coefficients remain normal finite
+  `f32` values.
+- Hidden 3D dash arithmetic is validated against the complete clipped viewport
+  diagonal. A fixed CPU dot-product fold can no longer hide dash-phase overflow
+  available to another legal GPU association.
 - Camera/geometry validation preserves base/offset correlation between
   commands and rejects both pre-transform relative-coordinate overflow and
   final screen-to-clip overflow, including particle-radius extrusion and

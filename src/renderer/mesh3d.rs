@@ -1453,13 +1453,23 @@ fn validate_shader_transform(
     model_rows: [[f32; 4]; 3],
     camera_rows: [[f32; 4]; 4],
 ) -> Result<(), Mesh3dRenderError> {
+    if model_rows
+        .into_iter()
+        .chain(camera_rows)
+        .flatten()
+        .any(is_nonzero_subnormal)
+    {
+        return Err(Mesh3dRenderError::InvalidGeometryTransform);
+    }
+    let requires_ftz_fallback = mesh.has_ftz_sensitive_coordinates();
     // Eight AABB corners are the constant-cost common path. If that
     // conservative envelope fails, inspect only coordinates consumed by the
     // GPU: synthetic corners lose axis correlation and may reject a sparse
     // mesh even though every actual vertex is safe.
-    if bounds_corners(mesh.bounds_min(), mesh.bounds_max())
-        .into_iter()
-        .all(|corner| validate_shader_point(corner, model_rows, camera_rows).is_ok())
+    if !requires_ftz_fallback
+        && bounds_corners(mesh.bounds_min(), mesh.bounds_max())
+            .into_iter()
+            .all(|corner| validate_shader_point(corner, model_rows, camera_rows).is_ok())
     {
         return Ok(());
     }
@@ -1505,12 +1515,18 @@ fn validate_edge_projection(
         ),
         None => None,
     };
-    let hidden_period = style
-        .hidden_pattern()
-        .map(|(dash, gap)| dash.get() + gap.get());
+    let hidden_period = style.hidden_pattern().map(|(dash, gap)| {
+        let dash = dash.get();
+        let gap = gap.get();
+        if is_nonzero_subnormal(dash) || is_nonzero_subnormal(gap) {
+            return f32::NAN;
+        }
+        dash + gap
+    });
     if hidden_period.is_some_and(|period| !period.is_finite()) {
         return Err(Mesh3dRenderError::InvalidEdgeProjection);
     }
+    validate_hidden_dash_envelope(viewport, hidden_period)?;
 
     for edge in mesh.display_edges() {
         let mut clip = [[0.0_f32; 4]; 2];
@@ -1580,6 +1596,38 @@ fn validate_edge_projection(
                 hidden_period,
             )?;
         }
+    }
+    Ok(())
+}
+
+fn validate_hidden_dash_envelope(
+    viewport: [f32; 4],
+    dash_period: Option<f32>,
+) -> Result<(), Mesh3dRenderError> {
+    let Some(period) = dash_period else {
+        return Ok(());
+    };
+    if period <= 0.0 || is_nonzero_subnormal(period) {
+        return Err(Mesh3dRenderError::InvalidEdgeProjection);
+    }
+
+    // Frustum-clipped endpoints lie inside the physical target, regardless of
+    // which legal association/FMA choice produced their clip coordinates.
+    // Validate dash arithmetic against that complete envelope rather than the
+    // one fixed CPU fold used by the diagnostic clipping mirror below.
+    let width = f64::from(viewport[0]);
+    let height = f64::from(viewport[1]);
+    let pixels_per_logical = f64::from(viewport[2]);
+    let screen_diagonal = width.hypot(height) * (1.0 + 8.0 * f64::from(f32::EPSILON));
+    let maximum_logical_distance = screen_diagonal / pixels_per_logical;
+    let maximum_repetition = maximum_logical_distance / f64::from(period);
+    if !screen_diagonal.is_finite()
+        || !maximum_logical_distance.is_finite()
+        || !maximum_repetition.is_finite()
+        || maximum_logical_distance > f64::from(f32::MAX)
+        || maximum_repetition > f64::from(f32::MAX)
+    {
+        return Err(Mesh3dRenderError::InvalidEdgeProjection);
     }
     Ok(())
 }
@@ -1787,6 +1835,17 @@ fn shader_dot_range(
     row: [f32; 4],
     point: [ShaderValueRange; 4],
 ) -> Result<ShaderValueRange, Mesh3dRenderError> {
+    for axis in 0..4 {
+        let point_is_subnormal = is_nonzero_subnormal(point[axis].fixed)
+            || is_nonzero_subnormal_f64(point[axis].minimum)
+            || is_nonzero_subnormal_f64(point[axis].maximum);
+        if (is_nonzero_subnormal(row[axis])
+            && (point[axis].minimum != 0.0 || point[axis].maximum != 0.0))
+            || (row[axis] != 0.0 && point_is_subnormal)
+        {
+            return Err(Mesh3dRenderError::InvalidGeometryTransform);
+        }
+    }
     let terms: [(f64, f64); 4] = std::array::from_fn(|axis| {
         interval_products_f64(row[axis], point[axis].minimum, point[axis].maximum)
     });
@@ -2713,6 +2772,33 @@ mod tests {
     }
 
     #[test]
+    fn shader_transform_rejects_ftz_sensitive_vertex_operands() {
+        let largest_subnormal = f32::from_bits(0x007f_ffff);
+        let mesh = Mesh3d::with_display_edges(
+            vec![Vec3::ZERO, Vec3::new(largest_subnormal, 0.0, 0.0).unwrap()],
+            Vec::new(),
+            vec![MeshEdge3d::new(0, 1).unwrap()],
+        )
+        .unwrap();
+        let camera = Camera3d::look_at(
+            Vec3::new(0.0, 0.0, 2.0).unwrap(),
+            Vec3::ZERO,
+            Vec3::Y,
+            Projection3d::orthographic(world(2.0), 1.0, world(0.1), world(10.0)).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            validate_shader_transform(
+                &mesh,
+                Transform3d::IDENTITY.model_rows().unwrap(),
+                camera.world_to_clip_rows().unwrap(),
+            ),
+            Err(Mesh3dRenderError::InvalidGeometryTransform)
+        );
+    }
+
+    #[test]
     fn shader_transform_rejects_pairwise_dot_overflow_after_finite_cpu_transform() {
         let maximum = f32::MAX;
         let angle = 0.5_f32.acos();
@@ -2946,6 +3032,50 @@ mod tests {
                 camera.world_to_clip_rows().unwrap(),
                 style,
                 [1_024.0, 1_024.0, 1.0, 0.0],
+            ),
+            Err(Mesh3dRenderError::InvalidEdgeProjection)
+        );
+    }
+
+    #[test]
+    fn edge_projection_bounds_dash_across_legal_shader_associations() {
+        let point = Vec3::new(-6.593_279e17, 2.460_645_7e18, 9.006_587e17).unwrap();
+        let mesh = Mesh3d::with_display_edges(
+            vec![point, point.checked_scale(0.5).unwrap()],
+            Vec::new(),
+            vec![MeshEdge3d::new(0, 1).unwrap()],
+        )
+        .unwrap();
+        let axis = Vec3::new(1.0, 1.0, 1.0).unwrap().normalized().unwrap();
+        let transform = Transform3d::new(
+            Vec3::ZERO,
+            Rotation3d::from_axis_angle(axis, std::f32::consts::FRAC_PI_2).unwrap(),
+            Vec3::new(1.0, 1.0, 1.0).unwrap(),
+        )
+        .unwrap();
+        let camera = Camera3d::look_at(
+            Vec3::ZERO,
+            Vec3::new(0.0, 0.0, 1.0).unwrap(),
+            Vec3::Y,
+            Projection3d::orthographic(world(5.0e10), 1.0, world(1.0), world(3.0e18)).unwrap(),
+        )
+        .unwrap();
+        let tiny = logical(1.5e-38);
+        let style = WireframeStyle3d::visible(Color::WHITE, logical(1.0))
+            .unwrap()
+            .with_hidden(Color::WHITE, logical(1.0), tiny, tiny)
+            .unwrap();
+
+        let model_rows = transform.model_rows().unwrap();
+        let model_point = [point.x(), point.y(), point.z(), 1.0];
+        assert_eq!(shader_dot(model_rows[0], model_point), Ok(0.0));
+        assert_eq!(
+            validate_edge_projection(
+                &mesh,
+                model_rows,
+                camera.world_to_clip_rows().unwrap(),
+                style,
+                [100.0, 100.0, 1.0, 0.0],
             ),
             Err(Mesh3dRenderError::InvalidEdgeProjection)
         );

@@ -96,8 +96,9 @@ impl WgpuRendererOptions {
     /// Builds options from presentation behavior and display scale.
     ///
     /// `scale_factor` is physical surface pixels per logical screen pixel. It
-    /// must be finite, positive, representable as `f32`, and large enough that
-    /// every supported physical surface has finite logical dimensions.
+    /// must be finite, representable as `f32`, and bounded so every non-empty
+    /// `u32` surface keeps its logical dimensions and reciprocal clip scale in
+    /// the normal finite `f32` range.
     pub fn new(
         present_mode: RendererPresentMode,
         scale_factor: f64,
@@ -187,10 +188,9 @@ pub(super) fn create_multisample_target(
 
 pub(super) fn validate_scale_factor(scale_factor: f64) -> Result<(), RendererConfigurationError> {
     let scale_factor_f32 = scale_factor as f32;
-    let minimum_scale_factor = u32::MAX as f64 / f32::MAX as f64;
-    if scale_factor.is_finite()
-        && scale_factor_f32.is_finite()
-        && scale_factor >= minimum_scale_factor
+    if scale_factor_f32.is_finite()
+        && crate::units::stable_physical_per_logical(scale_factor)
+        && crate::units::stable_physical_per_logical(f64::from(scale_factor_f32))
     {
         Ok(())
     } else {

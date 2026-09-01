@@ -139,8 +139,11 @@ GPU camera transform. A circle radius, rounded corner, or world-unit stroke
 width that is meaningful under the active zoom therefore does not disappear
 merely because adding it to a large source coordinate would round back to the
 same `f32`. Fill, stroke, joins/caps, shadow/spread, and gradient sampling share
-that representation. Any positive representable radial range remains a real
-range rather than being treated as zero by an epsilon threshold.
+that representation. Any positive normal `f32` radial range remains a real
+range rather than being treated as zero by an epsilon threshold. Nonzero
+subnormal operands are not portable across WGSL backends: when they could
+affect a GPU transform, rendering returns `InvalidGeometryTransform` instead
+of accepting a primitive that another driver may silently flush to zero.
 
 #### Rich bounded strokes
 
@@ -311,8 +314,10 @@ renderer.resize_with_scale_factor(width, height, window.scale_factor())?;
 ```
 
 Zero physical dimensions are ignored because a minimized surface cannot be
-configured at zero size. Scale factors that cannot produce a finite logical
-viewport are rejected.
+configured at zero size. Display and target scales are bounded so every
+non-empty `u32` target keeps both logical dimensions and reciprocal
+screen-to-clip coefficients in the normal finite `f32` range; more extreme
+ratios are rejected at construction or resize.
 
 #### Fixed UI and viewports
 
@@ -851,7 +856,9 @@ products are bounded independently of backend association/FMA choices, and the
 possible model-dot result interval becomes the input to camera validation. The
 edge validator then mirrors the remaining shader order through physical-width
 expansion, logical-distance and dash-phase calculation, NDC extrusion,
-homogeneous scaling, and final clip-coordinate addition. Any overflow is
+homogeneous scaling, and final clip-coordinate addition. Hidden dash division
+is additionally bounded by the complete clipped viewport diagonal so it does
+not depend on one CPU association of the transform. Any overflow is
 reported as `InvalidGeometryTransform` or `InvalidEdgeProjection`; it is never
 submitted as non-finite clip geometry. Transform checks use a constant-cost
 bounding-box envelope on the common path, then fall back to actual retained

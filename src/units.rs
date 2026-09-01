@@ -42,17 +42,24 @@ impl WorldLength {
     }
 }
 
-/// Positive finite physical texels per logical screen pixel.
+/// Backend-stable physical texels per logical screen pixel.
 ///
 /// A value below one represents a downsampled target and a value above one a
 /// native HiDPI or supersampled target. It is not a line width.
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
 pub struct PhysicalPerLogical(f32);
 
+pub(crate) const MIN_STABLE_PHYSICAL_PER_LOGICAL: f64 =
+    u32::MAX as f64 * f32::MIN_POSITIVE as f64 / 2.0;
+pub(crate) const MAX_STABLE_PHYSICAL_PER_LOGICAL: f64 = 1.0 / f32::MIN_POSITIVE as f64;
+
 impl PhysicalPerLogical {
-    /// Labels a positive finite physical-to-logical pixel ratio.
+    /// Labels a backend-stable physical-to-logical pixel ratio.
+    ///
+    /// The bounded range keeps logical dimensions and their reciprocal clip
+    /// scales normal (not subnormal) for every non-empty `u32` target.
     pub fn new(value: f32) -> Result<Self, UnitError> {
-        positive_finite(value)
+        stable_physical_per_logical(f64::from(value))
             .then_some(Self(value))
             .ok_or(UnitError::InvalidPhysicalPerLogical { value })
     }
@@ -76,7 +83,8 @@ pub enum UnitError {
         /// Rejected untyped scalar.
         value: f32,
     },
-    /// Physical-to-logical ratios must be finite and strictly positive.
+    /// Physical-to-logical ratios must keep `u32` target transforms in the
+    /// normal finite `f32` range.
     InvalidPhysicalPerLogical {
         /// Rejected untyped scalar.
         value: f32,
@@ -100,7 +108,7 @@ impl fmt::Display for UnitError {
             }
             Self::InvalidPhysicalPerLogical { value } => write!(
                 formatter,
-                "physical-per-logical ratio must be positive and finite, got {value}"
+                "physical-per-logical ratio must keep u32 target transforms in the normal finite f32 range, got {value}"
             ),
         }
     }
@@ -110,6 +118,11 @@ impl Error for UnitError {}
 
 fn positive_finite(value: f32) -> bool {
     value.is_finite() && value > 0.0
+}
+
+pub(crate) fn stable_physical_per_logical(value: f64) -> bool {
+    value.is_finite()
+        && (MIN_STABLE_PHYSICAL_PER_LOGICAL..=MAX_STABLE_PHYSICAL_PER_LOGICAL).contains(&value)
 }
 
 #[cfg(test)]
@@ -135,5 +148,13 @@ mod tests {
             PhysicalPerLogical::new(-1.0),
             Err(UnitError::InvalidPhysicalPerLogical { value: -1.0 })
         );
+        assert!(matches!(
+            PhysicalPerLogical::new(f32::MIN_POSITIVE),
+            Err(UnitError::InvalidPhysicalPerLogical { .. })
+        ));
+        assert!(matches!(
+            PhysicalPerLogical::new(f32::MAX),
+            Err(UnitError::InvalidPhysicalPerLogical { .. })
+        ));
     }
 }

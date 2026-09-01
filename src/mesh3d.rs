@@ -3,6 +3,7 @@ use std::{collections::BTreeSet, error::Error, fmt, sync::Arc};
 use crate::{Color, LogicalPixels, Vec3};
 
 const MAX_LOGICAL_EDGE_METRIC: f32 = 1_048_576.0;
+const FTZ_SENSITIVE_COORDINATE_LIMIT: f32 = f32::MIN_POSITIVE * 16_777_216.0;
 
 /// Surface material for one retained 3D instance.
 ///
@@ -266,6 +267,7 @@ pub struct Mesh3d {
     display_edges: Arc<[MeshEdge3d]>,
     bounds_min: Vec3,
     bounds_max: Vec3,
+    has_ftz_sensitive_coordinates: bool,
 }
 
 impl Mesh3d {
@@ -335,12 +337,18 @@ impl Mesh3d {
         }
 
         let (bounds_min, bounds_max) = mesh_bounds(&vertices);
+        let has_ftz_sensitive_coordinates = vertices.iter().any(|vertex| {
+            [vertex.x(), vertex.y(), vertex.z()]
+                .into_iter()
+                .any(|value| value != 0.0 && value.abs() < FTZ_SENSITIVE_COORDINATE_LIMIT)
+        });
         Ok(Self {
             vertices: vertices.into(),
             triangle_indices: triangle_indices.into(),
             display_edges: display_edges.into(),
             bounds_min,
             bounds_max,
+            has_ftz_sensitive_coordinates,
         })
     }
 
@@ -372,6 +380,12 @@ impl Mesh3d {
     /// Returns the inclusive model-space upper bound.
     pub const fn bounds_max(&self) -> Vec3 {
         self.bounds_max
+    }
+
+    /// Returns whether exact vertex validation is needed for portable WGSL FTZ behavior.
+    #[cfg(feature = "wgpu")]
+    pub(crate) const fn has_ftz_sensitive_coordinates(&self) -> bool {
+        self.has_ftz_sensitive_coordinates
     }
 
     /// Returns retained CPU bytes used by vertices, indices, and display edges.
