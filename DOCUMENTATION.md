@@ -1140,7 +1140,10 @@ association instead of relying on one CPU fold.
 The constant-cost scene envelope is the common path. If independent extrema
 form a nonexistent world/depth/direction combination, validation falls back to
 the actual tessellated or dynamic vertex tuples, including the distinct
-previous and next stroke directions. Lines retain logical-pixel width by
+previous and next stroke directions. Base and local-offset bounds are kept
+independent in that fast envelope because rounding the shader's intermediate
+`base - camera_center` can reorder otherwise equal exact sums by one ULP.
+Lines retain logical-pixel width by
 carrying a screen-extrusion direction separately from world position.
 
 The retained 3D transform is explicit:

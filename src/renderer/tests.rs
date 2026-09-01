@@ -1472,7 +1472,7 @@ fn geometry_extents_reject_final_screen_to_clip_overflow() {
 }
 
 #[test]
-fn geometry_extents_preserve_base_offset_correlation_between_commands() {
+fn geometry_validation_recovers_base_offset_correlation_between_commands() {
     let mut scene = Scene::new(Color::BLACK).unwrap();
     scene
         .try_circle(
@@ -1489,7 +1489,47 @@ fn geometry_extents_preserve_base_offset_correlation_between_commands() {
     let viewport = LogicalViewport::new(64.0, 64.0).unwrap();
     let uniform = CameraUniform::new(camera, viewport).unwrap();
 
-    assert!(GeometryExtents::from_vertices(&vertices).is_safe_for(uniform));
+    let extents = GeometryExtents::from_vertices(&vertices);
+    assert!(!extents.is_safe_for(uniform));
+    assert!(geometry_is_safe_for(
+        extents,
+        GeometryValidationSource::Tessellated(&vertices),
+        uniform,
+    ));
+}
+
+#[test]
+fn relative_bounds_cover_rounding_reordered_base_offset_pairs() {
+    let center = 1.661_066_2e32;
+    let pairs = [
+        (-6.524_132_6e24, -3.625_333_7e24),
+        (2.993_184_3e34, 8.678_791e24),
+        (-9.846_69e24, -2.212_276_4e-36),
+    ];
+    let minimum = pairs
+        .iter()
+        .map(|pair| pair.0)
+        .fold(f32::INFINITY, f32::min);
+    let maximum = pairs
+        .iter()
+        .map(|pair| pair.0)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let offset_minimum = pairs
+        .iter()
+        .map(|pair| pair.1)
+        .fold(f32::INFINITY, f32::min);
+    let offset_maximum = pairs
+        .iter()
+        .map(|pair| pair.1)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let bounds =
+        shader_relative_component_bounds(minimum, maximum, center, offset_minimum, offset_maximum)
+            .unwrap();
+
+    for (base, offset) in pairs {
+        let actual = (base - center) + offset;
+        assert!(actual >= bounds.0 && actual <= bounds.1);
+    }
 }
 
 #[test]

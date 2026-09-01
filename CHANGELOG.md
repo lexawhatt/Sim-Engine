@@ -123,6 +123,10 @@ composed frames, fixed-screen UI, retained images, and host-shaped text.
   or dynamic vertex tuples when independent scene-wide world/depth/direction
   extrema form a nonexistent combination. Safe correlated extreme geometry is
   accepted without adding a scan to ordinary frames.
+- Base/offset aggregation now follows the shader's rounded
+  `(base - camera_center) + offset` operation rather than ordering pairs by an
+  idealized exact sum. The conservative fast envelope cannot miss a one-ULP
+  extremum; exact vertex fallback still recovers safe correlated geometry.
 - Particle projection and CPU culling apply the same association-independent
   camera-row envelope through radius extrusion and screen-to-clip arithmetic.
   A particle is no longer silently culled according to a different CPU fold.

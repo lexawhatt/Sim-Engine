@@ -167,8 +167,8 @@ pub enum RenderTargetLoad {
 struct GeometryExtents {
     world_min: Vec2,
     world_max: Vec2,
-    correlated_world_min: [Option<CorrelatedWorldComponent>; 2],
-    correlated_world_max: [Option<CorrelatedWorldComponent>; 2],
+    world_offset_min: Vec2,
+    world_offset_max: Vec2,
     depth_min: f32,
     depth_max: f32,
     direction_min: Vec2,
@@ -178,12 +178,6 @@ struct GeometryExtents {
     tangent_distance_max_abs: f32,
     miter_limit_max: f32,
     empty: bool,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct CorrelatedWorldComponent {
-    base: f32,
-    offset: f32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -560,8 +554,8 @@ impl GeometryExtents {
         Self {
             world_min: Vec2::splat(f32::INFINITY),
             world_max: Vec2::splat(f32::NEG_INFINITY),
-            correlated_world_min: [None; 2],
-            correlated_world_max: [None; 2],
+            world_offset_min: Vec2::splat(f32::INFINITY),
+            world_offset_max: Vec2::splat(f32::NEG_INFINITY),
             depth_min: f32::INFINITY,
             depth_max: f32::NEG_INFINITY,
             direction_min: Vec2::splat(f32::INFINITY),
@@ -581,12 +575,10 @@ impl GeometryExtents {
         self.world_max.x = self.world_max.x.max(world.x);
         self.world_max.y = self.world_max.y.max(world.y);
         let world_offset = Vec2::new(vertex.world_offset[0], vertex.world_offset[1]);
-        for (axis, (base, offset)) in [(world.x, world_offset.x), (world.y, world_offset.y)]
-            .into_iter()
-            .enumerate()
-        {
-            self.include_correlated(axis, CorrelatedWorldComponent { base, offset });
-        }
+        self.world_offset_min.x = self.world_offset_min.x.min(world_offset.x);
+        self.world_offset_min.y = self.world_offset_min.y.min(world_offset.y);
+        self.world_offset_max.x = self.world_offset_max.x.max(world_offset.x);
+        self.world_offset_max.y = self.world_offset_max.y.max(world_offset.y);
         self.depth_min = self.depth_min.min(vertex.depth);
         self.depth_max = self.depth_max.max(vertex.depth);
 
@@ -620,26 +612,12 @@ impl GeometryExtents {
         self.world_min.y = self.world_min.y.min(world.y);
         self.world_max.x = self.world_max.x.max(world.x);
         self.world_max.y = self.world_max.y.max(world.y);
-        for (axis, base) in [world.x, world.y].into_iter().enumerate() {
-            self.include_correlated(axis, CorrelatedWorldComponent { base, offset: 0.0 });
-        }
+        self.world_offset_min = Vec2::ZERO;
+        self.world_offset_max = Vec2::ZERO;
         self.depth_min = self.depth_min.min(vertex.depth);
         self.depth_max = self.depth_max.max(vertex.depth);
         self.direction_min = Vec2::ZERO;
         self.direction_max = Vec2::ZERO;
-    }
-
-    fn include_correlated(&mut self, axis: usize, candidate: CorrelatedWorldComponent) {
-        if self.correlated_world_min[axis]
-            .is_none_or(|current| correlated_world_less(candidate, current))
-        {
-            self.correlated_world_min[axis] = Some(candidate);
-        }
-        if self.correlated_world_max[axis]
-            .is_none_or(|current| correlated_world_less(current, candidate))
-        {
-            self.correlated_world_max[axis] = Some(candidate);
-        }
     }
 
     fn from_dynamic_vertices(vertices: &[DynamicGpu]) -> Self {
@@ -674,8 +652,8 @@ impl GeometryExtents {
             self.world_min.x,
             self.world_max.x,
             center.x,
-            self.correlated_world_min[0],
-            self.correlated_world_max[0],
+            self.world_offset_min.x,
+            self.world_offset_max.x,
         ) else {
             return false;
         };
@@ -683,8 +661,8 @@ impl GeometryExtents {
             self.world_min.y,
             self.world_max.y,
             center.y,
-            self.correlated_world_min[1],
-            self.correlated_world_max[1],
+            self.world_offset_min.y,
+            self.world_offset_max.y,
         ) else {
             return false;
         };
@@ -823,8 +801,8 @@ fn shader_relative_component_bounds(
     world_minimum: f32,
     world_maximum: f32,
     camera_center: f32,
-    correlated_minimum: Option<CorrelatedWorldComponent>,
-    correlated_maximum: Option<CorrelatedWorldComponent>,
+    offset_minimum: f32,
+    offset_maximum: f32,
 ) -> Option<(f32, f32)> {
     // Keep the subtraction in f32 because that is the first WGSL operation.
     let relative_minimum = world_minimum - camera_center;
@@ -833,27 +811,17 @@ fn shader_relative_component_bounds(
         return None;
     }
 
-    let evaluate =
-        |component: CorrelatedWorldComponent| (component.base - camera_center) + component.offset;
-    let first = evaluate(correlated_minimum?);
-    let second = evaluate(correlated_maximum?);
-    if !first.is_finite() || !second.is_finite() {
+    // Exact `base + offset` ordering is not sufficient here: the shader first
+    // rounds `base - camera_center`, so two close correlated sums can reverse
+    // order by an ULP. Independent extrema are conservative for that actual
+    // operation sequence. The rare false rejection is recovered by the exact
+    // per-vertex fallback in `geometry_is_safe_for`.
+    let minimum = relative_minimum + offset_minimum;
+    let maximum = relative_maximum + offset_maximum;
+    if !minimum.is_finite() || !maximum.is_finite() {
         return None;
     }
-    Some((first.min(second), first.max(second)))
-}
-
-fn correlated_world_less(left: CorrelatedWorldComponent, right: CorrelatedWorldComponent) -> bool {
-    exact_f32_sum_parts(left.base, left.offset) < exact_f32_sum_parts(right.base, right.offset)
-}
-
-fn exact_f32_sum_parts(first: f32, second: f32) -> (f64, f64) {
-    let first = f64::from(first);
-    let second = f64::from(second);
-    let sum = first + second;
-    let second_virtual = sum - first;
-    let error = (first - (sum - second_virtual)) + (second - second_virtual);
-    (sum, error)
+    Some((minimum, maximum))
 }
 
 fn shader_world_dot_range(
