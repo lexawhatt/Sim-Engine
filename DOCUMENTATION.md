@@ -852,7 +852,11 @@ edge validator then mirrors the remaining shader order through physical-width
 expansion, logical-distance and dash-phase calculation, NDC extrusion,
 homogeneous scaling, and final clip-coordinate addition. Any overflow is
 reported as `InvalidGeometryTransform` or `InvalidEdgeProjection`; it is never
-submitted as non-finite clip geometry.
+submitted as non-finite clip geometry. Transform checks use a constant-cost
+bounding-box envelope on the common path, then fall back to actual retained
+vertices if an uncorrelated synthetic corner fails. Edge expansion uses the
+actual projected normal component per axis, so a zero component is not replaced
+by a pessimistic full-width bound.
 
 Current 3D scope is deliberately focused: opaque surfaces, retained transforms,
 hardware depth, solid visible edges, and dashed hidden edges. Translucent or

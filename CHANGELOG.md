@@ -122,6 +122,10 @@ composed frames, fixed-screen UI, retained images, and host-shaped text.
 - Retained 3D edge validation mirrors the complete post-projection shader
   arithmetic, including doubled raster width, logical-distance and dash phase,
   NDC extrusion, homogeneous scaling, and the final clip-coordinate addition.
+- Retained 3D transform validation now falls back from its constant-cost AABB
+  envelope to the mesh's actual correlated vertices instead of rejecting on a
+  nonexistent corner, and edge extrusion bounds use the actual projected
+  normal component on each axis.
 - Streaming composition returns its reusable transient vertex allocation to
   the renderer on every structured error path, preserving steady-state memory
   behavior after a rejected frame.

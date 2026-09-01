@@ -1453,17 +1453,36 @@ fn validate_shader_transform(
     model_rows: [[f32; 4]; 3],
     camera_rows: [[f32; 4]; 4],
 ) -> Result<(), Mesh3dRenderError> {
-    for corner in bounds_corners(mesh.bounds_min(), mesh.bounds_max()) {
-        let model_point = [corner.x(), corner.y(), corner.z(), 1.0];
-        let world = [
-            shader_dot(model_rows[0], model_point)?,
-            shader_dot(model_rows[1], model_point)?,
-            shader_dot(model_rows[2], model_point)?,
-            1.0,
-        ];
-        for row in camera_rows {
-            let _ = shader_dot(row, world)?;
-        }
+    // Eight AABB corners are the constant-cost common path. If that
+    // conservative envelope fails, inspect only coordinates consumed by the
+    // GPU: synthetic corners lose axis correlation and may reject a sparse
+    // mesh even though every actual vertex is safe.
+    if bounds_corners(mesh.bounds_min(), mesh.bounds_max())
+        .into_iter()
+        .all(|corner| validate_shader_point(corner, model_rows, camera_rows).is_ok())
+    {
+        return Ok(());
+    }
+    for vertex in mesh.vertices() {
+        validate_shader_point(*vertex, model_rows, camera_rows)?;
+    }
+    Ok(())
+}
+
+fn validate_shader_point(
+    point: Vec3,
+    model_rows: [[f32; 4]; 3],
+    camera_rows: [[f32; 4]; 4],
+) -> Result<(), Mesh3dRenderError> {
+    let model_point = [point.x(), point.y(), point.z(), 1.0];
+    let world = [
+        shader_dot(model_rows[0], model_point)?,
+        shader_dot(model_rows[1], model_point)?,
+        shader_dot(model_rows[2], model_point)?,
+        1.0,
+    ];
+    for row in camera_rows {
+        let _ = shader_dot(row, world)?;
     }
     Ok(())
 }
@@ -1535,11 +1554,27 @@ fn validate_edge_projection(
             return Err(Mesh3dRenderError::InvalidEdgeProjection);
         }
         let screen_length = (delta_x * delta_x + delta_y * delta_y).sqrt();
-        validate_edge_shader_arithmetic(clipped, screen_length, viewport, visible_raster, None)?;
+        let screen_normal = if screen_length > 0.0001 {
+            [-delta_y / screen_length, delta_x / screen_length]
+        } else {
+            [0.0, 0.0]
+        };
+        if !screen_normal.into_iter().all(f32::is_finite) {
+            return Err(Mesh3dRenderError::InvalidEdgeProjection);
+        }
+        validate_edge_shader_arithmetic(
+            clipped,
+            screen_length,
+            screen_normal,
+            viewport,
+            visible_raster,
+            None,
+        )?;
         if let Some(hidden_raster) = hidden_raster {
             validate_edge_shader_arithmetic(
                 clipped,
                 screen_length,
+                screen_normal,
                 viewport,
                 hidden_raster,
                 hidden_period,
@@ -1682,6 +1717,7 @@ fn edge_raster_envelope(
 fn validate_edge_shader_arithmetic(
     clipped: [[f32; 4]; 2],
     screen_length: f32,
+    screen_normal: [f32; 2],
     viewport: [f32; 4],
     raster: EdgeRasterEnvelope,
     dash_period: Option<f32>,
@@ -1708,9 +1744,12 @@ fn validate_edge_shader_arithmetic(
     }
 
     let dimensions = [viewport[0].max(1.0), viewport[1].max(1.0)];
-    let doubled_raster_width = raster.raster_half_width * 2.0;
     for axis in 0..2 {
-        let ndc_offset_max_abs = doubled_raster_width / dimensions[axis];
+        // Match `screen_normal * side_pattern * raster_half_width` before the
+        // shader's multiply-by-two. The two signs are checked at clip addition.
+        let screen_offset_max_abs = screen_normal[axis].abs() * raster.raster_half_width;
+        let doubled_screen_offset = screen_offset_max_abs * 2.0;
+        let ndc_offset_max_abs = doubled_screen_offset / dimensions[axis];
         if !ndc_offset_max_abs.is_finite() {
             return Err(Mesh3dRenderError::InvalidEdgeProjection);
         }
@@ -2705,6 +2744,55 @@ mod tests {
     }
 
     #[test]
+    fn shader_transform_accepts_safe_correlated_sparse_vertices() {
+        let extent = 0.9 * f32::MAX;
+        let mesh = Mesh3d::with_display_edges(
+            vec![
+                Vec3::new(extent, 0.0, 0.0).unwrap(),
+                Vec3::new(0.0, extent, 0.0).unwrap(),
+            ],
+            Vec::new(),
+            vec![MeshEdge3d::new(0, 1).unwrap()],
+        )
+        .unwrap();
+        let transform = Transform3d::new(
+            Vec3::ZERO,
+            Rotation3d::from_axis_angle(Vec3::Z, -std::f32::consts::FRAC_PI_4).unwrap(),
+            Vec3::new(1.0, 1.0, 1.0).unwrap(),
+        )
+        .unwrap();
+        let first = transform.transform_point(mesh.vertices()[0]).unwrap();
+        let second = transform.transform_point(mesh.vertices()[1]).unwrap();
+        for vertex in [first, second] {
+            assert!(vertex.x().is_finite() && vertex.y().is_finite() && vertex.z().is_finite());
+        }
+        let target = Vec3::new(first.x(), 0.0, 0.0).unwrap();
+        let camera = Camera3d::look_at(
+            Vec3::new(target.x(), 0.0, 2.0e38).unwrap(),
+            target,
+            Vec3::Y,
+            Projection3d::perspective(2.8, 1.0, world(1.0), world(3.0e38)).unwrap(),
+        )
+        .unwrap();
+        let viewport = LogicalViewport::new(64.0, 64.0).unwrap();
+        assert!(camera.project_world(first, viewport).unwrap().inside_view());
+        assert!(
+            camera
+                .project_world(second, viewport)
+                .unwrap()
+                .inside_view()
+        );
+        assert_eq!(
+            validate_shader_transform(
+                &mesh,
+                transform.model_rows().unwrap(),
+                camera.world_to_clip_rows().unwrap(),
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
     fn edge_projection_rejects_post_width_shader_overflow() {
         let mesh = Mesh3d::with_display_edges(
             vec![
@@ -2801,6 +2889,51 @@ mod tests {
                 [1_024.0, 1_024.0, 1.0, 0.0],
             ),
             Err(Mesh3dRenderError::InvalidEdgeProjection)
+        );
+    }
+
+    #[test]
+    fn edge_projection_uses_actual_screen_normal_for_extreme_width() {
+        let maximum_width = logical(1_048_576.0);
+        let requested_scale = f32::MAX / maximum_width.get();
+        let logical_viewport =
+            LogicalViewport::new(1.0 / requested_scale, 8_192.0 / requested_scale).unwrap();
+        let pixels_per_logical = target_pixels_per_logical(1, 8_192, logical_viewport).unwrap();
+        let scaled_width = maximum_width.get() * pixels_per_logical.get();
+        assert!(scaled_width.is_finite());
+
+        let view_depth = f32::from_bits(0x7f4d_1ce4);
+        let aspect = 1.0 / 8_192.0;
+        let vertical_fov = 1.0_f32;
+        let horizontal_scale = (vertical_fov * 0.5).tan() * aspect;
+        let half_x = view_depth * 0.5 * horizontal_scale;
+        let mesh = Mesh3d::with_display_edges(
+            vec![
+                Vec3::new(-half_x, 0.0, -view_depth).unwrap(),
+                Vec3::new(half_x, 0.0, -view_depth).unwrap(),
+            ],
+            Vec::new(),
+            vec![MeshEdge3d::new(0, 1).unwrap()],
+        )
+        .unwrap();
+        let camera = Camera3d::look_at(
+            Vec3::ZERO,
+            Vec3::new(0.0, 0.0, -1.0).unwrap(),
+            Vec3::Y,
+            Projection3d::perspective(vertical_fov, aspect, world(1.0), world(f32::MAX)).unwrap(),
+        )
+        .unwrap();
+        let style = WireframeStyle3d::visible(Color::WHITE, maximum_width).unwrap();
+
+        assert_eq!(
+            validate_edge_projection(
+                &mesh,
+                Transform3d::IDENTITY.model_rows().unwrap(),
+                camera.world_to_clip_rows().unwrap(),
+                style,
+                [1.0, 8_192.0, pixels_per_logical.get(), 0.0],
+            ),
+            Ok(())
         );
     }
 
