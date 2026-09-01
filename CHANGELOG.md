@@ -108,6 +108,9 @@ composed frames, fixed-screen UI, retained images, and host-shaped text.
   rejection, HiDPI-resize, and retained-resource recovery fixtures.
 - Repository-only nested-KWin HiDPI gate scripts, which fail closed
   when the required compositor or output-control tooling is unavailable.
+- The named performance matrix now owns a fixed single-output virtual-KWin
+  session, preventing desktop interaction, occlusion, and monitor churn from
+  changing or closing release workloads.
 - A retained scientific glyph-atlas probe in `ui_demo`, reused above all four
   world-camera workloads without steady-state atlas or instance upload.
 

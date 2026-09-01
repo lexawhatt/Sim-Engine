@@ -14,6 +14,49 @@ fi
 
 start_sha=${SIM_ENGINE_RELEASE_SHA:?release snapshot did not provide an exact SHA}
 output_dir=${SIM_ENGINE_RELEASE_OUTPUT_DIR:?release snapshot did not provide an output directory}
+
+# Keep the performance oracle isolated from user interaction, window occlusion,
+# monitor migration, and desktop output churn. The inner invocation receives a
+# single fixed 1280x720@1 output from KWin and still renders through the same
+# Vulkan adapter selected by wgpu.
+if [ "${SIM_ENGINE_MATRIX_COMPOSITOR:-0}" != 1 ]; then
+    for command in dbus-run-session kwin_wayland; do
+        if ! command -v "$command" >/dev/null 2>&1; then
+            echo "rendering benchmark matrix requires $command" >&2
+            exit 1
+        fi
+    done
+    compositor_root=$(mktemp -d "$output_dir/.matrix-compositor.XXXXXX")
+    cleanup_compositor() {
+        rm -rf -- "$compositor_root"
+    }
+    trap cleanup_compositor EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    mkdir "$compositor_root/runtime" "$compositor_root/config" \
+        "$compositor_root/data" "$compositor_root/cache"
+    chmod 700 "$compositor_root/runtime"
+    export SIM_ENGINE_MATRIX_SCRIPT="$project_root/scripts/rendering_benchmark_matrix.sh"
+    export SIM_ENGINE_MATRIX_COMPOSITOR=1
+    dbus-run-session -- env \
+        XDG_RUNTIME_DIR="$compositor_root/runtime" \
+        XDG_CONFIG_HOME="$compositor_root/config" \
+        XDG_DATA_HOME="$compositor_root/data" \
+        XDG_CACHE_HOME="$compositor_root/cache" \
+        kwin_wayland \
+        --virtual \
+        --socket sim-engine-matrix \
+        --width 1280 \
+        --height 720 \
+        --scale 1 \
+        --output-count 1 \
+        --no-lockscreen \
+        --no-global-shortcuts \
+        --exit-with-session "$project_root/scripts/rendering_benchmark_matrix_controller.sh"
+    exit 0
+fi
+
 assert_provenance() {
     if [ "$(git rev-parse HEAD)" != "$start_sha" ]; then
         echo "rendering benchmark matrix HEAD changed during the gate" >&2
