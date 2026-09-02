@@ -111,6 +111,9 @@ composed frames, fixed-screen UI, retained images, and host-shaped text.
 - The named performance matrix now owns a fixed single-output virtual-KWin
   session, preventing desktop interaction, occlusion, and monitor churn from
   changing or closing release workloads.
+- Surface benchmark scenes use monotonic layers for linear fixture setup;
+  adversarial interleaved-layer construction remains isolated in the dedicated
+  core-only construction benchmark.
 - A retained scientific glyph-atlas probe in `ui_demo`, reused above all four
   world-camera workloads without steady-state atlas or instance upload.
 

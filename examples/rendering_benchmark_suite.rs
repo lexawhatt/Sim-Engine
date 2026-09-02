@@ -1454,8 +1454,13 @@ fn build_screen_scene(count: usize, phase: usize) -> Result<ScreenScene, Box<dyn
         } else {
             Color::rgb8(27, 38, 52)
         };
+        // The release fixture measures retained preparation/rendering, not the
+        // deliberately adversarial interleaved-layer insertion path (covered
+        // by scene_construction_benchmark). Monotonic layers keep fixture
+        // construction linear and prevent setup time from dominating the gate.
+        let layer = index.saturating_mul(8) / count.max(1);
         scene.try_rect_on_layer(
-            Layer::new((index % 8) as i32),
+            Layer::new(layer.min(7) as i32),
             LogicalScreenPosition::new(x + 1.0, y + 1.0),
             LogicalScreenVector::new(8.0, 8.0),
             corner,
@@ -1476,8 +1481,9 @@ fn build_world_scene(count: usize, phase: usize) -> Result<Scene, Box<dyn Error>
         } else {
             Color::rgb8(27, 38, 52)
         };
+        let layer = index.saturating_mul(8) / count.max(1);
         scene.try_rect_on_layer(
-            Layer::new((index % 8) as i32),
+            Layer::new(layer.min(7) as i32),
             Rect::from_center_size(Vec2::new(x, y), Vec2::splat(1.7)),
             0.25,
             ShapeStyle::filled(color),
