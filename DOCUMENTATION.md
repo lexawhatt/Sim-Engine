@@ -198,8 +198,9 @@ must also use `LogicalPixels`. Endpoint markers always use logical pixels so ann
 readable. A marker's base is the path endpoint and its tip extends outward;
 the marked body endpoint is forced to a butt boundary. Marker length therefore
 cannot invert a short body or collide with a terminal join. Exact or
-numerically indistinguishable 180-degree retraces and repeated adjacent points
-are rejected as structured scene errors because no interior-disjoint
+numerically indistinguishable 180-degree retraces, almost-collinear turns whose
+shader branch cannot be selected portably, and repeated adjacent points are
+rejected as structured scene errors because no stable interior-disjoint
 translucent stroke topology exists for them.
 Every consecutive polyline segment must be drawable; `DegenerateGeometry`
 identifies a line segment or at least one consecutive polyline segment that is
@@ -1102,15 +1103,18 @@ separate construction benchmark owns the adversarial interleaved-layer cost and
 verifies the atomic batch path explicitly.
 Ordinary incremental insertion also maintains the scene's owned-payload byte
 total incrementally; allocation checks do not rescan every retained command.
+Cloning a scene recomputes capacity-derived payload and statistics accounting
+for the clone's actual polyline allocations.
 Prepared scenes and dynamic meshes cache the complete portable-shader geometry
 proof for up to eight exact camera/viewport uniforms. This keeps fixed and
 multi-viewport retained rendering O(1) with respect to validation after the
 first use of a configuration. Every successful dynamic-mesh mutation clears
 that cache, so changed vertices are proved again before they can be encoded.
-Streaming fixed-screen scenes use the stronger `ScreenScene` invariant and an
-aggregate shader-bound proof after tessellation. Almost-collinear turns whose
-join branch is not numerically stable are rejected when the command enters the
-scene; ordinary world scenes retain the full camera-dependent triangle proof.
+Streaming and prepared fixed-screen scenes retain generated-source and
+per-triangle shader proofs. Almost-collinear turns whose join branch is not
+numerically stable are rejected when the command enters the scene. The
+`ui_90_10` release workload streams square-cornered rectangles while its
+retained 90% preserves rounded geometry, keeping its changing-UI cost explicit.
 Mixed-layer construction, budget rejection, and recovery are not accepted
 `--fixture` values of `rendering_benchmark_suite`; `adapter_probe` and
 `hidpi_transition` are accepted non-performance utility fixtures used by the

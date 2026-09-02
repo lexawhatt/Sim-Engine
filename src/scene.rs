@@ -293,9 +293,9 @@ pub enum SceneError {
     /// join branch; a retraced centerline also has no interior-disjoint
     /// alpha-blended representation. `vertex_index` identifies the path point.
     DegenerateStrokeTurn {
-        /// Primitive containing the reversal.
+        /// Primitive containing the ambiguous turn.
         primitive: ScenePrimitive,
-        /// Zero-based index of the shared reversing point.
+        /// Zero-based index of the shared turn point.
         vertex_index: usize,
     },
     /// Shape has no fill, stroke, or shadow.
@@ -355,7 +355,7 @@ impl Error for SceneError {}
 ///
 /// A scene contains renderable primitives only. It does not own simulation
 /// entities, domain rules, or time stepping.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Scene {
     background: Color,
     /// Commands stored in draw order.
@@ -366,6 +366,31 @@ pub struct Scene {
     current_depth: f32,
     budget: Option<SceneBudget>,
     statistics: SceneStatistics,
+}
+
+impl Clone for Scene {
+    fn clone(&self) -> Self {
+        let commands = self.commands.clone();
+        let owned_payload_bytes = commands
+            .iter()
+            .map(|command| command.command.owned_allocation_bytes())
+            .fold(0usize, usize::saturating_add);
+        let mut statistics = self.statistics;
+        statistics.retained_bytes = commands
+            .len()
+            .saturating_mul(size_of::<SceneCommand>())
+            .saturating_add(owned_payload_bytes);
+        Self {
+            background: self.background,
+            commands,
+            owned_payload_bytes,
+            next_order: self.next_order,
+            current_screen_clip: self.current_screen_clip,
+            current_depth: self.current_depth,
+            budget: self.budget,
+            statistics,
+        }
+    }
 }
 
 impl Scene {
@@ -1126,7 +1151,7 @@ impl Scene {
     /// Appends connected stroked segments through world-space points.
     ///
     /// `width` is in logical screen pixels. Empty, single-point, non-finite,
-    /// repeated-adjacent, or numerically reversing input returns `false`
+    /// repeated-adjacent, or numerically ambiguous turn input returns `false`
     /// without adding a command; every consecutive segment must be drawable.
     pub fn polyline(&mut self, points: Vec<Vec2>, width: f32, color: Color) -> bool {
         self.try_polyline(points, width, color).is_ok()
@@ -1145,7 +1170,7 @@ impl Scene {
     /// Appends connected stroked segments through world-space points to a layer.
     ///
     /// `width` is in logical screen pixels. Empty, single-point, non-finite,
-    /// repeated-adjacent, or numerically reversing input returns `false`
+    /// repeated-adjacent, or numerically ambiguous turn input returns `false`
     /// without adding a command; every consecutive segment must be drawable.
     pub fn polyline_on_layer(
         &mut self,
@@ -3353,6 +3378,38 @@ mod tests {
             scene.commands.capacity() * size_of::<SceneCommand>()
         );
         assert!(scene.allocation_bytes() > 0);
+    }
+
+    #[test]
+    fn clone_recomputes_capacity_based_polyline_accounting() {
+        let mut points = Vec::with_capacity(1_024);
+        points.extend([Vec2::ZERO, Vec2::X]);
+        let mut scene = Scene::new(Color::BLACK).unwrap();
+        scene.try_polyline(points, 1.0, Color::WHITE).unwrap();
+
+        let cloned = scene.clone();
+        let actual_owned = cloned
+            .commands
+            .iter()
+            .map(|command| command.command.owned_allocation_bytes())
+            .fold(0usize, usize::saturating_add);
+        assert_eq!(cloned.owned_payload_bytes, actual_owned);
+        assert_eq!(
+            cloned.statistics.retained_bytes(),
+            cloned
+                .commands
+                .len()
+                .saturating_mul(size_of::<SceneCommand>())
+                .saturating_add(actual_owned)
+        );
+        assert_eq!(
+            cloned.allocation_bytes(),
+            cloned
+                .commands
+                .capacity()
+                .saturating_mul(size_of::<SceneCommand>())
+                .saturating_add(actual_owned)
+        );
     }
 
     #[test]

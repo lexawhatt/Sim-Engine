@@ -116,15 +116,18 @@ composed frames, fixed-screen UI, retained images, and host-shaped text.
   core-only construction benchmark.
 - `Scene` caches its owned polyline-payload allocation total, removing an
   accidental full-scene scan from every ordinary command insertion and storage
-  preflight.
+  preflight. Its custom `Clone` recomputes capacity-derived payload and retained
+  byte accounting for the cloned vectors instead of copying stale capacities.
 - Prepared scenes and dynamic meshes retain a bounded eight-entry validation
   cache keyed by the exact camera/viewport uniform. Immutable geometry is no
   longer re-proved vertex-by-vertex every frame; successful dynamic updates
   invalidate the cache before the next draw.
-- Streaming `ScreenScene` frames use their fixed-screen construction invariant
-  plus aggregate shader bounds instead of repeating a per-triangle camera
-  proof. Numerically ambiguous almost-collinear stroke turns are now rejected
-  at scene insertion, before this fast path.
+- Numerically ambiguous almost-collinear stroke turns are rejected at scene
+  insertion. Streaming `ScreenScene` frames retain the same generated-source
+  and per-triangle portability proof as the direct renderer path.
+- The `ui_90_10` surface workload streams 1,000 square-cornered UI rectangles;
+  the 9,000-command retained portion keeps rounded geometry. This bounds the
+  intended changing-UI workload without weakening runtime validation.
 - A retained scientific glyph-atlas probe in `ui_demo`, reused above all four
   world-camera workloads without steady-state atlas or instance upload.
 

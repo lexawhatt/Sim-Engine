@@ -1443,6 +1443,18 @@ fn scene_budget() -> SceneBudget {
 }
 
 fn build_screen_scene(count: usize, phase: usize) -> Result<ScreenScene, Box<dyn Error>> {
+    build_screen_scene_with_corners(count, phase, true)
+}
+
+fn build_square_screen_scene(count: usize, phase: usize) -> Result<ScreenScene, Box<dyn Error>> {
+    build_screen_scene_with_corners(count, phase, false)
+}
+
+fn build_screen_scene_with_corners(
+    count: usize,
+    phase: usize,
+    rounded: bool,
+) -> Result<ScreenScene, Box<dyn Error>> {
     let mut scene = ScreenScene::with_budget(Color::rgb8(9, 12, 18), scene_budget())?;
     let corner = LogicalPixels::new(1.5)?;
     for index in 0..count {
@@ -1459,13 +1471,15 @@ fn build_screen_scene(count: usize, phase: usize) -> Result<ScreenScene, Box<dyn
         // by scene_construction_benchmark). Monotonic layers keep fixture
         // construction linear and prevent setup time from dominating the gate.
         let layer = index.saturating_mul(8) / count.max(1);
-        scene.try_rect_on_layer(
-            Layer::new(layer.min(7) as i32),
-            LogicalScreenPosition::new(x + 1.0, y + 1.0),
-            LogicalScreenVector::new(8.0, 8.0),
-            corner,
-            ShapeStyle::filled(color),
-        )?;
+        let layer = Layer::new(layer.min(7) as i32);
+        let min = LogicalScreenPosition::new(x + 1.0, y + 1.0);
+        let size = LogicalScreenVector::new(8.0, 8.0);
+        let style = ShapeStyle::filled(color);
+        if rounded {
+            scene.try_rect_on_layer(layer, min, size, corner, style)?;
+        } else {
+            scene.try_square_rect_on_layer(layer, min, size, style)?;
+        }
     }
     Ok(scene)
 }
@@ -1541,7 +1555,7 @@ fn prepare_ui_90_10(renderer: &mut WgpuRenderer) -> Result<BenchmarkWorkload, Bo
         construction: initial_construction,
         completion_note: None,
         render: Box::new(move |renderer, _window, frame_index, _, _| {
-            let streaming = build_screen_scene(STREAMING_COMMANDS, frame_index)?;
+            let streaming = build_square_screen_scene(STREAMING_COMMANDS, frame_index)?;
             let mut frame = renderer.begin_frame(Color::rgb8(9, 12, 18), FrameBudget::default())?;
             frame.draw_prepared_screen_scene(&prepared, FramePassOptions::new(0))?;
             frame.draw_screen_scene(&streaming, FramePassOptions::new(1))?;
