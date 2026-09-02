@@ -1073,12 +1073,13 @@ The real compositor fixture requires the Linux executables
 `dbus-run-session`, `kwin_wayland`, and `kscreen-doctor`. Their absence is a
 hard gate failure, not a skipped test.
 
-The named performance matrix runs inside a private, single-output virtual KWin
-session fixed at 1280×720 and scale 1.0. This prevents user clicks, occlusion,
-desktop monitor migration, or output churn from closing or changing a release
-fixture while retaining the selected physical Vulkan adapter. The separate
-HiDPI oracle starts its own controlled KWin session and performs the real
-compositor scale/resize transaction there.
+The named performance matrix runs undecorated benchmark surfaces inside a
+private, single-output virtual KWin session fixed at 1280×720 and scale 1.0.
+This prevents window-manager decoration policy, user clicks, occlusion, desktop
+monitor migration, or output churn from resizing or closing a release fixture
+while retaining the selected physical Vulkan adapter. The separate HiDPI oracle
+starts its own controlled KWin session and performs the real compositor
+scale/resize transaction there.
 
 Its named surface fixtures are `ui_static_10k`, `ui_90_10`,
 `four_viewports`, `image_atlas`, `scientific_text`, `particle_scalar`,

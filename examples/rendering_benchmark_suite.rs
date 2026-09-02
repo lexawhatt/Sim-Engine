@@ -493,6 +493,7 @@ impl ApplicationHandler for BenchmarkApplication {
                 event_loop.create_window(
                     Window::default_attributes()
                         .with_title(format!("Sim;Engine benchmark | {}", self.fixture))
+                        .with_decorations(false)
                         .with_inner_size(LogicalSize::new(
                             f64::from(BENCHMARK_PHYSICAL_WIDTH),
                             f64::from(BENCHMARK_PHYSICAL_HEIGHT),
