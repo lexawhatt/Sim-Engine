@@ -189,9 +189,10 @@ composed frames, fixed-screen UI, retained images, and host-shaped text.
 - Streaming composition reuses its transient vertex allocation, tessellates
   directly into the upload buffer without an intermediate full-payload copy,
   and caches the immutable circle/corner unit samples used by primitive
-  tessellation. The unchanged 90/10 release fixture therefore measures host
-  scene work and GPU upload rather than repeated trigonometry and allocator
-  churn.
+  tessellation. The retained/streaming 90/10 release split therefore measures
+  host scene work and GPU upload rather than repeated trigonometry and
+  allocator churn; as noted above, its streamed rectangles now use square
+  corners.
 - Cached circle and quarter-circle samples use exact cardinal endpoints, so
   large finite circles close without a residual retrace and maximum-radius
   rounded rectangles meet straight edges without a scale-amplified tangent
