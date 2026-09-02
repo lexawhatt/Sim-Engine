@@ -607,6 +607,49 @@ fn logical_join_shader_branches_accept_right_angles_and_reject_threshold_angles(
 }
 
 #[test]
+fn retained_geometry_validation_cache_is_exact_bounded_and_clearable() {
+    let mut scene = Scene::new(Color::BLACK).unwrap();
+    scene
+        .try_rect(
+            Rect::from_center_size(Vec2::ZERO, Vec2::splat(8.0)),
+            0.0,
+            ShapeStyle::filled(Color::WHITE),
+        )
+        .unwrap();
+    let (vertices, _) = tessellate_for_test(&scene);
+    let extents = GeometryExtents::from_vertices(&vertices);
+    let source = GeometryValidationSource::Tessellated(&vertices);
+    let mut cache = GeometryValidationCache::default();
+
+    for width in 128..128 + GEOMETRY_VALIDATION_CACHE_CAPACITY + 1 {
+        let uniform = CameraUniform::new(
+            Camera2d::default(),
+            LogicalViewport::new(width as f32, 128.0).unwrap(),
+        )
+        .unwrap();
+        assert!(cache.validate(extents, source, uniform));
+        assert!(cache.validate(extents, source, uniform));
+    }
+    let state = cache.state.lock().unwrap();
+    assert_eq!(
+        state.entries.iter().flatten().count(),
+        GEOMETRY_VALIDATION_CACHE_CAPACITY
+    );
+    drop(state);
+
+    cache.clear();
+    assert!(
+        cache
+            .state
+            .lock()
+            .unwrap()
+            .entries
+            .iter()
+            .all(Option::is_none)
+    );
+}
+
+#[test]
 fn styled_strokes_preserve_clip_and_bound_miter_extrusion() {
     let clip = ScreenClipRect::from_min_size(
         LogicalScreenPosition::new(10.0, 12.0),
@@ -3214,6 +3257,7 @@ fn offscreen_gpu_readback_verifies_camera_depth_and_clip_contract() {
             renderer_identity: Arc::clone(&source_identity),
             vertex_buffer: Arc::new(create_dynamic_vertex_buffer(&device, 8)),
             geometry_extents: GeometryExtents::from_dynamic_vertices(&dynamic_vertices),
+            geometry_validation_cache: GeometryValidationCache::default(),
             vertices: dynamic_vertices,
             vertex_capacity: 8,
             budget: Some(DynamicMeshBudget::new(3, triangle_bytes, triangle_bytes).unwrap()),

@@ -117,6 +117,10 @@ composed frames, fixed-screen UI, retained images, and host-shaped text.
 - `Scene` caches its owned polyline-payload allocation total, removing an
   accidental full-scene scan from every ordinary command insertion and storage
   preflight.
+- Prepared scenes and dynamic meshes retain a bounded eight-entry validation
+  cache keyed by the exact camera/viewport uniform. Immutable geometry is no
+  longer re-proved vertex-by-vertex every frame; successful dynamic updates
+  invalidate the cache before the next draw.
 - A retained scientific glyph-atlas probe in `ui_demo`, reused above all four
   world-camera workloads without steady-state atlas or instance upload.
 

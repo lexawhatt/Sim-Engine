@@ -1102,6 +1102,11 @@ separate construction benchmark owns the adversarial interleaved-layer cost and
 verifies the atomic batch path explicitly.
 Ordinary incremental insertion also maintains the scene's owned-payload byte
 total incrementally; allocation checks do not rescan every retained command.
+Prepared scenes and dynamic meshes cache the complete portable-shader geometry
+proof for up to eight exact camera/viewport uniforms. This keeps fixed and
+multi-viewport retained rendering O(1) with respect to validation after the
+first use of a configuration. Every successful dynamic-mesh mutation clears
+that cache, so changed vertices are proved again before they can be encoded.
 Mixed-layer construction, budget rejection, and recovery are not accepted
 `--fixture` values of `rendering_benchmark_suite`; `adapter_probe` and
 `hidpi_transition` are accepted non-performance utility fixtures used by the

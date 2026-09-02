@@ -3,7 +3,7 @@ use std::{
     error::Error,
     fmt,
     ops::Range,
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -58,7 +58,7 @@ struct DynamicGpu {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+#[derive(Clone, Copy, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 struct CameraUniform {
     camera_center: [f32; 4],
     world_to_screen_x: [f32; 4],
@@ -917,6 +917,89 @@ fn shader_stroke_screen_bounds(
 enum GeometryValidationSource<'a> {
     Tessellated(&'a [Vertex]),
     Dynamic(&'a [DynamicGpu]),
+}
+
+const GEOMETRY_VALIDATION_CACHE_CAPACITY: usize = 8;
+
+#[derive(Clone, Copy)]
+struct GeometryValidationCacheEntry {
+    uniform: CameraUniform,
+    safe: bool,
+}
+
+struct GeometryValidationCacheState {
+    entries: [Option<GeometryValidationCacheEntry>; GEOMETRY_VALIDATION_CACHE_CAPACITY],
+    next: usize,
+}
+
+impl Default for GeometryValidationCacheState {
+    fn default() -> Self {
+        Self {
+            entries: [None; GEOMETRY_VALIDATION_CACHE_CAPACITY],
+            next: 0,
+        }
+    }
+}
+
+#[derive(Default)]
+struct GeometryValidationCache {
+    state: Mutex<GeometryValidationCacheState>,
+}
+
+impl GeometryValidationCache {
+    fn validate(
+        &self,
+        extents: GeometryExtents,
+        source: GeometryValidationSource<'_>,
+        uniform: CameraUniform,
+    ) -> bool {
+        {
+            let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            if let Some(entry) = state
+                .entries
+                .iter()
+                .flatten()
+                .find(|entry| entry.uniform == uniform)
+            {
+                return entry.safe;
+            }
+        }
+
+        let safe = geometry_is_safe_for(extents, source, uniform);
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(entry) = state
+            .entries
+            .iter()
+            .flatten()
+            .find(|entry| entry.uniform == uniform)
+        {
+            return entry.safe;
+        }
+        let next = state.next;
+        state.entries[next] = Some(GeometryValidationCacheEntry { uniform, safe });
+        state.next = (next + 1) % GEOMETRY_VALIDATION_CACHE_CAPACITY;
+        safe
+    }
+
+    fn clear(&mut self) {
+        let state = self
+            .state
+            .get_mut()
+            .unwrap_or_else(|error| error.into_inner());
+        *state = GeometryValidationCacheState::default();
+    }
+}
+
+fn geometry_is_safe_for_cached(
+    cache: Option<&GeometryValidationCache>,
+    extents: GeometryExtents,
+    source: GeometryValidationSource<'_>,
+    uniform: CameraUniform,
+) -> bool {
+    cache.map_or_else(
+        || geometry_is_safe_for(extents, source, uniform),
+        |cache| cache.validate(extents, source, uniform),
+    )
 }
 
 fn geometry_is_safe_for(
@@ -2416,7 +2499,8 @@ impl Error for PreparedSceneRenderError {}
 /// or clip changes require preparing a replacement. A prepared scene can only be
 /// rendered by the [`WgpuRenderer`] that created it. Use
 /// [`WgpuRenderer::restore_prepared_scene`] to recreate its GPU buffer for a
-/// replacement renderer after device loss.
+/// replacement renderer after device loss. Portable shader arithmetic is proved
+/// once per exact camera/viewport uniform and retained in a bounded cache.
 pub struct PreparedScene {
     renderer_identity: Arc<()>,
     background: Color,
@@ -2427,6 +2511,7 @@ pub struct PreparedScene {
     geometry_extents: GeometryExtents,
     draw_batches: Vec<PreparedDrawBatch>,
     tessellation: TessellationStats,
+    geometry_validation_cache: GeometryValidationCache,
 }
 
 /// Immutable prepared geometry whose positions are logical screen pixels.
@@ -2622,12 +2707,14 @@ impl Default for DynamicMeshBudget {
 /// A mesh retains its CPU vertices for validation and recreates its GPU buffer
 /// only when a replacement exceeds its current capacity. Use
 /// [`WgpuRenderer::update_dynamic_mesh_range`] for in-place partial updates.
+/// Its bounded camera-validation cache is cleared by every successful mutation.
 pub struct DynamicMesh2d {
     renderer_identity: Arc<()>,
     vertex_buffer: Arc<wgpu::Buffer>,
     vertices: Vec<DynamicGpu>,
     vertex_capacity: usize,
     geometry_extents: GeometryExtents,
+    geometry_validation_cache: GeometryValidationCache,
     budget: Option<DynamicMeshBudget>,
 }
 
@@ -4098,6 +4185,7 @@ impl WgpuRenderer {
             vertices.len(),
             geometry_extents,
             GeometryValidationSource::Tessellated(&vertices),
+            None,
             &draw_batches,
             *camera,
             tessellation,
@@ -4227,6 +4315,7 @@ impl WgpuRenderer {
         Ok(DynamicMesh2d {
             renderer_identity: Arc::clone(&self.renderer_identity),
             geometry_extents: GeometryExtents::from_dynamic_vertices(&vertices),
+            geometry_validation_cache: GeometryValidationCache::default(),
             vertex_buffer,
             vertices,
             vertex_capacity,
@@ -4305,6 +4394,7 @@ impl WgpuRenderer {
             submit_pending_uploads(&self.queue);
             mesh.vertices[first_vertex..end].copy_from_slice(&vertices);
             mesh.geometry_extents = GeometryExtents::from_dynamic_vertices(&mesh.vertices);
+            mesh.geometry_validation_cache.clear();
         }
         Ok(DynamicMeshUpdateReport {
             vertex_count: mesh.vertices.len(),
@@ -4355,6 +4445,7 @@ impl WgpuRenderer {
             mesh.vertices.len(),
             mesh.geometry_extents,
             GeometryValidationSource::Dynamic(&mesh.vertices),
+            Some(&mesh.geometry_validation_cache),
             draw_batches.as_slice(),
             *camera,
             Duration::ZERO,
@@ -5083,6 +5174,7 @@ impl WgpuRenderer {
             scene.vertex_count,
             scene.geometry_extents,
             GeometryValidationSource::Tessellated(&scene.vertices),
+            Some(&scene.geometry_validation_cache),
             &scene.draw_batches,
             *camera,
             Duration::ZERO,
@@ -5142,6 +5234,7 @@ impl WgpuRenderer {
         vertex_count: usize,
         geometry_extents: GeometryExtents,
         geometry_validation: GeometryValidationSource<'_>,
+        geometry_validation_cache: Option<&GeometryValidationCache>,
         draw_batches: &[PreparedDrawBatch],
         camera: Camera2d,
         tessellation: Duration,
@@ -5156,7 +5249,12 @@ impl WgpuRenderer {
     ) -> Result<RenderReport, RendererFrameError> {
         let (viewport, viewport_scissor, camera_uniform) =
             self.surface_geometry_context(camera, viewport_region)?;
-        if !geometry_is_safe_for(geometry_extents, geometry_validation, camera_uniform) {
+        if !geometry_is_safe_for_cached(
+            geometry_validation_cache,
+            geometry_extents,
+            geometry_validation,
+            camera_uniform,
+        ) {
             return Err(RendererFrameError::InvalidGeometryTransform);
         }
 
@@ -6342,6 +6440,7 @@ fn replace_dynamic_mesh_resources(
     }
     mesh.geometry_extents = GeometryExtents::from_dynamic_vertices(&replacement_vertices);
     mesh.vertices = replacement_vertices;
+    mesh.geometry_validation_cache.clear();
     Ok(DynamicMeshUpdateReport {
         vertex_count: mesh.vertices.len(),
         upload: update_started_at.elapsed(),
@@ -6774,6 +6873,7 @@ fn prepare_scene_resources(
         geometry_extents,
         draw_batches,
         tessellation,
+        geometry_validation_cache: GeometryValidationCache::default(),
     })
 }
 
@@ -6884,6 +6984,7 @@ fn restore_prepared_scene_resources(
         geometry_extents: source.geometry_extents,
         draw_batches,
         tessellation: source.tessellation,
+        geometry_validation_cache: GeometryValidationCache::default(),
     })
 }
 
@@ -6919,6 +7020,7 @@ fn restore_dynamic_mesh_resources(
         vertices,
         vertex_capacity: source.vertex_capacity,
         geometry_extents: source.geometry_extents,
+        geometry_validation_cache: GeometryValidationCache::default(),
         budget: source.budget,
     })
 }

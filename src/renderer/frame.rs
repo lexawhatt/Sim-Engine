@@ -1756,6 +1756,7 @@ fn present_frame_with_vertices<'frame>(
                     scene.vertex_count,
                     scene.geometry_extents,
                     GeometryValidationSource::Tessellated(&scene.vertices),
+                    Some(&scene.geometry_validation_cache),
                     &scene.draw_batches,
                     scene.command_count,
                     scene.tessellation,
@@ -1777,6 +1778,7 @@ fn present_frame_with_vertices<'frame>(
                     scene.scene.vertex_count,
                     scene.scene.geometry_extents,
                     GeometryValidationSource::Tessellated(&scene.scene.vertices),
+                    Some(&scene.scene.geometry_validation_cache),
                     &scene.scene.draw_batches,
                     scene.scene.command_count,
                     scene.scene.tessellation,
@@ -1805,6 +1807,7 @@ fn present_frame_with_vertices<'frame>(
                     mesh.vertices.len(),
                     mesh.geometry_extents,
                     GeometryValidationSource::Dynamic(&mesh.vertices),
+                    Some(&mesh.geometry_validation_cache),
                     batch.as_slice(),
                     usize::from(!mesh.vertices.is_empty()),
                     TessellationStats::default(),
@@ -2373,7 +2376,8 @@ fn preflight_frame_items(
                     target_viewport,
                 )
                 .ok_or(RendererFrameError::InvalidGeometryTransform)?;
-                if !geometry_is_safe_for(
+                if !geometry_is_safe_for_cached(
+                    Some(&scene.geometry_validation_cache),
                     scene.geometry_extents,
                     GeometryValidationSource::Tessellated(&scene.vertices),
                     uniform,
@@ -2392,7 +2396,8 @@ fn preflight_frame_items(
                     target_viewport,
                 )
                 .ok_or(RendererFrameError::InvalidGeometryTransform)?;
-                if !geometry_is_safe_for(
+                if !geometry_is_safe_for_cached(
+                    Some(&scene.scene.geometry_validation_cache),
                     scene.scene.geometry_extents,
                     GeometryValidationSource::Tessellated(&scene.scene.vertices),
                     uniform,
@@ -2414,7 +2419,8 @@ fn preflight_frame_items(
                     target_viewport,
                 )
                 .ok_or(RendererFrameError::InvalidGeometryTransform)?;
-                if !geometry_is_safe_for(
+                if !geometry_is_safe_for_cached(
+                    Some(&mesh.geometry_validation_cache),
                     mesh.geometry_extents,
                     GeometryValidationSource::Dynamic(&mesh.vertices),
                     uniform,
@@ -2854,6 +2860,7 @@ fn prepare_retained_geometry<'frame>(
     vertex_count: usize,
     extents: GeometryExtents,
     geometry_validation: GeometryValidationSource<'_>,
+    geometry_validation_cache: Option<&GeometryValidationCache>,
     batches: &[PreparedDrawBatch],
     command_count: usize,
     source_stats: TessellationStats,
@@ -2867,7 +2874,12 @@ fn prepare_retained_geometry<'frame>(
     let camera_uniform =
         CameraUniform::new_in_region(camera, viewport.viewport, viewport.origin, target_viewport)
             .ok_or(RendererFrameError::InvalidGeometryTransform)?;
-    if !geometry_is_safe_for(extents, geometry_validation, camera_uniform) {
+    if !geometry_is_safe_for_cached(
+        geometry_validation_cache,
+        extents,
+        geometry_validation,
+        camera_uniform,
+    ) {
         return Err(RendererFrameError::InvalidGeometryTransform.into());
     }
     let mut owned_batches = Vec::new();
