@@ -1736,6 +1736,7 @@ fn present_frame_with_vertices<'frame>(
                 prepare_streaming_scene_resolved(
                     scene.as_scene(),
                     camera_uniform,
+                    true,
                     viewport,
                     &mut *streaming_vertices,
                     &mut ready,
@@ -2795,6 +2796,7 @@ fn prepare_streaming_scene<'frame>(
     prepare_streaming_scene_resolved(
         scene,
         camera_uniform,
+        false,
         viewport,
         streaming_vertices,
         ready,
@@ -2807,6 +2809,7 @@ fn prepare_streaming_scene<'frame>(
 fn prepare_streaming_scene_resolved<'frame>(
     scene: &Scene,
     camera_uniform: CameraUniform,
+    fixed_screen: bool,
     viewport: ResolvedViewport,
     streaming_vertices: &mut Vec<Vertex>,
     ready: &mut Vec<ReadyItem<'frame>>,
@@ -2819,11 +2822,18 @@ fn prepare_streaming_scene_resolved<'frame>(
         .map_err(RendererFrameError::from)?;
     let vertices = &streaming_vertices[vertex_start..];
     let extents = GeometryExtents::from_vertices(vertices);
-    if !geometry_is_safe_for(
-        extents,
-        GeometryValidationSource::Tessellated(vertices),
-        camera_uniform,
-    ) {
+    let geometry_is_safe = if fixed_screen {
+        scene_command_sources_are_portable(scene)
+            && camera_uniform.sources_are_portable()
+            && extents.is_safe_for(camera_uniform)
+    } else {
+        geometry_is_safe_for(
+            extents,
+            GeometryValidationSource::Tessellated(vertices),
+            camera_uniform,
+        )
+    };
+    if !geometry_is_safe {
         streaming_vertices.truncate(vertex_start);
         return Err(RendererFrameError::InvalidGeometryTransform.into());
     }
@@ -3620,6 +3630,7 @@ mod tests {
             prepare_streaming_scene_resolved(
                 &scene,
                 uniform,
+                false,
                 resolved,
                 &mut vertices,
                 &mut ready,

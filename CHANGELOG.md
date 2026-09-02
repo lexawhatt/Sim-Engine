@@ -121,6 +121,10 @@ composed frames, fixed-screen UI, retained images, and host-shaped text.
   cache keyed by the exact camera/viewport uniform. Immutable geometry is no
   longer re-proved vertex-by-vertex every frame; successful dynamic updates
   invalidate the cache before the next draw.
+- Streaming `ScreenScene` frames use their fixed-screen construction invariant
+  plus aggregate shader bounds instead of repeating a per-triangle camera
+  proof. Numerically ambiguous almost-collinear stroke turns are now rejected
+  at scene insertion, before this fast path.
 - A retained scientific glyph-atlas probe in `ui_demo`, reused above all four
   world-camera workloads without steady-state atlas or instance upload.
 

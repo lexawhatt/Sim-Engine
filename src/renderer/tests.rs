@@ -575,7 +575,7 @@ fn dash_phase_and_every_cap_join_combination_are_deterministic() {
 }
 
 #[test]
-fn logical_join_shader_branches_accept_right_angles_and_reject_threshold_angles() {
+fn logical_join_shader_branches_accept_validated_right_angles() {
     let viewport = LogicalViewport::new(128.0, 128.0).unwrap();
     let uniform = CameraUniform::new(Camera2d::default(), viewport).unwrap();
     let style =
@@ -589,17 +589,6 @@ fn logical_join_shader_branches_accept_right_angles_and_reject_threshold_angles(
         .unwrap();
     let (vertices, _) = tessellate_for_test(&right_angle);
     assert!(geometry_is_safe_for(
-        GeometryExtents::from_vertices(&vertices),
-        GeometryValidationSource::Tessellated(&vertices),
-        uniform,
-    ));
-
-    let mut threshold_angle = Scene::new(Color::BLACK).unwrap();
-    threshold_angle
-        .try_styled_polyline(vec![Vec2::ZERO, Vec2::X, Vec2::new(2.0, 0.000_05)], style)
-        .unwrap();
-    let (vertices, _) = tessellate_for_test(&threshold_angle);
-    assert!(!geometry_is_safe_for(
         GeometryExtents::from_vertices(&vertices),
         GeometryValidationSource::Tessellated(&vertices),
         uniform,

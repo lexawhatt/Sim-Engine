@@ -16,7 +16,7 @@ pub(crate) const CORNER_SEGMENTS: usize = 12;
 pub(crate) const TESSELLATED_VERTEX_BYTES: usize = 20 * size_of::<f32>();
 const MAX_DASH_ELEMENTS: usize = 8;
 const MAX_MITER_LIMIT: f32 = 1_000.0;
-const MIN_STROKE_TURN_SINE: f64 = 0.000_001;
+const MIN_STROKE_TURN_SINE: f64 = 0.000_1;
 /// Maximum visible dash pieces one command may request from tessellation.
 pub const MAX_STROKE_DASH_SUBSEGMENTS: usize = 1_000_000;
 
@@ -287,10 +287,11 @@ pub enum SceneError {
     InvalidDimension(ScenePrimitive),
     /// A line segment, or at least one consecutive polyline segment, is not drawable.
     DegenerateGeometry(ScenePrimitive),
-    /// Consecutive polyline segments form an exact or numerically indistinguishable reversal.
+    /// Consecutive polyline segments form a numerically ambiguous continuation or reversal.
     ///
-    /// A retraced centerline has no interior-disjoint alpha-blended stroke
-    /// representation. `vertex_index` identifies the reversing path point.
+    /// An almost-collinear change of direction cannot select a stable shader
+    /// join branch; a retraced centerline also has no interior-disjoint
+    /// alpha-blended representation. `vertex_index` identifies the path point.
     DegenerateStrokeTurn {
         /// Primitive containing the reversal.
         primitive: ScenePrimitive,
@@ -1639,7 +1640,8 @@ where
         let direction_product = f64::from(incoming.x).hypot(f64::from(incoming.y))
             * f64::from(outgoing.x).hypot(f64::from(outgoing.y));
         let normalized_cross = cross / direction_product;
-        if normalized_cross.abs() <= MIN_STROKE_TURN_SINE && dot < 0.0 {
+        if normalized_cross.abs() <= MIN_STROKE_TURN_SINE && (dot < 0.0 || normalized_cross != 0.0)
+        {
             return Err(SceneError::DegenerateStrokeTurn {
                 primitive,
                 vertex_index: index + 1,
@@ -3239,7 +3241,7 @@ mod tests {
     }
 
     #[test]
-    fn polyline_rejects_zero_segments_and_numerically_reversed_turns() {
+    fn polyline_rejects_zero_segments_and_numerically_ambiguous_turns() {
         let style = StrokeStyle2d::logical(LogicalPixels::new(2.0).unwrap(), Color::WHITE);
         assert!(matches!(
             DrawCommand::styled_polyline(vec![Vec2::ZERO, Vec2::ZERO, Vec2::X], style),
@@ -3255,6 +3257,16 @@ mod tests {
         assert!(matches!(
             DrawCommand::styled_polyline(
                 vec![Vec2::ZERO, Vec2::X, Vec2::new(0.0, 0.000_000_1)],
+                style,
+            ),
+            Err(SceneError::DegenerateStrokeTurn {
+                primitive: ScenePrimitive::Polyline,
+                vertex_index: 1,
+            })
+        ));
+        assert!(matches!(
+            DrawCommand::styled_polyline(
+                vec![Vec2::ZERO, Vec2::X, Vec2::new(2.0, 0.000_05)],
                 style,
             ),
             Err(SceneError::DegenerateStrokeTurn {

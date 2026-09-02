@@ -1107,6 +1107,10 @@ proof for up to eight exact camera/viewport uniforms. This keeps fixed and
 multi-viewport retained rendering O(1) with respect to validation after the
 first use of a configuration. Every successful dynamic-mesh mutation clears
 that cache, so changed vertices are proved again before they can be encoded.
+Streaming fixed-screen scenes use the stronger `ScreenScene` invariant and an
+aggregate shader-bound proof after tessellation. Almost-collinear turns whose
+join branch is not numerically stable are rejected when the command enters the
+scene; ordinary world scenes retain the full camera-dependent triangle proof.
 Mixed-layer construction, budget rejection, and recovery are not accepted
 `--fixture` values of `rendering_benchmark_suite`; `adapter_probe` and
 `hidpi_transition` are accepted non-performance utility fixtures used by the
