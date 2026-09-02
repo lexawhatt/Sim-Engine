@@ -359,6 +359,7 @@ pub struct Scene {
     background: Color,
     /// Commands stored in draw order.
     commands: Vec<SceneCommand>,
+    owned_payload_bytes: usize,
     next_order: u64,
     current_screen_clip: Option<ScreenClipRect>,
     current_depth: f32,
@@ -388,6 +389,7 @@ impl Scene {
         Ok(Self {
             background,
             commands: Vec::new(),
+            owned_payload_bytes: 0,
             next_order: 0,
             current_screen_clip: None,
             current_depth: 0.0,
@@ -413,6 +415,7 @@ impl Scene {
     /// Removes all draw commands and active clipping without changing the background color.
     pub fn clear(&mut self) {
         self.commands.clear();
+        self.owned_payload_bytes = 0;
         self.next_order = 0;
         self.current_screen_clip = None;
         self.current_depth = 0.0;
@@ -439,17 +442,7 @@ impl Scene {
         self.commands
             .capacity()
             .saturating_mul(size_of::<SceneCommand>())
-            .saturating_add(
-                self.commands
-                    .iter()
-                    .map(|command| match command.command() {
-                        DrawCommand::Polyline(polyline) => {
-                            polyline.points.capacity().saturating_mul(size_of::<Vec2>())
-                        }
-                        DrawCommand::Circle(_) | DrawCommand::Rect(_) | DrawCommand::Line(_) => 0,
-                    })
-                    .fold(0usize, usize::saturating_add),
-            )
+            .saturating_add(self.owned_payload_bytes)
     }
 
     pub(crate) fn preflight_command_storage(
@@ -473,8 +466,9 @@ impl Scene {
             });
         }
         let required_len = self.commands.len().saturating_add(additional_commands);
-        let owned_payload_bytes =
-            scene_owned_payload_bytes(&self.commands).saturating_add(additional_owned_bytes);
+        let owned_payload_bytes = self
+            .owned_payload_bytes
+            .saturating_add(additional_owned_bytes);
         let capacity = if required_len <= self.commands.capacity() {
             self.commands.capacity()
         } else {
@@ -652,7 +646,7 @@ impl Scene {
         let mut attempted = 0usize;
         let mut attempted_by_primitive = PrimitiveCommandCounts::default();
         let mut next_order = self.next_order;
-        let existing_owned_payload_bytes = scene_owned_payload_bytes(&self.commands);
+        let existing_owned_payload_bytes = self.owned_payload_bytes;
         let mut staged_owned_payload_bytes = 0usize;
 
         for (layer, command) in commands {
@@ -820,6 +814,7 @@ impl Scene {
         staged.append(&mut self.commands);
         staged.sort_unstable_by_key(|command| (command.layer, command.order));
         self.commands = staged;
+        self.owned_payload_bytes = owned_payload_bytes;
         self.next_order = next_order;
         self.statistics = requested;
         Ok(())
@@ -864,7 +859,8 @@ impl Scene {
         }
 
         let command_retained_bytes = command.retained_bytes();
-        let owned_payload_bytes = scene_owned_payload_bytes(&self.commands)
+        let owned_payload_bytes = self
+            .owned_payload_bytes
             .saturating_add(command.owned_allocation_bytes());
         let requested = self.statistics.with_command(&command);
         if let Some(budget) = self.budget {
@@ -929,6 +925,7 @@ impl Scene {
                 || (existing.layer == scene_command.layer && existing.order <= scene_command.order)
         });
         self.commands.insert(position, scene_command);
+        self.owned_payload_bytes = owned_payload_bytes;
         self.next_order = self.next_order.saturating_add(1);
         self.statistics = requested;
         Ok(())
@@ -1829,13 +1826,6 @@ fn validate_scene_budget(
         }
     }
     Ok(())
-}
-
-fn scene_owned_payload_bytes(commands: &[SceneCommand]) -> usize {
-    commands
-        .iter()
-        .map(|command| command.command.owned_allocation_bytes())
-        .fold(0usize, usize::saturating_add)
 }
 
 fn scene_allocation_bytes(command_capacity: usize, owned_payload_bytes: usize) -> usize {

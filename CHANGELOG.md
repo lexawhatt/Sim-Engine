@@ -114,6 +114,9 @@ composed frames, fixed-screen UI, retained images, and host-shaped text.
 - Surface benchmark scenes use monotonic layers for linear fixture setup;
   adversarial interleaved-layer construction remains isolated in the dedicated
   core-only construction benchmark.
+- `Scene` caches its owned polyline-payload allocation total, removing an
+  accidental full-scene scan from every ordinary command insertion and storage
+  preflight.
 - A retained scientific glyph-atlas probe in `ui_demo`, reused above all four
   world-camera workloads without steady-state atlas or instance upload.
 

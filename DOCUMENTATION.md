@@ -1100,6 +1100,8 @@ transactional real-compositor HiDPI transition through the nested-KWin gate.
 The surface fixtures use monotonic layers so their setup remains linear; the
 separate construction benchmark owns the adversarial interleaved-layer cost and
 verifies the atomic batch path explicitly.
+Ordinary incremental insertion also maintains the scene's owned-payload byte
+total incrementally; allocation checks do not rescan every retained command.
 Mixed-layer construction, budget rejection, and recovery are not accepted
 `--fixture` values of `rendering_benchmark_suite`; `adapter_probe` and
 `hidpi_transition` are accepted non-performance utility fixtures used by the
