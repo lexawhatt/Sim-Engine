@@ -1578,3 +1578,124 @@ claims must additionally name the Linux adapter, PCI vendor/device and bus
 address, backend, driver, surface format/sample count, workload, present mode,
 confirmed current-monitor refresh where applicable, drawn/attempted counts,
 and measurement method.
+
+### 30. Official release procedure
+
+Publishing a crates.io version is permanent: the same version cannot be
+overwritten or deleted. A broken version can be yanked, but its archive remains
+available to existing lockfiles. For that reason, publish only the exact clean
+commit that passed the complete Linux release gate, and never use
+`--allow-dirty` or `--no-verify` for an official release.
+
+#### Prerequisites
+
+- The version in `Cargo.toml`, the release heading in `CHANGELOG.md`, and the
+  versioned links in `README.md` must agree.
+- `HEAD` must be the intended public commit and equal `origin/master`.
+- The maintainer must own `sim-engine` on crates.io, have a crates.io API token,
+  and be able to push tags and create releases in the GitHub repository.
+- The worktree must be clean. The release gate enforces this again.
+
+Authenticate with the crates.io token through Cargo's credential provider. Do
+not use a GitHub token here and do not place the token in a command-line
+argument or repository file:
+
+```bash
+cargo login
+```
+
+#### 1. Prove the exact release commit
+
+```bash
+git fetch origin
+test -z "$(git status --porcelain --untracked-files=all)"
+test "$(git rev-parse HEAD)" = "$(git rev-parse origin/master)"
+test -z "$(git tag -l v0.2.0)"
+test -z "$(git ls-remote --tags origin refs/tags/v0.2.0)"
+./scripts/linux_release_gate.sh
+```
+
+After the wrapper succeeds, bind the evidence to the current revision and
+create and inspect the package boundary one last time:
+
+```bash
+release_sha=$(git rev-parse HEAD)
+grep -Fxq "vcs_sha=$release_sha" \
+  target/linux-release-evidence/completion.txt
+grep -Fxq 'status=passed' target/linux-release-evidence/completion.txt
+cargo package --list
+cargo package --locked
+crate=target/package/sim-engine-0.2.0.crate
+tar -xOf "$crate" sim-engine-0.2.0/.cargo_vcs_info.json \
+  | grep -Fq "\"sha1\": \"$release_sha\""
+! tar -xOf "$crate" sim-engine-0.2.0/.cargo_vcs_info.json \
+  | grep -Fq '"dirty": true'
+cargo publish --dry-run --locked
+```
+
+`cargo package` explicitly refreshes the local archive; do not assume a publish
+dry run replaced a pre-existing `.crate` file. The provenance checks then prove
+that `.cargo_vcs_info.json` names the release commit and is not marked dirty.
+The publish dry run verifies the upload path without uploading. Review the
+archive and file list if anything changed since the gate. Do not continue if
+`HEAD`, the worktree, or evidence changes.
+
+#### 2. Publish the immutable crate
+
+```bash
+cargo publish --locked
+```
+
+Cargo may time out while waiting for the new version to appear in the registry
+index even after a successful upload. Before retrying, check the crates.io
+package page or run `cargo info sim-engine@0.2.0`; retrying an accepted version
+cannot overwrite it.
+
+#### 3. Tag the published commit
+
+Create the tag only after crates.io confirms the package. This avoids a public
+release tag for an upload that never succeeded, while the packaged
+`.cargo_vcs_info.json` still binds the uploaded source to the clean commit:
+
+```bash
+test "$(git rev-parse HEAD)" = "$release_sha"
+git tag -a v0.2.0 -m "Sim;Engine v0.2.0"
+test "$(git rev-list -n 1 v0.2.0)" = "$release_sha"
+git push origin v0.2.0
+```
+
+Tags for published versions are immutable release history. Never move or
+force-push one. If `v0.2.0` already exists, stop and verify its target instead
+of replacing it.
+
+#### 4. Create the GitHub Release and verify public artifacts
+
+Prepare release notes from the `0.2.0` changelog section, then either use the
+GitHub web interface or the GitHub CLI:
+
+```bash
+gh release create v0.2.0 \
+  --verify-tag \
+  --title "Sim;Engine v0.2.0" \
+  --notes-file /tmp/sim-engine-v0.2.0-notes.md
+```
+
+Finally verify all four public identities:
+
+- `https://crates.io/crates/sim-engine/0.2.0` shows version 0.2.0;
+- `https://docs.rs/sim-engine/0.2.0` completes successfully;
+- Git tag `v0.2.0` points to `$release_sha`;
+- the GitHub Release names the same tag and is not marked as a prerelease.
+
+If a serious defect is discovered after publishing, do not attempt to delete
+or overwrite 0.2.0. Yank it and prepare a corrected patch release:
+
+```bash
+cargo yank --version 0.2.0 sim-engine
+```
+
+The authoritative external references are Cargo's
+[publishing guide](https://doc.rust-lang.org/cargo/reference/publishing.html),
+[`cargo publish` reference](https://doc.rust-lang.org/cargo/commands/cargo-publish.html),
+and GitHub's
+[release documentation](https://docs.github.com/en/repositories/releasing-projects-on-github/managing-releases-in-a-repository).

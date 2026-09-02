@@ -21,7 +21,7 @@ scenes, positioned 2D viewports, offscreen scene rendering, a heterogeneous
 single-present frame composer, retained RGBA images and atlas batches,
 host-shaped glyph runs, explicitly budgeted dynamic triangles, richer bounded
 2D strokes, and a named rendering benchmark matrix. See the
-[0.2.0 changelog](https://github.com/lexawhatt/Sim-Engine/blob/v0.2.0/CHANGELOG.md#020---2026-09-01) for the complete delta from
+[0.2.0 changelog](https://github.com/lexawhatt/Sim-Engine/blob/v0.2.0/CHANGELOG.md#020---2026-09-02) for the complete delta from
 0.1.0.
 
 ## Documentation
@@ -87,6 +87,12 @@ are not part of v0.2.0.
 
 The default feature set includes the `wgpu` renderer:
 
+```bash
+cargo add sim-engine@0.2
+```
+
+or add it directly to `Cargo.toml`:
+
 ```toml
 [dependencies]
 sim-engine = "0.2"
@@ -104,26 +110,28 @@ sim-engine = { version = "0.2", default-features = false }
 ```rust
 use sim_engine::{Camera2d, Color, Rect, Scene, ShapeStyle, Vec2};
 
-let camera = Camera2d::new(Vec2::ZERO, 2.0)?;
-let mut scene = Scene::new(Color::rgb8(12, 14, 18))?;
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let camera = Camera2d::new(Vec2::ZERO, 2.0)?;
+    let mut scene = Scene::new(Color::rgb8(12, 14, 18))?;
 
-scene.try_circle(
-    Vec2::new(10.0, 20.0),
-    8.0,
-    ShapeStyle::filled(Color::rgb8(86, 195, 255)),
-)?;
-scene.try_rect(
-    Rect::from_center_size(Vec2::ZERO, Vec2::new(120.0, 64.0)),
-    8.0,
-    ShapeStyle::fill_stroke(
-        Color::rgb8(24, 31, 44),
-        2.0,
-        Color::rgb8(86, 195, 255),
-    ),
-)?;
+    scene.try_circle(
+        Vec2::new(10.0, 20.0),
+        8.0,
+        ShapeStyle::filled(Color::rgb8(86, 195, 255)),
+    )?;
+    scene.try_rect(
+        Rect::from_center_size(Vec2::ZERO, Vec2::new(120.0, 64.0)),
+        8.0,
+        ShapeStyle::fill_stroke(
+            Color::rgb8(24, 31, 44),
+            2.0,
+            Color::rgb8(86, 195, 255),
+        ),
+    )?;
 
-# let _ = camera;
-# Ok::<(), Box<dyn std::error::Error>>(())
+    let _ = camera;
+    Ok(())
+}
 ```
 
 Window creation stays in the host. Renderer initialization is asynchronous;
@@ -278,6 +286,12 @@ gate and exact SHA; the same directory contains `linux-vulkan-surface.txt`,
 `linux-hidpi-transition.txt`. The performance manifest preserves the complete
 fixture counters, timings, thresholds, and passed verdicts for all nine
 surface runs instead of leaving them only in terminal output.
+
+Maintainers should follow the complete
+[official release procedure](https://github.com/lexawhatt/Sim-Engine/blob/v0.2.0/DOCUMENTATION.md#30-official-release-procedure).
+Publishing is complete only when crates.io exposes the immutable package, the
+annotated Git tag points at the evidenced commit, and the matching GitHub
+Release is public.
 
 ## License
 

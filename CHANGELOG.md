@@ -1,14 +1,15 @@
 # Changelog
 
 All notable user-visible changes to Sim;Engine are recorded here. The project
-uses Keep a Changelog-style structure and follows Semantic Versioning once the
-public API reaches 1.0.
+uses a Keep a Changelog-style structure and Semantic Versioning. While the
+public API is pre-1.0, minor releases may contain documented source-breaking
+changes.
 
 ## Unreleased
 
 No unreleased changes.
 
-## 0.2.0 - 2026-09-01
+## 0.2.0 - 2026-09-02
 
 Second official Linux release. This release turns the Sim;X integration
 foundation developed after 0.1.0 into supported, bounded APIs for complete
