@@ -32,7 +32,8 @@ host-shaped glyph runs, explicitly budgeted dynamic triangles, richer bounded
 The 0.3 work adds capacity-aware glyph/sprite updates, independent per-draw
 placement and tint, bounded reusable composition storage, portable filled-3D
 clipping with object-attributed errors, indexed editable 3D scenes, shared
-opaque UV textures, and exact-tip scientific arrows. CPU optimizations reuse
+opaque UV textures, exact-tip scientific arrows, and optional antialiased TTF/OTF
+text with cached glyphs and logical baseline metrics. CPU optimizations reuse
 exact text/geometry validation results without reordering draws or weakening
 precision checks. These APIs require this checkout until 0.3 is published;
 they are not capabilities of the crates.io 0.2 package.
@@ -62,6 +63,8 @@ they are not capabilities of the crates.io 0.2 package.
 - streaming, prepared, and dynamic triangle geometry;
 - retained sRGB RGBA images, atlas sprite batches, and world-space image quads;
 - host-shaped, bounded glyph atlas runs with deterministic logical bounds;
+- optional `text` feature: load TTF/OTF outlines, shape single-direction lines,
+  and cache antialiased glyphs at the requested font size and DPI;
 - budgeted instanced particle rendering;
 - scalar-field textures, color maps, partial updates, and heatmaps;
 - offscreen targets, composition, and bounded trails;
@@ -125,8 +128,10 @@ For 0.3 development, depend on your checked-out source and pin its commit in
 your integration's lockfile/repository. Run the new fixtures from this checkout:
 
 ```bash
-cargo run --release --example text_ui_updates
-cargo run --release --example text_ui_updates -- --acceptance
+cargo run --release --features text --example text_ui_updates
+cargo run --release --features text --example text_ui_updates -- --page fonts
+cargo run --release --features text --example text_ui_updates -- --font /path/to/MyFont.ttf
+cargo run --release --features text --example text_ui_updates -- --acceptance
 cargo run --release --example frame_cache_benchmark
 cargo run --release --example frame_cache_benchmark -- --case mixed --labels 1000 --trials 3 --frames 120
 cargo run --release --example stroke_gallery -- --page 5
@@ -134,13 +139,53 @@ cargo run --release --example editable_textured_3d
 cargo run --release --example editable_textured_3d -- --acceptance
 ```
 
-The text demo owns its tiny numeric font; Engine adds no font shaping, UI
-navigation, audio, or game-domain dependency. `--acceptance` exercises public
-update, composition and recovery routes and requires actual presented frames.
+The text lab has three pages: `1` compares DejaVu Sans/Serif/Mono, Inter and
+DejaVu Math; `2` (default) shows `𝓣𝔂𝓹𝓮 𝓼𝓸𝓶𝓮𝓽𝓱𝓲𝓷𝓰 𝓽𝓸 𝓼𝓽𝓪𝓻𝓽`, math
+symbols, Japanese, combining accents and one Arabic RTL run; `3` exercises
+retained updates, clipping and motion at 16/24/48 logical pixels. Use the wheel
+to scroll shorter gallery windows, and `--page fonts|unicode|motion` to select
+the initial page. Licensed font fixtures are embedded, including an 89 KiB
+Japanese **example subset**, not a full CJK font. `--font` replaces the selected
+font comparison and motion samples with your TTF/OTF file. Font support
+is opt-in; the default renderer and core-only builds retain their dependency
+boundary. UI navigation, audio, and domain logic stay in the host. `--acceptance` exercises public
+update, composition and recovery routes and requires 40 actual presented
+frames on each page. Automatic font fallback and mixed-script paragraph layout
+are not implied by these independently shaped, explicitly font-selected rows.
 For changing-text diagnostics, use `frame_cache_benchmark --case recolored
 --labels 1000 --cache on`; compare with `--upload-staging 0` to isolate bounded
 uniform-upload packing without disabling the other caches. Transfer memory and
 GPU copy work are reported separately from host-upload bytes.
+
+### Loading a font (0.3 development)
+
+Enable `features = ["text"]` on your checkout dependency:
+
+```toml
+sim-engine = { path = "../Sim-Engine", features = ["text"] }
+```
+
+```rust,no_run
+# #[cfg(feature = "text")]
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+use sim_engine::{FontBudget, FontFace};
+
+let font = FontFace::from_bytes(
+    std::fs::read("assets/MyFont.ttf")?,
+    FontBudget::default(),
+)?;
+# let _ = font;
+# Ok(())
+# }
+# #[cfg(not(feature = "text"))]
+# fn main() {}
+```
+
+Then create a `TextAtlas2d`, prepare a `TextRun2d`, and draw it through the
+frame composer. The [font guide](DOCUMENTATION.md#loading-ttfotf-fonts-optional-text-feature)
+covers the complete render/update/DPI/recovery workflow. Supply trusted,
+appropriately licensed font assets. Automatic font fallback, paragraph bidi,
+wrapping, color emoji, and font-file I/O are not built into the engine.
 
 ## Quick Start
 

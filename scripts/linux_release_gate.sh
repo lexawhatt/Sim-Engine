@@ -29,16 +29,19 @@ cargo fmt --all -- --check
 
 echo "[3/11] Rust 1.90 minimum version"
 cargo +1.90.0 check --all-targets --no-default-features
+cargo +1.90.0 check --all-targets
 cargo +1.90.0 check --all-targets --all-features
 
 echo "[4/11] all Linux targets"
 cargo test --all-targets --all-features
+cargo test --all-targets
 
 echo "[5/11] core-only"
 cargo test --all-targets --no-default-features
 
 echo "[6/11] strict clippy"
 cargo clippy --all-targets --no-default-features -- -D warnings
+cargo clippy --all-targets -- -D warnings
 cargo clippy --all-targets --all-features -- -D warnings
 
 echo "[7/11] public documentation"
@@ -88,6 +91,8 @@ echo "GPU evidence: $output_dir/linux-vulkan-adapter.txt"
 
 echo "[9/11] named rendering performance matrix"
 assert_provenance
+WGPU_BACKEND=vulkan \
+cargo run --release --features text --example text_ui_updates -- --acceptance
 WGPU_BACKEND=vulkan \
 SIM_ENGINE_REQUIRE_VULKAN=1 \
 ./scripts/rendering_benchmark_matrix.sh

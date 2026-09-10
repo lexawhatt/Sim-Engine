@@ -8057,6 +8057,10 @@ mod glyph;
 mod image;
 mod mesh3d;
 mod tessellation;
+#[cfg(feature = "text")]
+mod text;
+#[cfg(feature = "text")]
+pub use text::{TextAtlas2d, TextAtlasBudget, TextError, TextRun2d, TextUpdateReport};
 mod visualization;
 use config::{
     MultisampleTarget, create_multisample_target, logical_to_physical_screen,

@@ -12,6 +12,26 @@ from the official 0.2.0 release; a development version is not release sign-off.
 
 ### Added
 
+- Optional `text` feature for trusted TTF/OTF outline assets: `FontFace` loads
+  owned bytes without copying their backing allocation, rustybuzz shapes one
+  directional line, and ab_glyph rasterizes grayscale antialiased coverage.
+  Logical EM sizes, baselines, advances, kerning, ligatures and glyph offsets
+  are explicit; unsupported text, missing glyphs and work limits return errors.
+- `TextAtlas2d` and `TextRun2d` reuse the retained glyph rendering path. Each
+  atlas fixes font, size and DPI; glyphs never move or evict existing runs.
+  Unchanged UTF-8 updates skip shaping/upload, changed text reuses instance
+  capacity, and warm cache glyphs are not rasterized again. Failure preserves
+  old runs but may retain new bounded cache entries. Recovery is explicit.
+- Real-font `text_ui_updates` example with licensed DejaVu Sans, Cyrillic,
+  16/24/48 px sizes, baseline placement, tinted/clipped copies, and `--font PATH`.
+  Run it with `--features text`; default `wgpu` remains independent of shaping.
+- Three-page type lab adds Sans/Serif/Mono/Inter/Math comparisons, exact
+  supplementary mathematical Unicode, Japanese Han/Kana, combining marks and
+  an explicit Arabic RTL run. Japanese uses a renamed, licensed, reproducible
+  89 KiB example-only subset. Font selection remains explicit per row.
+  Wheel scrolling, `--page` and `1`/`2`/`3` navigation are example-owned.
+  Bounded acceptance requires real presents on every page; GPU glyph readback
+  covers 48 position/tint/filter cells across DPI and sample configurations.
 - Strict GPU scissor coverage checks all four pixel boundaries with native and
   fractional DPI, both single-sample and production MSAA rendering. Placement
   failures report logical/physical coordinates, format and sample count.

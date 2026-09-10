@@ -2,6 +2,8 @@ use super::*;
 
 mod red_team;
 mod scissor;
+#[cfg(feature = "text")]
+mod text;
 
 fn destination(x: f32, y: f32) -> LogicalViewportRegion {
     LogicalViewportRegion::new(
@@ -50,6 +52,8 @@ pub(in crate::renderer) async fn verify_retained_ui_updates(
     sample_count: u32,
 ) {
     scissor::verify_scissor_edges(device, queue, format, sample_count).await;
+    #[cfg(feature = "text")]
+    text::verify_font_coverage(device, queue, format, sample_count).await;
     proof::verify_revision_invalidation(device, queue, recovery_device, recovery_queue);
     red_team::verify_exact_update_budgets(device, queue, format, sample_count).await;
     let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);

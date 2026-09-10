@@ -1,23 +1,28 @@
-//! Host-owned tiny numeric font demonstrating retained updates and shared layout.
-//! Space pauses, R resets, Esc exits. Optional --uncapped and --frames N.
+//! Real TTF text with retained updates, independent placement/tint, and clipping.
+//! Space pauses, R resets, Esc exits. Use --help for font and smoke-test options.
 
 #[path = "support/retained_ui_acceptance.rs"]
 mod retained_ui_acceptance;
+#[path = "support/text_font_gallery.rs"]
+mod text_font_gallery;
+#[path = "support/text_ui_acceptance.rs"]
+mod text_ui_acceptance;
+#[path = "support/text_ui_content.rs"]
+mod text_ui_content;
 
-use std::{error::Error, sync::Arc, time::Instant};
+use std::{error::Error, path::PathBuf, sync::Arc, time::Instant};
 
 use sim_engine::{
-    Color, FrameBudget, FramePassOptions, GlyphAtlas2d, GlyphAtlasBudget, GlyphAtlasEntry, GlyphId,
-    GlyphRun2d, GlyphRunBudget, Image2d, ImageBatch2d, ImageBatchBudget, ImageBatchPlacement,
-    ImageBudget, ImageSampling, ImageSprite2d, ImageTexelRect, LogicalScreenPosition,
-    LogicalScreenVector, LogicalViewport, LogicalViewportRegion, PositionedGlyph2d, RenderStatus,
-    RendererPresentMode, ScreenClipRect, ScreenScene, ShapeStyle, WgpuRenderer,
+    Color, FontBudget, FontFace, FrameBudget, FramePassOptions, LogicalScreenPosition,
+    LogicalScreenVector, RenderStatus, RendererPresentMode, ScreenScene, ShapeStyle, WgpuRenderer,
     WgpuRendererOptions,
 };
+use text_font_gallery::{FontGallery, GalleryFonts, PAGE_COUNT, PRESENTS_PER_PAGE, TextPage};
+use text_ui_content::TextContent;
 use winit::{
     application::ApplicationHandler,
     dpi::LogicalSize,
-    event::{ElementState, WindowEvent},
+    event::{ElementState, MouseScrollDelta, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
     keyboard::{KeyCode, PhysicalKey},
     window::{Window, WindowId},
@@ -25,99 +30,119 @@ use winit::{
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
-const DIGITS: [[u8; 5]; 10] = [
-    [7, 5, 5, 5, 7],
-    [2, 6, 2, 2, 7],
-    [7, 1, 7, 4, 7],
-    [7, 1, 7, 1, 7],
-    [5, 5, 7, 1, 1],
-    [7, 4, 7, 1, 7],
-    [7, 4, 7, 5, 7],
-    [7, 1, 1, 1, 1],
-    [7, 5, 7, 5, 7],
-    [7, 5, 7, 1, 7],
-];
+const EMBEDDED_FONT: &[u8] = include_bytes!("assets/fonts/DejaVuSans.ttf");
+const ACCEPTANCE_TEXT_PRESENTS: usize = PAGE_COUNT * PRESENTS_PER_PAGE;
+const MAX_SKIPPED_ATTEMPTS: usize = 120;
 
-fn font() -> (Vec<u8>, Vec<GlyphAtlasEntry>) {
-    let mut pixels = vec![0; 50 * 7 * 4];
-    let mut entries = Vec::new();
-    for (digit, rows) in DIGITS.iter().enumerate() {
-        for (y, row) in rows.iter().enumerate() {
-            for x in 0..3 {
-                if row & (4 >> x) != 0 {
-                    let start = ((y + 1) * 50 + digit * 5 + x + 1) * 4;
-                    pixels[start..start + 4].fill(255);
+#[derive(Default)]
+struct Options {
+    uncapped: bool,
+    frame_limit: Option<usize>,
+    acceptance: bool,
+    font_path: Option<PathBuf>,
+    help: bool,
+    page: TextPage,
+}
+
+impl Options {
+    fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Self> {
+        let mut options = Self::default();
+        let mut arguments = arguments.into_iter();
+        while let Some(argument) = arguments.next() {
+            match argument.as_str() {
+                "--uncapped" => options.uncapped = true,
+                "--acceptance" => options.acceptance = true,
+                "--help" | "-h" => options.help = true,
+                "--font" => {
+                    let path = arguments.next().ok_or("--font requires a file path")?;
+                    options.font_path = Some(path.into());
                 }
+                "--page" => {
+                    options.page =
+                        TextPage::parse(&arguments.next().ok_or("--page requires a name")?)?;
+                }
+                "--frames" => {
+                    let count = arguments
+                        .next()
+                        .ok_or("--frames requires a count")?
+                        .parse()?;
+                    if count == 0 {
+                        return Err("--frames must be positive".into());
+                    }
+                    options.frame_limit = Some(count);
+                }
+                _ => return Err(format!("unknown argument: {argument}; use --help").into()),
             }
         }
-        entries.push(GlyphAtlasEntry::new(
-            GlyphId::new(digit as u32),
-            ImageTexelRect::new(digit as u32 * 5 + 1, 1, 3, 5).unwrap(),
-        ));
+        if options.acceptance && options.frame_limit.is_some() {
+            return Err("--acceptance has its own bounded frame count; omit --frames".into());
+        }
+        Ok(options)
     }
-    (pixels, entries)
-}
 
-fn region(x: f32, y: f32, width: f32, height: f32) -> Result<LogicalViewportRegion> {
-    Ok(LogicalViewportRegion::new(
-        LogicalScreenPosition::new(x, y),
-        LogicalViewport::new(width, height)?,
-    )?)
-}
-
-fn layout(number: u64, output: &mut Vec<PositionedGlyph2d>) -> Result<()> {
-    output.clear();
-    let mut digits = [0_u32; 20];
-    let mut count = 0;
-    let mut value = number;
-    loop {
-        digits[count] = (value % 10) as u32;
-        count += 1;
-        value /= 10;
-        if value == 0 {
-            break;
+    fn font_bytes(&self) -> Result<Vec<u8>> {
+        match &self.font_path {
+            Some(path) => std::fs::read(path)
+                .map_err(|error| format!("cannot read font {}: {error}", path.display()).into()),
+            None => Ok(EMBEDDED_FONT.to_vec()),
         }
     }
-    for (index, digit) in digits[..count].iter().rev().enumerate() {
-        output.push(PositionedGlyph2d::new(
-            GlyphId::new(*digit),
-            region(index as f32 * 32.0 - 2.0, -4.0, 24.0, 40.0)?,
-            Color::WHITE,
-        )?);
+
+    fn verify_completion(&self, drawn: usize, acceptance_finished: bool) -> Result<()> {
+        if self.acceptance && (!acceptance_finished || drawn < ACCEPTANCE_TEXT_PRESENTS) {
+            return Err(format!(
+                "text acceptance interrupted: {drawn}/{ACCEPTANCE_TEXT_PRESENTS} TTF presents; recovery completed={acceptance_finished}"
+            )
+            .into());
+        }
+        if let Some(limit) = self.frame_limit
+            && drawn < limit
+        {
+            return Err(
+                format!("text smoke interrupted: {drawn}/{limit} confirmed presents").into(),
+            );
+        }
+        Ok(())
     }
-    Ok(())
 }
 
 struct Demo {
     window: Arc<Window>,
     renderer: WgpuRenderer,
-    atlas: GlyphAtlas2d,
-    run: GlyphRun2d,
-    image: Image2d,
-    sprites: ImageBatch2d,
-    glyphs: Vec<PositionedGlyph2d>,
+    font: FontFace,
+    gallery_fonts: GalleryFonts,
+    gallery: Option<FontGallery>,
+    page: TextPage,
+    panel_page: TextPage,
+    page_presents: [usize; PAGE_COUNT],
+    scroll: f32,
+    panel_scroll: f32,
+    text: Option<TextContent>,
     panels: ScreenScene,
+    panel_width: f32,
     seconds: f64,
     last_frame: Instant,
     paused: bool,
-    attempts: usize,
+    drawn: usize,
+    skipped: usize,
     frame_limit: Option<usize>,
+    acceptance_requested: bool,
     acceptance: Option<retained_ui_acceptance::RetainedUiAcceptance>,
+    text_acceptance: Option<text_ui_acceptance::TextAcceptance>,
 }
 
 impl Demo {
-    fn new(
-        events: &ActiveEventLoop,
-        uncapped: bool,
-        frame_limit: Option<usize>,
-        acceptance: bool,
-    ) -> Result<Self> {
-        let window = Arc::new(events.create_window(Window::default_attributes()
-            .with_title("0.3 text/UI: shared counter, tinted scrolling copy, moving atlas sprite | Space/R/Esc")
-            .with_inner_size(LogicalSize::new(900.0, 500.0)))?);
+    fn new(events: &ActiveEventLoop, options: &Options, font: FontFace) -> Result<Self> {
+        let window = Arc::new(
+            events.create_window(
+                Window::default_attributes()
+                    .with_title("Sim;Engine 0.3 | Type Lab: 1 Fonts / 2 Unicode / 3 Motion | Esc")
+                    .with_inner_size(LogicalSize::new(1120.0, 820.0)),
+            )?,
+        );
         let size = window.inner_size();
-        let options = WgpuRendererOptions::new(
-            if uncapped {
+        let renderer_options = WgpuRendererOptions::new(
+            if options.uncapped {
                 RendererPresentMode::NoVsync
             } else {
                 RendererPresentMode::Vsync
@@ -128,147 +153,205 @@ impl Demo {
             window.clone(),
             size.width,
             size.height,
-            options,
+            renderer_options,
         ))?;
         let notify = window.clone();
         renderer.set_pre_present_notify(move || notify.pre_present_notify());
-        let acceptance = acceptance
+        let text_acceptance = options
+            .acceptance
+            .then(|| text_ui_acceptance::TextAcceptance::new(&renderer, font.clone()))
+            .transpose()?;
+        let acceptance = options
+            .acceptance
             .then(|| retained_ui_acceptance::RetainedUiAcceptance::new(&mut renderer))
             .transpose()?;
-        let (pixels, entries) = font();
-        let atlas = renderer.create_glyph_atlas(
-            50,
-            7,
-            pixels.clone(),
-            entries,
-            GlyphAtlasBudget::default(),
-        )?;
-        let mut glyphs = Vec::with_capacity(20);
-        layout(9, &mut glyphs)?;
-        let run =
-            renderer.create_glyph_run(&atlas, glyphs.clone(), GlyphRunBudget::new(20, 8192)?)?;
-        let image = renderer.create_image_rgba8(50, 7, pixels, ImageBudget::default())?;
-        let sprites = renderer.create_image_batch(
-            &image,
-            vec![ImageSprite2d::new(
-                ImageTexelRect::new(1, 1, 3, 5)?,
-                region(0.0, 0.0, 36.0, 60.0)?,
-                Color::WHITE,
-            )?],
-            ImageBatchBudget::new(16, 8192)?,
-        )?;
+        println!(
+            "TTF text: font={}, physical_size={}x{}, dpi={:.3}, present={:?}; Space pause, R reset, Esc exit",
+            options.font_path.as_ref().map_or_else(
+                || "embedded DejaVu Sans".to_owned(),
+                |path| path.display().to_string()
+            ),
+            size.width,
+            size.height,
+            renderer.scale_factor(),
+            renderer.surface_present_mode(),
+        );
         Ok(Self {
             window,
             renderer,
-            atlas,
-            run,
-            image,
-            sprites,
-            glyphs,
+            gallery_fonts: GalleryFonts::load(font.clone(), options.font_path.is_some())?,
+            gallery: None,
+            page: options.page,
+            panel_page: options.page,
+            page_presents: [0; PAGE_COUNT],
+            scroll: 0.0,
+            panel_scroll: 0.0,
+            font,
+            text: None,
             panels: ScreenScene::new(Color::BLACK)?,
+            panel_width: 0.0,
             seconds: 0.0,
             last_frame: Instant::now(),
             paused: false,
-            attempts: 0,
-            frame_limit,
+            drawn: 0,
+            skipped: 0,
+            frame_limit: options.frame_limit,
+            acceptance_requested: options.acceptance,
             acceptance,
+            text_acceptance,
         })
     }
 
     fn redraw(&mut self) -> Result<bool> {
         if let Some(acceptance) = &mut self.acceptance {
-            return acceptance.step(&mut self.renderer);
+            if acceptance.step(&mut self.renderer)? {
+                self.acceptance = None;
+                if let Some(text_acceptance) = &mut self.text_acceptance {
+                    text_acceptance.restore_after_recovery(&self.renderer)?;
+                }
+                self.last_frame = Instant::now();
+                println!("Low-level retained UI acceptance passed; starting real TTF presents.");
+            }
+            return Ok(false);
         }
         let now = Instant::now();
         if !self.paused {
             self.seconds += now.duration_since(self.last_frame).as_secs_f64().min(0.1);
         }
         self.last_frame = now;
-        let counter = 9 + (self.seconds * 10.0) as u64;
-        layout(counter, &mut self.glyphs)?;
-        let run_update =
-            self.renderer
-                .update_glyph_run(&self.atlas, &mut self.run, &self.glyphs)?;
-        let angle = self.seconds as f32;
-        let digit = (counter % 10) as u32;
-        let sprite = ImageSprite2d::new(
-            ImageTexelRect::new(digit * 5 + 1, 1, 3, 5)?,
-            region(360.0 + angle.sin() * 300.0, 320.0, 36.0, 60.0)?,
-            Color::rgb8(255, 184, 75),
-        )?;
-        let sprite_update =
-            self.renderer
-                .update_image_batch(&self.image, &mut self.sprites, &[sprite])?;
-        self.panels.clear();
-        for (y, color) in [
-            (36.0, Color::rgb8(27, 39, 60)),
-            (148.0, Color::rgb8(21, 49, 43)),
-            (292.0, Color::rgb8(49, 37, 28)),
-        ] {
-            self.panels.try_square_rect(
-                LogicalScreenPosition::new(24.0, y),
-                LogicalScreenVector::new(810.0, 104.0),
-                ShapeStyle::filled(color),
-            )?;
+        let counter = if self.acceptance_requested {
+            9 + self.drawn as u64
+        } else {
+            9 + (self.seconds * 10.0) as u64
+        };
+        let dpi = self.renderer.scale_factor() as f32;
+        let page = if self.acceptance_requested {
+            TextPage::acceptance_page(self.drawn)
+        } else {
+            self.page
+        };
+        if page != TextPage::Motion
+            && self
+                .gallery
+                .as_ref()
+                .is_none_or(|gallery| gallery.dpi() != dpi)
+        {
+            let gallery = FontGallery::new(&self.renderer, &self.gallery_fonts, dpi)?;
+            let (cpu, gpu) = gallery.retained_bytes();
+            println!(
+                "Font gallery ready: dpi={dpi:.3}, cache_cpu_bytes={cpu}, cache_gpu_bytes={gpu}; font source bytes are separate"
+            );
+            self.gallery = Some(gallery);
+        }
+        if page == TextPage::Motion && self.text.as_ref().is_none_or(|text| text.dpi() != dpi) {
+            // Publish all three new raster scales together; old resources stay
+            // drawable if any font preparation or GPU allocation is rejected.
+            let rebuilt = TextContent::new(&self.renderer, self.font.clone(), dpi, counter)?;
+            println!("TTF atlases rebuilt: logical sizes 16/24/48 px, physical scale {dpi:.3}");
+            self.text = Some(rebuilt);
+        }
+        let changed = if page == TextPage::Motion {
+            self.text
+                .as_mut()
+                .ok_or("text resources were not initialized")?
+                .update_counter(&self.renderer, counter)?
+        } else {
+            false
+        };
+        let panel_width = (self.renderer.logical_size().0 - 64.0).max(1.0);
+        let scroll = if page == TextPage::Motion {
+            0.0
+        } else {
+            self.scroll
+                .clamp(0.0, (820.0 - self.renderer.logical_size().1).max(0.0))
+        };
+        if self.panel_width != panel_width || self.panel_page != page || self.panel_scroll != scroll
+        {
+            let mut panels = ScreenScene::new(Color::BLACK)?;
+            let bands: Vec<_> = if page == TextPage::Motion {
+                vec![
+                    (82.0, 64.0, Color::rgb8(27, 39, 60)),
+                    (158.0, 66.0, Color::rgb8(27, 39, 60)),
+                    (236.0, 86.0, Color::rgb8(27, 39, 60)),
+                    (344.0, 72.0, Color::rgb8(49, 37, 28)),
+                    (452.0, 94.0, Color::rgb8(21, 49, 43)),
+                ]
+            } else {
+                let baselines = if page == TextPage::Fonts {
+                    vec![142.0, 247.0, 352.0, 457.0, 562.0, 667.0]
+                } else {
+                    vec![142.0, 242.0, 335.0, 428.0, 521.0, 614.0, 707.0]
+                };
+                baselines
+                    .into_iter()
+                    .map(|baseline| (baseline - 70.0, 91.0, Color::rgb8(23, 32, 48)))
+                    .collect()
+            };
+            for (y, height, color) in bands {
+                panels.try_square_rect(
+                    LogicalScreenPosition::new(32.0, y - scroll),
+                    LogicalScreenVector::new(panel_width, height),
+                    ShapeStyle::filled(color),
+                )?;
+            }
+            self.panels = panels;
+            self.panel_width = panel_width;
+            self.panel_page = page;
+            self.panel_scroll = scroll;
         }
         let mut frame = self
             .renderer
             .begin_frame(Color::rgb8(12, 16, 25), FrameBudget::default())?;
         frame.draw_screen_scene(&self.panels, FramePassOptions::new(0))?;
-        frame.draw_glyph_run_placed(
-            &self.atlas,
-            &self.run,
-            ImageBatchPlacement::new(
-                LogicalScreenVector::new(56.0, 72.0),
-                Color::rgb8(108, 203, 255),
-            )?,
-            ImageSampling::Nearest,
-            FramePassOptions::new(1),
-        )?;
-        frame.draw_glyph_run_placed(
-            &self.atlas,
-            &self.run,
-            ImageBatchPlacement::new(
-                LogicalScreenVector::new(360.0 + angle.sin() * 460.0, 184.0),
-                Color::rgb8(90, 240, 155).with_alpha(0.5),
-            )?,
-            ImageSampling::Nearest,
-            FramePassOptions::new(2).with_clip(ScreenClipRect::from_min_size(
-                LogicalScreenPosition::new(24.0, 148.0),
-                LogicalScreenVector::new(810.0, 104.0),
-            )?),
-        )?;
-        frame.draw_image_batch(
-            &self.image,
-            &self.sprites,
-            ImageSampling::Nearest,
-            FramePassOptions::new(3),
-        )?;
+        if page == TextPage::Motion {
+            self.text
+                .as_ref()
+                .ok_or("text resources were not initialized")?
+                .draw(&mut frame, self.seconds as f32, panel_width)?;
+            if let Some(text_acceptance) = &self.text_acceptance {
+                text_acceptance.draw(&mut frame)?;
+            }
+        } else {
+            self.gallery
+                .as_ref()
+                .ok_or("font gallery was not initialized")?
+                .draw(&mut frame, page, panel_width, scroll)?;
+        }
         let report = frame.present()?;
-        self.attempts += 1;
-        if self.attempts.is_multiple_of(120) || run_update.instances().replaced_instance_buffer() {
+        if report.status() == RenderStatus::Drawn {
+            self.drawn += 1;
+            self.page_presents[page.index()] += 1;
+        } else {
+            self.skipped += 1;
+            if self.skipped >= MAX_SKIPPED_ATTEMPTS
+                && (self.acceptance_requested || self.frame_limit.is_some())
+            {
+                return Err(format!(
+                    "TTF example did not complete: {} drawn, {} skipped attempts ({:?})",
+                    self.drawn,
+                    self.skipped,
+                    report.status()
+                )
+                .into());
+            }
+        }
+        if changed && self.drawn.is_multiple_of(120) {
             println!(
-                "count={counter} glyph_capacity={} glyph_upload={} glyph_buffer_grew={} sprite_upload={} sprite_buffer_grew={} present={:?}",
-                run_update.capacity(),
-                run_update.instances().uploaded_instance_bytes(),
-                run_update.instances().replaced_instance_buffer(),
-                sprite_update.uploaded_instance_bytes(),
-                sprite_update.replaced_instance_buffer(),
-                report.status()
+                "counter={counter}, drawn={}, skipped={}, dpi={dpi:.3}, text updated without rerasterizing cached glyphs",
+                self.drawn, self.skipped,
             );
         }
-        if report.status() == RenderStatus::Drawn {
-            self.window.request_redraw();
+        if self.acceptance_requested && self.drawn >= ACCEPTANCE_TEXT_PRESENTS {
+            return Ok(true);
         }
-        Ok(self.frame_limit.is_some_and(|limit| self.attempts >= limit))
+        Ok(self.frame_limit.is_some_and(|limit| self.drawn >= limit))
     }
 }
 
 struct Application {
     demo: Option<Demo>,
-    uncapped: bool,
-    frame_limit: Option<usize>,
-    acceptance: bool,
+    options: Options,
+    font: FontFace,
     error: Option<String>,
 }
 
@@ -277,7 +360,7 @@ impl ApplicationHandler for Application {
         if self.demo.is_some() {
             return;
         }
-        match Demo::new(events, self.uncapped, self.frame_limit, self.acceptance) {
+        match Demo::new(events, &self.options, self.font.clone()) {
             Ok(demo) => {
                 demo.window.request_redraw();
                 self.demo = Some(demo);
@@ -288,6 +371,7 @@ impl ApplicationHandler for Application {
             }
         }
     }
+
     fn window_event(&mut self, events: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
         let Some(demo) = &mut self.demo else {
             return;
@@ -309,6 +393,19 @@ impl ApplicationHandler for Application {
                     .map(|_| false)
                     .map_err(Into::into)
             }
+            WindowEvent::MouseWheel { delta, .. } if !demo.acceptance_requested => {
+                let movement = match delta {
+                    MouseScrollDelta::LineDelta(_, lines) => lines * 42.0,
+                    MouseScrollDelta::PixelDelta(position) => {
+                        (position.y / demo.window.scale_factor()) as f32
+                    }
+                };
+                if movement.is_finite() {
+                    demo.scroll = (demo.scroll - movement)
+                        .clamp(0.0, (820.0 - demo.renderer.logical_size().1).max(0.0));
+                }
+                Ok(false)
+            }
             WindowEvent::KeyboardInput { event, .. }
                 if event.state == ElementState::Pressed && !event.repeat =>
             {
@@ -316,6 +413,18 @@ impl ApplicationHandler for Application {
                     PhysicalKey::Code(KeyCode::Escape) => events.exit(),
                     PhysicalKey::Code(KeyCode::Space) => demo.paused = !demo.paused,
                     PhysicalKey::Code(KeyCode::KeyR) => demo.seconds = 0.0,
+                    PhysicalKey::Code(KeyCode::Digit1) => {
+                        demo.page = TextPage::Fonts;
+                        demo.scroll = 0.0;
+                    }
+                    PhysicalKey::Code(KeyCode::Digit2) => {
+                        demo.page = TextPage::Unicode;
+                        demo.scroll = 0.0;
+                    }
+                    PhysicalKey::Code(KeyCode::Digit3) => {
+                        demo.page = TextPage::Motion;
+                        demo.scroll = 0.0;
+                    }
                     _ => {}
                 }
                 Ok(false)
@@ -332,6 +441,7 @@ impl ApplicationHandler for Application {
             _ => {}
         }
     }
+
     fn about_to_wait(&mut self, _: &ActiveEventLoop) {
         if let Some(demo) = &self.demo {
             demo.window.request_redraw();
@@ -341,17 +451,25 @@ impl ApplicationHandler for Application {
 
 fn main() -> Result<()> {
     env_logger::init();
-    let arguments = std::env::args().collect::<Vec<_>>();
-    let frame_limit = arguments
-        .windows(2)
-        .find(|pair| pair[0] == "--frames")
-        .map(|pair| pair[1].parse())
-        .transpose()?;
+    let options = Options::parse(std::env::args().skip(1))?;
+    if options.help {
+        println!(
+            "cargo run --release --features text --example text_ui_updates -- [OPTIONS]\n\
+             --font PATH   Use a caller-provided TTF/OTF instead of embedded DejaVu Sans\n\
+             --page NAME   fonts / unicode (default) / motion; switch live with 1 / 2 / 3\n\
+             --uncapped    Request Immediate presentation, with backend fallback\n\
+             --frames N    Exit after N confirmed text presents\n\
+             --acceptance  Run recovery checks, then 40 Drawn on each of the three pages\n\
+             1/2/3 switch pages, wheel scrolls, Space pauses motion, R resets, Esc exits.\n\
+             Moving the window between different-DPI outputs rebuilds glyph rasters."
+        );
+        return Ok(());
+    }
+    let font = FontFace::from_bytes(options.font_bytes()?, FontBudget::default())?;
     let mut application = Application {
         demo: None,
-        uncapped: arguments.iter().any(|arg| arg == "--uncapped"),
-        frame_limit,
-        acceptance: arguments.iter().any(|arg| arg == "--acceptance"),
+        options,
+        font,
         error: None,
     };
     let events = EventLoop::new()?;
@@ -360,29 +478,90 @@ fn main() -> Result<()> {
     if let Some(error) = application.error {
         return Err(error.into());
     }
+    let (drawn, skipped, acceptance_finished) =
+        application.demo.as_ref().map_or((0, 0, false), |demo| {
+            (
+                demo.drawn,
+                demo.skipped,
+                demo.acceptance.is_none()
+                    && demo
+                        .text_acceptance
+                        .as_ref()
+                        .is_some_and(|text| text.restored())
+                    && demo
+                        .page_presents
+                        .into_iter()
+                        .all(|count| count >= PRESENTS_PER_PAGE),
+            )
+        });
+    application
+        .options
+        .verify_completion(drawn, acceptance_finished)?;
+    if application.options.acceptance {
+        println!(
+            "Real font acceptance passed: {drawn} Drawn frames, {skipped} skipped attempts; 40 per page (Fonts/Unicode/Motion), Japanese/math/combining/RTL plus restored runs. This is surface/API smoke, not a pixel oracle."
+        );
+    } else if application.options.frame_limit.is_some() {
+        println!("TTF smoke passed: {drawn} Drawn frames, {skipped} skipped attempts");
+    }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn arguments(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
     #[test]
-    fn counter_layout_grows_without_reversing_digits_and_preserves_bearings() {
-        let mut glyphs = Vec::with_capacity(20);
-        layout(100, &mut glyphs).unwrap();
-        assert_eq!(
-            glyphs
-                .iter()
-                .map(|glyph| glyph.glyph().value())
-                .collect::<Vec<_>>(),
-            vec![1, 0, 0]
-        );
-        assert_eq!(
-            glyphs[0].destination().origin(),
-            LogicalScreenPosition::new(-2.0, -4.0)
-        );
-        layout(0, &mut glyphs).unwrap();
-        assert_eq!(glyphs.len(), 1);
-        assert_eq!(glyphs.capacity(), 20);
+    fn text_example_options_require_complete_bounded_inputs() {
+        for invalid in [
+            vec!["--font"],
+            vec!["--frames"],
+            vec!["--frames", "0"],
+            vec!["--frames", "oops"],
+            vec!["--unknown"],
+            vec!["--acceptance", "--frames", "1"],
+        ] {
+            assert!(Options::parse(arguments(&invalid)).is_err());
+        }
+        let options = Options::parse(arguments(&[
+            "--font",
+            "a font.ttf",
+            "--frames",
+            "120",
+            "--uncapped",
+        ]))
+        .unwrap();
+        assert_eq!(options.font_path, Some(PathBuf::from("a font.ttf")));
+        assert_eq!(options.frame_limit, Some(120));
+        assert!(options.uncapped);
+    }
+
+    #[test]
+    fn embedded_font_loads_without_system_font_discovery() {
+        FontFace::from_bytes(EMBEDDED_FONT.to_vec(), FontBudget::default()).unwrap();
+    }
+
+    #[test]
+    fn early_window_close_cannot_pass_acceptance_or_bounded_smoke() {
+        let acceptance = Options {
+            acceptance: true,
+            ..Options::default()
+        };
+        assert!(acceptance.verify_completion(0, false).is_err());
+        assert!(acceptance.verify_completion(119, true).is_err());
+        assert!(acceptance.verify_completion(120, false).is_err());
+        assert!(acceptance.verify_completion(120, true).is_ok());
+        let smoke = Options {
+            frame_limit: Some(7),
+            ..Options::default()
+        };
+        assert!(smoke.verify_completion(0, false).is_err());
+        assert!(smoke.verify_completion(6, false).is_err());
+        assert!(smoke.verify_completion(7, false).is_ok());
+        assert!(Options::default().verify_completion(0, false).is_ok());
     }
 }

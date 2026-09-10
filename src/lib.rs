@@ -14,6 +14,16 @@ mod screen;
 mod tween;
 mod units;
 
+#[cfg(feature = "text")]
+mod text;
+#[cfg(feature = "text")]
+pub use renderer::{TextAtlas2d, TextAtlasBudget, TextError, TextRun2d, TextUpdateReport};
+#[cfg(feature = "text")]
+pub use text::{
+    FontBudget, FontBudgetResource, FontError, FontFace, RasterizedGlyph, ShapedGlyph, ShapedLine,
+    TextDirection, TextLayoutBudget, TextStyle,
+};
+
 #[cfg(test)]
 mod test_allocations;
 

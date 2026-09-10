@@ -1190,7 +1190,10 @@ fn validate_metadata_capacity(
     Ok(())
 }
 
-fn validate_glyph_run_budget(glyph_count: usize, budget: GlyphRunBudget) -> Result<(), GlyphError> {
+pub(super) fn validate_glyph_run_budget(
+    glyph_count: usize,
+    budget: GlyphRunBudget,
+) -> Result<(), GlyphError> {
     if glyph_count > budget.max_glyphs {
         return Err(GlyphError::EntryBudgetExceeded {
             limit: budget.max_glyphs,

@@ -65,6 +65,7 @@ sim-engine = { path = "../Sim-Engine", default-features = false }
 | Configuration | Provides |
 | --- | --- |
 | default / `wgpu` | `WgpuRenderer`, GPU resources, targets, composition, particles, heatmaps, and retained 3D drawing |
+| `text` (opt-in; includes `wgpu`) | TTF/OTF loading from bytes, single-line shaping, antialiased glyph rasterization, fixed-capacity font atlases and retained text runs |
 | `--no-default-features` | scenes, cameras, colors, fields, particles, tweening, 3D math, mesh topology, and styles |
 
 Window creation is deliberately outside the crate. The host may use `winit`,
@@ -717,6 +718,12 @@ one prepared scene in several viewports does not multiply either metric. Work
 counts still count every draw. This makes the prepared/static
 invariant directly observable: after warm-up, unchanged prepared scenes,
 images, atlases, and glyph runs do not re-enter streaming geometry counters.
+Optional text shaping/rasterization happens before composition. Font bytes,
+shaped-line scratch, UTF-8 copies and `TextAtlas2d` cache metadata are not frame
+source allocations; inspect `FontFace::allocation_bytes`,
+`TextAtlas2d::recovery_memory_bytes` and `TextRun2d::recovery_memory_bytes`
+separately. The latter two already include their low-level glyph resources,
+so adding them to frame retained totals would double-count those allocations.
 Dynamic meshes remain caller-uploaded resources, while particle fields are
 culled, compacted, and uploaded on every drawn frame even when their retained
 source instances did not change; their bytes correctly remain streaming.
@@ -870,9 +877,174 @@ Use `ImageBatchBudget::RETAINED_BYTES_PER_SPRITE` and
 `GPU_BYTES_PER_SPRITE` when sizing exact capacities instead of hard-coding the
 private GPU layout; empty batches still own one minimum GPU buffer slot.
 
+#### Loading TTF/OTF fonts (optional `text` feature)
+
+For application labels and counters, enable the optional font path. It uses
+rustybuzz for OpenType shaping and ab_glyph for grayscale outline coverage.
+No system font is implicitly selected, and no font is included in the library
+binary. The demonstration font and its license live under `examples/assets/fonts`.
+
+```toml
+sim-engine = { path = "../Sim-Engine", features = ["text"] }
+```
+
+After publication, replace the path with `version = "0.3"`. The default
+`wgpu` feature alone still accepts host-shaped glyph atlases and does not
+enable the font loader or shaping dependencies.
+
+Load a trusted, licensed TrueType or OpenType outline font from bytes:
+
+```rust,no_run
+# #[cfg(feature = "text")]
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+use sim_engine::{FontBudget, FontFace};
+
+let font = FontFace::from_bytes(
+    std::fs::read("assets/MyFont.ttf")?,
+    FontBudget::default(),
+)?;
+// Alternatively, embed your asset: include_bytes!("../assets/MyFont.ttf").to_vec().
+// FontFace::clone shares this allocation instead of copying the font.
+# let _ = font;
+# Ok(())
+# }
+# #[cfg(not(feature = "text"))]
+# fn main() {}
+```
+
+File I/O belongs to the host: `std::fs::read` allocates before Engine receives
+the bytes. If the path is user-controlled, bound the file read separately.
+`FontBudget` bounds the supplied Vec capacity and the font's glyph count;
+it does not make arbitrary font files safe to process. Dependency parser and
+shaper allocations are not all allocation-fallible, and their internal
+scratch/traversal is not an operating-system OOM or hostile-font sandbox.
+
+Create one atlas per font/style/DPI, then prepare the label once:
+
+```rust,ignore
+use sim_engine::{
+    Color, FrameBudget, FramePassOptions, ImageBatchPlacement, ImageSampling,
+    LogicalPixels, LogicalScreenVector, PhysicalPerLogical,
+    TextAtlas2d, TextAtlasBudget, TextLayoutBudget, TextStyle,
+};
+
+let style = TextStyle::new(
+    LogicalPixels::new(24.0)?,             // logical pixels per EM
+    PhysicalPerLogical::new(window.scale_factor() as f32)?,
+)?;
+let mut text_atlas = TextAtlas2d::new(
+    &renderer, font.clone(), style, TextAtlasBudget::default(),
+)?;
+let mut label = text_atlas.prepare(
+    &renderer, "Simulation: 60 FPS", TextLayoutBudget::default(),
+)?;
+
+// Draw at a baseline, not at the top-left of the glyph bitmap.
+let baseline = LogicalScreenVector::new(24.0, 80.0);
+let mut frame = renderer.begin_frame(Color::rgb8(12, 14, 18), FrameBudget::default())?;
+frame.draw_glyph_run_placed(
+    text_atlas.atlas(), label.glyph_run(),
+    ImageBatchPlacement::new(baseline, Color::WHITE)?,
+    ImageSampling::Linear, FramePassOptions::new(10),
+)?;
+let report = frame.present()?;
+
+// Update only when content changes. Exact unchanged text skips all text work.
+let update = text_atlas.update(
+    &renderer, &mut label, "Simulation: 61 FPS", TextLayoutBudget::default(),
+)?;
+```
+
+`advance()` includes spaces; `ascent()`, signed `descent()` and `line_height()`
+are logical-pixel font metrics. `glyph_run().bounds()` instead measures drawable
+quads including transparent filter support. Negative bearings are valid. An
+empty string or spaces can have no drawable quads, without being an error.
+Latin and Cyrillic work when the font covers them. Kerning, ligatures and mark
+offsets come from the font's shaping tables. `TextDirection` chooses one
+horizontal directional run; automatic direction does **not** implement
+mixed-direction paragraph bidi or per-script segmentation.
+
+Use `ImageSampling::Linear`, not nearest-neighbor magnification of a small
+bitmap. The cache rasterizes at the configured physical EM size. A two-texel
+transparent white border preserves filtered coverage and avoids both dark
+straight-alpha fringes and MSAA clipping of the fractional-pixel halo. Logical
+placement preserves raster texel scale under the image API's center-to-center
+UV convention. Fractional baseline movement filters existing coverage rather
+than generating a new hinted/subpixel raster variant on every frame.
+
+Resource and error rules:
+
+- The default atlas is fixed at 1024x1024 RGBA: 4 MiB retained CPU pixels and
+  4 MiB GPU texels, plus bounded cache metadata. `TextAtlasBudget::new` selects
+  smaller/larger dimensions, cache count and `GlyphRunBudget`. Device limits
+  are checked before atlas pixel allocation. There is no implicit growth,
+  eviction, repacking, or invalidation of older runs.
+- `TextLayoutBudget` bounds input bytes before shaping, output glyphs after
+  shaping, and each cache-miss glyph's pixel/outline work before raster
+  allocation. Warm glyphs are reused; exact unchanged UTF-8 performs no work
+  and does not recheck a newly supplied layout budget.
+  Per-run count/byte/device capacity is conservatively preflighted for every
+  shaped glyph, including whitespace, before placements or cache misses.
+- `AtlasFull`, `GlyphCacheFull`, missing/unsupported glyphs and invalid text
+  return structured errors. A failed prepare/update preserves every old run,
+  but may leave successfully cached new glyphs from earlier in the operation.
+  Cache warming is not an all-or-nothing transaction. Device failure cannot
+  roll back queue work already submitted.
+- Color, opacity, scrolling and clipping use the existing per-draw placement
+  API; they do not change the cached glyphs or require layout updates.
+- After font size or DPI changes, construct a replacement atlas and runs at
+  the new `TextStyle`, then swap only after success. Font bytes can be shared
+  through `FontFace::clone`; both old/new atlases temporarily consume memory.
+- After device recovery, call `text_atlas.restore(&renderer)` and then
+  `text_atlas.restore_run(&renderer, &mut label)` for every live run. Exact
+  retained pixels/layout are restored without shaping or rasterization.
+
+The current slice supports single-face outline fonts (collection index zero).
+It does not provide font discovery/fallback, line breaking, paragraph layout,
+variable-axis selection, color emoji, text editing, selection or UI navigation.
+Applications needing those policies can keep using the low-level API below.
+
+##### Multi-font and Unicode gallery
+
+```bash
+cargo run --release --features text --example text_ui_updates -- --page unicode
+cargo run --release --features text --example text_ui_updates -- --page fonts
+cargo run --release --features text --example text_ui_updates -- --page motion
+```
+
+Switch pages with `1`/`2`/`3`; wheel-scroll a shorter gallery window. Fonts are
+explicitly chosen per row, not discovered through automatic fallback:
+
+- Sans/serif/monospace comparison: DejaVu Sans, Inter (CFF), DejaVu Serif,
+  DejaVu Sans Mono, and DejaVu Math TeX Gyre.
+- `𝓣𝔂𝓹𝓮 𝓼𝓸𝓶𝓮𝓽𝓱𝓲𝓷𝓰 𝓽𝓸 𝓼𝓽𝓪𝓻𝓽` consists of supplementary-plane
+  mathematical Unicode characters. DejaVu Math covers them; they are not ASCII
+  letters with a style flag. The original characters and UTF-8 clusters are
+  preserved. This is symbol rendering, not a TeX/math-expression layout engine.
+- Japanese hiragana, katakana and selected kanji use a renamed 89 KiB subset
+  derived from Noto Sans CJK JP. It includes the demonstrated characters, not
+  arbitrary Japanese text. Full application fonts should be loaded with
+  `FontFace::from_bytes` and suitable source-byte limits.
+- NFC/decomposed accents test combining-mark placement; an explicit Arabic
+  right-to-left row tests single-run shaping, not paragraph bidi resolution.
+
+Font sources, exact coverage, licenses and the reproducible Japanese-subset
+script are in `examples/assets/fonts`. Python/fontTools are needed only to
+regenerate that asset, never to build or run the library. A missing character
+still returns `FontError::MissingGlyph`; the gallery does not replace it with
+a different glyph or silently pick another font. `--font PATH` affects the
+selected-font comparison and motion sample; built-in Unicode rows retain the
+font selected for their character repertoire.
+
+The `--acceptance` mode restores old text resources after device replacement,
+then requires 40 confirmed `Drawn` frames on **each** of the three pages.
+Early window closure is failure in bounded modes. GPU readback additionally
+checks Latin, Cyrillic, mathematical script/fraktur and Japanese glyph pixels
+at fractional DPI/baselines, with linear/nearest sampling, alpha tint and MSAA.
+
 #### Host-shaped glyph runs
 
-The text layer deliberately starts below font selection and shaping. The host
+This lower-level path starts below font selection and shaping. The host
 chooses fonts, fallback, localization, bidi behavior, baselines, advances, and
 line breaks. It gives Sim;Engine opaque `GlyphId` values, atlas rectangles, and
 already-positioned logical quads:
@@ -950,7 +1122,7 @@ clip lying outside the target produces an empty effective scissor. Zero-size
 with independent translation/tint. `draw_image_batch_placed` follows the same
 contract. Existing unplaced calls mean zero translation and white tint.
 
-Try `cargo run --release --example text_ui_updates`; Space pauses, R resets,
+Try `cargo run --release --features text --example text_ui_updates -- --page motion`; Space pauses, R resets,
 Esc exits. `--acceptance` runs bounded public update/recovery checks and requires
 real `Drawn` presentations; it is not a substitute for the GPU pixel oracle.
 
@@ -1522,8 +1694,9 @@ cargo run --release --example stroke_gallery -- --uncapped
 cargo run --release --example stroke_gallery -- --page 5
 
 # Changing labels and independently placed/tinted retained copies
-cargo run --release --example text_ui_updates
-cargo run --release --example text_ui_updates -- --acceptance
+cargo run --release --features text --example text_ui_updates
+cargo run --release --features text --example text_ui_updates -- --font /path/to/MyFont.ttf
+cargo run --release --features text --example text_ui_updates -- --acceptance
 
 # Paired cache off/on surface workloads (not a universal FPS guarantee)
 cargo run --release --example frame_cache_benchmark
@@ -1866,9 +2039,10 @@ automation are repeatable.
   single-sample/production MSAA and scale 1/1.25. This software-driver CI floor
   neither changes host OS requirements nor certifies untested driver versions.
 - The crate is pre-1.0.
-- Font loading, text shaping, fallback selection, line breaking, and automatic
-  atlas eviction are not implemented. The low-level API renders
-  host-shaped glyph runs and retains their atlas/cache resources.
+- Optional `text` loads trusted TTF/OTF outlines and shapes horizontal single-run
+  text. Font fallback, paragraph bidi, line breaking, color emoji and automatic
+  atlas eviction are not implemented. The low-level API remains available for
+  host-shaped glyph runs and externally managed font policies.
 - Retained 3D supports opaque surfaces and depth-classified edges, not section
   materials, projected anchors, labels, or picking.
 - Renderer timing is CPU-side; public GPU timestamps are not available.

@@ -31,10 +31,13 @@ path = "src/lib.rs"
 [features]
 default = ["wgpu"]
 wgpu = ["dep:bytemuck", "dep:wgpu"]
+text = ["wgpu", "dep:ab_glyph", "dep:rustybuzz"]
 
 [dependencies]
 bytemuck = { version = "1.25.2", features = ["derive"], optional = true }
 wgpu = { version = "30.0.1", optional = true }
+ab_glyph = { version = "0.2.32", optional = true }
+rustybuzz = { version = "0.20.1", optional = true }
 
 [dev-dependencies]
 env_logger = "0.11.11"
@@ -80,7 +83,7 @@ required-features = ["wgpu"]
 
 [[example]]
 name = "text_ui_updates"
-required-features = ["wgpu"]
+required-features = ["text"]
 
 [[example]]
 name = "frame_cache_benchmark"
