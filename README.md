@@ -16,6 +16,11 @@ adapter/driver is supported when the mandatory semantic fixture passes on it;
 untested drivers are not inferred from Mesa evidence. The minimum supported
 Rust version is 1.90.
 
+The software-Vulkan CI fixture uses Mesa 25.3+ lavapipe. Mesa 25.2.8 llvmpipe
+has a reproduced MSAA scissor leak and does not pass the development contract;
+its upstream fix is included in [Mesa 25.3](https://docs.mesa3d.org/relnotes/25.3.0.html).
+This does not impose an Ubuntu-version requirement on host applications.
+
 Version 0.2.0 adds the bounded Sim;X integration foundation: fixed-screen
 scenes, positioned 2D viewports, offscreen scene rendering, a heterogeneous
 single-present frame composer, retained RGBA images and atlas batches,

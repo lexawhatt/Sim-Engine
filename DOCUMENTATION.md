@@ -1858,6 +1858,13 @@ automation are repeatable.
   fixture passes on that concrete adapter/driver. CI records Mesa software
   evidence and the release evidence records the exact tested adapter; untested
   AMD/NVIDIA drivers are not silently certified by those results.
+- Software-Vulkan CI uses packaged lavapipe from Ubuntu 26.04 and requires Mesa
+  25.3 or newer. Mesa 25.2.8 llvmpipe was reproduced leaking half-covered MSAA
+  samples outside integer scissor bounds. The upstream scissor-plane fix is
+  included in [Mesa 25.3](https://docs.mesa3d.org/relnotes/25.3.0.html). The
+  oracle retains strict outside-clip expectations and tests all four edges at
+  single-sample/production MSAA and scale 1/1.25. This software-driver CI floor
+  neither changes host OS requirements nor certifies untested driver versions.
 - The crate is pre-1.0.
 - Font loading, text shaping, fallback selection, line breaking, and automatic
   atlas eviction are not implemented. The low-level API renders
@@ -1888,8 +1895,10 @@ publishes `target/linux-release-evidence/`, containing `completion.txt`,
 performance manifest records the exact SHA plus every fixture's adapter,
 surface, present mode, trial FPS, CPU/acquire percentiles, deterministic work
 counters, threshold, and passed verdict. CI's narrower semantic job writes and
-publishes `target/linux-vulkan-adapter.txt` directly as the
-`linux-vulkan-adapter` artifact. The manifest names the exact VCS SHA, backend,
+publishes `target/linux-vulkan-adapter.txt` and the installed driver/loader
+package versions in `target/linux-vulkan-packages.txt` as the
+`linux-vulkan-adapter` artifact. It explicitly selects the packaged lavapipe
+ICD and asserts llvmpipe plus MSAA x4. The manifest names the exact VCS SHA, backend,
 adapter type, vendor/model IDs, PCI bus address when available, driver, oracle
 format, and sample count for the semantic run. CI supplies `github.sha` and
 asserts that the artifact does not contain `vcs_sha=unknown`.

@@ -1,6 +1,7 @@
 use super::*;
 
 mod red_team;
+mod scissor;
 
 fn destination(x: f32, y: f32) -> LogicalViewportRegion {
     LogicalViewportRegion::new(
@@ -48,6 +49,7 @@ pub(in crate::renderer) async fn verify_retained_ui_updates(
     format: wgpu::TextureFormat,
     sample_count: u32,
 ) {
+    scissor::verify_scissor_edges(device, queue, format, sample_count).await;
     proof::verify_revision_invalidation(device, queue, recovery_device, recovery_queue);
     red_team::verify_exact_update_budgets(device, queue, format, sample_count).await;
     let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
@@ -290,25 +292,33 @@ pub(in crate::renderer) async fn verify_retained_ui_updates(
         };
         let half = encoded(0.5);
         let quarter = encoded(0.25);
-        let near = |actual: [u8; 3], expected: [u8; 3]| {
+        let near = |x: f32, y: f32, expected: [u8; 3]| {
+            let actual = pixel(x, y);
+            let physical_x = (x * scale) as usize;
+            let physical_y = (y * scale) as usize;
             assert!(
                 actual
                     .into_iter()
                     .zip(expected)
                     .all(|(a, b)| a.abs_diff(b) <= 3),
-                "pixel {actual:?} != {expected:?}"
+                "placement pixel logical=({x}, {y}) physical=({physical_x}, {physical_y}) \
+                 target={physical}x{physical} scale={scale} format={format:?} samples={sample_count}: \
+                 {actual:?} != {expected:?}; green physical row={:?}",
+                (0..physical as usize)
+                    .map(|column| bytes[physical_y * stride + column * 4 + green])
+                    .collect::<Vec<_>>()
             )
         };
-        near(pixel(6.0, 6.0), [half, 0, 0]);
-        near(pixel(12.0, 12.0), [quarter, 0, half]);
-        near(pixel(25.0, 6.0), [0, quarter, 0]);
-        near(pixel(23.0, 6.0), [0, 0, 0]);
-        near(pixel(31.0, 6.0), [0, 0, 0]);
-        near(pixel(2.0, 26.0), [0, half, half]);
-        near(pixel(63.0, 26.0), [0, 0, half]);
-        near(pixel(44.0, 2.0), [half, 0, half]);
-        near(pixel(44.0, 63.0), [half, half, 0]);
-        near(pixel(44.0, 44.0), [0, 0, 0]);
+        near(6.0, 6.0, [half, 0, 0]);
+        near(12.0, 12.0, [quarter, 0, half]);
+        near(25.0, 6.0, [0, quarter, 0]);
+        near(23.0, 6.0, [0, 0, 0]);
+        near(31.0, 6.0, [0, 0, 0]);
+        near(2.0, 26.0, [0, half, half]);
+        near(63.0, 26.0, [0, 0, half]);
+        near(44.0, 2.0, [half, 0, half]);
+        near(44.0, 63.0, [half, half, 0]);
+        near(44.0, 44.0, [0, 0, 0]);
         glyph::update_glyph_run_resources(device, queue, &atlas, &mut run, &[glyph]).unwrap();
     }
     let recovery_identity = Arc::new(());

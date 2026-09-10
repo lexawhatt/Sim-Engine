@@ -66,7 +66,9 @@ jobs:
 
   linux-gpu-contract:
     name: Linux strict Vulkan contract
-    runs-on: ubuntu-latest
+    # Mesa 25.2 llvmpipe leaks MSAA samples outside integer scissor bounds.
+    # Keep the strict pixel oracle; use a driver with Mesa's 25.3 scissor fix.
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
@@ -75,13 +77,29 @@ jobs:
       - name: Install Mesa software GPU
         run: |
           sudo apt-get update
-          sudo apt-get install -y mesa-vulkan-drivers
+          sudo apt-get install -y mesa-vulkan-drivers libvulkan1
+          mesa_version=$(dpkg-query -W -f='${Version}' mesa-vulkan-drivers)
+          if ! dpkg --compare-versions "${mesa_version#*:}" ge 25.3.0; then
+            echo "Mesa 25.3+ is required for the llvmpipe MSAA scissor fixture; got ${mesa_version}" >&2
+            exit 1
+          fi
+          mapfile -t mesa_icds < <(dpkg-query -L mesa-vulkan-drivers | grep -E '/lvp_icd(\.x86_64)?\.json$')
+          if [[ ${#mesa_icds[@]} != 1 || ! -f "${mesa_icds[0]}" ]]; then
+            echo "Expected exactly one packaged lavapipe ICD" >&2
+            exit 1
+          fi
+          printf 'VK_DRIVER_FILES=%s\n' "${mesa_icds[0]}" >> "$GITHUB_ENV"
+          mkdir -p target
+          dpkg-query -W -f='${binary:Package}=${Version}\n' \
+            mesa-vulkan-drivers libvulkan1 > target/linux-vulkan-packages.txt
       - name: Run semantic shader/readback fixture
         env:
           SIM_ENGINE_REQUIRE_GPU_TESTS: "1"
           SIM_ENGINE_REQUIRE_VULKAN: "1"
           SIM_ENGINE_GPU_EVIDENCE_PATH: target/linux-vulkan-adapter.txt
           SIM_ENGINE_RELEASE_SHA: ${{ github.sha }}
+          SIM_ENGINE_GPU_SURFACE_FORMAT: Rgba8UnormSrgb
+          SIM_ENGINE_GPU_SURFACE_SAMPLE_COUNT: "4"
           WGPU_BACKEND: vulkan
         run: |
           cargo test --all-features \
@@ -89,9 +107,13 @@ jobs:
             -- --nocapture
           grep -Fxq "vcs_sha=${SIM_ENGINE_RELEASE_SHA}" target/linux-vulkan-adapter.txt
           ! grep -Fxq 'vcs_sha=unknown' target/linux-vulkan-adapter.txt
+          grep -Fxq 'driver=llvmpipe' target/linux-vulkan-adapter.txt
+          grep -Fxq 'oracle_sample_count=4' target/linux-vulkan-adapter.txt
       - name: Publish Vulkan adapter evidence
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: linux-vulkan-adapter
-          path: target/linux-vulkan-adapter.txt
+          path: |
+            target/linux-vulkan-adapter.txt
+            target/linux-vulkan-packages.txt
           if-no-files-found: error

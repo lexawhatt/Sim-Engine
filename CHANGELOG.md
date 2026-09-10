@@ -12,6 +12,9 @@ from the official 0.2.0 release; a development version is not release sign-off.
 
 ### Added
 
+- Strict GPU scissor coverage checks all four pixel boundaries with native and
+  fractional DPI, both single-sample and production MSAA rendering. Placement
+  failures report logical/physical coordinates, format and sample count.
 - Borrowed-slice `update_glyph_run` and `update_image_batch`: unchanged data
   skips upload; same-capacity edits retain CPU conversion arrays and GPU instance
   buffers; growth is bounded and synchronous errors preserve the old drawable.
@@ -49,6 +52,12 @@ from the official 0.2.0 release; a development version is not release sign-off.
 
 ### Changed and migration from 0.2
 
+- The software-Vulkan CI job uses explicit Ubuntu 26.04 and packaged lavapipe
+  with Mesa 25.3 or newer, with driver-package versions in its evidence. Mesa
+  25.2.8 llvmpipe was reproduced leaking MSAA coverage beyond scissor bounds;
+  upstream fixed the scissor planes in 25.3. Tests and pixel tolerances remain
+  strict. This is a software-driver CI requirement, not a new minimum Ubuntu
+  version for Engine applications or certification of other drivers.
 - `ImageBatchBudget` and `GlyphRunBudget` now include retained GPU-instance
   conversion staging in their CPU byte limits. Increase hand-computed 0.2
   limits to cover it; count limits alone do not override byte limits.
