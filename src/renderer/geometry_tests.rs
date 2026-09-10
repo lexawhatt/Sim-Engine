@@ -89,6 +89,38 @@ fn position_memo_returns_bit_identical_intervals_and_is_bounded() {
 }
 
 #[test]
+fn shared_anchor_proofs_match_reference_for_every_fan_vertex_and_camera() {
+    let mut scene = Scene::new(Color::BLACK).unwrap();
+    for depth in [-12.0, 0.0, 4.0] {
+        assert!(scene.set_depth(depth));
+        for center in [Vec2::ZERO, Vec2::new(17.0, -3.0), Vec2::splat(1e10)] {
+            scene
+                .try_circle(center, 7.0, ShapeStyle::filled(Color::WHITE))
+                .unwrap();
+            scene
+                .try_rect(
+                    Rect::from_center_size(center, Vec2::new(4096.0, 2048.0)),
+                    3.0,
+                    ShapeStyle::filled(Color::WHITE),
+                )
+                .unwrap();
+        }
+    }
+    let vertices = tessellate(&scene);
+    for uniform in uniforms() {
+        let mut proofs = PositionProofs::new(uniform);
+        for vertex in &vertices {
+            let bits =
+                |ranges: ClipRanges| ranges.map(|(low, high)| (low.to_bits(), high.to_bits()));
+            assert_eq!(
+                proofs.clip(*vertex).map(bits),
+                tessellated_vertex_clip_ranges(*vertex, uniform).map(bits)
+            );
+        }
+    }
+}
+
+#[test]
 fn optimized_validation_matches_old_proofs_for_caps_joins_widths_and_markers() {
     let mut accepted = 0;
     let mut rejected = 0;

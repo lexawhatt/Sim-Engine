@@ -48,6 +48,7 @@ pub(in crate::renderer) async fn verify_retained_ui_updates(
     format: wgpu::TextureFormat,
     sample_count: u32,
 ) {
+    proof::verify_revision_invalidation(device, queue, recovery_device, recovery_queue);
     red_team::verify_exact_update_budgets(device, queue, format, sample_count).await;
     let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
     let identity = Arc::new(());

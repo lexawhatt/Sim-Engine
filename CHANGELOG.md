@@ -69,6 +69,22 @@ from the official 0.2.0 release; a development version is not release sign-off.
   rejection behavior are retained through differential tests.
 - Frame-cache peak accounting includes scratch retained after late transform
   rejection and conservative old/new Vec growth headroom before idle eviction.
+- Repeated streaming scenes within one frame reuse a bounded exact tessellation
+  proof and the same uploaded vertex ranges, preserving draw ordering and
+  per-item clips. Proofs cannot outlive their immutable scene borrows. Frame
+  vertex counts still count draw references; upload counters report the smaller
+  actual payload, while construction budgets remain conservative.
+- Retained glyph/sprite batches cache their last exact geometry transform proof.
+  Per-draw recoloring and UV/tint-only instance updates do not rerun per-glyph
+  validation. Changed destinations/count invalidate the proof, changed
+  placement/target transforms are checked again, and device restoration starts
+  with an empty proof. This adds no heap allocation.
+- Warmed composition avoids transient provenance-reference clones and repeated
+  scratch-capacity scans without changing cache budgets or memory accounting.
+- Shared world-anchor projections are computed once per consecutive fan in
+  2D validation. Interval analysis counts terms in one pass and precomputes
+  exact rounding coefficients; frozen-reference tests compare output bits,
+  overflow/subnormal rejection, and the general fallback formula.
 
 ### Scope and measurement
 

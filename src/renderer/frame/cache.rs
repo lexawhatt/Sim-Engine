@@ -1,5 +1,9 @@
 use super::*;
 
+#[cfg(test)]
+#[path = "cache_diagnostics.rs"]
+mod diagnostics;
+
 /// Idle retention limits for composition scratch and cached draw bindings.
 ///
 /// Active work remains bounded by `FrameBudget`. When a frame exceeds these
@@ -134,8 +138,24 @@ enum BindingKey {
     },
 }
 
-impl BindingKey {
-    fn texture(&self) -> Option<(&Arc<()>, usize)> {
+/// Temporary descriptions borrow provenance. Only a new retained slot clones
+/// its identity; a warmed draw must not increment/decrement a shared Arc.
+#[derive(Clone, Copy)]
+enum BindingKeyRef<'a> {
+    Camera,
+    Image {
+        identity: &'a Arc<()>,
+        sampling: ImageSampling,
+        texture_bytes: usize,
+    },
+    Target {
+        identity: &'a Arc<()>,
+        texture_bytes: usize,
+    },
+}
+
+impl<'a> BindingKeyRef<'a> {
+    fn texture(self) -> Option<(&'a Arc<()>, usize)> {
         match self {
             Self::Camera => None,
             Self::Image {
@@ -146,25 +166,75 @@ impl BindingKey {
             | Self::Target {
                 identity,
                 texture_bytes,
-            } => Some((identity, *texture_bytes)),
+            } => Some((identity, texture_bytes)),
         }
     }
-    fn matches(&self, other: &Self) -> bool {
+
+    fn into_owned(self) -> BindingKey {
+        match self {
+            Self::Camera => BindingKey::Camera,
+            Self::Image {
+                identity,
+                sampling,
+                texture_bytes,
+            } => BindingKey::Image {
+                identity: Arc::clone(identity),
+                sampling,
+                texture_bytes,
+            },
+            Self::Target {
+                identity,
+                texture_bytes,
+            } => BindingKey::Target {
+                identity: Arc::clone(identity),
+                texture_bytes,
+            },
+        }
+    }
+}
+
+impl BindingKey {
+    fn as_ref(&self) -> BindingKeyRef<'_> {
+        match self {
+            Self::Camera => BindingKeyRef::Camera,
+            Self::Image {
+                identity,
+                sampling,
+                texture_bytes,
+            } => BindingKeyRef::Image {
+                identity,
+                sampling: *sampling,
+                texture_bytes: *texture_bytes,
+            },
+            Self::Target {
+                identity,
+                texture_bytes,
+            } => BindingKeyRef::Target {
+                identity,
+                texture_bytes: *texture_bytes,
+            },
+        }
+    }
+
+    fn texture(&self) -> Option<(&Arc<()>, usize)> {
+        self.as_ref().texture()
+    }
+    fn matches(&self, other: BindingKeyRef<'_>) -> bool {
         match (self, other) {
-            (Self::Camera, Self::Camera) => true,
+            (Self::Camera, BindingKeyRef::Camera) => true,
             (
                 Self::Image {
                     identity: a,
                     sampling: sa,
                     ..
                 },
-                Self::Image {
+                BindingKeyRef::Image {
                     identity: b,
                     sampling: sb,
                     ..
                 },
-            ) => Arc::ptr_eq(a, b) && sa == sb,
-            (Self::Target { identity: a, .. }, Self::Target { identity: b, .. }) => {
+            ) => Arc::ptr_eq(a, b) && *sa == sb,
+            (Self::Target { identity: a, .. }, BindingKeyRef::Target { identity: b, .. }) => {
                 Arc::ptr_eq(a, b)
             }
             _ => false,
@@ -220,23 +290,26 @@ impl FrameCache {
     }
 
     pub(super) fn finish(&mut self) {
+        let mut cpu_bytes = self.cpu_bytes();
         self.statistics.peak_cpu_bytes = self
             .initial_cpu_bytes
-            .saturating_add(self.cpu_bytes().saturating_mul(2));
-        if self.cpu_bytes() > self.budget.max_cpu_bytes {
+            .saturating_add(cpu_bytes.saturating_mul(2));
+        if cpu_bytes > self.budget.max_cpu_bytes {
             self.items = Vec::new();
             self.retained_resources = Vec::new();
             self.scalar_luts = Vec::new();
             self.ready = Vec::new();
             self.bindings = Vec::new();
             self.batches = Vec::new();
+            cpu_bytes = self.cpu_bytes();
         }
-        if self.cpu_bytes() > self.budget.max_cpu_bytes {
+        if cpu_bytes > self.budget.max_cpu_bytes {
             self.slots = Vec::new();
             self.statistics.uniform_bytes = 0;
             self.statistics.texture_bytes = 0;
+            cpu_bytes = 0;
         }
-        self.statistics.cpu_bytes = self.cpu_bytes();
+        self.statistics.cpu_bytes = cpu_bytes;
         self.statistics.binding_count = self.slots.iter().flatten().count();
     }
 
@@ -295,7 +368,7 @@ impl FrameCache {
         let description = binding_description(item);
         if let Some((key, bytes)) = &description
             && let Some(Some(cached)) = self.slots.get_mut(slot)
-            && cached.key.matches(key)
+            && cached.key.matches(*key)
             && cached.len == bytes.len()
         {
             if &cached.bytes[..cached.len] != *bytes {
@@ -362,7 +435,7 @@ impl FrameCache {
         let mut stored = [0; std::mem::size_of::<ImageUniform>()];
         stored[..bytes.len()].copy_from_slice(bytes);
         self.slots[slot] = Some(CachedBinding {
-            key,
+            key: key.into_owned(),
             binding: binding.clone(),
             bytes: stored,
             len: bytes.len(),
@@ -371,14 +444,14 @@ impl FrameCache {
     }
 }
 
-fn binding_description<'a>(item: &'a ReadyItem<'_>) -> Option<(BindingKey, &'a [u8])> {
+fn binding_description<'a>(item: &'a ReadyItem<'_>) -> Option<(BindingKeyRef<'a>, &'a [u8])> {
     match item {
         ReadyItem::Geometry(geometry) => Some((
-            BindingKey::Camera,
+            BindingKeyRef::Camera,
             bytemuck::bytes_of(&geometry.camera_uniform),
         )),
         ReadyItem::Particle { camera_uniform, .. } => {
-            Some((BindingKey::Camera, bytemuck::bytes_of(camera_uniform)))
+            Some((BindingKeyRef::Camera, bytemuck::bytes_of(camera_uniform)))
         }
         ReadyItem::Image {
             image,
@@ -392,8 +465,8 @@ fn binding_description<'a>(item: &'a ReadyItem<'_>) -> Option<(BindingKey, &'a [
             sampling,
             ..
         } => Some((
-            BindingKey::Image {
-                identity: Arc::clone(&image.resource_identity),
+            BindingKeyRef::Image {
+                identity: &image.resource_identity,
                 sampling: *sampling,
                 texture_bytes: image.gpu_allocation_bytes(),
             },
@@ -402,8 +475,8 @@ fn binding_description<'a>(item: &'a ReadyItem<'_>) -> Option<(BindingKey, &'a [
         ReadyItem::Target {
             target, uniform, ..
         } => Some((
-            BindingKey::Target {
-                identity: Arc::clone(&target.resource_identity),
+            BindingKeyRef::Target {
+                identity: &target.resource_identity,
                 texture_bytes: target.allocation_bytes,
             },
             bytemuck::bytes_of(uniform),
@@ -639,19 +712,19 @@ mod tests {
             sampling: ImageSampling::Nearest,
             texture_bytes: 4,
         };
-        assert!(nearest.matches(&nearest.clone()));
-        assert!(!nearest.matches(&BindingKey::Image {
-            identity: Arc::new(()),
+        assert!(nearest.matches(nearest.as_ref()));
+        assert!(!nearest.matches(BindingKeyRef::Image {
+            identity: &Arc::new(()),
             sampling: ImageSampling::Nearest,
             texture_bytes: 4,
         }));
-        assert!(!nearest.matches(&BindingKey::Image {
-            identity: Arc::clone(&identity),
+        assert!(!nearest.matches(BindingKeyRef::Image {
+            identity: &identity,
             sampling: ImageSampling::Linear,
             texture_bytes: 4,
         }));
-        assert!(!nearest.matches(&BindingKey::Target {
-            identity,
+        assert!(!nearest.matches(BindingKeyRef::Target {
+            identity: &identity,
             texture_bytes: 4
         }));
     }

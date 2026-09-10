@@ -4,6 +4,7 @@ mod cache;
 #[cfg(test)]
 #[path = "frame/dedup_diagnostics.rs"]
 mod dedup_diagnostics;
+mod streaming;
 pub(super) use cache::FrameCache;
 pub use cache::{FrameCacheBudget, FrameCacheStatistics};
 
@@ -391,7 +392,9 @@ impl FrameStatistics {
         self.vertex_count
     }
 
-    /// Returns vertices generated or selected during this frame.
+    /// Returns streaming vertices selected by draws during this frame.
+    /// Repeated references may share one within-frame upload; use
+    /// [`Self::streaming_upload_bytes`] for the actual transferred payload.
     pub const fn streaming_vertex_count(self) -> usize {
         self.streaming_vertex_count
     }
@@ -1778,6 +1781,7 @@ fn present_frame_with_vertices<'frame>(
     let mut tessellation_stats = TessellationStats::default();
     let mut geometry_reused = false;
     let mut geometry_streamed = false;
+    let mut streaming_proofs = streaming::StreamingSceneProofs::default();
     let mut simulated_color_map_lut = renderer.color_map_cache.as_ref().map(|cache| cache.lut);
 
     for item in items.drain(..) {
@@ -1800,6 +1804,7 @@ fn present_frame_with_vertices<'frame>(
                         &mut statistics,
                         &mut tessellation_stats,
                         batches,
+                        &mut streaming_proofs,
                     )
                 })?;
                 geometry_streamed = true;
@@ -1824,7 +1829,7 @@ fn present_frame_with_vertices<'frame>(
                     return Err(RendererFrameError::GeometryCapacityTooLarge.into());
                 }
                 with_streaming_batches(&mut cache.batches, |batches| {
-                    prepare_streaming_scene_resolved(
+                    streaming_proofs.prepare(
                         scene.as_scene(),
                         camera_uniform,
                         viewport,
@@ -2630,8 +2635,7 @@ fn preflight_frame_items(
             } => {
                 let viewport = resolve_viewport(renderer, target_viewport, *options)?;
                 let uniform = image::batch_uniform(target_viewport, viewport.origin, *placement)?;
-                if !image_sprites_are_safe_for_target(
-                    batch.sprites(),
+                if !batch.sprites_are_safe_for_target(
                     Vec2::new(uniform.uv_rect[0], uniform.uv_rect[1]),
                     uniform.destination,
                 ) {
@@ -2643,54 +2647,13 @@ fn preflight_frame_items(
     Ok(())
 }
 
+#[cfg(test)]
 fn image_sprites_are_safe_for_target(
     sprites: &[ImageSprite2d],
     viewport_origin: Vec2,
     clip_transform: [f32; 4],
 ) -> bool {
-    if ![viewport_origin.x, viewport_origin.y]
-        .into_iter()
-        .chain(clip_transform)
-        .all(is_portable_shader_source)
-    {
-        return false;
-    }
-    sprites.iter().all(|sprite| {
-        let destination = sprite.destination();
-        let origin = destination.origin().to_vec2();
-        let size = destination.viewport().size();
-        if ![origin.x, origin.y, size.x, size.y]
-            .into_iter()
-            .all(is_portable_shader_source)
-        {
-            return false;
-        }
-        let horizontal = shader_interval_sum_range([
-            (f64::from(viewport_origin.x), f64::from(viewport_origin.x)),
-            (f64::from(origin.x), f64::from(origin.x)),
-            (0.0, f64::from(size.x)),
-        ]);
-        let vertical = shader_interval_sum_range([
-            (f64::from(viewport_origin.y), f64::from(viewport_origin.y)),
-            (f64::from(origin.y), f64::from(origin.y)),
-            (0.0, f64::from(size.y)),
-        ]);
-        horizontal.is_some_and(|horizontal| {
-            shader_clip_interval_is_safe(
-                horizontal.0,
-                horizontal.1,
-                clip_transform[0],
-                clip_transform[2],
-            )
-        }) && vertical.is_some_and(|vertical| {
-            shader_clip_interval_is_safe(
-                vertical.0,
-                vertical.1,
-                clip_transform[1],
-                clip_transform[3],
-            )
-        })
-    })
+    image::sprites_are_safe_for_target(sprites, viewport_origin, clip_transform)
 }
 
 fn set_particle_rendered(items: &mut [ReadyItem<'_>], presented: bool) {
@@ -2873,7 +2836,7 @@ fn with_streaming_batches(
 
 #[allow(clippy::too_many_arguments)]
 fn prepare_streaming_scene<'frame>(
-    scene: &Scene,
+    scene: &'frame Scene,
     camera: Camera2d,
     options: FramePassOptions,
     renderer: &WgpuRenderer,
@@ -2883,6 +2846,7 @@ fn prepare_streaming_scene<'frame>(
     statistics: &mut FrameStatistics,
     aggregate: &mut TessellationStats,
     batches: &mut Vec<PreparedDrawBatch>,
+    proofs: &mut streaming::StreamingSceneProofs<'frame>,
 ) -> Result<(), FrameComposerError> {
     let viewport = resolve_viewport(renderer, target_viewport, options)?;
     let camera_uniform =
@@ -2896,7 +2860,7 @@ fn prepare_streaming_scene<'frame>(
     ) {
         return Err(RendererFrameError::GeometryCapacityTooLarge.into());
     }
-    prepare_streaming_scene_resolved(
+    proofs.prepare(
         scene,
         camera_uniform,
         viewport,

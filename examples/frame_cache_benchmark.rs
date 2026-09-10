@@ -2,6 +2,7 @@
 //! `--frames N` sets measured presented frames per case; `--quick` uses one label.
 //! CPU allocation counts include wgpu work on this event-loop thread, not GPU
 //! execution or worker-thread allocations. Surface acquire is reported separately.
+//! Cache off/on controls composition storage/bindings, not source-owned proofs.
 
 use std::{
     alloc::{GlobalAlloc, Layout, System},
@@ -141,6 +142,10 @@ struct Samples {
     uploads: usize,
     elapsed: Duration,
     acquire: Duration,
+    tessellation: Duration,
+    upload: Duration,
+    camera_upload: Duration,
+    encode: Duration,
     measured_started: Option<Instant>,
     work_times: Vec<Duration>,
     acquire_times: Vec<Duration>,
@@ -378,6 +383,10 @@ impl Benchmark {
             self.samples.uploads += report.statistics().upload_bytes();
             self.samples.elapsed += elapsed;
             self.samples.acquire += report.metrics().surface_acquire();
+            self.samples.tessellation += report.metrics().tessellation();
+            self.samples.upload += report.metrics().upload();
+            self.samples.camera_upload += report.metrics().camera_uniform_upload();
+            self.samples.encode += report.metrics().encode_submit_present();
             self.samples
                 .work_times
                 .push(elapsed.saturating_sub(report.metrics().surface_acquire()));
@@ -424,6 +433,16 @@ impl Benchmark {
             report.statistics().pass_count(),
             work_p95,
             acquire_p95,
+        );
+        println!(
+            "stages case={} labels={} cache={} tessellation_and_preflight_ms={:.3} upload_and_image_bindings_ms={:.3} camera_bindings_ms={:.3} encode_submit_present_ms={:.3}",
+            case.content.name(),
+            case.labels,
+            case.cached,
+            self.samples.tessellation.as_secs_f64() * 1000.0 / count,
+            self.samples.upload.as_secs_f64() * 1000.0 / count,
+            self.samples.camera_upload.as_secs_f64() * 1000.0 / count,
+            self.samples.encode.as_secs_f64() * 1000.0 / count,
         );
         self.samples = Samples::new(self.measured_frames);
         self.case_index += 1;

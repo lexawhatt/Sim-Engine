@@ -27,7 +27,9 @@ host-shaped glyph runs, explicitly budgeted dynamic triangles, richer bounded
 The 0.3 work adds capacity-aware glyph/sprite updates, independent per-draw
 placement and tint, bounded reusable composition storage, portable filled-3D
 clipping with object-attributed errors, indexed editable 3D scenes, shared
-opaque UV textures, and exact-tip scientific arrows. These APIs require this checkout until 0.3 is published;
+opaque UV textures, and exact-tip scientific arrows. CPU optimizations reuse
+exact text/geometry validation results without reordering draws or weakening
+precision checks. These APIs require this checkout until 0.3 is published;
 they are not capabilities of the crates.io 0.2 package.
 
 ## Documentation

@@ -473,7 +473,9 @@ referenced textures and binding slots. `set_frame_cache_budget` configures it;
 `FrameBudget`; work larger than the idle cache can render but is not retained
 unboundedly afterwards. `frame_cache_statistics` reports current capacities,
 last-frame buffer/bind-group creation, reused bindings, uniform writes and
-nominal transient peaks. Zero limits disable retention for paired comparisons.
+nominal transient peaks. Zero limits disable this composition storage/binding
+retention for paired comparisons; they do not disable source-owned validation
+proofs or allocation-free work reuse within a single frame.
 The CPU peak is a conservative capacity bound, not a sampled allocator peak:
 initial retained bytes plus twice final owned capacities covers transient Vec
 growth. Even late rejected streaming geometry returns its batch scratch before
@@ -498,15 +500,39 @@ unchanged/recolored/moved and mixed-order variants, a 100-circle world pass,
 world plus 256 changing HUD rectangles, and 64 images interleaved with 128
 rectangles. It asserts source/command counts and warmed uniform-creation
 invariants and reports actual presented FPS, build/renderer CPU time, acquire
-time, main-thread allocations and cache bytes separately. This is a diagnostic
+time, main-thread allocations and cache bytes separately. Additional stage
+lines separate preflight/tessellation, uploads/image bindings, camera bindings,
+and encode/submit/present CPU time. This is a diagnostic
 benchmark, not a GPU-timestamp measurement or a universal 60 FPS promise.
 
 The 0.3 CPU validation path avoids duplicate position proofs and memoizes eight
-exact position keys within each call. It reuses the same interval arithmetic;
+exact position keys within each call, including the shared world-anchor
+projection of circle/rounded-corner vertices. The interval helper uses a single
+term-counting pass and exact precomputed rounding coefficients, with the
+original formula as its general fallback. It reuses the same interval arithmetic;
 inconclusive or overflowing geometry is still rejected. Image/glyph batches
-likewise receive one per-sprite preflight proof, not a duplicate proof while
-constructing ready draw items. Differential tests retain the previous geometry
-validator as an independent behavioral reference.
+keep one fixed inline, thread-safe proof keyed by the exact six transform
+components used by their shader. Unchanged/recolored draws reuse it; moving a
+run or changing its target transform revalidates it. Successful geometry
+updates invalidate the entry when destination coordinates, sizes or count
+change. UV/tint-only instance updates, as well as rejected/identical updates,
+preserve the proof; UV/tint validation and changed-instance uploads still run.
+Restored resources start empty. This metadata has no heap allocation and is
+not included in the capacity-based source/cache allocation counters.
+
+Within one `present`, up to eight streaming scene/uniform pairs can reuse
+their already validated tessellation. The keys retain immutable scene borrows
+and compare exact uniform bytes; no scene address survives into a later frame.
+Each draw still has its own scissor/clip and appears in its original painter
+order, but identical streamed geometry shares one uploaded range. Vertex/source
+counts count draw references; actual upload-byte counters exclude duplicate
+transfers. The per-source `TessellationStats` aggregate remains nominal geometry
+work, just as for prepared scenes, not a second actual-upload counter. Frame
+construction still requires its conservative per-source budget before this
+reuse is known. Distinct scenes,
+new transforms and evicted keys take the full validation path. Differential
+tests retain the previous validators as behavioral references. These CPU
+optimizations do not reduce GPU draw calls or relax any precision guard.
 
 ### 7. Cameras and motion
 

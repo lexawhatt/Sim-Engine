@@ -87,14 +87,21 @@ where
         return Err(ImageError::RendererMismatch);
     }
     preflight_image_batch_capacity(device, count, budget)?;
-    if sprites.clone().count() != count
-        || sprites.clone().any(|sprite| {
-            !sprite.source.fits(image.width, image.height)
-                || !sprite.tint.is_normalized()
-                || !logical_image_region_is_portable(sprite.destination)
-        })
-    {
+    if sprites.clone().count() != count {
         return Err(ImageError::InvalidSprite);
+    }
+    let mut destinations_unchanged = count == batch.sprites.len();
+    for (index, sprite) in sprites.clone().enumerate() {
+        if !sprite.source.fits(image.width, image.height)
+            || !sprite.tint.is_normalized()
+            || !logical_image_region_is_portable(sprite.destination)
+        {
+            return Err(ImageError::InvalidSprite);
+        }
+        destinations_unchanged = destinations_unchanged
+            && batch.sprites.get(index).is_some_and(|previous| {
+                proof::destination_bits(*previous) == proof::destination_bits(sprite)
+            });
     }
 
     let old_cpu = batch.recovery_memory_bytes();
@@ -143,6 +150,13 @@ where
     });
     let replaced = replacement.is_some();
     let peak_gpu = old_gpu.saturating_add(if replaced { gpu_bytes } else { 0 });
+    // No remaining synchronous rejection precedes publishing the new arrays.
+    // UV/tint never participate in the geometry proof. Keep that exact result
+    // when every ordered destination component is bit-identical; any changed
+    // position, size or count invalidates before the new arrays are published.
+    if !destinations_unchanged {
+        batch.geometry_proof.invalidate();
+    }
     if let Some(values) = new_sprites {
         batch.sprites = values;
     }

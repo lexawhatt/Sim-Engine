@@ -4,6 +4,10 @@ const IMAGE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 
 mod updates;
 pub(super) use updates::{batch_retained_bytes, update_image_batch_resources};
+mod proof;
+use proof::BatchProofCache;
+#[cfg(test)]
+pub(super) use proof::sprites_are_safe_for_target;
 
 #[cfg(test)]
 mod update_tests;
@@ -452,7 +456,8 @@ pub struct ImageBatchBudget {
 
 impl ImageBatchBudget {
     /// CPU bytes per sprite capacity slot: description plus conversion staging.
-    /// Does not include image pixels, Vec headers or allocator metadata.
+    /// Does not include image pixels, fixed inline handle/proof metadata,
+    /// Vec headers or allocator metadata.
     pub const RETAINED_BYTES_PER_SPRITE: usize =
         std::mem::size_of::<ImageSprite2d>() + std::mem::size_of::<ImageInstance>();
 
@@ -495,7 +500,11 @@ impl Default for ImageBatchBudget {
 /// Sprite positions are local logical pixels and can be placed in any frame
 /// viewport without rebuilding or uploading the batch. The exact CPU sprite
 /// list is retained for renderer recovery. An empty batch is valid and emits
-/// no draw call.
+/// no draw call. One fixed inline entry reuses the exact geometry validation
+/// result when ordered destination rectangles and their transform are unchanged;
+/// position, size or count updates invalidate it, while UV/tint-only updates
+/// preserve it. Restoration starts with no cached proof. This
+/// does not skip drawing or upload validation and allocates no cache storage.
 pub struct ImageBatch2d {
     renderer_identity: Arc<()>,
     image_identity: Arc<()>,
@@ -504,6 +513,9 @@ pub struct ImageBatch2d {
     sprites: Vec<ImageSprite2d>,
     instances: Vec<ImageInstance>,
     budget: ImageBatchBudget,
+    // Fixed inline metadata, not an allocation or caller-sized retained array.
+    // Successful destination/count mutations invalidate this exact proof.
+    geometry_proof: BatchProofCache,
 }
 
 impl ImageBatch2d {
@@ -523,6 +535,7 @@ impl ImageBatch2d {
     }
 
     /// Returns retained CPU recovery and reusable conversion-staging bytes.
+    /// Fixed inline handle/proof metadata is excluded, like Vec headers.
     pub fn recovery_memory_bytes(&self) -> usize {
         self.sprites
             .capacity()
@@ -542,6 +555,15 @@ impl ImageBatch2d {
     /// Returns CPU capacity reusable without growing either retained array.
     pub fn capacity(&self) -> usize {
         self.sprites.capacity().min(self.instances.capacity())
+    }
+
+    pub(super) fn sprites_are_safe_for_target(
+        &self,
+        viewport_origin: Vec2,
+        clip_transform: [f32; 4],
+    ) -> bool {
+        self.geometry_proof
+            .validate(&self.sprites, viewport_origin, clip_transform)
     }
 }
 
@@ -1041,6 +1063,7 @@ pub(super) fn create_image_batch_resources(
         sprites,
         instances,
         budget,
+        geometry_proof: BatchProofCache::default(),
     })
 }
 

@@ -1201,6 +1201,7 @@ fn dynamic_vertex_clip_ranges(
     screen_ranges_to_clip(screen, uniform)
 }
 
+#[cfg(test)]
 fn tessellated_vertex_clip_ranges(
     vertex: Vertex,
     uniform: CameraUniform,
@@ -1208,6 +1209,7 @@ fn tessellated_vertex_clip_ranges(
     screen_ranges_to_clip(tessellated_vertex_screen_ranges(vertex, uniform)?, uniform)
 }
 
+#[cfg(test)]
 fn tessellated_vertex_screen_ranges(
     vertex: Vertex,
     uniform: CameraUniform,
@@ -1925,6 +1927,10 @@ fn shader_interval_sum_is_safe<const N: usize>(terms: [(f64, f64); N]) -> bool {
     shader_interval_sum_range(terms).is_some()
 }
 
+#[cfg(test)]
+#[path = "shader_interval_sum_tests.rs"]
+mod shader_interval_sum_tests;
+
 fn shader_interval_sum_range<const N: usize>(terms: [(f64, f64); N]) -> Option<(f64, f64)> {
     // WGSL's `dot` may be lowered with a backend-selected association or FMA
     // pattern. Bound all multiplication/addition rounding as well as every
@@ -1937,6 +1943,9 @@ fn shader_interval_sum_range<const N: usize>(terms: [(f64, f64); N]) -> Option<(
     let mut minimum_sum = 0.0;
     let mut maximum_sum = 0.0;
     let mut magnitude_sum = 0.0;
+    let mut active_terms = 0usize;
+    let mut inexact_products = 0usize;
+    let mut active_term = (0.0, 0.0);
     for term in terms {
         // WGSL permits implementations to flush subnormal arithmetic to zero.
         // A flushed product can become visually significant after a later
@@ -1955,20 +1964,19 @@ fn shader_interval_sum_range<const N: usize>(terms: [(f64, f64); N]) -> Option<(
         minimum_sum += term.0;
         maximum_sum += term.1;
         magnitude_sum += term.0.abs().max(term.1.abs());
+        if term.0 != 0.0 || term.1 != 0.0 {
+            active_terms += 1;
+            active_term = term;
+        }
+        inexact_products += usize::from(term.0 != term.1 || f64::from(term.0 as f32) != term.0);
     }
 
     // Exact zero terms do not participate in any association, and an isolated
     // exactly representable product needs no rounding allowance. This keeps
     // component-selection rows tight inside the portability envelope while
     // retaining a conservative margin for operations which can round.
-    let active_terms = terms
-        .iter()
-        .filter(|term| term.0 != 0.0 || term.1 != 0.0)
-        .count();
     if active_terms == 1 {
-        let term = terms
-            .into_iter()
-            .find(|term| term.0 != 0.0 || term.1 != 0.0)?;
+        let term = active_term;
         // A single interval term has no association ambiguity. When both
         // endpoints are already representable f32 values, they also prove
         // that the producing multiply rounded exactly at the extrema; adding
@@ -1982,18 +1990,28 @@ fn shader_interval_sum_range<const N: usize>(terms: [(f64, f64); N]) -> Option<(
             return Some(term);
         }
     }
-    let inexact_products = terms
-        .iter()
-        .filter(|term| {
-            term.0 != term.1 || !term.0.is_finite() || f64::from(term.0 as f32) != term.0
-        })
-        .count();
     let operation_count = inexact_products + active_terms.saturating_sub(1);
-    let operation_count = operation_count as f64;
     // WGSL correctly-rounded operations may select either adjacent f32 value;
     // use the directed-rounding bound rather than Rust's round-to-nearest.
-    let unit_roundoff = 2.0_f64.powi(-23);
-    let gamma = operation_count * unit_roundoff / (1.0 - operation_count * unit_roundoff);
+    // Compute the original formula at compile time for all N<=8 operation
+    // counts. No decimal approximation or reduced rounding allowance is used.
+    const GAMMA: [f64; 16] = {
+        let unit_roundoff = f32::EPSILON as f64;
+        let mut values = [0.0; 16];
+        let mut index = 0;
+        while index < values.len() {
+            let count = index as f64;
+            values[index] = count * unit_roundoff / (1.0 - count * unit_roundoff);
+            index += 1;
+        }
+        values
+    };
+    let gamma = GAMMA.get(operation_count).copied().unwrap_or_else(|| {
+        let count = operation_count as f64;
+        let unit_roundoff = f64::from(f32::EPSILON);
+        count * unit_roundoff / (1.0 - count * unit_roundoff)
+    });
+    let operation_count = operation_count as f64;
     let subnormal_margin = if magnitude_sum > 0.0 {
         operation_count * f64::from(f32::MIN_POSITIVE)
     } else {

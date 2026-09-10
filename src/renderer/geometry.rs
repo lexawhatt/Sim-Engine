@@ -28,6 +28,7 @@ struct PositionProofs {
     uniform: CameraUniform,
     entries: [Option<(PositionKey, ClipRanges)>; 8],
     next: usize,
+    anchor: Option<([u32; 3], ClipRanges)>,
 }
 
 impl PositionProofs {
@@ -36,6 +37,7 @@ impl PositionProofs {
             uniform,
             entries: [None; 8],
             next: 0,
+            anchor: None,
         }
     }
 
@@ -49,9 +51,77 @@ impl PositionProofs {
         {
             return Some(*ranges);
         }
-        let ranges = tessellated_vertex_clip_ranges(vertex, self.uniform)?;
+        let anchor = self.anchor(vertex)?;
+        let offset = Vec2::new(vertex.world_offset[0], vertex.world_offset[1]);
+        let mut screen = [(0.0, 0.0); 2];
+        for (axis, row) in [
+            self.uniform.world_to_screen_x,
+            self.uniform.world_to_screen_y,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let base = shader_interval_sum_range([
+                anchor[axis],
+                shader_direction_dot_range(row, offset, offset)?,
+            ])?;
+            let screen_offset = f64::from(vertex.screen_offset[axis]);
+            screen[axis] = rounded_f32_add_range(base, (screen_offset, screen_offset), false)?;
+        }
+        let ranges = screen_ranges_to_clip(screen, self.uniform)?;
         self.entries[self.next] = Some((key, ranges));
         self.next = (self.next + 1) % self.entries.len();
+        Some(ranges)
+    }
+
+    fn anchor(&mut self, vertex: Vertex) -> Option<ClipRanges> {
+        let key = [
+            vertex.world_position[0],
+            vertex.world_position[1],
+            vertex.depth,
+        ]
+        .map(f32::to_bits);
+        if let Some((previous, ranges)) = self.anchor
+            && previous == key
+        {
+            return Some(ranges);
+        }
+        // Circles and rounded corners keep a shared world anchor separate from
+        // local offsets. Reuse only that exact subexpression of the reference
+        // tessellated_vertex_base_screen_ranges; offset and clip proofs still
+        // run for each distinct full position key. One inline entry is enough
+        // for a triangle fan and cannot outlive this immutable uniform.
+        let relative = [0, 1].map(|axis| {
+            shader_relative_component_bounds(
+                vertex.world_position[axis],
+                vertex.world_position[axis],
+                self.uniform.camera_center[axis],
+                0.0,
+                0.0,
+            )
+        });
+        let [Some(horizontal), Some(vertical)] = relative else {
+            return None;
+        };
+        let minimum = [horizontal.0, vertical.0];
+        let maximum = [horizontal.1, vertical.1];
+        let ranges = [
+            shader_world_dot_range(
+                self.uniform.world_to_screen_x,
+                minimum,
+                maximum,
+                vertex.depth,
+                vertex.depth,
+            )?,
+            shader_world_dot_range(
+                self.uniform.world_to_screen_y,
+                minimum,
+                maximum,
+                vertex.depth,
+                vertex.depth,
+            )?,
+        ];
+        self.anchor = Some((key, ranges));
         Some(ranges)
     }
 }
