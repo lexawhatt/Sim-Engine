@@ -3,6 +3,8 @@
 //! CPU allocation counts include wgpu work on this event-loop thread, not GPU
 //! execution or worker-thread allocations. Surface acquire is reported separately.
 //! Cache off/on controls composition storage/bindings, not source-owned proofs.
+//! Use --case/--labels/--cache for focused comparisons and --trials for repeated
+//! measurements of identical content; every trial is printed independently.
 
 use std::{
     alloc::{GlobalAlloc, Layout, System},
@@ -28,6 +30,10 @@ use winit::{
 };
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
+
+#[path = "support/frame_cache_cases.rs"]
+mod cases;
+use cases::Selection;
 
 thread_local! {
     static COUNTING: Cell<bool> = const { Cell::new(false) };
@@ -73,7 +79,7 @@ unsafe impl GlobalAlloc for CountingAllocator {
 #[global_allocator]
 static ALLOCATOR: CountingAllocator = CountingAllocator;
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Content {
     World,
     WorldScreen,
@@ -98,7 +104,7 @@ impl Content {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Case {
     content: Content,
     labels: usize,
@@ -146,6 +152,7 @@ struct Samples {
     upload: Duration,
     camera_upload: Duration,
     encode: Duration,
+    outside_report: Duration,
     measured_started: Option<Instant>,
     work_times: Vec<Duration>,
     acquire_times: Vec<Duration>,
@@ -175,10 +182,12 @@ struct Benchmark {
     case_index: usize,
     samples: Samples,
     measured_frames: usize,
+    trials: usize,
 }
 
 impl Benchmark {
-    fn new(events: &ActiveEventLoop, measured_frames: usize, quick: bool) -> Result<Self> {
+    fn new(events: &ActiveEventLoop, measured_frames: usize, selection: Selection) -> Result<Self> {
+        let cases = selection.cases()?;
         let window = Arc::new(
             events.create_window(
                 Window::default_attributes()
@@ -238,7 +247,7 @@ impl Benchmark {
             })
             .collect::<Vec<_>>();
         let mut runs = Vec::new();
-        for _ in 0..if quick { 1 } else { 1000 } {
+        for _ in 0..if selection.quick { 1 } else { 1000 } {
             runs.push(renderer.create_glyph_run(
                 &atlas,
                 glyphs.clone(),
@@ -275,34 +284,7 @@ impl Benchmark {
             }
             mixed_panels.push(scene);
         }
-        let mut cases = Vec::new();
-        for content in [Content::World, Content::WorldScreen, Content::Mixed64] {
-            for cached in [false, true] {
-                cases.push(Case {
-                    content,
-                    labels: 0,
-                    cached,
-                });
-            }
-        }
-        let counts: &[usize] = if quick { &[1] } else { &[1, 100, 1000] };
-        for &labels in counts {
-            for content in [
-                Content::Labels,
-                Content::Recolored,
-                Content::Moved,
-                Content::Mixed,
-            ] {
-                for cached in [false, true] {
-                    cases.push(Case {
-                        content,
-                        labels,
-                        cached,
-                    });
-                }
-            }
-        }
-        renderer.set_frame_cache_budget(FrameCacheBudget::new(0, 0, 0, 0));
+        renderer.set_frame_cache_budget(cases[0].cache_budget());
         Ok(Self {
             window,
             renderer,
@@ -317,6 +299,7 @@ impl Benchmark {
             case_index: 0,
             samples: Samples::new(measured_frames),
             measured_frames,
+            trials: selection.trials,
         })
     }
 
@@ -387,6 +370,7 @@ impl Benchmark {
             self.samples.upload += report.metrics().upload();
             self.samples.camera_upload += report.metrics().camera_uniform_upload();
             self.samples.encode += report.metrics().encode_submit_present();
+            self.samples.outside_report += elapsed.saturating_sub(report.metrics().total_cpu());
             self.samples
                 .work_times
                 .push(elapsed.saturating_sub(report.metrics().surface_acquire()));
@@ -405,6 +389,8 @@ impl Benchmark {
             .unwrap_or(0.0);
         let work_p95 = p95(&mut self.samples.work_times).as_secs_f64() * 1000.0;
         let acquire_p95 = p95(&mut self.samples.acquire_times).as_secs_f64() * 1000.0;
+        let trial = self.case_index / (self.cases.len() / self.trials) + 1;
+        println!("measurement trial={trial} trials={}", self.trials);
         println!(
             "case={} labels={} glyphs_per_label=32 cache={} drawn={} presented_fps={:.2} main_thread_allocations_per_frame={:.2} allocated_bytes_per_frame={:.0} new_uniform_buffers_per_frame={:.2} new_bind_groups_per_frame={:.2} upload_bytes_per_frame={:.0} renderer_and_build_ms={:.3} acquire_ms={:.3} cache_cpu_bytes={} cache_uniform_bytes={} cache_texture_bytes={} cache_bindings={} cache_peak_cpu_bytes={} cache_peak_uniform_bytes={} source_scenes={} source_images={} source_glyph_runs={} commands={} passes={} renderer_and_build_p95_ms={:.3} acquire_p95_ms={:.3}",
             case.content.name(),
@@ -435,7 +421,7 @@ impl Benchmark {
             acquire_p95,
         );
         println!(
-            "stages case={} labels={} cache={} tessellation_and_preflight_ms={:.3} upload_and_image_bindings_ms={:.3} camera_bindings_ms={:.3} encode_submit_present_ms={:.3}",
+            "stages case={} labels={} cache={} tessellation_and_preflight_ms={:.3} upload_and_image_bindings_ms={:.3} camera_bindings_ms={:.3} encode_submit_present_ms={:.3} outside_report_ms={:.3}",
             case.content.name(),
             case.labels,
             case.cached,
@@ -443,6 +429,7 @@ impl Benchmark {
             self.samples.upload.as_secs_f64() * 1000.0 / count,
             self.samples.camera_upload.as_secs_f64() * 1000.0 / count,
             self.samples.encode.as_secs_f64() * 1000.0 / count,
+            self.samples.outside_report.as_secs_f64() * 1000.0 / count,
         );
         self.samples = Samples::new(self.measured_frames);
         self.case_index += 1;
@@ -450,11 +437,7 @@ impl Benchmark {
             return Ok(true);
         }
         self.renderer
-            .set_frame_cache_budget(if self.cases[self.case_index].cached {
-                FrameCacheBudget::default()
-            } else {
-                FrameCacheBudget::new(0, 0, 0, 0)
-            });
+            .set_frame_cache_budget(self.cases[self.case_index].cache_budget());
         Ok(false)
     }
 
@@ -555,7 +538,7 @@ impl Benchmark {
 struct App {
     benchmark: Option<Benchmark>,
     frames: usize,
-    quick: bool,
+    selection: Selection,
     error: Option<String>,
 }
 
@@ -564,7 +547,7 @@ impl ApplicationHandler for App {
         if self.benchmark.is_some() {
             return;
         }
-        match Benchmark::new(events, self.frames, self.quick) {
+        match Benchmark::new(events, self.frames, self.selection) {
             Ok(benchmark) => {
                 benchmark.window.request_redraw();
                 self.benchmark = Some(benchmark);
@@ -620,7 +603,7 @@ fn main() -> Result<()> {
     env_logger::init();
     let mut arguments = std::env::args().skip(1);
     let mut frames = 60;
-    let mut quick = false;
+    let mut selection = Selection::default();
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
             "--frames" => {
@@ -629,21 +612,44 @@ fn main() -> Result<()> {
                     .ok_or("--frames requires a count")?
                     .parse()?;
             }
-            "--quick" => quick = true,
+            "--quick" => selection.quick = true,
+            "--case" => {
+                selection.set_content(&arguments.next().ok_or("--case requires a name")?)?
+            }
+            "--labels" => {
+                selection.labels = Some(
+                    arguments
+                        .next()
+                        .ok_or("--labels requires a count")?
+                        .parse()?,
+                )
+            }
+            "--cache" => {
+                selection.set_cache(&arguments.next().ok_or("--cache requires on/off/both")?)?
+            }
+            "--trials" => {
+                selection.trials = arguments
+                    .next()
+                    .ok_or("--trials requires a count")?
+                    .parse()?
+            }
             "--help" => {
-                println!("frame_cache_benchmark [--frames N] [--quick]");
+                println!(
+                    "frame_cache_benchmark [--frames 1..10000] [--quick] [--case world|world_screen|mixed64_images128rects|unchanged|recolored|moved|mixed] [--labels 0|1|100|1000] [--cache on|off|both] [--trials 1..100]\nEach trial warms up 20 presents; trial order alternates. Defaults retain all 30 cases. This is diagnostic, not a release gate."
+                );
                 return Ok(());
             }
             _ => return Err(format!("unknown argument {argument}").into()),
         }
     }
-    if frames == 0 {
-        return Err("--frames must be positive".into());
+    if !(1..=10000).contains(&frames) {
+        return Err("--frames must be in 1..=10000".into());
     }
+    selection.cases()?;
     let mut app = App {
         benchmark: None,
         frames,
-        quick,
+        selection,
         error: None,
     };
     let events = EventLoop::new()?;

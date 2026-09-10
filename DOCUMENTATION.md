@@ -488,7 +488,19 @@ invalidates cached bindings; a new generation warms up independently.
 
 Stable ordered camera/image/target slots reuse bindings and buffers. Changed
 uniform bytes are queued after prior submissions; unchanged bytes are not
-uploaded. This is not a promise of zero backend allocations: queue staging,
+uploaded. On a slot miss, a fixed eight-entry, per-present memo can share an
+earlier binding with identical resource identity, sampling and exact uniform
+bytes. Shared aliases are not retained in independently mutable slots, so a
+later frame can change either draw without overwriting the other's uniform.
+`shared_bind_groups()` counts this subset of `reused_bind_groups()`; creation,
+upload and retained-uniform counters count actual resources, not aliases.
+Persistent slot hits keep their constant-time lookup. This optimization also
+applies when idle retention is disabled; scalar-field bindings remain excluded.
+Within each render pass the encoder also skips unchanged full-buffer vertex
+bindings and scissor rectangles. It keeps every draw and bind-group selection
+in order; no state is reused across passes or frames.
+
+This is not a promise of zero backend allocations: queue staging,
 encoding, surface acquisition, and currently uncached scalar bindings remain
 separate costs. Keep mixed item order intact; regrouping by texture would change
 alpha composition.
@@ -502,7 +514,18 @@ rectangles. It asserts source/command counts and warmed uniform-creation
 invariants and reports actual presented FPS, build/renderer CPU time, acquire
 time, main-thread allocations and cache bytes separately. Additional stage
 lines separate preflight/tessellation, uploads/image bindings, camera bindings,
-and encode/submit/present CPU time. This is a diagnostic
+encode/submit/present CPU time, and time outside the renderer report (including
+host frame construction and cleanup). To repeat one unchanged workload:
+
+```bash
+cargo run --release --example frame_cache_benchmark -- \
+  --case mixed --labels 1000 --cache both --trials 3 --frames 120
+```
+
+Filtering does not reduce source counts or quality. Every trial starts with
+20 unmeasured presents; even-numbered trials reverse case order. Each trial is
+reported separately, including slow trials. With no filters, all 30 original
+cases remain enabled. `--cache on` focuses on warmed behavior. This is a diagnostic
 benchmark, not a GPU-timestamp measurement or a universal 60 FPS promise.
 
 The 0.3 CPU validation path avoids duplicate position proofs and memoizes eight
@@ -1548,6 +1571,7 @@ composed, drawn, measured, and recovered.
 | `renderer/mesh3d_surface.rs` | interval-proven bounded surface clipping and preflight |
 | `renderer/mesh3d_texture.rs` | opaque texture/material ownership and recovery |
 | `renderer/frame/cache.rs` | bounded frame scratch, uniform and binding reuse |
+| `renderer/frame/encoding.rs` | ordered mixed-source draw encoding and pass-local state reuse |
 | `renderer/primitive.wgsl` | 2D, particle, heatmap, and composition shaders |
 | `renderer/mesh3d.wgsl` | 3D projection and screen-space edge expansion |
 

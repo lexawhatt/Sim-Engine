@@ -123,6 +123,7 @@ your integration's lockfile/repository. Run the new fixtures from this checkout:
 cargo run --release --example text_ui_updates
 cargo run --release --example text_ui_updates -- --acceptance
 cargo run --release --example frame_cache_benchmark
+cargo run --release --example frame_cache_benchmark -- --case mixed --labels 1000 --trials 3 --frames 120
 cargo run --release --example stroke_gallery -- --page 5
 cargo run --release --example editable_textured_3d
 cargo run --release --example editable_textured_3d -- --acceptance

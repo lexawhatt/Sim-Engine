@@ -3,6 +3,11 @@ use super::*;
 #[cfg(test)]
 #[path = "cache_diagnostics.rs"]
 mod diagnostics;
+#[cfg(test)]
+#[path = "cache_sharing_tests.rs"]
+mod sharing_tests;
+#[cfg(test)]
+pub(in crate::renderer) use sharing_tests::assert_gpu_binding_sharing_contract;
 
 /// Idle retention limits for composition scratch and cached draw bindings.
 ///
@@ -69,6 +74,7 @@ pub struct FrameCacheStatistics {
     pub(super) created_buffers: usize,
     pub(super) created_bind_groups: usize,
     pub(super) reused_bind_groups: usize,
+    pub(super) shared_bind_groups: usize,
     pub(super) uploaded_uniform_bytes: usize,
     pub(super) peak_cpu_bytes: usize,
     pub(super) peak_uniform_bytes: usize,
@@ -100,9 +106,15 @@ impl FrameCacheStatistics {
     pub const fn created_bind_groups(self) -> usize {
         self.created_bind_groups
     }
-    /// Existing bind groups reused by the previous composed frame.
+    /// Bind groups reused from retained slots or earlier items of this frame.
     pub const fn reused_bind_groups(self) -> usize {
         self.reused_bind_groups
+    }
+    /// Subset of reused bind groups shared with an earlier identical draw
+    /// binding in the same frame. Shared aliases are never retained in a second
+    /// mutable uniform slot. The bounded memo may miss older duplicates.
+    pub const fn shared_bind_groups(self) -> usize {
+        self.shared_bind_groups
     }
     /// Uniform bytes actually written by the previous composed frame.
     pub const fn uploaded_uniform_bytes(self) -> usize {
@@ -155,6 +167,28 @@ enum BindingKeyRef<'a> {
 }
 
 impl<'a> BindingKeyRef<'a> {
+    fn matches(self, other: BindingKeyRef<'_>) -> bool {
+        match (self, other) {
+            (Self::Camera, BindingKeyRef::Camera) => true,
+            (
+                Self::Image {
+                    identity: a,
+                    sampling: sa,
+                    ..
+                },
+                BindingKeyRef::Image {
+                    identity: b,
+                    sampling: sb,
+                    ..
+                },
+            ) => Arc::ptr_eq(a, b) && sa == sb,
+            (Self::Target { identity: a, .. }, BindingKeyRef::Target { identity: b, .. }) => {
+                Arc::ptr_eq(a, b)
+            }
+            _ => false,
+        }
+    }
+
     fn texture(self) -> Option<(&'a Arc<()>, usize)> {
         match self {
             Self::Camera => None,
@@ -220,24 +254,39 @@ impl BindingKey {
         self.as_ref().texture()
     }
     fn matches(&self, other: BindingKeyRef<'_>) -> bool {
-        match (self, other) {
-            (Self::Camera, BindingKeyRef::Camera) => true,
-            (
-                Self::Image {
-                    identity: a,
-                    sampling: sa,
-                    ..
-                },
-                BindingKeyRef::Image {
-                    identity: b,
-                    sampling: sb,
-                    ..
-                },
-            ) => Arc::ptr_eq(a, b) && *sa == sb,
-            (Self::Target { identity: a, .. }, BindingKeyRef::Target { identity: b, .. }) => {
-                Arc::ptr_eq(a, b)
-            }
-            _ => false,
+        self.as_ref().matches(other)
+    }
+}
+
+type BindingDescription<'a> = (BindingKeyRef<'a>, &'a [u8]);
+
+#[derive(Clone, Copy)]
+struct SharedBinding<'a> {
+    description: BindingDescription<'a>,
+    index: usize,
+}
+
+/// Fixed stack scratch for one binding-construction loop. It borrows immutable
+/// ready descriptions, never GPU slots or the growing current bindings Vec.
+/// Recording a persistent hit is O(1); only a slot miss searches eight entries.
+#[derive(Default)]
+pub(super) struct FrameBindingSharing<'a> {
+    entries: [Option<SharedBinding<'a>>; 8],
+    next: usize,
+}
+
+impl<'a> FrameBindingSharing<'a> {
+    fn find(&self, (key, bytes): BindingDescription<'_>) -> Option<usize> {
+        self.entries.iter().flatten().find_map(|entry| {
+            (entry.description.0.matches(key) && entry.description.1 == bytes)
+                .then_some(entry.index)
+        })
+    }
+
+    fn remember(&mut self, description: Option<BindingDescription<'a>>, index: usize) {
+        if let Some(description) = description {
+            self.entries[self.next] = Some(SharedBinding { description, index });
+            self.next = (self.next + 1) % self.entries.len();
         }
     }
 }
@@ -272,6 +321,7 @@ impl FrameCache {
         self.statistics.created_buffers = 0;
         self.statistics.created_bind_groups = 0;
         self.statistics.reused_bind_groups = 0;
+        self.statistics.shared_bind_groups = 0;
         self.statistics.uploaded_uniform_bytes = 0;
         self.statistics.peak_cpu_bytes = self.initial_cpu_bytes;
         self.statistics.peak_uniform_bytes = self.statistics.uniform_bytes;
@@ -359,29 +409,68 @@ impl FrameCache {
         }
     }
 
-    pub(super) fn binding(
+    pub(super) fn binding<'a>(
         &mut self,
         renderer: &mut WgpuRenderer,
-        item: &ReadyItem<'_>,
+        item: &'a ReadyItem<'_>,
         slot: usize,
+        sharing: &mut FrameBindingSharing<'a>,
+        bindings: &[FrameBinding],
     ) -> FrameBinding {
         let description = binding_description(item);
+        if let Some(binding) =
+            self.reuse_binding(&renderer.queue, description, slot, sharing, bindings)
+        {
+            return binding;
+        }
+        let binding = create_frame_binding(renderer, item);
+        self.retain_new_binding(binding, description, slot, sharing)
+    }
+
+    fn reuse_binding<'a>(
+        &mut self,
+        queue: &wgpu::Queue,
+        description: Option<BindingDescription<'a>>,
+        slot: usize,
+        sharing: &mut FrameBindingSharing<'a>,
+        bindings: &[FrameBinding],
+    ) -> Option<FrameBinding> {
         if let Some((key, bytes)) = &description
             && let Some(Some(cached)) = self.slots.get_mut(slot)
             && cached.key.matches(*key)
             && cached.len == bytes.len()
         {
             if &cached.bytes[..cached.len] != *bytes {
-                renderer
-                    .queue
-                    .write_buffer(&cached.binding._buffer, 0, bytes);
+                queue.write_buffer(&cached.binding._buffer, 0, bytes);
                 cached.bytes[..cached.len].copy_from_slice(bytes);
                 self.statistics.uploaded_uniform_bytes += bytes.len();
             }
             self.statistics.reused_bind_groups += 1;
-            return cached.binding.clone();
+            sharing.remember(description, slot);
+            return Some(cached.binding.clone());
         }
-        let binding = create_frame_binding(renderer, item);
+        if let Some(description) = description
+            && let Some(index) = sharing.find(description)
+            && let Some(binding) = bindings.get(index)
+        {
+            // Do not publish this clone into `slots[slot]`: a later frame may
+            // write a different uniform into either independent item slot.
+            self.statistics.reused_bind_groups += 1;
+            self.statistics.shared_bind_groups += 1;
+            sharing.remember(Some(description), slot);
+            return Some(binding.clone());
+        }
+        None
+    }
+
+    fn retain_new_binding<'a>(
+        &mut self,
+        binding: FrameBinding,
+        description: Option<BindingDescription<'a>>,
+        slot: usize,
+        sharing: &mut FrameBindingSharing<'a>,
+    ) -> FrameBinding {
+        sharing.remember(description, slot);
         let uniform_size = binding._buffer.size() as usize;
         self.statistics.created_buffers += 1;
         self.statistics.created_bind_groups += 1;

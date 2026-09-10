@@ -81,6 +81,16 @@ from the official 0.2.0 release; a development version is not release sign-off.
   with an empty proof. This adds no heap allocation.
 - Warmed composition avoids transient provenance-reference clones and repeated
   scratch-capacity scans without changing cache budgets or memory accounting.
+- Identical camera/image/target bindings can share one uniform buffer and bind
+  group within a composed frame on persistent-slot misses. A fixed eight-entry
+  memo compares exact resource, sampling and uniform keys; aliases never become
+  independent mutable retained slots. `shared_bind_groups()` separates these
+  reuses from ordinary retained-slot hits, with physical creation/upload counts.
+- The frame encoder skips redundant full-buffer vertex bindings and scissor
+  setters within a render pass, preserving all draws, clipping and painter order.
+- Frame-cache diagnostics support case/count/cache filters and repeated,
+  independently reported trials with alternating case order and unchanged
+  workload sizes. CPU time outside the renderer report is reported separately.
 - Shared world-anchor projections are computed once per consecutive fan in
   2D validation. Interval analysis counts terms in one pass and precomputes
   exact rounding coefficients; frozen-reference tests compare output bits,

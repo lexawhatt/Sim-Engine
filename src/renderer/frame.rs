@@ -4,8 +4,13 @@ mod cache;
 #[cfg(test)]
 #[path = "frame/dedup_diagnostics.rs"]
 mod dedup_diagnostics;
+mod encoding;
+#[cfg(test)]
+pub(super) use encoding::assert_gpu_encoding_contract;
 mod streaming;
 pub(super) use cache::FrameCache;
+#[cfg(test)]
+pub(super) use cache::assert_gpu_binding_sharing_contract;
 pub use cache::{FrameCacheBudget, FrameCacheStatistics};
 
 /// Work category constrained by a [`FrameBudget`].
@@ -2318,9 +2323,10 @@ fn present_frame_with_vertices<'frame>(
     let mut binding_upload = Duration::ZERO;
     let mut camera_uniform_upload = Duration::ZERO;
     let planned_uniform_bytes = ready.iter().map(ready_uniform_bytes).sum::<usize>();
+    let mut sharing = cache::FrameBindingSharing::default();
     for (slot, item) in ready.iter().enumerate() {
         let binding_started_at = Instant::now();
-        bindings.push(cache.binding(renderer, item, slot));
+        bindings.push(cache.binding(renderer, item, slot, &mut sharing, bindings));
         let elapsed = binding_started_at.elapsed();
         match item {
             ReadyItem::Geometry(_) | ReadyItem::Particle { .. } => {
@@ -2400,9 +2406,7 @@ fn present_frame_with_vertices<'frame>(
             occlusion_query_set: None,
             multiview_mask: None,
         });
-        for (item, binding) in ready.iter().zip(bindings.iter()) {
-            encode_ready_item(renderer, &mut pass, item, binding);
-        }
+        encoding::encode_items(renderer, &mut pass, ready, bindings);
     }
     renderer.queue.submit([encoder.finish()]);
     renderer.notify_before_present();
@@ -3194,104 +3198,6 @@ fn create_camera_binding(renderer: &WgpuRenderer, uniform: &CameraUniform) -> Fr
     FrameBinding {
         _buffer: buffer,
         bind_group,
-    }
-}
-
-fn encode_ready_item<'pass>(
-    renderer: &'pass WgpuRenderer,
-    pass: &mut wgpu::RenderPass<'pass>,
-    item: &'pass ReadyItem<'_>,
-    binding: &'pass FrameBinding,
-) {
-    match item {
-        ReadyItem::Geometry(geometry) => {
-            if geometry.vertex_count == 0 {
-                return;
-            }
-            let (pipeline, vertex_buffer) = match geometry.source {
-                ReadySource::Streaming => (&renderer.pipeline, renderer.vertex_buffer.as_ref()),
-                ReadySource::Prepared(buffer) => (&renderer.pipeline, buffer),
-                ReadySource::Dynamic(buffer) => (&renderer.dynamic_pipeline, buffer),
-            };
-            pass.set_pipeline(pipeline);
-            pass.set_bind_group(0, &binding.bind_group, &[]);
-            pass.set_vertex_buffer(0, vertex_buffer.slice(..));
-            for batch in &geometry.batches {
-                let Some(scissor) = effective_scissor(
-                    geometry.viewport,
-                    batch.screen_clip,
-                    renderer.scale_factor as f32,
-                ) else {
-                    continue;
-                };
-                pass.set_scissor_rect(scissor.x, scissor.y, scissor.width, scissor.height);
-                pass.draw(batch.vertex_range.clone(), 0..1);
-            }
-        }
-        ReadyItem::Particle {
-            field,
-            visible_count,
-            viewport,
-            ..
-        } => {
-            if *visible_count == 0 || viewport.item_clipped_out {
-                return;
-            }
-            let scissor = viewport.item_clip.unwrap_or(viewport.scissor);
-            pass.set_pipeline(&renderer.particle_pipeline);
-            pass.set_bind_group(0, &binding.bind_group, &[]);
-            pass.set_vertex_buffer(0, renderer.particle_unit_buffer.slice(..));
-            pass.set_vertex_buffer(1, field.instance_buffer.slice(..));
-            pass.set_scissor_rect(scissor.x, scissor.y, scissor.width, scissor.height);
-            pass.draw(0..6, 0..*visible_count as u32);
-        }
-        ReadyItem::Scalar { viewport, .. } => {
-            if viewport.item_clipped_out {
-                return;
-            }
-            let scissor = viewport.item_clip.unwrap_or(viewport.scissor);
-            pass.set_pipeline(&renderer.heatmap_pipeline);
-            pass.set_bind_group(0, &binding.bind_group, &[]);
-            pass.set_scissor_rect(scissor.x, scissor.y, scissor.width, scissor.height);
-            pass.draw(0..6, 0..1);
-        }
-        ReadyItem::Image { viewport, .. } => {
-            if viewport.item_clipped_out {
-                return;
-            }
-            let scissor = viewport.item_clip.unwrap_or(viewport.scissor);
-            pass.set_pipeline(&renderer.image_renderer.pipeline);
-            pass.set_bind_group(0, &binding.bind_group, &[]);
-            pass.set_scissor_rect(scissor.x, scissor.y, scissor.width, scissor.height);
-            pass.draw(0..6, 0..1);
-        }
-        ReadyItem::ImageBatch {
-            batch, viewport, ..
-        } => {
-            if batch.sprite_count() == 0 || viewport.item_clipped_out {
-                return;
-            }
-            let scissor = viewport.item_clip.unwrap_or(viewport.scissor);
-            pass.set_pipeline(&renderer.image_renderer.batch_pipeline);
-            pass.set_bind_group(0, &binding.bind_group, &[]);
-            pass.set_vertex_buffer(0, batch.instance_buffer.slice(..));
-            pass.set_scissor_rect(scissor.x, scissor.y, scissor.width, scissor.height);
-            pass.draw(0..6, 0..batch.sprite_count() as u32);
-        }
-        ReadyItem::Target {
-            blend_mode,
-            viewport,
-            ..
-        } => {
-            if viewport.item_clipped_out {
-                return;
-            }
-            let scissor = viewport.item_clip.unwrap_or(viewport.scissor);
-            pass.set_pipeline(renderer.composition_pipelines.pipeline(*blend_mode));
-            pass.set_bind_group(0, &binding.bind_group, &[]);
-            pass.set_scissor_rect(scissor.x, scissor.y, scissor.width, scissor.height);
-            pass.draw(0..6, 0..1);
-        }
     }
 }
 

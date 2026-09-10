@@ -3051,6 +3051,8 @@ fn offscreen_gpu_readback_verifies_camera_depth_and_clip_contract() {
             sample_count,
         )
         .await;
+        frame::assert_gpu_binding_sharing_contract(&device, &queue);
+        frame::assert_gpu_encoding_contract(&device, &queue, format, sample_count);
         mesh3d::assert_gpu_depth_contract(&device, &queue, format);
         mesh3d::assert_gpu_scene_recovery_contract(
             &device,
