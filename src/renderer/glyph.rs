@@ -103,6 +103,11 @@ pub struct GlyphRunBudget {
 }
 
 impl GlyphRunBudget {
+    /// CPU bytes per glyph capacity slot, including sprite and GPU conversion
+    /// staging. Atlas storage and allocator metadata are excluded.
+    pub const RETAINED_BYTES_PER_GLYPH: usize =
+        std::mem::size_of::<PositionedGlyph2d>() + ImageBatchBudget::RETAINED_BYTES_PER_SPRITE;
+
     /// Creates non-zero limits for positioned glyphs and recovery metadata.
     pub fn new(max_glyphs: usize, max_retained_bytes: usize) -> Result<Self, GlyphError> {
         if max_glyphs == 0 || max_retained_bytes < glyph_retained_bytes(1).unwrap_or(usize::MAX) {
@@ -119,7 +124,7 @@ impl GlyphRunBudget {
         self.max_glyphs
     }
 
-    /// Returns the maximum retained run and sprite-description bytes.
+    /// Returns the maximum retained glyph, sprite and conversion-staging bytes.
     pub const fn max_retained_bytes(self) -> usize {
         self.max_retained_bytes
     }
@@ -381,7 +386,7 @@ impl GlyphRunStatistics {
         self.atlas_misses
     }
 
-    /// Returns exact retained glyph and sprite-description bytes.
+    /// Returns retained glyph, sprite and conversion-staging capacity bytes.
     pub const fn retained_bytes(self) -> usize {
         self.retained_bytes
     }
@@ -400,6 +405,38 @@ pub struct GlyphRun2d {
     budget: GlyphRunBudget,
 }
 
+/// Outcome of an atomic capacity-aware glyph-run update.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GlyphRunUploadReport {
+    batch: ImageBatchUploadReport,
+    capacity: usize,
+    retained_bytes: usize,
+    peak_retained_bytes: usize,
+}
+
+impl GlyphRunUploadReport {
+    /// Returns the accepted positioned-glyph count.
+    pub const fn glyph_count(self) -> usize {
+        self.batch.sprite_count()
+    }
+    /// Returns glyph/layout capacity reusable without growing CPU arrays.
+    pub const fn capacity(self) -> usize {
+        self.capacity
+    }
+    /// Returns the instance upload and GPU capacity/growth outcome.
+    pub const fn instances(self) -> ImageBatchUploadReport {
+        self.batch
+    }
+    /// Returns all retained CPU glyph, sprite and conversion-staging bytes.
+    pub const fn retained_bytes(self) -> usize {
+        self.retained_bytes
+    }
+    /// Returns the conservative old/new CPU peak, excluding caller and backend storage.
+    pub const fn peak_retained_bytes(self) -> usize {
+        self.peak_retained_bytes
+    }
+}
+
 impl GlyphRun2d {
     /// Returns the exact host-positioned glyph descriptions.
     pub fn glyphs(&self) -> &[PositionedGlyph2d] {
@@ -409,6 +446,11 @@ impl GlyphRun2d {
     /// Returns the retained glyph count.
     pub fn glyph_count(&self) -> usize {
         self.glyphs.len()
+    }
+
+    /// Returns CPU capacity reusable without growing glyph or sprite arrays.
+    pub fn capacity(&self) -> usize {
+        self.glyphs.capacity().min(self.batch.capacity())
     }
 
     /// Returns deterministic logical-pixel bounds without font interpretation.
@@ -431,7 +473,7 @@ impl GlyphRun2d {
         }
     }
 
-    /// Returns exact CPU glyph and sprite-description recovery bytes.
+    /// Returns CPU glyph, sprite and conversion-staging capacity bytes.
     pub fn recovery_memory_bytes(&self) -> usize {
         self.glyphs
             .capacity()
@@ -538,6 +580,23 @@ impl WgpuRenderer {
             glyphs,
             budget,
         )
+    }
+
+    /// Updates host-shaped layout while reusing CPU and GPU capacity when possible.
+    ///
+    /// Exact unchanged input uploads nothing; an empty slice clears the drawable
+    /// run but retains capacity. The atlas must be the run's original active-device
+    /// atlas. All glyph sources, bounds and budget checks complete before changing
+    /// drawable state. Synchronous rejection preserves the previous revision;
+    /// device failure cannot roll back work already submitted to the queue.
+    pub fn update_glyph_run(
+        &self,
+        atlas: &GlyphAtlas2d,
+        run: &mut GlyphRun2d,
+        glyphs: &[PositionedGlyph2d],
+    ) -> Result<GlyphRunUploadReport, GlyphError> {
+        self.validate_glyph_run(atlas, run)?;
+        update_glyph_run_resources(&self.device, &self.queue, atlas, run, glyphs)
     }
 
     /// Restores exact atlas pixels and metadata for this renderer generation.
@@ -683,7 +742,10 @@ pub(super) fn create_glyph_run_resources(
     let bounds = measure_glyphs(&glyphs)?;
     let batch_budget = ImageBatchBudget::new(budget.max_glyphs, budget.max_retained_bytes)?;
     image::preflight_image_batch_capacity(device, glyphs.len(), batch_budget)?;
-    let glyphs = compact_glyph_vec(glyphs, budget.max_retained_bytes)?;
+    let glyph_byte_limit = budget
+        .max_retained_bytes
+        .saturating_sub(image::batch_retained_bytes(glyphs.len().max(1)));
+    let glyphs = compact_glyph_vec(glyphs, glyph_byte_limit)?;
     let sprites = resolve_glyph_sprites(&atlas.entries, &glyphs)?;
     let actual_retained_bytes = glyphs
         .capacity()
@@ -699,6 +761,14 @@ pub(super) fn create_glyph_run_resources(
             actual: actual_retained_bytes,
         });
     }
+    let batch_budget = ImageBatchBudget::new(
+        budget.max_glyphs,
+        budget.max_retained_bytes.saturating_sub(
+            glyphs
+                .capacity()
+                .saturating_mul(std::mem::size_of::<PositionedGlyph2d>()),
+        ),
+    )?;
     let batch = image::create_image_batch_resources(
         device,
         queue,
@@ -712,6 +782,84 @@ pub(super) fn create_glyph_run_resources(
         glyphs,
         bounds,
         budget,
+    })
+}
+
+pub(super) fn update_glyph_run_resources(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    atlas: &GlyphAtlas2d,
+    run: &mut GlyphRun2d,
+    glyphs: &[PositionedGlyph2d],
+) -> Result<GlyphRunUploadReport, GlyphError> {
+    validate_glyph_run_budget(glyphs.len(), run.budget)?;
+    image::preflight_image_batch_capacity(
+        device,
+        glyphs.len(),
+        ImageBatchBudget::new(run.budget.max_glyphs, run.budget.max_retained_bytes)?,
+    )?;
+    validate_glyph_membership(&atlas.entries, glyphs)?;
+    if glyphs.iter().any(|glyph| !glyph.tint.is_normalized()) {
+        return Err(GlyphError::InvalidGlyph);
+    }
+    let bounds = measure_glyphs(glyphs)?;
+    let old_glyph_bytes = run
+        .glyphs
+        .capacity()
+        .saturating_mul(std::mem::size_of::<PositionedGlyph2d>());
+    let mut replacement = if glyphs.len() > run.glyphs.capacity() {
+        let mut values = Vec::new();
+        values
+            .try_reserve_exact(glyphs.len())
+            .map_err(|_| GlyphError::AllocationFailed {
+                requested_bytes: std::mem::size_of_val(glyphs),
+            })?;
+        Some(values)
+    } else {
+        None
+    };
+    let glyph_capacity = replacement
+        .as_ref()
+        .map_or(run.glyphs.capacity(), Vec::capacity);
+    let glyph_bytes = glyph_capacity.saturating_mul(std::mem::size_of::<PositionedGlyph2d>());
+    let batch_budget = ImageBatchBudget::new(
+        run.budget.max_glyphs,
+        run.budget.max_retained_bytes.saturating_sub(glyph_bytes),
+    )?;
+    // Membership, tint and destination validation above prove one sprite per
+    // glyph. The common update also checks that exact count before publication.
+    let sprites = glyphs.iter().filter_map(|glyph| {
+        let source = find_entry(&atlas.entries, glyph.glyph)?.source;
+        ImageSprite2d::new(source, glyph.destination, glyph.tint).ok()
+    });
+    let batch = image::update_image_batch_resources(
+        device,
+        queue,
+        &atlas.image,
+        &mut run.batch,
+        sprites,
+        glyphs.len(),
+        batch_budget,
+    )?;
+    let peak_retained_bytes = batch
+        .peak_retained_bytes()
+        .saturating_add(old_glyph_bytes)
+        .saturating_add(if replacement.is_some() {
+            glyph_bytes
+        } else {
+            0
+        });
+    if let Some(values) = replacement.take() {
+        run.glyphs = values;
+    }
+    run.glyphs.clear();
+    run.glyphs.extend_from_slice(glyphs);
+    run.bounds = bounds;
+    Ok(GlyphRunUploadReport {
+        batch,
+        capacity: run.capacity(),
+        retained_bytes: run.recovery_memory_bytes(),
+        peak_retained_bytes,
     })
 }
 
@@ -1060,9 +1208,7 @@ fn validate_glyph_run_budget(glyph_count: usize, budget: GlyphRunBudget) -> Resu
 }
 
 fn glyph_retained_bytes(glyph_count: usize) -> Option<usize> {
-    let glyph_bytes = glyph_count.checked_mul(std::mem::size_of::<PositionedGlyph2d>())?;
-    let sprite_bytes = glyph_count.checked_mul(std::mem::size_of::<ImageSprite2d>())?;
-    glyph_bytes.checked_add(sprite_bytes)
+    glyph_count.checked_mul(GlyphRunBudget::RETAINED_BYTES_PER_GLYPH)
 }
 
 fn find_entry(entries: &[GlyphAtlasEntry], glyph: GlyphId) -> Option<GlyphAtlasEntry> {

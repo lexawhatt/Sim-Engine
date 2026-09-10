@@ -1,7 +1,9 @@
-# Sim;Engine v0.2.0 Documentation
+# Sim;Engine v0.3.0 Development Documentation
 
-This document is the public guide and engineering reference for the official
-Sim;Engine v0.2.0 release. It is divided into two parts:
+This document is the integration guide and engineering reference for the
+unreleased Sim;Engine v0.3.0 checkout. The published version is still 0.2.0;
+its [frozen guide](https://github.com/lexawhatt/Sim-Engine/blob/v0.2.0/DOCUMENTATION.md)
+describes that package. This guide is divided into two parts:
 
 - [Integration Handbook](#part-i-integration-handbook) - how to add the crate,
   construct visual state, choose a rendering path, recover resources, and
@@ -16,7 +18,7 @@ For exact signatures and error variants, generate the Rust API reference:
 cargo doc --all-features --no-deps --open
 ```
 
-Sim;Engine v0.2.0 remains pre-1.0. Linux with
+Sim;Engine remains pre-1.0. Linux with
 Vulkan is its supported release target, and Rust 1.90 is the minimum supported
 Rust version.
 
@@ -45,18 +47,19 @@ submit GPU work, without normally waiting for its completion.
 
 ### 2. Installation and features
 
-The default feature set includes the `wgpu` backend:
+Until 0.3 is published, use a local checkout for the APIs in this guide. The
+default feature set includes the `wgpu` backend:
 
 ```toml
 [dependencies]
-sim-engine = "0.2"
+sim-engine = { path = "../Sim-Engine" }
 ```
 
 Use the CPU-side visual-state APIs without GPU dependencies:
 
 ```toml
 [dependencies]
-sim-engine = { version = "0.2", default-features = false }
+sim-engine = { path = "../Sim-Engine", default-features = false }
 ```
 
 | Configuration | Provides |
@@ -215,6 +218,16 @@ expansion loop. Miter length is bounded by `1.0..=1000.0`; geometry beyond the
 configured limit falls back to bevel presentation. Extreme finite widths whose
 derived extrusion would overflow are rejected as `InvalidStroke`.
 
+`StrokeMarker2d::arrow(...).with_anchor(StrokeMarkerAnchor2d::TipAtEndpoint)`
+keeps the visible tip at the supplied mathematical endpoint. The default
+`BaseAtEndpoint` still extends outward. Exact-tip mode currently accepts only
+undashed two-point lines/polylines; longer or dashed paths return
+`UnsupportedTipMarkerPath`. Both shaft ends are butt-ended. Marker length is
+clamped to one quarter of the projected dominant-axis span, so even two inward
+markers on a very short vector leave a non-inverted, disjoint shaft. Widths may
+be logical or world units; marker dimensions remain logical pixels. There is
+no camera-dependent world-endpoint adjustment in host visual state.
+
 #### Bounded scenes
 
 Production adapters that translate externally sized visual state should use
@@ -265,6 +278,13 @@ validates the transaction before replacing the ordered command store, then
 performs one `O(N log N)` sort using unique insertion order as the stable
 tie-breaker. The core-only `scene_construction_benchmark` measures this path.
 The compatibility constructor `Scene::new` remains explicitly unbounded.
+
+For already sorted streams, ordinary insertion now checks the final ordering
+key and appends directly. Validation, depth/layer/insertion ordering and budget
+accounting are unchanged; out-of-order streams retain the existing ordered
+insertion path. The paired `paired_scene_append_benchmark` ignored test
+compares both algorithms with equal warmed capacities and allocation counts;
+this isolates insertion work, not complete application extraction or rendering.
 
 ### 5. Ordering, clipping, and pseudo-depth
 
@@ -442,6 +462,26 @@ Images and glyph runs use the same ordering rule and clip/viewport
 intersection as geometry. Referencing the same atlas several times counts its
 nominal texel payload once toward the frame texture budget. Atlas pixels and
 retained instances are not uploaded again merely because the frame draws them.
+
+`FrameCacheBudget` independently bounds idle CPU scratch, uniform buffers,
+referenced textures and binding slots. `set_frame_cache_budget` configures it;
+`clear_frame_cache` releases cached references. Active frames still obey
+`FrameBudget`; work larger than the idle cache can render but is not retained
+unboundedly afterwards. `frame_cache_statistics` reports current capacities,
+last-frame buffer/bind-group creation, reused bindings, uniform writes and
+nominal transient peaks. Zero limits disable retention for paired comparisons.
+Frame construction still reserves conservative uniform-upload budget before
+cache lookup; an eventual cache hit reduces reported actual upload, not the
+minimum construction budget required for that item.
+Dropping an unpresented composer clears all borrowed sources. Device recovery
+invalidates cached bindings; a new generation warms up independently.
+
+Stable ordered camera/image/target slots reuse bindings and buffers. Changed
+uniform bytes are queued after prior submissions; unchanged bytes are not
+uploaded. This is not a promise of zero backend allocations: queue staging,
+encoding, surface acquisition, and currently uncached scalar bindings remain
+separate costs. Keep mixed item order intact; regrouping by texture would change
+alpha composition.
 
 ### 7. Cameras and motion
 
@@ -713,6 +753,18 @@ texture data and whose replacement flag refers only to the texture.
 and replacement flag refer only to the instance buffer, never to the atlas
 texture.
 
+For moving sprites, `update_image_batch(&image, &mut batch, &sprites)` accepts
+borrowed descriptions. Unchanged input uploads zero bytes. Stable-capacity
+changes reuse CPU description/conversion arrays and the GPU buffer; shrinking
+to empty retains capacity. Growth reserves bounded candidates before changing
+the drawable batch. `replace_image_batch` uses the same route. Inspect count,
+CPU/GPU capacity, current/peak bytes and `replaced_instance_buffer` in its report.
+The CPU budget includes both descriptions and retained GPU-instance conversion
+storage; hand-sized 0.2 byte limits need adjustment.
+Use `ImageBatchBudget::RETAINED_BYTES_PER_SPRITE` and
+`GPU_BYTES_PER_SPRITE` when sizing exact capacities instead of hard-coding the
+private GPU layout; empty batches still own one minimum GPU buffer slot.
+
 #### Host-shaped glyph runs
 
 The text layer deliberately starts below font selection and shaping. The host
@@ -760,6 +812,42 @@ the same frame order; stable insertion order preserves the host's chosen
 overlap. `GlyphRunStatistics` exposes submitted glyphs, rendered quads, misses,
 and retained bytes. Successful retained runs have zero misses and cause no
 texture upload after warm-up.
+
+Use `update_glyph_run(&atlas, &mut run, &positioned_glyphs)` for actual text or
+layout changes. The report exposes logical glyph count, capacity, instance
+upload/replacement, and aggregate retained/peak CPU bytes. The budget includes
+glyph descriptions, sprite descriptions and persistent conversion staging.
+Unknown glyphs, foreign/stale atlases, count/byte overflow and synchronous
+allocation failure leave the old run drawable with its old bounds. GPU device
+loss is not a rollback guarantee for work already submitted.
+`GlyphRunBudget::RETAINED_BYTES_PER_GLYPH` exposes the per-capacity CPU cost;
+atlas bytes are budgeted separately. Spare capacities and growth overlap are
+reported, not inferred from the current glyph count.
+
+For panel motion or hover color, do not rewrite the run:
+
+```rust,ignore
+let placement = ImageBatchPlacement::new(
+    LogicalScreenVector::new(scroll_x, scroll_y),
+    Color::WHITE.with_alpha(0.5),
+)?;
+frame.draw_glyph_run_placed(
+    &atlas, &run, placement, ImageSampling::Linear,
+    FramePassOptions::new(20).with_clip(panel_clip),
+)?;
+```
+
+Content translation is relative to the selected viewport origin. Per-draw tint
+multiplies per-glyph tint in straight linear RGBA. Viewport and clip do not move.
+Negative bearings and partially or wholly offscreen content are valid; a valid
+clip lying outside the target produces an empty effective scissor. Zero-size
+`ScreenClipRect` itself remains invalid. The same run may appear multiple times
+with independent translation/tint. `draw_image_batch_placed` follows the same
+contract. Existing unplaced calls mean zero translation and white tint.
+
+Try `cargo run --release --example text_ui_updates`; Space pauses, R resets,
+Esc exits. `--acceptance` runs bounded public update/recovery checks and requires
+real `Drawn` presentations; it is not a substitute for the GPU pixel oracle.
 
 ### 11. Particles and hard budgets
 
@@ -933,6 +1021,28 @@ private scene provenance. A handle from another `Scene3d` returns
 `ObjectNotFound` even when both objects have the same local numeric value.
 `Scene3d::set_visible` hides an object without releasing retained topology.
 
+Handles resolve through reusable indexed slots: `instance`, `set_transform`,
+`set_style` and `set_visible` perform O(1) object lookup. `remove(id)` returns
+the retired instance, preserves all survivor IDs and insertion order, and takes
+O(N) to compact dense storage. A reused slot receives a never-repeated ID;
+removed and foreign handles remain rejected. Drop the returned instance when
+its mesh is no longer needed; backend in-flight references may outlive it.
+
+`Scene3d::with_budget` bounds live objects, CPU bookkeeping and distinct mesh
+CPU/GPU allocations. `statistics()` separates reusable slot capacity from
+live count and deduplicates shared topology/buffers. External host references
+and opaque driver allocations are excluded. `set_mesh(id, &replacement)`
+validates ownership, style compatibility and final resource limits before
+rebinding only that object. Its report includes old/new mesh overlap. Other
+objects sharing the previous mesh retain their previous revision.
+
+`create_mesh3d_with_budget` checks source capacity, conversion staging and GPU
+bytes before caller-scale allocation. `replace_mesh3d` atomically assigns a new
+immutable revision to one retained handle and reports its upload/peak bytes;
+it does **not** modify clones or reuse same-capacity buffers. Scene rebinding is
+explicit. CPU source and nominal GPU overlap are bounded by old plus incoming
+revision limits, not by an immediate driver-deallocation promise.
+
 Opaque surfaces write `Depth32Float`. Edge classification is conservative:
 fragments occluded beyond a two-implementation-depth-unit tolerance receive a
 logical-pixel dash pattern, while coplanar and sub-depth-resolution separations
@@ -949,16 +1059,26 @@ visible edge is shortened; a fully clipped edge emits no fragments without
 rejecting the rest of the frame. Before submission, model and camera dot
 products are bounded independently of backend association/FMA choices, and the
 possible model-dot result interval becomes the input to camera validation. The
-surface validator also proves that each potentially visible triangle is fully
-inside the frustum and has one stable, normal projected signed-area direction
-across those legal arithmetic choices. A triangle wholly outside one common
-frustum plane remains in the submitted index buffer and report count but is a
-deterministic raster no-op. A surface triangle crossing a frustum plane is
-rejected with `UnportableSurfaceTopology` in v0.2; this fail-closed boundary
-avoids relying on backend-dependent clipped topology until an interval polygon
-clipper becomes part of the public contract. Keep the retained surface inside
-the camera frustum, split it at an application-controlled clipping boundary, or
-use explicit display edges when only a crossing construction line is required.
+surface validator proves a stable, normal projected signed-area direction.
+In 0.3, an object containing crossing triangles uses a bounded homogeneous
+polygon clipper across all six planes. It carries conservative transform and
+intersection intervals and emits canonical clip-space triangle lists only
+when topology is provable. Its display edges use the same canonical transform,
+so independently associated GPU dot products cannot separate an edge from its
+own surface. Fully inside objects keep the original retained indexed path.
+Entirely outside triangles remain deterministic no-ops; genuinely ambiguous,
+grazing, edge-on or unrepresentable geometry still fails closed.
+
+`validate_scene3d_for_target` and `render_scene3d_to_target_with_budget` use the
+same authoritative preflight. `Mesh3dRenderBudget` caps generated vertices,
+triangles and combined surface/edge upload bytes. `Mesh3dPreflightReport`
+distinguishes generated topology, clipped source triangles and discarded source
+triangles. Validation covers the complete visible set and additional work
+before target mutation or submission. Object-local errors carry `object_id()`
+and their underlying category; camera, target, renderer ownership and aggregate
+budget errors are scene-level. Hidden invalid objects are excluded. A successful
+preflight is valid for that exact scene/camera/target/budget, not a reusable
+permission to submit a subsequently changed scene.
 The edge validator then mirrors the remaining shader order through physical-width
 expansion, logical-distance and dash-phase calculation, NDC extrusion,
 homogeneous scaling, and final clip-coordinate addition. Hidden dash division
@@ -1581,6 +1701,9 @@ and measurement method.
 
 ### 30. Official release procedure
 
+The commands below target the planned 0.3.0 release. Do not run publication or
+create its tag while the changelog still says Unreleased or review is pending.
+
 Publishing a crates.io version is permanent: the same version cannot be
 overwritten or deleted. A broken version can be yanked, but its archive remains
 available to existing lockfiles. For that reason, publish only the exact clean
@@ -1610,8 +1733,8 @@ cargo login
 git fetch origin
 test -z "$(git status --porcelain --untracked-files=all)"
 test "$(git rev-parse HEAD)" = "$(git rev-parse origin/master)"
-test -z "$(git tag -l v0.2.0)"
-test -z "$(git ls-remote --tags origin refs/tags/v0.2.0)"
+test -z "$(git tag -l v0.3.0)"
+test -z "$(git ls-remote --tags origin refs/tags/v0.3.0)"
 ./scripts/linux_release_gate.sh
 ```
 
@@ -1625,10 +1748,10 @@ grep -Fxq "vcs_sha=$release_sha" \
 grep -Fxq 'status=passed' target/linux-release-evidence/completion.txt
 cargo package --list
 cargo package --locked
-crate=target/package/sim-engine-0.2.0.crate
-tar -xOf "$crate" sim-engine-0.2.0/.cargo_vcs_info.json \
+crate=target/package/sim-engine-0.3.0.crate
+tar -xOf "$crate" sim-engine-0.3.0/.cargo_vcs_info.json \
   | grep -Fq "\"sha1\": \"$release_sha\""
-! tar -xOf "$crate" sim-engine-0.2.0/.cargo_vcs_info.json \
+! tar -xOf "$crate" sim-engine-0.3.0/.cargo_vcs_info.json \
   | grep -Fq '"dirty": true'
 cargo publish --dry-run --locked
 ```
@@ -1648,7 +1771,7 @@ cargo publish --locked
 
 Cargo may time out while waiting for the new version to appear in the registry
 index even after a successful upload. Before retrying, check the crates.io
-package page or run `cargo info sim-engine@0.2.0`; retrying an accepted version
+package page or run `cargo info sim-engine@0.3.0`; retrying an accepted version
 cannot overwrite it.
 
 #### 3. Tag the published commit
@@ -1659,39 +1782,39 @@ release tag for an upload that never succeeded, while the packaged
 
 ```bash
 test "$(git rev-parse HEAD)" = "$release_sha"
-git tag -a v0.2.0 -m "Sim;Engine v0.2.0"
-test "$(git rev-list -n 1 v0.2.0)" = "$release_sha"
-git push origin v0.2.0
+git tag -a v0.3.0 -m "Sim;Engine v0.3.0"
+test "$(git rev-list -n 1 v0.3.0)" = "$release_sha"
+git push origin v0.3.0
 ```
 
 Tags for published versions are immutable release history. Never move or
-force-push one. If `v0.2.0` already exists, stop and verify its target instead
+force-push one. If `v0.3.0` already exists, stop and verify its target instead
 of replacing it.
 
 #### 4. Create the GitHub Release and verify public artifacts
 
-Prepare release notes from the `0.2.0` changelog section, then either use the
+Prepare release notes from the `0.3.0` changelog section, then either use the
 GitHub web interface or the GitHub CLI:
 
 ```bash
-gh release create v0.2.0 \
+gh release create v0.3.0 \
   --verify-tag \
-  --title "Sim;Engine v0.2.0" \
-  --notes-file /tmp/sim-engine-v0.2.0-notes.md
+  --title "Sim;Engine v0.3.0" \
+  --notes-file /tmp/sim-engine-v0.3.0-notes.md
 ```
 
 Finally verify all four public identities:
 
-- `https://crates.io/crates/sim-engine/0.2.0` shows version 0.2.0;
-- `https://docs.rs/sim-engine/0.2.0` completes successfully;
-- Git tag `v0.2.0` points to `$release_sha`;
+- `https://crates.io/crates/sim-engine/0.3.0` shows version 0.3.0;
+- `https://docs.rs/sim-engine/0.3.0` completes successfully;
+- Git tag `v0.3.0` points to `$release_sha`;
 - the GitHub Release names the same tag and is not marked as a prerelease.
 
 If a serious defect is discovered after publishing, do not attempt to delete
-or overwrite 0.2.0. Yank it and prepare a corrected patch release:
+or overwrite 0.3.0. Yank it and prepare a corrected patch release:
 
 ```bash
-cargo yank --version 0.2.0 sim-engine
+cargo yank --version 0.3.0 sim-engine
 ```
 
 The authoritative external references are Cargo's

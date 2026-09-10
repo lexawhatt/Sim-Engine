@@ -376,6 +376,10 @@ fn tessellate_open_stroke(
     style: crate::StrokeStyle2d,
     vertices: &mut Vec<Vertex>,
 ) -> Result<(), TessellationError> {
+    if style.has_tip_marker() {
+        push_exact_vector(points[0], points[1], style, vertices);
+        return Ok(());
+    }
     let color = style.stroke().color();
     if let Some(dash) = style.dash_pattern() {
         tessellate_dashed_stroke(points, dash, style, vertices)?;
@@ -1101,6 +1105,101 @@ fn push_world_round_cap(
             let offset = tangent * (angle.cos() * radius) + normal * (angle.sin() * radius);
             vertices.push(world_vertex_with_offset(center, offset, Vec2::ZERO, color));
         }
+    }
+}
+
+fn push_exact_vector(
+    from: Vec2,
+    to: Vec2,
+    style: crate::StrokeStyle2d,
+    vertices: &mut Vec<Vertex>,
+) {
+    let direction = to - from;
+    let color = style.stroke().color();
+    let half_width = style.stroke().width() * 0.5;
+    let world_width = style.width_mode() == crate::StrokeWidthMode2d::WorldUnits;
+    let normal = precise_unit(direction).perp();
+    let inset = |marker: Option<crate::StrokeMarker2d>, sign| {
+        marker
+            .filter(|marker| marker.anchor() == crate::StrokeMarkerAnchor2d::TipAtEndpoint)
+            .map_or(0.0, |marker| sign * marker.length().get())
+    };
+    let start_inset = inset(style.start_marker(), 1.0);
+    let end_inset = inset(style.end_marker(), -1.0);
+    let vertex = |position: Vec2, side: f32, tangent: f32| {
+        let mut vertex =
+            exact_vector_vertex(position, direction, side * half_width, tangent, color);
+        if world_width {
+            let offset = normal * (side * half_width);
+            vertex.world_offset = [offset.x, offset.y];
+            vertex.stroke_role = -2.0;
+        }
+        vertex
+    };
+    let start_positive = vertex(from, 1.0, start_inset);
+    let start_negative = vertex(from, -1.0, start_inset);
+    let end_positive = vertex(to, 1.0, end_inset);
+    let end_negative = vertex(to, -1.0, end_inset);
+    vertices.extend_from_slice(&[
+        start_positive,
+        end_positive,
+        end_negative,
+        start_positive,
+        end_negative,
+        start_negative,
+    ]);
+    for (position, start, marker) in [
+        (from, true, style.start_marker()),
+        (to, false, style.end_marker()),
+    ] {
+        let Some(marker) = marker else { continue };
+        if marker.anchor() == crate::StrokeMarkerAnchor2d::BaseAtEndpoint {
+            push_stroke_marker(position, direction, start, marker, color, vertices);
+            continue;
+        }
+        let tangent = inset(Some(marker), if start { 1.0 } else { -1.0 });
+        vertices.extend_from_slice(&[
+            exact_vector_vertex(position, direction, 0.0, 0.0, color),
+            exact_vector_vertex(
+                position,
+                direction,
+                marker.width().get() * 0.5,
+                tangent,
+                color,
+            ),
+            exact_vector_vertex(
+                position,
+                direction,
+                -marker.width().get() * 0.5,
+                tangent,
+                color,
+            ),
+        ]);
+    }
+}
+
+fn exact_vector_vertex(
+    position: Vec2,
+    direction: Vec2,
+    normal: f32,
+    tangent: f32,
+    color: Color,
+) -> Vertex {
+    Vertex {
+        world_position: [position.x, position.y],
+        depth: 0.0,
+        world_offset: [0.0; 2],
+        screen_offset: [0.0; 2],
+        // Unlike joined strokes this branch needs the full projected segment
+        // span to bound inward markers after arbitrary camera transforms.
+        previous_direction: [direction.x, direction.y],
+        next_direction: [direction.x, direction.y],
+        normal_distance: normal,
+        tangent_distance: tangent,
+        miter_limit: 1.0,
+        stroke_role: -1.0,
+        stroke_parameter: 0.0,
+        color: color.to_array(),
     }
 }
 

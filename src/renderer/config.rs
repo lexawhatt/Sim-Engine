@@ -360,6 +360,7 @@ impl WgpuRenderer {
         self.heatmap_uniform_buffer = heatmap_uniform_buffer;
         self.heatmap_bind_group_layout = heatmap_bind_group_layout;
         self.color_map_cache = None;
+        self.frame_cache.clear();
         self.vertex_buffer = vertex_buffer;
         self.particle_unit_buffer = particle_unit_buffer;
         self.vertex_capacity = INITIAL_VERTEX_CAPACITY;

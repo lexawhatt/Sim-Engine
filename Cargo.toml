@@ -1,6 +1,6 @@
 [package]
 name = "sim-engine"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.90"
 license = "MIT OR Apache-2.0"
@@ -76,4 +76,12 @@ required-features = ["wgpu"]
 
 [[example]]
 name = "cylinder_derivation_3d"
+required-features = ["wgpu"]
+
+[[example]]
+name = "text_ui_updates"
+required-features = ["wgpu"]
+
+[[example]]
+name = "frame_cache_benchmark"
 required-features = ["wgpu"]

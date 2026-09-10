@@ -1,5 +1,9 @@
 use super::*;
 
+mod cache;
+pub(super) use cache::FrameCache;
+pub use cache::{FrameCacheBudget, FrameCacheStatistics};
+
 /// Work category constrained by a [`FrameBudget`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrameBudgetResource {
@@ -548,6 +552,19 @@ pub struct FrameComposer<'frame> {
     scalar_lut_allocation_count: usize,
     planned: FrameStatistics,
     next_insertion: usize,
+    cache: FrameCache,
+}
+
+impl Drop for FrameComposer<'_> {
+    fn drop(&mut self) {
+        self.cache.items = cache::recycle_items(std::mem::take(&mut self.items));
+        self.retained_resources.clear();
+        self.scalar_luts.clear();
+        self.cache.retained_resources = std::mem::take(&mut self.retained_resources);
+        self.cache.scalar_luts = std::mem::take(&mut self.scalar_luts);
+        self.cache.finish();
+        self.renderer.frame_cache = std::mem::take(&mut self.cache);
+    }
 }
 
 struct ScalarLutPlan {
@@ -717,6 +734,7 @@ enum FrameItem<'frame> {
     ImageBatch {
         image: &'frame Image2d,
         batch: &'frame ImageBatch2d,
+        placement: ImageBatchPlacement,
         sampling: ImageSampling,
         options: FramePassOptions,
         insertion: usize,
@@ -780,17 +798,23 @@ impl WgpuRenderer {
         if !background.is_normalized() {
             return Err(FrameComposerError::InvalidBackground);
         }
+        let mut cache = std::mem::take(&mut self.frame_cache);
+        cache.begin();
+        let items = std::mem::take(&mut cache.items);
+        let retained_resources = std::mem::take(&mut cache.retained_resources);
+        let scalar_luts = std::mem::take(&mut cache.scalar_luts);
         Ok(FrameComposer {
             renderer: self,
             background,
             budget,
-            items: Vec::new(),
-            retained_resources: Vec::new(),
-            scalar_luts: Vec::new(),
+            items,
+            retained_resources,
+            scalar_luts,
             scalar_lut_upload_count: 0,
             scalar_lut_allocation_count: 0,
             planned: FrameStatistics::default(),
             next_insertion: 0,
+            cache,
         })
     }
 }
@@ -1347,12 +1371,39 @@ impl<'frame> FrameComposer<'frame> {
         sampling: ImageSampling,
         options: FramePassOptions,
     ) -> Result<(), FrameComposerError> {
+        self.draw_image_batch_placed(
+            image,
+            batch,
+            ImageBatchPlacement::default(),
+            sampling,
+            options,
+        )
+    }
+
+    /// Draws a retained batch with independent logical translation and tint.
+    /// The pass viewport and clip stay fixed while the content moves; negative
+    /// offsets and partially offscreen content are supported without re-upload.
+    pub fn draw_image_batch_placed(
+        &mut self,
+        image: &'frame Image2d,
+        batch: &'frame ImageBatch2d,
+        placement: ImageBatchPlacement,
+        sampling: ImageSampling,
+        options: FramePassOptions,
+    ) -> Result<(), FrameComposerError> {
         if self.renderer.validate_image_batch(image, batch).is_err() {
             return Err(FrameComposerError::RendererMismatch {
                 source: FrameSourceKind::Image,
             });
         }
-        self.push_retained_image_batch(image, batch, sampling, options, FrameSourceKind::Image)
+        self.push_retained_image_batch(
+            image,
+            batch,
+            placement,
+            sampling,
+            options,
+            FrameSourceKind::Image,
+        )
     }
 
     /// Adds one host-shaped retained glyph run as one instanced draw when non-empty.
@@ -1364,6 +1415,27 @@ impl<'frame> FrameComposer<'frame> {
         &mut self,
         atlas: &'frame GlyphAtlas2d,
         run: &'frame GlyphRun2d,
+        sampling: ImageSampling,
+        options: FramePassOptions,
+    ) -> Result<(), FrameComposerError> {
+        self.draw_glyph_run_placed(
+            atlas,
+            run,
+            ImageBatchPlacement::default(),
+            sampling,
+            options,
+        )
+    }
+
+    /// Draws a shared glyph layout with independent logical translation and tint.
+    /// Glyph bearings and per-glyph tint are preserved; draw tint multiplies them.
+    /// The item clip is not translated. Existing default calls are equivalent
+    /// to zero translation and white tint.
+    pub fn draw_glyph_run_placed(
+        &mut self,
+        atlas: &'frame GlyphAtlas2d,
+        run: &'frame GlyphRun2d,
+        placement: ImageBatchPlacement,
         sampling: ImageSampling,
         options: FramePassOptions,
     ) -> Result<(), FrameComposerError> {
@@ -1415,6 +1487,7 @@ impl<'frame> FrameComposer<'frame> {
             FrameItem::ImageBatch {
                 image,
                 batch,
+                placement,
                 sampling,
                 options,
                 insertion: self.next_insertion,
@@ -1426,6 +1499,7 @@ impl<'frame> FrameComposer<'frame> {
         &mut self,
         image: &'frame Image2d,
         batch: &'frame ImageBatch2d,
+        placement: ImageBatchPlacement,
         sampling: ImageSampling,
         options: FramePassOptions,
         source: FrameSourceKind,
@@ -1463,6 +1537,7 @@ impl<'frame> FrameComposer<'frame> {
             FrameItem::ImageBatch {
                 image,
                 batch,
+                placement,
                 sampling,
                 options,
                 insertion: self.next_insertion,
@@ -1629,47 +1704,49 @@ enum ReadyItem<'frame> {
     },
 }
 
+#[derive(Clone)]
 struct FrameBinding {
     _buffer: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
 }
 
-fn present_frame(composer: FrameComposer<'_>) -> Result<FrameReport, FrameComposerError> {
-    let FrameComposer {
-        renderer,
-        background,
-        budget,
-        items,
-        retained_resources: _,
-        scalar_luts: _,
-        scalar_lut_upload_count: _,
-        scalar_lut_allocation_count: _,
-        planned,
-        next_insertion: _,
-    } = composer;
+fn present_frame(mut composer: FrameComposer<'_>) -> Result<FrameReport, FrameComposerError> {
+    let renderer = &mut *composer.renderer;
     // Always return the transient allocation, including structured error
     // paths before surface acquisition.
     let mut streaming_vertices = std::mem::take(&mut renderer.vertices);
     streaming_vertices.clear();
+    let mut ready = std::mem::take(&mut composer.cache.ready);
+    let mut bindings = std::mem::take(&mut composer.cache.bindings);
     let result = present_frame_with_vertices(
         renderer,
-        background,
-        budget,
-        items,
-        planned,
+        composer.background,
+        composer.budget,
+        &mut composer.items,
+        composer.planned,
         &mut streaming_vertices,
+        &mut ready,
+        &mut bindings,
+        &mut composer.cache,
     );
     renderer.vertices = streaming_vertices;
+    composer.cache.ready = cache::recycle_ready_with_batches(ready, &mut composer.cache.batches);
+    bindings.clear();
+    composer.cache.bindings = bindings;
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 fn present_frame_with_vertices<'frame>(
     renderer: &mut WgpuRenderer,
     background: Color,
     budget: FrameBudget,
-    mut items: Vec<FrameItem<'frame>>,
+    items: &mut Vec<FrameItem<'frame>>,
     planned: FrameStatistics,
     streaming_vertices: &mut Vec<Vertex>,
+    ready: &mut Vec<ReadyItem<'frame>>,
+    bindings: &mut Vec<FrameBinding>,
+    cache: &mut FrameCache,
 ) -> Result<FrameReport, FrameComposerError> {
     let frame_started_at = Instant::now();
     items.sort_unstable_by_key(FrameItem::sort_key);
@@ -1678,8 +1755,7 @@ fn present_frame_with_vertices<'frame>(
         .logical_viewport()
         .map_err(|_| RendererFrameError::InvalidViewport)?;
     let tessellation_started_at = Instant::now();
-    preflight_frame_items(renderer, target_viewport, &items)?;
-    let mut ready = Vec::new();
+    preflight_frame_items(renderer, target_viewport, items)?;
     ready
         .try_reserve(items.len())
         .map_err(|_| FrameComposerError::AllocationFailed {
@@ -1687,13 +1763,21 @@ fn present_frame_with_vertices<'frame>(
                 .len()
                 .saturating_mul(std::mem::size_of::<ReadyItem<'_>>()),
         })?;
+    cache
+        .batches
+        .try_reserve(items.len().saturating_sub(cache.batches.len()))
+        .map_err(|_| FrameComposerError::AllocationFailed {
+            requested_bytes: items
+                .len()
+                .saturating_mul(std::mem::size_of::<Vec<PreparedDrawBatch>>()),
+        })?;
     let mut statistics = FrameStatistics::default();
     let mut tessellation_stats = TessellationStats::default();
     let mut geometry_reused = false;
     let mut geometry_streamed = false;
     let mut simulated_color_map_lut = renderer.color_map_cache.as_ref().map(|cache| cache.lut);
 
-    for item in items {
+    for item in items.drain(..) {
         match item {
             FrameItem::Scene {
                 scene,
@@ -1708,9 +1792,10 @@ fn present_frame_with_vertices<'frame>(
                     renderer,
                     target_viewport,
                     &mut *streaming_vertices,
-                    &mut ready,
+                    ready,
                     &mut statistics,
                     &mut tessellation_stats,
+                    cache.batches.pop().unwrap_or_default(),
                 )?;
                 geometry_streamed = true;
             }
@@ -1738,9 +1823,10 @@ fn present_frame_with_vertices<'frame>(
                     camera_uniform,
                     viewport,
                     &mut *streaming_vertices,
-                    &mut ready,
+                    ready,
                     &mut statistics,
                     &mut tessellation_stats,
+                    cache.batches.pop().unwrap_or_default(),
                 )?;
                 geometry_streamed = true;
             }
@@ -1763,9 +1849,10 @@ fn present_frame_with_vertices<'frame>(
                     camera,
                     viewport,
                     target_viewport,
-                    &mut ready,
+                    ready,
                     &mut statistics,
                     &mut tessellation_stats,
+                    cache.batches.pop().unwrap_or_default(),
                 )?;
                 geometry_reused = true;
             }
@@ -1785,9 +1872,10 @@ fn present_frame_with_vertices<'frame>(
                     camera,
                     viewport,
                     target_viewport,
-                    &mut ready,
+                    ready,
                     &mut statistics,
                     &mut tessellation_stats,
+                    cache.batches.pop().unwrap_or_default(),
                 )?;
                 geometry_reused = true;
             }
@@ -1814,9 +1902,10 @@ fn present_frame_with_vertices<'frame>(
                     camera,
                     viewport,
                     target_viewport,
-                    &mut ready,
+                    ready,
                     &mut statistics,
                     &mut tessellation_stats,
+                    cache.batches.pop().unwrap_or_default(),
                 )?;
                 geometry_streamed = true;
             }
@@ -1832,7 +1921,7 @@ fn present_frame_with_vertices<'frame>(
                     camera,
                     viewport,
                     target_viewport,
-                    &mut ready,
+                    ready,
                     &mut statistics,
                 )?;
                 geometry_streamed = true;
@@ -2041,27 +2130,16 @@ fn present_frame_with_vertices<'frame>(
             FrameItem::ImageBatch {
                 image,
                 batch,
+                placement,
                 sampling,
                 options,
                 ..
             } => {
                 let viewport = resolve_viewport(renderer, target_viewport, options)?;
-                let uniform = ImageUniform {
-                    destination: [
-                        2.0 / target_viewport.width(),
-                        -2.0 / target_viewport.height(),
-                        -1.0,
-                        1.0,
-                    ],
-                    uv_rect: [viewport.origin.x, viewport.origin.y, 0.0, 0.0],
-                    tint: Color::WHITE.to_array(),
-                    world_clip_x: [0.0; 4],
-                    world_clip_y: [0.0; 4],
-                    world_mode: [0.0; 4],
-                };
+                let uniform = image::batch_uniform(target_viewport, viewport.origin, placement)?;
                 if !image_sprites_are_safe_for_target(
                     batch.sprites(),
-                    viewport.origin,
+                    Vec2::new(uniform.uv_rect[0], uniform.uv_rect[1]),
                     uniform.destination,
                 ) {
                     return Err(RendererFrameError::InvalidGeometryTransform.into());
@@ -2152,7 +2230,6 @@ fn present_frame_with_vertices<'frame>(
     validate_frame_budget(budget, statistics)?;
     renderer.ensure_vertex_capacity(streaming_vertices.len())?;
 
-    let mut bindings = Vec::new();
     bindings
         .try_reserve(ready.len())
         .map_err(|_| FrameComposerError::AllocationFailed {
@@ -2160,6 +2237,7 @@ fn present_frame_with_vertices<'frame>(
                 .len()
                 .saturating_mul(std::mem::size_of::<FrameBinding>()),
         })?;
+    cache.reserve_slots(ready.len())?;
     let tessellation = tessellation_started_at.elapsed();
 
     // Surface availability is resolved after all fallible CPU preparation but
@@ -2170,7 +2248,7 @@ fn present_frame_with_vertices<'frame>(
         wgpu::CurrentSurfaceTexture::Success(texture)
         | wgpu::CurrentSurfaceTexture::Suboptimal(texture) => texture,
         wgpu::CurrentSurfaceTexture::Timeout => {
-            set_particle_rendered(&mut ready, false);
+            set_particle_rendered(ready, false);
             return Ok(frame_report(
                 RenderStatus::Skipped(RendererSurfaceStatus::Timeout),
                 statistics.without_uploads(),
@@ -2186,7 +2264,7 @@ fn present_frame_with_vertices<'frame>(
             ));
         }
         wgpu::CurrentSurfaceTexture::Occluded => {
-            set_particle_rendered(&mut ready, false);
+            set_particle_rendered(ready, false);
             return Ok(frame_report(
                 RenderStatus::Skipped(RendererSurfaceStatus::Occluded),
                 statistics.without_uploads(),
@@ -2203,7 +2281,7 @@ fn present_frame_with_vertices<'frame>(
         }
         wgpu::CurrentSurfaceTexture::Outdated => {
             let _ = renderer.resize(renderer.config.width, renderer.config.height);
-            set_particle_rendered(&mut ready, false);
+            set_particle_rendered(ready, false);
             return Ok(frame_report(
                 RenderStatus::Skipped(RendererSurfaceStatus::Outdated),
                 statistics.without_uploads(),
@@ -2229,9 +2307,10 @@ fn present_frame_with_vertices<'frame>(
 
     let mut binding_upload = Duration::ZERO;
     let mut camera_uniform_upload = Duration::ZERO;
-    for item in &ready {
+    let planned_uniform_bytes = ready.iter().map(ready_uniform_bytes).sum::<usize>();
+    for (slot, item) in ready.iter().enumerate() {
         let binding_started_at = Instant::now();
-        bindings.push(create_frame_binding(renderer, item));
+        bindings.push(cache.binding(renderer, item, slot));
         let elapsed = binding_started_at.elapsed();
         match item {
             ReadyItem::Geometry(_) | ReadyItem::Particle { .. } => {
@@ -2245,6 +2324,10 @@ fn present_frame_with_vertices<'frame>(
             }
         }
     }
+    statistics.upload_bytes = statistics
+        .upload_bytes
+        .saturating_sub(planned_uniform_bytes)
+        .saturating_add(cache.uploaded_uniform_bytes());
 
     let upload_started_at = Instant::now();
     if !streaming_vertices.is_empty() {
@@ -2254,7 +2337,7 @@ fn present_frame_with_vertices<'frame>(
             bytemuck::cast_slice(streaming_vertices),
         );
     }
-    for item in &ready {
+    for item in ready.iter() {
         if let ReadyItem::Particle {
             field,
             visible_count,
@@ -2307,14 +2390,14 @@ fn present_frame_with_vertices<'frame>(
             occlusion_query_set: None,
             multiview_mask: None,
         });
-        for (item, binding) in ready.iter().zip(&bindings) {
+        for (item, binding) in ready.iter().zip(bindings.iter()) {
             encode_ready_item(renderer, &mut pass, item, binding);
         }
     }
     renderer.queue.submit([encoder.finish()]);
     renderer.notify_before_present();
     renderer.queue.present(surface_texture);
-    set_particle_rendered(&mut ready, true);
+    set_particle_rendered(ready, true);
     let encode_submit_present = encode_started_at.elapsed();
     Ok(frame_report(
         RenderStatus::Drawn,
@@ -2534,18 +2617,18 @@ fn preflight_frame_items(
                     }
                 }
             }
-            FrameItem::ImageBatch { batch, options, .. } => {
+            FrameItem::ImageBatch {
+                batch,
+                options,
+                placement,
+                ..
+            } => {
                 let viewport = resolve_viewport(renderer, target_viewport, *options)?;
-                let clip_transform = [
-                    2.0 / target_viewport.width(),
-                    -2.0 / target_viewport.height(),
-                    -1.0,
-                    1.0,
-                ];
+                let uniform = image::batch_uniform(target_viewport, viewport.origin, *placement)?;
                 if !image_sprites_are_safe_for_target(
                     batch.sprites(),
-                    viewport.origin,
-                    clip_transform,
+                    Vec2::new(uniform.uv_rect[0], uniform.uv_rect[1]),
+                    uniform.destination,
                 ) {
                     return Err(RendererFrameError::InvalidGeometryTransform.into());
                 }
@@ -2779,6 +2862,7 @@ fn prepare_streaming_scene<'frame>(
     ready: &mut Vec<ReadyItem<'frame>>,
     statistics: &mut FrameStatistics,
     aggregate: &mut TessellationStats,
+    batches: Vec<PreparedDrawBatch>,
 ) -> Result<(), FrameComposerError> {
     let viewport = resolve_viewport(renderer, target_viewport, options)?;
     let camera_uniform =
@@ -2800,6 +2884,7 @@ fn prepare_streaming_scene<'frame>(
         ready,
         statistics,
         aggregate,
+        batches,
     )
 }
 
@@ -2812,9 +2897,9 @@ fn prepare_streaming_scene_resolved<'frame>(
     ready: &mut Vec<ReadyItem<'frame>>,
     statistics: &mut FrameStatistics,
     aggregate: &mut TessellationStats,
+    mut batches: Vec<PreparedDrawBatch>,
 ) -> Result<(), FrameComposerError> {
     let vertex_start = streaming_vertices.len();
-    let mut batches = Vec::new();
     let stats = tessellate_scene(scene, streaming_vertices, &mut batches)
         .map_err(RendererFrameError::from)?;
     let vertices = &streaming_vertices[vertex_start..];
@@ -2870,6 +2955,7 @@ fn prepare_retained_geometry<'frame>(
     ready: &mut Vec<ReadyItem<'frame>>,
     statistics: &mut FrameStatistics,
     aggregate: &mut TessellationStats,
+    mut owned_batches: Vec<PreparedDrawBatch>,
 ) -> Result<(), FrameComposerError> {
     let camera_uniform =
         CameraUniform::new_in_region(camera, viewport.viewport, viewport.origin, target_viewport)
@@ -2882,7 +2968,6 @@ fn prepare_retained_geometry<'frame>(
     ) {
         return Err(RendererFrameError::InvalidGeometryTransform.into());
     }
-    let mut owned_batches = Vec::new();
     owned_batches
         .try_reserve(batches.len())
         .map_err(|_| FrameComposerError::AllocationFailed {
@@ -3088,6 +3173,17 @@ fn create_frame_binding(renderer: &mut WgpuRenderer, item: &ReadyItem<'_>) -> Fr
                 bind_group,
             }
         }
+    }
+}
+
+fn ready_uniform_bytes(item: &ReadyItem<'_>) -> usize {
+    match item {
+        ReadyItem::Geometry(_) | ReadyItem::Particle { .. } => std::mem::size_of::<CameraUniform>(),
+        ReadyItem::Scalar { .. } => std::mem::size_of::<HeatmapUniform>(),
+        ReadyItem::Image { .. } | ReadyItem::ImageBatch { .. } => {
+            std::mem::size_of::<ImageUniform>()
+        }
+        ReadyItem::Target { .. } => std::mem::size_of::<CompositeUniform>(),
     }
 }
 
@@ -3625,6 +3721,7 @@ mod tests {
                 &mut ready,
                 &mut statistics,
                 &mut aggregate,
+                Vec::new(),
             ),
             Err(FrameComposerError::Frame(
                 RendererFrameError::InvalidGeometryTransform
@@ -3675,6 +3772,7 @@ mod tests {
                 &mut ready,
                 &mut statistics,
                 &mut aggregate,
+                Vec::new(),
             ),
             Err(FrameComposerError::Frame(
                 RendererFrameError::InvalidGeometryTransform

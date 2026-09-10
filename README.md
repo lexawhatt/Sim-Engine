@@ -10,7 +10,7 @@ clipping, interpolation, GPU resources, composition, recovery, and rendering
 diagnostics. Physics, simulation stepping, domain entities, UI navigation, and
 plugins remain in the host application.
 
-Version **0.2.0** is the current official Sim;Engine release. The crate remains
+This branch develops **0.3.0**; **0.2.0** remains the published release. The crate remains
 pre-1.0, and its supported release target is Linux with Vulkan. A concrete
 adapter/driver is supported when the mandatory semantic fixture passes on it;
 untested drivers are not inferred from Mesa evidence. The minimum supported
@@ -24,11 +24,18 @@ host-shaped glyph runs, explicitly budgeted dynamic triangles, richer bounded
 [0.2.0 changelog](https://github.com/lexawhatt/Sim-Engine/blob/v0.2.0/CHANGELOG.md#020---2026-09-02) for the complete delta from
 0.1.0.
 
+The 0.3 work adds capacity-aware glyph/sprite updates, independent per-draw
+placement and tint, bounded reusable composition storage, portable filled-3D
+clipping with object-attributed errors, indexed editable 3D scenes, and exact-tip
+scientific arrows. These APIs require this checkout until 0.3 is published;
+they are not capabilities of the crates.io 0.2 package.
+
 ## Documentation
 
-- [Library documentation](https://github.com/lexawhatt/Sim-Engine/blob/v0.2.0/DOCUMENTATION.md) - installation, concepts, every
+- [Development documentation](DOCUMENTATION.md) - installation, concepts, every
   rendering path, recovery, performance, architecture, and examples.
-- [Changelog](https://github.com/lexawhatt/Sim-Engine/blob/v0.2.0/CHANGELOG.md) - release history and user-visible changes.
+- [Changelog](CHANGELOG.md) - release history, migration, and unreleased changes.
+- [Published 0.2 documentation](https://github.com/lexawhatt/Sim-Engine/blob/v0.2.0/DOCUMENTATION.md) - the frozen guide for crates.io users.
 - Generated API reference:
 
   ```bash
@@ -85,7 +92,8 @@ are not part of v0.2.0.
 
 ## Installation
 
-The default feature set includes the `wgpu` renderer:
+The commands below install the published **0.2** release, not the development
+APIs described above. The default feature set includes the `wgpu` renderer:
 
 ```bash
 cargo add sim-engine@0.2
@@ -104,6 +112,19 @@ Use core visual-state APIs without GPU dependencies:
 [dependencies]
 sim-engine = { version = "0.2", default-features = false }
 ```
+
+For 0.3 development, depend on your checked-out source and pin its commit in
+your integration's lockfile/repository. Run the new fixtures from this checkout:
+
+```bash
+cargo run --release --example text_ui_updates
+cargo run --release --example text_ui_updates -- --acceptance
+cargo run --release --example frame_cache_benchmark
+```
+
+The text demo owns its tiny numeric font; Engine adds no font shaping, UI
+navigation, audio, or game-domain dependency. `--acceptance` exercises public
+update, composition and recovery routes and requires actual presented frames.
 
 ## Quick Start
 

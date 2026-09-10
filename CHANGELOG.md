@@ -7,7 +7,63 @@ changes.
 
 ## Unreleased
 
-No unreleased changes.
+Development target: **0.3.0**, not yet published. This section describes changes
+from the official 0.2.0 release; a development version is not release sign-off.
+
+### Added
+
+- Borrowed-slice `update_glyph_run` and `update_image_batch`: unchanged data
+  skips upload; same-capacity edits retain CPU conversion arrays and GPU instance
+  buffers; growth is bounded and synchronous errors preserve the old drawable.
+- `GlyphRunUploadReport` and expanded `ImageBatchUploadReport` distinguish live
+  count, CPU/GPU capacity, actual upload, replacement, and old/new overlap.
+- `ImageBatchPlacement`, `draw_glyph_run_placed` and `draw_image_batch_placed`
+  apply logical translation and multiplicative normalized linear tint without
+  rebuilding a shared run. Clip and viewport remain stationary.
+- `FrameCacheBudget` and cache statistics for reusable composition scratch and
+  camera/image/target bindings; unchanged uniforms skip writes. Cache clearing,
+  abort cleanup, and renderer-generation reset are explicit.
+- Bounded six-plane filled-triangle clipping for retained 3D, sharing the same
+  authoritative preflight with `validate_scene3d_for_target`; generated work is
+  reported and limited by `Mesh3dRenderBudget`.
+- Object-local preflight failures carry a stable `Object3dId` and original
+  category. Camera, target and aggregate capacity errors remain scene-level.
+- Constant-time live-object lookup; `Scene3d::instance`, `remove`, `set_mesh`,
+  explicit `Scene3dBudget`, and deduplicated source/buffer accounting. Removal
+  preserves survivor IDs and insertion order; freed slots do not revive old IDs.
+- Budgeted immutable mesh creation/replacement with nominal staging and old/new
+  overlap reports. Replacing one handle does not mutate its existing clones.
+- `StrokeMarkerAnchor2d::TipAtEndpoint` for exact scientific vectors. The
+  existing outward `BaseAtEndpoint` remains the default. Exact-tip markers
+  currently require undashed two-point paths and use a butt-ended shaft.
+- Public text/UI update/recovery fixture and paired frame-cache benchmark.
+  Regression coverage includes clipped and tinted shared glyphs, fractional
+  DPI, allocation reuse, short exact-tip arrows, and 3D frustum boundaries.
+
+### Changed and migration from 0.2
+
+- `ImageBatchBudget` and `GlyphRunBudget` now include retained GPU-instance
+  conversion staging in their CPU byte limits. Increase hand-computed 0.2
+  limits to cover it; count limits alone do not override byte limits.
+- `replace_image_batch` delegates to the capacity-aware update route: a
+  successful replacement no longer necessarily creates a new instance buffer.
+- `Scene3d` has finite default object/source/buffer limits; use `with_budget`
+  for an explicitly sized workload. Mixing renderer generations is rejected
+  when inserting or rebinding meshes, not only at render time.
+- Match context-bearing 3D preflight errors instead of assuming every geometry
+  rejection is a bare scene-level category. Numerically ambiguous clipping
+  still fails closed; supported clipping does not relax precision validation.
+- Monotonically ordered Scene insertion appends directly, with the existing
+  ordering fallback for out-of-order input. Paired warmed tests preserve exact
+  command order, statistics, budgets and zero allocation counts.
+
+### Scope and measurement
+
+Mesh replacement is immutable, not in-place topology streaming. Cache metrics
+exclude opaque driver allocations; no whole-frame zero-allocation or universal
+FPS claim follows from library staging reuse. Performance comparisons require
+the same workload, adapter, format and presentation mode. 0.3 release evidence
+will be recorded after integration and independent review.
 
 ## 0.2.0 - 2026-09-02
 

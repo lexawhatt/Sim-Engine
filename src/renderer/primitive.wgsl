@@ -73,7 +73,24 @@ fn vs_main(input: VertexIn) -> VertexOut {
     );
     var screen = projected_world + projected_world_offset;
 
-    if abs(input.normal_distance) > 0.0 || abs(input.tangent_distance) > 0.0 {
+    if input.stroke_role < 0.0 {
+        let projected_direction = vec2<f32>(
+            dot(camera.world_to_screen_x.xy, input.next_direction),
+            dot(camera.world_to_screen_y.xy, input.next_direction),
+        );
+        let tangent = safe_unit(projected_direction);
+        let normal = vec2<f32>(-tangent.y, tangent.x);
+        // Dominant-axis length is a conservative bound on Euclidean length.
+        // A quarter at each end leaves at least half the shaft, including
+        // arbitrarily short vectors, without a length-squared overflow.
+        let maximum_inset = max(abs(projected_direction.x), abs(projected_direction.y)) * 0.25;
+        let inset = clamp(input.tangent_distance, -maximum_inset, maximum_inset);
+        var normal_distance = input.normal_distance;
+        if input.stroke_role == -2.0 {
+            normal_distance = dot(projected_world_offset, normal);
+        }
+        screen = projected_world + normal * normal_distance + tangent * inset;
+    } else if abs(input.normal_distance) > 0.0 || abs(input.tangent_distance) > 0.0 {
         let previous_screen = vec2<f32>(
             dot(camera.world_to_screen_x.xy, input.previous_direction),
             dot(camera.world_to_screen_y.xy, input.previous_direction),

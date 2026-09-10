@@ -316,6 +316,9 @@ pub enum SceneError {
     },
     /// Dash/gap boundaries collapse at the source path's `f32` coordinate scale.
     UnrepresentableStrokePattern(ScenePrimitive),
+    /// A tip-anchored arrow was used with dashes or a path containing more than
+    /// two points. Exact-vector markers currently require an undashed segment.
+    UnsupportedTipMarkerPath(ScenePrimitive),
     /// Shadow offset, spread, or color is invalid.
     InvalidShadow(ScenePrimitive),
     /// Active logical screen clip is non-finite or empty.
@@ -640,7 +643,19 @@ impl Scene {
     }
 
     /// Appends a command to a layer with structured rejection diagnostics.
+    ///
+    /// An incoming layer at or above the last layer appends without searching.
+    /// Out-of-order layers use stable insertion. Both paths perform the same
+    /// validation, budget checks, statistics updates, and capacity reuse.
     pub fn try_push_to_layer(
+        &mut self,
+        layer: Layer,
+        command: DrawCommand,
+    ) -> Result<(), SceneError> {
+        self.try_push_to_layer_ordered::<true>(layer, command)
+    }
+
+    fn try_push_to_layer_ordered<const FAST_APPEND: bool>(
         &mut self,
         layer: Layer,
         command: DrawCommand,
@@ -648,7 +663,7 @@ impl Scene {
         let primitive = command.primitive();
         self.statistics.requested_commands = self.statistics.requested_commands.saturating_add(1);
         self.statistics.requested_by_primitive.increment(primitive);
-        let result = self.try_push_to_layer_inner(layer, command);
+        let result = self.try_push_to_layer_inner::<FAST_APPEND>(layer, command);
         if result.is_err() {
             self.statistics.rejected_commands = self.statistics.rejected_commands.saturating_add(1);
             self.statistics.rejected_by_primitive.increment(primitive);
@@ -871,7 +886,7 @@ impl Scene {
         self.record_batch_rejection(1, counts);
     }
 
-    fn try_push_to_layer_inner(
+    fn try_push_to_layer_inner<const FAST_APPEND: bool>(
         &mut self,
         layer: Layer,
         command: DrawCommand,
@@ -946,11 +961,23 @@ impl Scene {
             screen_clip: self.current_screen_clip,
             command,
         };
-        let position = self.commands.partition_point(|existing| {
-            existing.layer < scene_command.layer
-                || (existing.layer == scene_command.layer && existing.order <= scene_command.order)
-        });
-        self.commands.insert(position, scene_command);
+        if FAST_APPEND
+            && self
+                .commands
+                .last()
+                .is_none_or(|existing| existing.layer <= layer)
+        {
+            // Orders are monotonic even at saturation, so equal layers can
+            // append without disturbing stable painter order.
+            self.commands.push(scene_command);
+        } else {
+            let position = self.commands.partition_point(|existing| {
+                existing.layer < scene_command.layer
+                    || (existing.layer == scene_command.layer
+                        && existing.order <= scene_command.order)
+            });
+            self.commands.insert(position, scene_command);
+        }
         self.owned_payload_bytes = owned_payload_bytes;
         self.next_order = self.next_order.saturating_add(1);
         self.statistics = requested;
@@ -1579,6 +1606,9 @@ fn validate_stroke_path_iter<I>(
 where
     I: Iterator<Item = Vec2> + Clone,
 {
+    if style.has_tip_marker() && (style.dash.is_some() || points.clone().count() != 2) {
+        return Err(SceneError::UnsupportedTipMarkerPath(primitive));
+    }
     let maximum_offset = f64::from(style.stroke.width) * 0.5 * f64::from(style.miter_limit);
     if !maximum_offset.is_finite() || maximum_offset > f64::from(f32::MAX) {
         return Err(SceneError::InvalidStroke(primitive));
@@ -2098,11 +2128,27 @@ impl StrokeDashPattern2d {
     }
 }
 
+/// Placement of a logical-pixel arrow relative to its mathematical path endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StrokeMarkerAnchor2d {
+    /// Put the marker base at the endpoint and extend its tip outward.
+    BaseAtEndpoint,
+    /// Put the marker tip exactly at the endpoint and shorten the shaft inward.
+    ///
+    /// Supported on undashed two-point paths only. Both shaft ends use butt
+    /// boundaries. Each inward length is bounded to one quarter of the projected
+    /// segment's larger absolute X/Y span, preserving a non-inverted shaft even
+    /// with two markers. Marker width stays in logical pixels. World-width shaft
+    /// boundaries are perpendicular to the projected tangent, keeping their
+    /// projected perpendicular thickness without shear into the arrowhead.
+    TipAtEndpoint,
+}
+
 /// Reusable arrow marker definition for a line endpoint.
 ///
 /// Marker dimensions are logical pixels even when the line body uses a world
-/// width, keeping scientific annotations readable under camera zoom. A marked
-/// endpoint ignores the ordinary cap: the body ends with a butt boundary at
+/// width, keeping scientific annotations readable under camera zoom. By default,
+/// a marked endpoint ignores the ordinary cap: the body ends with a butt boundary at
 /// the path endpoint, which is also the marker base. The filled triangle grows
 /// outward from the path, so markers remain interior-disjoint from arbitrarily
 /// short, dashed, or camera-scaled terminal segments.
@@ -2110,12 +2156,29 @@ impl StrokeDashPattern2d {
 pub struct StrokeMarker2d {
     length: LogicalPixels,
     width: LogicalPixels,
+    anchor: StrokeMarkerAnchor2d,
 }
 
 impl StrokeMarker2d {
     /// Builds a filled triangular arrow marker.
     pub const fn arrow(length: LogicalPixels, width: LogicalPixels) -> Self {
-        Self { length, width }
+        Self {
+            length,
+            width,
+            anchor: StrokeMarkerAnchor2d::BaseAtEndpoint,
+        }
+    }
+
+    /// Selects the marker anchor. Tip anchoring uses the bounded exact-vector
+    /// contract documented by [`StrokeMarkerAnchor2d::TipAtEndpoint`].
+    pub const fn with_anchor(mut self, anchor: StrokeMarkerAnchor2d) -> Self {
+        self.anchor = anchor;
+        self
+    }
+
+    /// Returns how the marker is anchored to the mathematical endpoint.
+    pub const fn anchor(self) -> StrokeMarkerAnchor2d {
+        self.anchor
     }
 
     /// Returns marker length along the endpoint tangent.
@@ -2196,13 +2259,13 @@ impl StrokeStyle2d {
         self
     }
 
-    /// Adds an outward-pointing triangular marker based at the first path point.
+    /// Adds a triangular marker at the first path point using its selected anchor.
     pub const fn with_start_marker(mut self, marker: StrokeMarker2d) -> Self {
         self.start_marker = Some(marker);
         self
     }
 
-    /// Adds an outward-pointing triangular marker based at the last path point.
+    /// Adds a triangular marker at the last path point using its selected anchor.
     pub const fn with_end_marker(mut self, marker: StrokeMarker2d) -> Self {
         self.end_marker = Some(marker);
         self
@@ -2246,6 +2309,13 @@ impl StrokeStyle2d {
     /// Returns the optional last-endpoint marker.
     pub const fn end_marker(self) -> Option<StrokeMarker2d> {
         self.end_marker
+    }
+
+    pub(crate) fn has_tip_marker(self) -> bool {
+        [self.start_marker, self.end_marker]
+            .into_iter()
+            .flatten()
+            .any(|marker| marker.anchor == StrokeMarkerAnchor2d::TipAtEndpoint)
     }
 
     fn is_valid(self) -> bool {
@@ -2669,6 +2739,10 @@ impl Shadow {
             && self.color.is_normalized()
     }
 }
+
+#[cfg(test)]
+#[path = "scene/append_tests.rs"]
+mod append_tests;
 
 #[cfg(test)]
 mod tests {

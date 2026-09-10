@@ -5,8 +5,17 @@ use crate::{
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[path = "mesh3d_surface.rs"]
+mod surface;
+pub use surface::{Mesh3dPreflightReport, Mesh3dRenderBudget};
+use surface::{SurfaceClipEdge, SurfaceClipVertex, SurfaceFrame, SurfaceObject};
+
 #[cfg(test)]
 use crate::{MeshEdge3d, Projection3d, Rotation3d, SurfaceStyle3d, WorldLength};
+
+#[cfg(test)]
+#[path = "mesh3d_lifetime_tests.rs"]
+mod lifetime_tests;
 
 #[cfg(test)]
 fn logical(value: f32) -> LogicalPixels {
@@ -163,6 +172,14 @@ struct ClipProbeOutputGpu {
 
 pub(super) struct Mesh3dRenderer {
     pipeline: wgpu::RenderPipeline,
+    clipped_surface_pipeline: wgpu::RenderPipeline,
+    clipped_surface_buffer: Option<wgpu::Buffer>,
+    clipped_surface_capacity: usize,
+    clipped_surface_objects: Vec<SurfaceObject>,
+    clipped_visible_edge_pipeline: wgpu::RenderPipeline,
+    clipped_hidden_edge_pipeline: wgpu::RenderPipeline,
+    clipped_edge_buffer: Option<wgpu::Buffer>,
+    clipped_edge_capacity: usize,
     visible_edge_pipeline: wgpu::RenderPipeline,
     hidden_edge_pipeline: wgpu::RenderPipeline,
     camera_uniform_buffer: wgpu::Buffer,
@@ -274,6 +291,44 @@ impl Mesh3dRenderer {
             multiview_mask: None,
             cache: None,
         });
+        let clipped_surface_pipeline =
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("sim-engine clipped 3D surface pipeline"),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("mesh3d_clipped_surface_vs_main"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    buffers: &[
+                        Some(SurfaceClipVertex::LAYOUT),
+                        Some(MeshInstanceGpu::LAYOUT),
+                    ],
+                },
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    ..Default::default()
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: DEPTH_FORMAT,
+                    depth_write_enabled: Some(true),
+                    depth_compare: Some(wgpu::CompareFunction::Less),
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
+                multisample: wgpu::MultisampleState::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("mesh3d_fs_main"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                multiview_mask: None,
+                cache: None,
+            });
         let edge_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("sim-engine 3D edge pipeline layout"),
             bind_group_layouts: &[Some(&camera_layout), Some(&edge_object_layout)],
@@ -287,6 +342,7 @@ impl Mesh3dRenderer {
             wgpu::CompareFunction::LessEqual,
             "mesh3d_visible_edge_fs_main",
             "sim-engine visible 3D edge pipeline",
+            false,
         );
         let hidden_edge_pipeline = create_edge_pipeline(
             device,
@@ -296,9 +352,38 @@ impl Mesh3dRenderer {
             wgpu::CompareFunction::Greater,
             "mesh3d_hidden_edge_fs_main",
             "sim-engine hidden 3D edge pipeline",
+            false,
+        );
+        let clipped_visible_edge_pipeline = create_edge_pipeline(
+            device,
+            &shader,
+            &edge_pipeline_layout,
+            format,
+            wgpu::CompareFunction::LessEqual,
+            "mesh3d_visible_edge_fs_main",
+            "sim-engine canonical visible 3D edge pipeline",
+            true,
+        );
+        let clipped_hidden_edge_pipeline = create_edge_pipeline(
+            device,
+            &shader,
+            &edge_pipeline_layout,
+            format,
+            wgpu::CompareFunction::Greater,
+            "mesh3d_hidden_edge_fs_main",
+            "sim-engine canonical hidden 3D edge pipeline",
+            true,
         );
         Self {
             pipeline,
+            clipped_surface_pipeline,
+            clipped_surface_buffer: None,
+            clipped_surface_capacity: 0,
+            clipped_surface_objects: Vec::new(),
+            clipped_visible_edge_pipeline,
+            clipped_hidden_edge_pipeline,
+            clipped_edge_buffer: None,
+            clipped_edge_capacity: 0,
             visible_edge_pipeline,
             hidden_edge_pipeline,
             camera_uniform_buffer,
@@ -421,9 +506,14 @@ pub struct RetainedMesh3d {
     index_count: u32,
     edge_count: u32,
     gpu_allocation_bytes: usize,
+    budget: Mesh3dUploadBudget,
 }
 
 impl RetainedMesh3d {
+    /// Returns this revision's upload and restoration capacity limits.
+    pub const fn budget(&self) -> Mesh3dUploadBudget {
+        self.budget
+    }
     /// Returns the immutable core topology retained for recovery.
     pub fn source(&self) -> &Mesh3d {
         &self.source
@@ -445,224 +535,15 @@ impl RetainedMesh3d {
     }
 }
 
-/// Stable scene handle for a retained 3D object.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Object3dId {
-    scene_id: u64,
-    object_id: u64,
-}
-
-impl Object3dId {
-    /// Returns the stable scene-local numeric value for diagnostics.
-    ///
-    /// Equality and hashing also include private scene provenance. Store the
-    /// complete handle, rather than only this number, in host object maps.
-    pub const fn get(self) -> u64 {
-        self.object_id
-    }
-}
-
-/// One retained mesh reference plus its independent model transform and style.
-#[derive(Clone)]
-pub struct Mesh3dInstance {
-    id: Object3dId,
-    mesh: RetainedMesh3d,
-    transform: Transform3d,
-    style: MeshStyle3d,
-    visible: bool,
-}
-
-impl Mesh3dInstance {
-    fn new(
-        id: Object3dId,
-        mesh: &RetainedMesh3d,
-        transform: Transform3d,
-        style: MeshStyle3d,
-    ) -> Self {
-        Self {
-            id,
-            mesh: mesh.clone(),
-            transform,
-            style,
-            visible: true,
-        }
-    }
-
-    /// Returns the stable scene object identifier.
-    pub const fn id(&self) -> Object3dId {
-        self.id
-    }
-
-    /// Returns the retained GPU mesh reference.
-    pub const fn mesh(&self) -> &RetainedMesh3d {
-        &self.mesh
-    }
-
-    /// Returns this object's model-to-world transform.
-    pub const fn transform(&self) -> Transform3d {
-        self.transform
-    }
-
-    /// Returns its extensible surface/edge material bundle.
-    pub const fn style(&self) -> MeshStyle3d {
-        self.style
-    }
-
-    /// Returns whether this object participates in drawing and render counts.
-    pub const fn is_visible(&self) -> bool {
-        self.visible
-    }
-
-    /// Returns explicit edge presentation when enabled for this object.
-    pub const fn wireframe(&self) -> Option<WireframeStyle3d> {
-        self.style.wireframe_style()
-    }
-}
-
-/// Ready 3D visual state rendered with one camera and depth attachment.
-pub struct Scene3d {
-    scene_id: u64,
-    background: Color,
-    instances: Vec<Mesh3dInstance>,
-    next_object_id: u64,
-}
-
-impl Scene3d {
-    /// Creates an empty scene with a normalized opaque clear color.
-    pub fn new(background: Color) -> Result<Self, Scene3dError> {
-        if !background.is_normalized() || background.alpha() != 1.0 {
-            return Err(Scene3dError::InvalidBackground);
-        }
-        let scene_id = NEXT_SCENE3D_ID
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                current.checked_add(1)
-            })
-            .map_err(|_| Scene3dError::SceneIdExhausted)?;
-        Ok(Self {
-            scene_id,
-            background,
-            instances: Vec::new(),
-            next_object_id: 0,
-        })
-    }
-
-    /// Adds a retained object and returns a stable handle for later updates.
-    pub fn try_push(
-        &mut self,
-        mesh: &RetainedMesh3d,
-        transform: Transform3d,
-        style: MeshStyle3d,
-    ) -> Result<Object3dId, Scene3dError> {
-        validate_mesh_style(mesh, style)?;
-        validate_scene3d_transform(transform)?;
-        let next_object_id = self
-            .next_object_id
-            .checked_add(1)
-            .ok_or(Scene3dError::ObjectIdExhausted)?;
-        self.instances
-            .try_reserve(1)
-            .map_err(|_| Scene3dError::AllocationFailed {
-                requested_bytes: std::mem::size_of::<Mesh3dInstance>(),
-            })?;
-        let id = Object3dId {
-            scene_id: self.scene_id,
-            object_id: self.next_object_id,
-        };
-        self.instances
-            .push(Mesh3dInstance::new(id, mesh, transform, style));
-        self.next_object_id = next_object_id;
-        Ok(id)
-    }
-
-    /// Returns the normalized finite opaque target clear color.
-    pub const fn background(&self) -> Color {
-        self.background
-    }
-
-    /// Returns objects in host insertion order; depth determines visibility.
-    pub fn instances(&self) -> &[Mesh3dInstance] {
-        &self.instances
-    }
-
-    /// Returns the number of independently transformed objects.
-    pub fn object_count(&self) -> usize {
-        self.instances.len()
-    }
-
-    /// Returns objects currently participating in rendering.
-    pub fn visible_object_count(&self) -> usize {
-        self.instances
-            .iter()
-            .filter(|instance| instance.visible)
-            .count()
-    }
-
-    /// Replaces one object's model transform without touching retained topology.
-    pub fn set_transform(
-        &mut self,
-        object_id: Object3dId,
-        transform: Transform3d,
-    ) -> Result<(), Scene3dError> {
-        validate_scene3d_transform(transform)?;
-        let instance = self.instance_mut(object_id)?;
-        instance.transform = transform;
-        Ok(())
-    }
-
-    /// Replaces one object's complete extensible visual material bundle.
-    pub fn set_style(
-        &mut self,
-        object_id: Object3dId,
-        style: MeshStyle3d,
-    ) -> Result<(), Scene3dError> {
-        let instance = self.instance_mut(object_id)?;
-        validate_mesh_style(&instance.mesh, style)?;
-        instance.style = style;
-        Ok(())
-    }
-
-    /// Shows or hides one object without releasing retained topology.
-    pub fn set_visible(
-        &mut self,
-        object_id: Object3dId,
-        visible: bool,
-    ) -> Result<(), Scene3dError> {
-        let instance = self.instance_mut(object_id)?;
-        instance.visible = visible;
-        Ok(())
-    }
-
-    /// Enables or disables explicit visible/hidden edges for one object.
-    pub fn set_wireframe(
-        &mut self,
-        object_id: Object3dId,
-        wireframe: Option<WireframeStyle3d>,
-    ) -> Result<(), Scene3dError> {
-        let instance = self.instance_mut(object_id)?;
-        let surface = instance.style.surface_style();
-        let style = match (surface, wireframe) {
-            (Some(surface), Some(wireframe)) => {
-                MeshStyle3d::surface(surface).with_wireframe(wireframe)
-            }
-            (Some(surface), None) => MeshStyle3d::surface(surface),
-            (None, Some(wireframe)) => MeshStyle3d::wireframe(wireframe),
-            (None, None) => return Err(Scene3dError::EmptyStyle),
-        };
-        validate_mesh_style(&instance.mesh, style)?;
-        instance.style = style;
-        Ok(())
-    }
-
-    fn instance_mut(&mut self, object_id: Object3dId) -> Result<&mut Mesh3dInstance, Scene3dError> {
-        if object_id.scene_id != self.scene_id {
-            return Err(Scene3dError::ObjectNotFound { object_id });
-        }
-        self.instances
-            .iter_mut()
-            .find(|instance| instance.id == object_id)
-            .ok_or(Scene3dError::ObjectNotFound { object_id })
-    }
-}
+#[path = "mesh3d_objects.rs"]
+mod objects;
+#[path = "mesh3d_upload.rs"]
+mod upload;
+pub use objects::{
+    Mesh3dInstance, Object3dId, Scene3d, Scene3dBudget, Scene3dBudgetResource, Scene3dError,
+    Scene3dMeshUpdateReport, Scene3dStatistics,
+};
+pub use upload::{Mesh3dUploadBudget, Mesh3dUploadBudgetResource, Mesh3dUploadReport};
 
 /// Offscreen color and depth attachments for stereometry rendering.
 pub struct RenderTarget3d {
@@ -711,65 +592,6 @@ impl RenderTarget3d {
     }
 }
 
-/// Rejection reason for 3D scene visual state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Scene3dError {
-    /// The target clear color must be normalized and opaque.
-    InvalidBackground,
-    /// Surface and wireframe were both disabled.
-    EmptyStyle,
-    /// The selected surface/edge modes have no corresponding mesh topology.
-    StyleHasNoMatchingGeometry,
-    /// A model transform cannot be represented portably by the GPU shader.
-    InvalidTransform,
-    /// No more process-unique scene identifiers can be allocated.
-    SceneIdExhausted,
-    /// No more stable object identifiers can be allocated.
-    ObjectIdExhausted,
-    /// CPU storage for another retained object could not be reserved.
-    AllocationFailed {
-        /// Additional bytes requested for the rejected object.
-        requested_bytes: usize,
-    },
-    /// An object update referenced a missing stable handle.
-    ObjectNotFound {
-        /// Stable handle that is absent from this scene.
-        object_id: Object3dId,
-    },
-}
-
-impl fmt::Display for Scene3dError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::InvalidBackground => write!(formatter, "3D scene background must be opaque"),
-            Self::EmptyStyle => write!(formatter, "3D object requires a surface or wireframe"),
-            Self::StyleHasNoMatchingGeometry => write!(
-                formatter,
-                "3D object style has no matching triangles or display edges"
-            ),
-            Self::InvalidTransform => {
-                write!(
-                    formatter,
-                    "3D model transform is outside the portable shader envelope"
-                )
-            }
-            Self::SceneIdExhausted => write!(formatter, "3D scene identifiers exhausted"),
-            Self::ObjectIdExhausted => write!(formatter, "3D scene object identifiers exhausted"),
-            Self::AllocationFailed { requested_bytes } => write!(
-                formatter,
-                "could not reserve {requested_bytes} bytes for another 3D scene object"
-            ),
-            Self::ObjectNotFound { object_id } => write!(
-                formatter,
-                "3D scene object {} does not exist in this scene",
-                object_id.get()
-            ),
-        }
-    }
-}
-
-impl Error for Scene3dError {}
-
 fn validate_mesh_style(mesh: &RetainedMesh3d, style: MeshStyle3d) -> Result<(), Scene3dError> {
     let has_surface = style.surface_style().is_some() && mesh.triangle_count() > 0;
     let has_wireframe =
@@ -791,6 +613,19 @@ fn validate_scene3d_transform(transform: Transform3d) -> Result<(), Scene3dError
 /// Resource creation or ownership failure for retained 3D rendering.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Mesh3dResourceError {
+    /// Explicit mesh upload limits must be nonzero.
+    InvalidBudget,
+    /// The replaced resource belongs to another logical renderer generation.
+    RendererMismatch,
+    /// Upload limits rejected bytes before caller-scale allocation.
+    BudgetExceeded {
+        /// Rejected byte category.
+        resource: Mesh3dUploadBudgetResource,
+        /// Configured maximum.
+        limit: usize,
+        /// Required bytes.
+        actual: usize,
+    },
     /// Vertex, index, or edge data exceeds the active device's buffer-size limit.
     CapacityTooLarge,
     /// At least one retained model-space vertex is outside the portable shader envelope.
@@ -809,6 +644,18 @@ pub enum Mesh3dResourceError {
 impl fmt::Display for Mesh3dResourceError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidBudget => write!(formatter, "3D mesh upload limits must be nonzero"),
+            Self::RendererMismatch => {
+                write!(formatter, "3D mesh belongs to another renderer generation")
+            }
+            Self::BudgetExceeded {
+                resource,
+                limit,
+                actual,
+            } => write!(
+                formatter,
+                "3D mesh {resource:?} budget exceeded: {actual} > {limit}"
+            ),
             Self::CapacityTooLarge => write!(formatter, "3D mesh exceeds GPU buffer limits"),
             Self::NonPortableVertex => write!(
                 formatter,
@@ -836,8 +683,8 @@ pub enum Mesh3dRenderError {
     RendererMismatch,
     /// Model/camera inputs or their arithmetic leave the portable GPU envelope.
     InvalidGeometryTransform,
-    /// A surface triangle would require unproven clipping or has a projected
-    /// orientation that is not stable across portable shader arithmetic.
+    /// A surface triangle has clipping topology or a projected orientation
+    /// that is not stable across portable shader arithmetic.
     UnportableSurfaceTopology,
     /// The visible per-frame object buffers exceed a GPU or host capacity.
     InstanceCapacityTooLarge,
@@ -845,6 +692,49 @@ pub enum Mesh3dRenderError {
     CameraTargetAspectMismatch,
     /// Edge clipping, projection, or style arithmetic is not portable for this target.
     InvalidEdgeProjection,
+    /// A visible object's transform, surface or edge proof failed. The stable
+    /// handle identifies that exact object even when several share one mesh.
+    ObjectFailure {
+        /// Complete scene-provenance-bearing object handle.
+        object_id: Object3dId,
+        /// Existing numerical validation category for this object.
+        reason: Mesh3dObjectError,
+    },
+    /// Generated clipping topology exceeds a caller budget or device capacity.
+    GeneratedGeometryCapacityTooLarge,
+}
+
+/// Instance-local numerical rejection category from authoritative 3D preflight.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mesh3dObjectError {
+    /// Model/camera arithmetic cannot be represented portably.
+    InvalidGeometryTransform,
+    /// Clipped surface topology or projected orientation remains ambiguous.
+    UnportableSurfaceTopology,
+    /// Display-edge clipping or extrusion cannot be represented portably.
+    InvalidEdgeProjection,
+}
+
+impl Mesh3dRenderError {
+    fn for_object(self, object_id: Object3dId) -> Self {
+        let reason = match self {
+            Self::InvalidGeometryTransform => Mesh3dObjectError::InvalidGeometryTransform,
+            Self::UnportableSurfaceTopology => Mesh3dObjectError::UnportableSurfaceTopology,
+            Self::InvalidEdgeProjection => Mesh3dObjectError::InvalidEdgeProjection,
+            _ => return self,
+        };
+        Self::ObjectFailure { object_id, reason }
+    }
+
+    /// Returns an offending object when the failure is uniquely instance-local.
+    /// Ownership, camera/target mismatch and aggregate capacity errors return
+    /// `None`; they must not be attributed to an arbitrary visible object.
+    pub const fn object_id(self) -> Option<Object3dId> {
+        match self {
+            Self::ObjectFailure { object_id, .. } => Some(object_id),
+            _ => None,
+        }
+    }
 }
 
 impl fmt::Display for Mesh3dRenderError {
@@ -875,6 +765,15 @@ impl fmt::Display for Mesh3dRenderError {
                 formatter,
                 "3D edge clipping or screen-space arithmetic is outside the portable GPU envelope"
             ),
+            Self::ObjectFailure { object_id, reason } => write!(
+                formatter,
+                "3D object {} failed preflight: {reason:?}",
+                object_id.get()
+            ),
+            Self::GeneratedGeometryCapacityTooLarge => write!(
+                formatter,
+                "generated 3D surface topology exceeds frame or device capacity"
+            ),
         }
     }
 }
@@ -891,19 +790,24 @@ pub struct Mesh3dRenderReport {
     draw_call_count: usize,
     upload: Duration,
     encode_submit: Duration,
+    preflight: Mesh3dPreflightReport,
 }
 
 impl Mesh3dRenderReport {
+    /// Returns exact clipping/generated-work counts from authoritative preflight.
+    pub const fn preflight(self) -> Mesh3dPreflightReport {
+        self.preflight
+    }
     /// Returns independently transformed visible objects submitted for drawing.
     ///
     /// Objects wholly outside a common frustum plane remain submitted objects
-    /// even when rasterization produces no fragments. Partially clipped
-    /// surface triangles are rejected before this report is produced.
+    /// even when rasterization produces no fragments. See `preflight()` for
+    /// explicitly clipped and discarded source-triangle counts.
     pub const fn object_count(self) -> usize {
         self.object_count
     }
 
-    /// Returns total indexed triangles submitted across every object.
+    /// Returns indexed and generated triangles submitted across every object.
     pub const fn triangle_count(self) -> usize {
         self.triangle_count
     }
@@ -991,7 +895,7 @@ impl WgpuRenderer {
         &self,
         source: &RetainedMesh3d,
     ) -> Result<RetainedMesh3d, Mesh3dResourceError> {
-        self.create_mesh3d(source.source.clone())
+        self.create_mesh3d_with_budget(source.source.clone(), source.budget)
     }
 
     /// Atomically restores every stale retained mesh referenced by a 3D scene.
@@ -1053,23 +957,86 @@ impl WgpuRenderer {
     ///
     /// Object insertion order does not determine visibility. Every surface
     /// writes and tests hardware depth. Model transforms are uploaded through a
-    /// reusable instance buffer; retained topology is never retessellated.
-    /// Surface triangles must be provably fully inside the frustum or wholly
-    /// outside one common plane. A partially clipped or association-dependent
-    /// projected triangle returns
-    /// [`Mesh3dRenderError::UnportableSurfaceTopology`]. Explicit display edges
-    /// use a separate complete homogeneous clipper and may cross the frustum.
+    /// reusable instance buffer. Wholly inside objects retain their indexed
+    /// topology; crossing surfaces use bounded homogeneous CPU clipping against
+    /// all six frustum planes. Ambiguous classification/orientation produces an
+    /// object-attributed error. Explicit display edges retain their complete
+    /// interval-validated homogeneous shader clipper.
     pub fn render_scene3d_to_target(
         &mut self,
         target: &RenderTarget3d,
         scene: &Scene3d,
         camera: Camera3d,
     ) -> Result<Mesh3dRenderReport, Mesh3dRenderError> {
-        let upload_started_at = Instant::now();
-        validate_target_identity(&self.renderer_identity, target)?;
-        for instance in scene.instances().iter().filter(|instance| instance.visible) {
-            validate_mesh_identity(&self.renderer_identity, &instance.mesh)?;
-        }
+        self.render_scene3d_to_target_with_budget(
+            target,
+            scene,
+            camera,
+            Mesh3dRenderBudget::default(),
+        )
+    }
+
+    /// Validates every visible object and exact generated clipping work without
+    /// changing target pixels, retained resources or submitting GPU work.
+    ///
+    /// This is the same authoritative preflight used by rendering. Private
+    /// bounded scratch may be allocated; the report is not a reusable draw
+    /// authorization after the scene, target or camera changes.
+    pub fn validate_scene3d_for_target(
+        &self,
+        target: &RenderTarget3d,
+        scene: &Scene3d,
+        camera: Camera3d,
+        budget: Mesh3dRenderBudget,
+    ) -> Result<Mesh3dPreflightReport, Mesh3dRenderError> {
+        self.mesh3d_renderer
+            .preflight_scene3d(
+                &self.device,
+                &self.renderer_identity,
+                target,
+                scene,
+                camera,
+                budget,
+            )
+            .map(|(_, frame)| frame.report)
+    }
+
+    /// Draws a scene with explicit additional clipping topology limits.
+    ///
+    /// All validation, generated counts and host/GPU capacity checks complete
+    /// before the first GPU write or target mutation. Numerical ambiguity is
+    /// attributed to the exact visible object; aggregate capacity remains a
+    /// scene-level error. Wholly inside objects retain their indexed GPU path.
+    pub fn render_scene3d_to_target_with_budget(
+        &mut self,
+        target: &RenderTarget3d,
+        scene: &Scene3d,
+        camera: Camera3d,
+        budget: Mesh3dRenderBudget,
+    ) -> Result<Mesh3dRenderReport, Mesh3dRenderError> {
+        self.mesh3d_renderer.render_scene3d(
+            &self.device,
+            &self.queue,
+            &self.renderer_identity,
+            target,
+            scene,
+            camera,
+            budget,
+        )
+    }
+}
+
+impl Mesh3dRenderer {
+    fn preflight_scene3d(
+        &self,
+        device: &wgpu::Device,
+        renderer_identity: &Arc<()>,
+        target: &RenderTarget3d,
+        scene: &Scene3d,
+        camera: Camera3d,
+        budget: Mesh3dRenderBudget,
+    ) -> Result<(Camera3dUniform, SurfaceFrame), Mesh3dRenderError> {
+        validate_target_identity(renderer_identity, target)?;
         validate_camera_target_aspect(camera, target.logical_viewport())?;
         let camera_uniform = Camera3dUniform::new(
             camera,
@@ -1077,41 +1044,90 @@ impl WgpuRenderer {
             target.height(),
             target.pixels_per_logical(),
         )?;
-        // Validate the complete visible set before mutating staging buffers or
-        // growing GPU resources. Invisible retained objects consume neither
-        // per-frame capacity nor validation work.
-        for instance in scene.instances().iter().filter(|instance| instance.visible) {
-            let model_rows = instance
-                .transform
-                .model_rows()
-                .map_err(|_| Mesh3dRenderError::InvalidGeometryTransform)?;
-            validate_shader_points(instance.mesh.source(), model_rows, camera_uniform.rows())?;
-            if instance.style.surface_style().is_some() {
-                validate_surface_triangle_topology(
-                    instance.mesh.source(),
-                    model_rows,
-                    camera_uniform.rows(),
-                )?;
-            }
-            if let Some(style) = instance.wireframe() {
-                validate_edge_projection(
-                    instance.mesh.source(),
-                    model_rows,
-                    camera_uniform.rows(),
-                    style,
-                    camera_uniform.viewport,
-                )?;
-            }
+        let capacity = scene
+            .visible_object_count()
+            .max(1)
+            .checked_next_power_of_two()
+            .ok_or(Mesh3dRenderError::InstanceCapacityTooLarge)?;
+        if !buffer_capacity_fits::<MeshInstanceGpu>(device, capacity)
+            || capacity
+                .checked_mul(self.edge_object_stride)
+                .is_none_or(|bytes| {
+                    bytes as u64 > device.limits().max_buffer_size || bytes > u32::MAX as usize
+                })
+        {
+            return Err(Mesh3dRenderError::InstanceCapacityTooLarge);
         }
+        let frame = surface::preflight(
+            renderer_identity,
+            scene,
+            camera_uniform,
+            budget,
+            device.limits().max_buffer_size,
+        )?;
+        Ok((camera_uniform, frame))
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn render_scene3d(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        renderer_identity: &Arc<()>,
+        target: &RenderTarget3d,
+        scene: &Scene3d,
+        camera: Camera3d,
+        budget: Mesh3dRenderBudget,
+    ) -> Result<Mesh3dRenderReport, Mesh3dRenderError> {
+        let upload_started_at = Instant::now();
+        let (camera_uniform, surface_frame) =
+            self.preflight_scene3d(device, renderer_identity, target, scene, camera, budget)?;
         let visible_count = scene.visible_object_count();
-        self.mesh3d_renderer
-            .ensure_frame_capacity(&self.device, visible_count)?;
-        self.mesh3d_renderer.instances.clear();
-        self.mesh3d_renderer.edge_object_bytes.clear();
-        self.mesh3d_renderer.edge_object_bytes.resize(
-            visible_count.saturating_mul(self.mesh3d_renderer.edge_object_stride),
-            0,
-        );
+        let replacement_surface_buffer =
+            if surface_frame.vertices.len() > self.clipped_surface_capacity {
+                Some(device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("sim-engine clipped 3D surface buffer"),
+                    size: (surface_frame.vertices.len() * std::mem::size_of::<SurfaceClipVertex>())
+                        as u64,
+                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                }))
+            } else {
+                None
+            };
+        let replacement_edge_buffer = if surface_frame.edges.len() > self.clipped_edge_capacity {
+            Some(device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("sim-engine canonical clip-space 3D edge buffer"),
+                size: (surface_frame.edges.len() * std::mem::size_of::<SurfaceClipEdge>()) as u64,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }))
+        } else {
+            None
+        };
+        self.ensure_frame_capacity(device, visible_count)?;
+        if let Some(buffer) = replacement_surface_buffer {
+            self.clipped_surface_buffer = Some(buffer);
+            self.clipped_surface_capacity = surface_frame.vertices.len();
+        }
+        if let Some(buffer) = replacement_edge_buffer {
+            self.clipped_edge_buffer = Some(buffer);
+            self.clipped_edge_capacity = surface_frame.edges.len();
+        }
+        self.clipped_surface_objects = surface_frame.objects;
+        if let Some(buffer) = &self.clipped_surface_buffer
+            && !surface_frame.vertices.is_empty()
+        {
+            queue.write_buffer(buffer, 0, bytemuck::cast_slice(&surface_frame.vertices));
+        }
+        if let Some(buffer) = &self.clipped_edge_buffer
+            && !surface_frame.edges.is_empty()
+        {
+            queue.write_buffer(buffer, 0, bytemuck::cast_slice(&surface_frame.edges));
+        }
+        self.instances.clear();
+        self.edge_object_bytes.clear();
+        self.edge_object_bytes
+            .resize(visible_count.saturating_mul(self.edge_object_stride), 0);
         let mut triangle_count = 0usize;
         let mut edge_count = 0usize;
         let mut draw_call_count = 0usize;
@@ -1121,11 +1137,8 @@ impl WgpuRenderer {
             .filter(|instance| instance.visible)
             .enumerate()
         {
-            let model_rows = instance
-                .transform
-                .model_rows()
-                .map_err(|_| Mesh3dRenderError::InvalidGeometryTransform)?;
-            self.mesh3d_renderer.instances.push(MeshInstanceGpu {
+            let model_rows = self.clipped_surface_objects[object_index].model_rows;
+            self.instances.push(MeshInstanceGpu {
                 model_row_0: model_rows[0],
                 model_row_1: model_rows[1],
                 model_row_2: model_rows[2],
@@ -1136,8 +1149,17 @@ impl WgpuRenderer {
                     .to_array(),
             });
             if instance.style.surface_style().is_some() {
-                triangle_count = triangle_count.saturating_add(instance.mesh.triangle_count());
-                if instance.mesh.index_buffer.is_some() {
+                let generated = self.clipped_surface_objects[object_index]
+                    .generated
+                    .as_ref();
+                triangle_count = triangle_count.saturating_add(
+                    generated.map_or(instance.mesh.triangle_count(), |range| {
+                        (range.end - range.start) as usize / 3
+                    }),
+                );
+                if generated.map_or(instance.mesh.index_buffer.is_some(), |range| {
+                    !range.is_empty()
+                }) {
                     draw_call_count = draw_call_count.saturating_add(1);
                 }
             }
@@ -1168,48 +1190,42 @@ impl WgpuRenderer {
                         gap_length,
                     ],
                 };
-                let start = object_index * self.mesh3d_renderer.edge_object_stride;
+                let start = object_index * self.edge_object_stride;
                 let end = start + std::mem::size_of::<EdgeObjectUniform>();
-                self.mesh3d_renderer.edge_object_bytes[start..end]
+                self.edge_object_bytes[start..end]
                     .copy_from_slice(bytemuck::bytes_of(&edge_uniform));
             }
         }
 
-        self.queue.write_buffer(
-            &self.mesh3d_renderer.camera_uniform_buffer,
+        queue.write_buffer(
+            &self.camera_uniform_buffer,
             0,
             bytemuck::bytes_of(&camera_uniform),
         );
-        if !self.mesh3d_renderer.instances.is_empty() {
-            self.queue.write_buffer(
-                &self.mesh3d_renderer.instance_buffer,
+        if !self.instances.is_empty() {
+            queue.write_buffer(
+                &self.instance_buffer,
                 0,
-                bytemuck::cast_slice(&self.mesh3d_renderer.instances),
+                bytemuck::cast_slice(&self.instances),
             );
         }
-        if !self.mesh3d_renderer.edge_object_bytes.is_empty() {
-            self.queue.write_buffer(
-                &self.mesh3d_renderer.edge_object_buffer,
-                0,
-                &self.mesh3d_renderer.edge_object_bytes,
-            );
+        if !self.edge_object_bytes.is_empty() {
+            queue.write_buffer(&self.edge_object_buffer, 0, &self.edge_object_bytes);
         }
         let upload = upload_started_at.elapsed();
         let encode_started_at = Instant::now();
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("sim-engine retained 3D scene encoder"),
-            });
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("sim-engine retained 3D scene encoder"),
+        });
         encode_scene_pass(
             &mut encoder,
-            &self.mesh3d_renderer,
+            self,
             &target.color.view,
             &target.depth_view,
             scene.background(),
             scene.instances(),
         );
-        self.queue.submit([encoder.finish()]);
+        queue.submit([encoder.finish()]);
         let encode_submit = encode_started_at.elapsed();
         Ok(Mesh3dRenderReport {
             object_count: visible_count,
@@ -1219,6 +1235,7 @@ impl WgpuRenderer {
             draw_call_count,
             upload,
             encode_submit,
+            preflight: surface_frame.report,
         })
     }
 }
@@ -1229,7 +1246,7 @@ fn create_retained_mesh(
     renderer_identity: Arc<()>,
     source: Mesh3d,
 ) -> Result<RetainedMesh3d, Mesh3dResourceError> {
-    let prepared = prepare_retained_mesh_upload(device, source)?;
+    let prepared = upload::prepare_with_budget(device, source, Mesh3dUploadBudget::default())?;
     Ok(upload_prepared_retained_mesh(
         device,
         queue,
@@ -1243,6 +1260,7 @@ struct PreparedRetainedMeshUpload {
     layout: Mesh3dUploadLayout,
     vertices: Vec<MeshVertexGpu>,
     edges: Vec<MeshEdgeGpu>,
+    budget: Mesh3dUploadBudget,
 }
 
 fn prepare_retained_mesh_upload(
@@ -1286,6 +1304,7 @@ fn prepare_retained_mesh_upload(
         layout,
         vertices,
         edges,
+        budget: Mesh3dUploadBudget::default(),
     })
 }
 
@@ -1308,6 +1327,7 @@ fn upload_prepared_retained_mesh(
         layout,
         vertices,
         edges,
+        budget,
     } = prepared;
     let vertex_buffer = Arc::new(device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("sim-engine retained 3D vertex buffer"),
@@ -1355,6 +1375,7 @@ fn upload_prepared_retained_mesh(
         index_count: layout.index_count,
         edge_count: layout.edge_count,
         gpu_allocation_bytes: layout.total_bytes as usize,
+        budget,
     }
 }
 
@@ -1367,7 +1388,12 @@ fn restore_scene3d_resources(
     let pending_staging_bytes = scene
         .instances
         .len()
-        .checked_mul(std::mem::size_of::<(usize, Arc<wgpu::Buffer>, Mesh3d)>())
+        .checked_mul(std::mem::size_of::<(
+            usize,
+            Arc<wgpu::Buffer>,
+            Mesh3d,
+            Mesh3dUploadBudget,
+        )>())
         .and_then(|bytes| u64::try_from(bytes).ok())
         .ok_or(Mesh3dResourceError::CapacityTooLarge)?;
     let prepared_staging_bytes = scene
@@ -1392,7 +1418,7 @@ fn restore_scene3d_resources(
         .checked_mul(std::mem::size_of::<Mesh3dInstance>())
         .and_then(|bytes| u64::try_from(bytes).ok())
         .ok_or(Mesh3dResourceError::CapacityTooLarge)?;
-    let mut pending = Vec::<(usize, Arc<wgpu::Buffer>, Mesh3d)>::new();
+    let mut pending = Vec::<(usize, Arc<wgpu::Buffer>, Mesh3d, Mesh3dUploadBudget)>::new();
     pending
         .try_reserve_exact(scene.instances.len())
         .map_err(|_| Mesh3dResourceError::HostAllocationFailed {
@@ -1427,6 +1453,7 @@ fn restore_scene3d_resources(
             key,
             Arc::clone(&instance.mesh.vertex_buffer),
             instance.mesh.source.clone(),
+            instance.mesh.budget,
         ));
     }
     pending.sort_unstable_by_key(|entry| entry.0);
@@ -1434,8 +1461,8 @@ fn restore_scene3d_resources(
 
     // Complete every device-limit check and caller-scale host allocation
     // before the first replacement GPU resource is created or written.
-    for (key, old_vertex_buffer, source) in pending {
-        let upload = prepare_retained_mesh_upload(device, source)?;
+    for (key, old_vertex_buffer, source, budget) in pending {
+        let upload = upload::prepare_with_budget(device, source, budget)?;
         prepared.push((key, old_vertex_buffer, upload));
     }
     for (key, _old_vertex_buffer, upload) in prepared {
@@ -1457,6 +1484,8 @@ fn restore_scene3d_resources(
         total.saturating_add(mesh.gpu_allocation_bytes())
     });
     scene.instances = replacement_instances;
+    scene.renderer_identity = Some(renderer_identity);
+    scene.rebuild_resource_keys();
     Ok(Scene3dRestoreReport {
         object_count: scene.object_count(),
         migrated_object_count,
@@ -1528,6 +1557,7 @@ fn create_edge_pipeline(
     depth_compare: wgpu::CompareFunction,
     fragment_entry: &'static str,
     label: &'static str,
+    clip_space: bool,
 ) -> wgpu::RenderPipeline {
     let (vertex_entry, depth_bias) = if depth_compare == wgpu::CompareFunction::Greater {
         (
@@ -1548,6 +1578,15 @@ fn create_edge_pipeline(
             },
         )
     };
+    let vertex_entry = if clip_space {
+        if depth_compare == wgpu::CompareFunction::Greater {
+            "mesh3d_clipped_hidden_edge_vs_main"
+        } else {
+            "mesh3d_clipped_visible_edge_vs_main"
+        }
+    } else {
+        vertex_entry
+    };
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some(label),
         layout: Some(layout),
@@ -1555,7 +1594,11 @@ fn create_edge_pipeline(
             module: shader,
             entry_point: Some(vertex_entry),
             compilation_options: wgpu::PipelineCompilationOptions::default(),
-            buffers: &[Some(MeshEdgeGpu::LAYOUT)],
+            buffers: &[Some(if clip_space {
+                SurfaceClipEdge::LAYOUT
+            } else {
+                MeshEdgeGpu::LAYOUT
+            })],
         },
         primitive: wgpu::PrimitiveState {
             topology: wgpu::PrimitiveTopology::TriangleList,
@@ -1723,104 +1766,57 @@ fn validate_shader_points(
     Ok(())
 }
 
+#[cfg(test)]
 fn validate_surface_triangle_topology(
     mesh: &Mesh3d,
     model_rows: [[f32; 4]; 3],
     camera_rows: [[f32; 4]; 4],
 ) -> Result<(), Mesh3dRenderError> {
+    surface::classify_surface(mesh, model_rows, camera_rows, |_, _, _| Ok(()))
+}
+
+fn validate_projected_triangle_orientation(
+    clips: [[ShaderValueRange; 4]; 3],
+) -> Result<(), Mesh3dRenderError> {
     let minimum_normal = f64::from(f32::MIN_POSITIVE);
-    for triangle in mesh.triangle_indices().chunks_exact(3) {
-        let clips = [
-            shader_clip_point_ranges(
-                mesh.vertices()[triangle[0] as usize],
-                model_rows,
-                camera_rows,
-            )
-            .map_err(|_| Mesh3dRenderError::UnportableSurfaceTopology)?,
-            shader_clip_point_ranges(
-                mesh.vertices()[triangle[1] as usize],
-                model_rows,
-                camera_rows,
-            )
-            .map_err(|_| Mesh3dRenderError::UnportableSurfaceTopology)?,
-            shader_clip_point_ranges(
-                mesh.vertices()[triangle[2] as usize],
-                model_rows,
-                camera_rows,
-            )
-            .map_err(|_| Mesh3dRenderError::UnportableSurfaceTopology)?,
-        ];
-        let planes = [
-            clip_plane_ranges(clips[0])
-                .map_err(|_| Mesh3dRenderError::UnportableSurfaceTopology)?,
-            clip_plane_ranges(clips[1])
-                .map_err(|_| Mesh3dRenderError::UnportableSurfaceTopology)?,
-            clip_plane_ranges(clips[2])
-                .map_err(|_| Mesh3dRenderError::UnportableSurfaceTopology)?,
-        ];
-
-        // A triangle wholly outside one common plane emits no fragments on
-        // every backend, so its post-divide topology is irrelevant.
-        let always_clipped = (0..planes[0].len()).any(|plane| {
-            planes
-                .iter()
-                .all(|vertex| vertex[plane].1 <= -minimum_normal)
-        });
-        if always_clipped {
-            continue;
-        }
-
-        // v0.2 deliberately rejects surface triangles that need hardware
-        // clipping. Without carrying interval polygons through clipping, a
-        // grazing triangle could acquire backend-dependent topology even when
-        // each endpoint has a stable plane classification. Display edges use
-        // their separate complete interval clipper.
-        let always_inside = clips.iter().zip(planes).all(|(clip, planes)| {
-            clip[3].minimum >= minimum_normal && planes.into_iter().all(|plane| plane.0 >= 0.0)
-        });
-        if !always_inside {
-            return Err(Mesh3dRenderError::UnportableSurfaceTopology);
-        }
-
-        let ndc = clips.map(|clip| {
-            let denominator = (clip[3].minimum, clip[3].maximum);
-            [
-                wgsl_division_range((clip[0].minimum, clip[0].maximum), denominator),
-                wgsl_division_range((clip[1].minimum, clip[1].maximum), denominator),
-            ]
-        });
-        let ndc = [
-            [
-                ndc[0][0].ok_or(Mesh3dRenderError::UnportableSurfaceTopology)?,
-                ndc[0][1].ok_or(Mesh3dRenderError::UnportableSurfaceTopology)?,
-            ],
-            [
-                ndc[1][0].ok_or(Mesh3dRenderError::UnportableSurfaceTopology)?,
-                ndc[1][1].ok_or(Mesh3dRenderError::UnportableSurfaceTopology)?,
-            ],
-            [
-                ndc[2][0].ok_or(Mesh3dRenderError::UnportableSurfaceTopology)?,
-                ndc[2][1].ok_or(Mesh3dRenderError::UnportableSurfaceTopology)?,
-            ],
-        ];
-        let first_x = rounded_f32_add_range(ndc[1][0], ndc[0][0], true)
-            .ok_or(Mesh3dRenderError::UnportableSurfaceTopology)?;
-        let first_y = rounded_f32_add_range(ndc[2][1], ndc[0][1], true)
-            .ok_or(Mesh3dRenderError::UnportableSurfaceTopology)?;
-        let second_y = rounded_f32_add_range(ndc[1][1], ndc[0][1], true)
-            .ok_or(Mesh3dRenderError::UnportableSurfaceTopology)?;
-        let second_x = rounded_f32_add_range(ndc[2][0], ndc[0][0], true)
-            .ok_or(Mesh3dRenderError::UnportableSurfaceTopology)?;
-        let positive = rounded_f32_product_range(first_x, first_y)
-            .ok_or(Mesh3dRenderError::UnportableSurfaceTopology)?;
-        let negative = rounded_f32_product_range(second_y, second_x)
-            .ok_or(Mesh3dRenderError::UnportableSurfaceTopology)?;
-        let signed_area = rounded_f32_add_range(positive, negative, true)
-            .ok_or(Mesh3dRenderError::UnportableSurfaceTopology)?;
-        let stable_area = signed_area.0 >= minimum_normal || signed_area.1 <= -minimum_normal;
-        if !stable_area {
-            return Err(Mesh3dRenderError::UnportableSurfaceTopology);
-        }
+    let ndc = clips.map(|clip| {
+        let denominator = (clip[3].minimum, clip[3].maximum);
+        [
+            wgsl_division_range((clip[0].minimum, clip[0].maximum), denominator),
+            wgsl_division_range((clip[1].minimum, clip[1].maximum), denominator),
+        ]
+    });
+    let ndc = [
+        [
+            ndc[0][0].ok_or(Mesh3dRenderError::UnportableSurfaceTopology)?,
+            ndc[0][1].ok_or(Mesh3dRenderError::UnportableSurfaceTopology)?,
+        ],
+        [
+            ndc[1][0].ok_or(Mesh3dRenderError::UnportableSurfaceTopology)?,
+            ndc[1][1].ok_or(Mesh3dRenderError::UnportableSurfaceTopology)?,
+        ],
+        [
+            ndc[2][0].ok_or(Mesh3dRenderError::UnportableSurfaceTopology)?,
+            ndc[2][1].ok_or(Mesh3dRenderError::UnportableSurfaceTopology)?,
+        ],
+    ];
+    let first_x = rounded_f32_add_range(ndc[1][0], ndc[0][0], true)
+        .ok_or(Mesh3dRenderError::UnportableSurfaceTopology)?;
+    let first_y = rounded_f32_add_range(ndc[2][1], ndc[0][1], true)
+        .ok_or(Mesh3dRenderError::UnportableSurfaceTopology)?;
+    let second_y = rounded_f32_add_range(ndc[1][1], ndc[0][1], true)
+        .ok_or(Mesh3dRenderError::UnportableSurfaceTopology)?;
+    let second_x = rounded_f32_add_range(ndc[2][0], ndc[0][0], true)
+        .ok_or(Mesh3dRenderError::UnportableSurfaceTopology)?;
+    let positive = rounded_f32_product_range(first_x, first_y)
+        .ok_or(Mesh3dRenderError::UnportableSurfaceTopology)?;
+    let negative = rounded_f32_product_range(second_y, second_x)
+        .ok_or(Mesh3dRenderError::UnportableSurfaceTopology)?;
+    let signed_area = rounded_f32_add_range(positive, negative, true)
+        .ok_or(Mesh3dRenderError::UnportableSurfaceTopology)?;
+    let stable_area = signed_area.0 >= minimum_normal || signed_area.1 <= -minimum_normal;
+    if !stable_area {
+        return Err(Mesh3dRenderError::UnportableSurfaceTopology);
     }
     Ok(())
 }
@@ -2736,18 +2732,33 @@ fn encode_scene_pass(
         if instance.style.surface_style().is_none() {
             continue;
         }
-        let Some(index_buffer) = instance.mesh.index_buffer.as_ref() else {
-            continue;
-        };
         let instance_start =
             (instance_index * std::mem::size_of::<MeshInstanceGpu>()) as wgpu::BufferAddress;
         let instance_end =
             instance_start + std::mem::size_of::<MeshInstanceGpu>() as wgpu::BufferAddress;
-        pass.set_vertex_buffer(0, instance.mesh.vertex_buffer.slice(..));
         pass.set_vertex_buffer(
             1,
             renderer.instance_buffer.slice(instance_start..instance_end),
         );
+        if let Some(range) = renderer
+            .clipped_surface_objects
+            .get(instance_index)
+            .and_then(|object| object.generated.as_ref())
+        {
+            if let Some(buffer) = &renderer.clipped_surface_buffer
+                && !range.is_empty()
+            {
+                pass.set_pipeline(&renderer.clipped_surface_pipeline);
+                pass.set_vertex_buffer(0, buffer.slice(..));
+                pass.draw(range.clone(), 0..1);
+            }
+            continue;
+        }
+        let Some(index_buffer) = instance.mesh.index_buffer.as_ref() else {
+            continue;
+        };
+        pass.set_pipeline(&renderer.pipeline);
+        pass.set_vertex_buffer(0, instance.mesh.vertex_buffer.slice(..));
         pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
         pass.draw_indexed(0..instance.mesh.index_count, 0, 0..1);
     }
@@ -2768,6 +2779,21 @@ fn encode_scene_pass(
         }
         let dynamic_offset = (object_index * renderer.edge_object_stride) as u32;
         pass.set_bind_group(1, &renderer.edge_object_bind_group, &[dynamic_offset]);
+        if let Some(range) = renderer
+            .clipped_surface_objects
+            .get(object_index)
+            .and_then(|object| object.generated_edges.as_ref())
+        {
+            if let Some(buffer) = &renderer.clipped_edge_buffer
+                && !range.is_empty()
+            {
+                pass.set_pipeline(&renderer.clipped_hidden_edge_pipeline);
+                pass.set_vertex_buffer(0, buffer.slice(..));
+                pass.draw(0..6, range.clone());
+            }
+            continue;
+        }
+        pass.set_pipeline(&renderer.hidden_edge_pipeline);
         pass.set_vertex_buffer(0, edge_buffer.slice(..));
         pass.draw(0..6, 0..instance.mesh.edge_count);
     }
@@ -2785,6 +2811,21 @@ fn encode_scene_pass(
         };
         let dynamic_offset = (object_index * renderer.edge_object_stride) as u32;
         pass.set_bind_group(1, &renderer.edge_object_bind_group, &[dynamic_offset]);
+        if let Some(range) = renderer
+            .clipped_surface_objects
+            .get(object_index)
+            .and_then(|object| object.generated_edges.as_ref())
+        {
+            if let Some(buffer) = &renderer.clipped_edge_buffer
+                && !range.is_empty()
+            {
+                pass.set_pipeline(&renderer.clipped_visible_edge_pipeline);
+                pass.set_vertex_buffer(0, buffer.slice(..));
+                pass.draw(0..6, range.clone());
+            }
+            continue;
+        }
+        pass.set_pipeline(&renderer.visible_edge_pipeline);
         pass.set_vertex_buffer(0, edge_buffer.slice(..));
         pass.draw(0..6, 0..instance.mesh.edge_count);
     }
@@ -2796,6 +2837,7 @@ pub(super) fn assert_gpu_depth_contract(
     queue: &wgpu::Queue,
     format: wgpu::TextureFormat,
 ) {
+    surface::assert_gpu_surface_contract(device, queue, format);
     assert_gpu_clip_equivalence(device, queue);
     let identity = Arc::new(());
     let mut renderer = Mesh3dRenderer::new(device, format);
@@ -3228,6 +3270,18 @@ pub(super) fn assert_gpu_scene_recovery_contract(
     recovery_device: &wgpu::Device,
     recovery_queue: &wgpu::Queue,
 ) {
+    lifetime_tests::assert_lifetime_contract(
+        source_device,
+        source_queue,
+        recovery_device,
+        recovery_queue,
+    );
+    surface::assert_gpu_clipped_recovery(
+        source_device,
+        source_queue,
+        recovery_device,
+        recovery_queue,
+    );
     let source_identity = Arc::new(());
     let recovery_identity = Arc::new(());
     let topology = Mesh3d::with_display_edges(
@@ -3994,7 +4048,7 @@ mod tests {
         );
         assert_eq!(
             validate_surface_triangle_topology(&crossing, model_rows, camera_rows),
-            Err(Mesh3dRenderError::UnportableSurfaceTopology)
+            Ok(())
         );
 
         let outside = mesh(vec![

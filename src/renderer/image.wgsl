@@ -75,7 +75,7 @@ fn image_batch_vs_main(
         1.0,
     );
     output.uv = mix(instance.uv_rect.xy, instance.uv_rect.zw, amount);
-    output.tint = instance.tint;
+    output.tint = instance.tint * image.tint;
     return output;
 }
 

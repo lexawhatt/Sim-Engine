@@ -2,6 +2,14 @@ use super::*;
 
 const IMAGE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 
+mod updates;
+pub(super) use updates::{batch_retained_bytes, update_image_batch_resources};
+
+#[cfg(test)]
+mod update_tests;
+#[cfg(test)]
+pub(super) use update_tests::verify_retained_ui_updates;
+
 /// Immutable resource limits retained with an [`Image2d`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ImageBudget {
@@ -116,6 +124,53 @@ pub enum ImageSampling {
     Linear,
 }
 
+/// Independent presentation of one retained image batch or glyph run.
+///
+/// Translation uses top-left logical pixels in the pass's local coordinates.
+/// It moves content before viewport placement, without moving the pass clip.
+/// Tint multiplies each instance's straight-linear RGBA, including alpha.
+/// Multiple draws can share immutable layout with different placements.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ImageBatchPlacement {
+    translation: crate::LogicalScreenVector,
+    tint: Color,
+}
+
+impl ImageBatchPlacement {
+    /// Creates a portable logical translation and normalized multiplicative tint.
+    /// Negative translation is supported. Target-dependent arithmetic is checked
+    /// again before submission; leaving the target is ordinary clipping.
+    pub fn new(translation: crate::LogicalScreenVector, tint: Color) -> Result<Self, ImageError> {
+        let offset = translation.to_vec2();
+        if ![offset.x, offset.y]
+            .into_iter()
+            .all(is_portable_shader_source)
+            || !tint.is_normalized()
+        {
+            return Err(ImageError::InvalidPlacement);
+        }
+        Ok(Self { translation, tint })
+    }
+
+    /// Returns the content offset in local logical pixels.
+    pub const fn translation(self) -> crate::LogicalScreenVector {
+        self.translation
+    }
+    /// Returns the draw-wide straight-linear tint.
+    pub const fn tint(self) -> Color {
+        self.tint
+    }
+}
+
+impl Default for ImageBatchPlacement {
+    fn default() -> Self {
+        Self {
+            translation: crate::LogicalScreenVector::new(0.0, 0.0),
+            tint: Color::WHITE,
+        }
+    }
+}
+
 /// Failure while creating, restoring, or updating an RGBA image.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImageError {
@@ -148,6 +203,8 @@ pub enum ImageError {
     UpdateRegionOutOfBounds,
     /// A sprite source rectangle or tint is invalid for its image.
     InvalidSprite,
+    /// Draw translation is outside the portable envelope or tint is not normalized.
+    InvalidPlacement,
     /// A sprite batch exceeds its retained count or CPU metadata byte limit.
     BatchBudgetExceeded {
         /// Configured upper bound.
@@ -186,6 +243,9 @@ impl fmt::Display for ImageError {
             }
             Self::UpdateRegionOutOfBounds => write!(formatter, "image update is out of bounds"),
             Self::InvalidSprite => write!(formatter, "image sprite source or tint is invalid"),
+            Self::InvalidPlacement => {
+                write!(formatter, "image batch translation or tint is invalid")
+            }
             Self::BatchBudgetExceeded { limit, actual } => {
                 write!(formatter, "image batch work {actual} exceeds limit {limit}")
             }
@@ -223,6 +283,12 @@ impl ImageUploadReport {
 pub struct ImageBatchUploadReport {
     uploaded_instance_bytes: usize,
     replaced_instance_buffer: bool,
+    sprite_count: usize,
+    retained_capacity: usize,
+    gpu_capacity: usize,
+    retained_bytes: usize,
+    peak_retained_bytes: usize,
+    peak_gpu_bytes: usize,
 }
 
 impl ImageBatchUploadReport {
@@ -234,6 +300,38 @@ impl ImageBatchUploadReport {
     /// Returns whether the operation replaced the underlying instance buffer.
     pub const fn replaced_instance_buffer(self) -> bool {
         self.replaced_instance_buffer
+    }
+
+    /// Returns the accepted logical sprite count, including zero for an empty update.
+    pub const fn sprite_count(self) -> usize {
+        self.sprite_count
+    }
+
+    /// Returns reusable CPU sprite/instance capacity, excluding allocator metadata.
+    pub const fn retained_capacity(self) -> usize {
+        self.retained_capacity
+    }
+
+    /// Returns reusable GPU instance capacity (an empty buffer has one slot).
+    pub const fn gpu_capacity(self) -> usize {
+        self.gpu_capacity
+    }
+
+    /// Returns retained CPU description and conversion-staging allocation bytes.
+    pub const fn retained_bytes(self) -> usize {
+        self.retained_bytes
+    }
+
+    /// Returns the maximum old-plus-new CPU allocation bytes owned during this update.
+    /// Caller input and opaque allocator/backend staging are not included.
+    pub const fn peak_retained_bytes(self) -> usize {
+        self.peak_retained_bytes
+    }
+
+    /// Returns old-plus-new GPU instance-buffer bytes during replacement, or the
+    /// reused allocation size. In-flight retirement remains owned by wgpu.
+    pub const fn peak_gpu_bytes(self) -> usize {
+        self.peak_gpu_bytes
     }
 }
 
@@ -353,9 +451,17 @@ pub struct ImageBatchBudget {
 }
 
 impl ImageBatchBudget {
+    /// CPU bytes per sprite capacity slot: description plus conversion staging.
+    /// Does not include image pixels, Vec headers or allocator metadata.
+    pub const RETAINED_BYTES_PER_SPRITE: usize =
+        std::mem::size_of::<ImageSprite2d>() + std::mem::size_of::<ImageInstance>();
+
+    /// GPU instance record bytes; empty batches retain one minimum buffer slot.
+    pub const GPU_BYTES_PER_SPRITE: usize = std::mem::size_of::<ImageInstance>();
+
     /// Creates non-zero sprite-count and retained-byte limits.
     pub fn new(max_sprites: usize, max_retained_bytes: usize) -> Result<Self, ImageError> {
-        if max_sprites == 0 || max_retained_bytes < std::mem::size_of::<ImageSprite2d>() {
+        if max_sprites == 0 || max_retained_bytes < batch_retained_bytes(1) {
             return Err(ImageError::InvalidBudget);
         }
         Ok(Self {
@@ -369,7 +475,7 @@ impl ImageBatchBudget {
         self.max_sprites
     }
 
-    /// Returns maximum retained sprite-description bytes.
+    /// Returns maximum retained CPU sprite-description and conversion-staging bytes.
     pub const fn max_retained_bytes(self) -> usize {
         self.max_retained_bytes
     }
@@ -396,6 +502,7 @@ pub struct ImageBatch2d {
     pub(super) image_recovery_identity: Arc<()>,
     pub(super) instance_buffer: wgpu::Buffer,
     sprites: Vec<ImageSprite2d>,
+    instances: Vec<ImageInstance>,
     budget: ImageBatchBudget,
 }
 
@@ -415,19 +522,26 @@ impl ImageBatch2d {
         self.budget
     }
 
-    /// Returns retained CPU recovery bytes.
+    /// Returns retained CPU recovery and reusable conversion-staging bytes.
     pub fn recovery_memory_bytes(&self) -> usize {
         self.sprites
             .capacity()
             .saturating_mul(std::mem::size_of::<ImageSprite2d>())
+            .saturating_add(
+                self.instances
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<ImageInstance>()),
+            )
     }
 
-    /// Returns GPU instance-buffer bytes actively addressed by the batch.
+    /// Returns actual retained GPU buffer bytes, including reusable spare capacity.
     pub fn gpu_allocation_bytes(&self) -> usize {
-        self.sprites
-            .len()
-            .max(1)
-            .saturating_mul(std::mem::size_of::<ImageInstance>())
+        self.instance_buffer.size() as usize
+    }
+
+    /// Returns CPU capacity reusable without growing either retained array.
+    pub fn capacity(&self) -> usize {
+        self.sprites.capacity().min(self.instances.capacity())
     }
 }
 
@@ -458,6 +572,30 @@ pub(super) struct ImageUniform {
     pub(super) world_clip_x: [f32; 4],
     pub(super) world_clip_y: [f32; 4],
     pub(super) world_mode: [f32; 4],
+}
+
+pub(super) fn batch_uniform(
+    target: LogicalViewport,
+    viewport_origin: Vec2,
+    placement: ImageBatchPlacement,
+) -> Result<ImageUniform, RendererFrameError> {
+    let origin = viewport_origin + placement.translation().to_vec2();
+    let destination = [2.0 / target.width(), -2.0 / target.height(), -1.0, 1.0];
+    if ![origin.x, origin.y]
+        .into_iter()
+        .chain(destination)
+        .all(is_portable_shader_source)
+    {
+        return Err(RendererFrameError::InvalidGeometryTransform);
+    }
+    Ok(ImageUniform {
+        destination,
+        uv_rect: [origin.x, origin.y, 0.0, 0.0],
+        tint: placement.tint().to_array(),
+        world_clip_x: [0.0; 4],
+        world_clip_y: [0.0; 4],
+        world_mode: [0.0; 4],
+    })
 }
 
 pub(super) struct ImageRenderer {
@@ -731,24 +869,15 @@ impl WgpuRenderer {
         )
     }
 
-    /// Atomically replaces a batch after validating every source rectangle.
+    /// Updates a batch from owned input, reusing capacity when possible.
+    /// Prefer [`Self::update_image_batch`] when the host retains its input storage.
     pub fn replace_image_batch(
         &self,
         image: &Image2d,
         batch: &mut ImageBatch2d,
         sprites: Vec<ImageSprite2d>,
     ) -> Result<ImageBatchUploadReport, ImageError> {
-        self.validate_image_batch(image, batch)?;
-        let replacement = self.create_image_batch(image, sprites, batch.budget)?;
-        let uploaded_bytes = replacement
-            .sprites
-            .len()
-            .saturating_mul(std::mem::size_of::<ImageInstance>());
-        *batch = replacement;
-        Ok(ImageBatchUploadReport {
-            uploaded_instance_bytes: uploaded_bytes,
-            replaced_instance_buffer: true,
-        })
+        self.update_image_batch(image, batch, &sprites)
     }
 
     /// Restores a batch against the restored copy of its original atlas.
@@ -834,12 +963,17 @@ pub(super) fn create_image_batch_resources(
     }) {
         return Err(ImageError::InvalidSprite);
     }
-    let sprites = compact_vec_with_byte_limit(sprites, budget.max_retained_bytes, |actual| {
-        ImageError::BatchBudgetExceeded {
+    let staging_bytes = sprites
+        .len()
+        .saturating_mul(std::mem::size_of::<ImageInstance>());
+    let sprites = compact_vec_with_byte_limit(
+        sprites,
+        budget.max_retained_bytes.saturating_sub(staging_bytes),
+        |actual| ImageError::BatchBudgetExceeded {
             limit: budget.max_retained_bytes,
             actual,
-        }
-    })?;
+        },
+    )?;
     let mut instances = Vec::new();
     instances
         .try_reserve_exact(sprites.len())
@@ -875,6 +1009,20 @@ pub(super) fn create_image_batch_resources(
         }
         instances.push(instance);
     }
+    let retained_bytes = sprites
+        .capacity()
+        .saturating_mul(std::mem::size_of::<ImageSprite2d>())
+        .saturating_add(
+            instances
+                .capacity()
+                .saturating_mul(std::mem::size_of::<ImageInstance>()),
+        );
+    if retained_bytes > budget.max_retained_bytes {
+        return Err(ImageError::BatchBudgetExceeded {
+            limit: budget.max_retained_bytes,
+            actual: retained_bytes,
+        });
+    }
     let instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("sim-engine retained image sprite instances"),
         size: gpu_bytes as wgpu::BufferAddress,
@@ -891,6 +1039,7 @@ pub(super) fn create_image_batch_resources(
         image_recovery_identity: Arc::clone(&image.recovery_identity),
         instance_buffer,
         sprites,
+        instances,
         budget,
     })
 }
@@ -1039,7 +1188,7 @@ pub(super) fn preflight_image_batch_capacity(
         return Err(ImageError::DimensionsTooLarge);
     }
     let retained_bytes = sprite_count
-        .checked_mul(std::mem::size_of::<ImageSprite2d>())
+        .checked_mul(batch_retained_bytes(1))
         .ok_or(ImageError::DimensionsTooLarge)?;
     if retained_bytes > budget.max_retained_bytes {
         return Err(ImageError::BatchBudgetExceeded {
@@ -1177,6 +1326,12 @@ mod tests {
         let batch = ImageBatchUploadReport {
             uploaded_instance_bytes: 96,
             replaced_instance_buffer: true,
+            sprite_count: 2,
+            retained_capacity: 2,
+            gpu_capacity: 2,
+            retained_bytes: batch_retained_bytes(2),
+            peak_retained_bytes: batch_retained_bytes(2),
+            peak_gpu_bytes: 96,
         };
 
         assert!(replacement.replaced_texture());

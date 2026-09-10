@@ -1064,9 +1064,11 @@ fn tessellated_triangle_topology_is_portable(vertices: &[Vertex], uniform: Camer
     }
     let minimum_normal = f64::from(f32::MIN_POSITIVE);
     for triangle in vertices.chunks_exact(3) {
-        let has_shader_extrusion = !triangle
-            .iter()
-            .all(|vertex| vertex.normal_distance == 0.0 && vertex.tangent_distance == 0.0);
+        let has_shader_extrusion = !triangle.iter().all(|vertex| {
+            vertex.normal_distance == 0.0
+                && vertex.tangent_distance == 0.0
+                && vertex.stroke_role >= 0.0
+        });
         if has_shader_extrusion {
             let Some(first) = logical_stroke_vertex_screen_ranges(triangle[0], uniform) else {
                 return false;
@@ -1288,6 +1290,9 @@ fn logical_stroke_vertex_screen_ranges(
     vertex: Vertex,
     uniform: CameraUniform,
 ) -> Option<([(f64, f64); 2], bool)> {
+    if vertex.stroke_role < 0.0 {
+        return exact_markers::vertex_screen_ranges(vertex, uniform);
+    }
     let base = tessellated_vertex_base_screen_ranges(vertex, uniform)?;
     let previous_source = Vec2::new(vertex.previous_direction[0], vertex.previous_direction[1]);
     let next_source = Vec2::new(vertex.next_direction[0], vertex.next_direction[1]);
@@ -3529,6 +3534,7 @@ pub struct WgpuRenderer {
     heatmap_uniform_buffer: wgpu::Buffer,
     heatmap_bind_group_layout: wgpu::BindGroupLayout,
     color_map_cache: Option<CachedColorMap>,
+    frame_cache: frame::FrameCache,
     vertex_buffer: Arc<wgpu::Buffer>,
     particle_unit_buffer: wgpu::Buffer,
     vertex_capacity: usize,
@@ -3679,6 +3685,7 @@ impl WgpuRenderer {
             heatmap_uniform_buffer,
             heatmap_bind_group_layout,
             color_map_cache: None,
+            frame_cache: frame::FrameCache::default(),
             vertex_buffer,
             particle_unit_buffer,
             vertex_capacity: INITIAL_VERTEX_CAPACITY,
@@ -8023,6 +8030,7 @@ fn create_particle_instance_buffer(device: &wgpu::Device, capacity: usize) -> wg
 }
 
 mod config;
+mod exact_markers;
 mod frame;
 mod glyph;
 mod image;
@@ -8035,22 +8043,27 @@ use config::{
 };
 pub use config::{RendererPresentMode, RendererSurfacePresentMode, WgpuRendererOptions};
 pub use frame::{
-    FrameBudget, FrameBudgetResource, FrameComposer, FrameComposerError, FramePassOptions,
-    FrameReport, FrameSourceKind, FrameSourceStatistics, FrameStatistics,
+    FrameBudget, FrameBudgetResource, FrameCacheBudget, FrameCacheStatistics, FrameComposer,
+    FrameComposerError, FramePassOptions, FrameReport, FrameSourceKind, FrameSourceStatistics,
+    FrameStatistics,
 };
 pub use glyph::{
     GlyphAtlas2d, GlyphAtlasBudget, GlyphAtlasEntry, GlyphError, GlyphId, GlyphRun2d,
-    GlyphRunBounds, GlyphRunBudget, GlyphRunStatistics, GlyphUploadReport, PositionedGlyph2d,
+    GlyphRunBounds, GlyphRunBudget, GlyphRunStatistics, GlyphRunUploadReport, GlyphUploadReport,
+    PositionedGlyph2d,
 };
 pub use image::{
-    Image2d, ImageBatch2d, ImageBatchBudget, ImageBatchUploadReport, ImageBudget, ImageError,
-    ImageSampling, ImageSprite2d, ImageTexelRect, ImageUploadReport,
+    Image2d, ImageBatch2d, ImageBatchBudget, ImageBatchPlacement, ImageBatchUploadReport,
+    ImageBudget, ImageError, ImageSampling, ImageSprite2d, ImageTexelRect, ImageUploadReport,
 };
 use image::{ImageRenderer, ImageUniform};
 use mesh3d::Mesh3dRenderer;
 pub use mesh3d::{
-    Mesh3dInstance, Mesh3dRenderError, Mesh3dRenderReport, Mesh3dResourceError, Object3dId,
-    RenderTarget3d, RetainedMesh3d, Scene3d, Scene3dError, Scene3dRestoreReport,
+    Mesh3dInstance, Mesh3dObjectError, Mesh3dPreflightReport, Mesh3dRenderBudget,
+    Mesh3dRenderError, Mesh3dRenderReport, Mesh3dResourceError, Mesh3dUploadBudget,
+    Mesh3dUploadBudgetResource, Mesh3dUploadReport, Object3dId, RenderTarget3d, RetainedMesh3d,
+    Scene3d, Scene3dBudget, Scene3dBudgetResource, Scene3dError, Scene3dMeshUpdateReport,
+    Scene3dRestoreReport, Scene3dStatistics,
 };
 use tessellation::{
     logical_viewport_scissor, offset_scissor, screen_clip_to_scissor, tessellate_scene,

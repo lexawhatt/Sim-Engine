@@ -47,6 +47,16 @@ fn mesh3d_fs_main(input: Mesh3dVertexOut) -> @location(0) vec4<f32> {
     return input.color;
 }
 
+// Crossing surfaces arrive as a bounded, CPU-proven homogeneous triangle list.
+// Keeping clip w preserves perspective-correct depth and interpolation.
+@vertex
+fn mesh3d_clipped_surface_vs_main(
+    @location(0) clip_position: vec4<f32>,
+    @location(4) color: vec4<f32>,
+) -> Mesh3dVertexOut {
+    return Mesh3dVertexOut(clip_position, color);
+}
+
 struct Mesh3dEdgeIn {
     @location(0) model_start: vec3<f32>,
     @location(1) model_end: vec3<f32>,
@@ -193,10 +203,23 @@ fn edge_vertex(
     logical_width: f32,
     color: vec4<f32>,
 ) -> Mesh3dEdgeOut {
-    let clipped = clip_edge_to_frustum(
+    return edge_vertex_from_clip(
         project_edge_point(input.model_start),
         project_edge_point(input.model_end),
+        vertex_index,
+        logical_width,
+        color,
     );
+}
+
+fn edge_vertex_from_clip(
+    source_start: vec4<f32>,
+    source_end: vec4<f32>,
+    vertex_index: u32,
+    logical_width: f32,
+    color: vec4<f32>,
+) -> Mesh3dEdgeOut {
+    let clipped = clip_edge_to_frustum(source_start, source_end);
     let start_clip = clipped.start_clip;
     let end_clip = clipped.end_clip;
     let start_ndc = start_clip.xy / start_clip.w;
@@ -246,6 +269,29 @@ fn edge_coverage(input: Mesh3dEdgeOut) -> f32 {
         0.0,
         1.0,
     );
+}
+
+struct Mesh3dClipEdgeIn {
+    @location(0) start_clip: vec4<f32>,
+    @location(1) end_clip: vec4<f32>,
+};
+
+@vertex
+fn mesh3d_clipped_visible_edge_vs_main(
+    input: Mesh3dClipEdgeIn,
+    @builtin(vertex_index) vertex_index: u32,
+) -> Mesh3dEdgeOut {
+    return edge_vertex_from_clip(input.start_clip, input.end_clip, vertex_index,
+        edge_object.edge_style.x, edge_object.visible_color);
+}
+
+@vertex
+fn mesh3d_clipped_hidden_edge_vs_main(
+    input: Mesh3dClipEdgeIn,
+    @builtin(vertex_index) vertex_index: u32,
+) -> Mesh3dEdgeOut {
+    return edge_vertex_from_clip(input.start_clip, input.end_clip, vertex_index,
+        edge_object.edge_style.y, edge_object.hidden_color);
 }
 
 @vertex

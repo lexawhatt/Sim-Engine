@@ -3038,6 +3038,16 @@ fn offscreen_gpu_readback_verifies_camera_depth_and_clip_contract() {
             recovery_device.push_error_scope(wgpu::ErrorFilter::Validation);
         assert_gpu_large_center_circle(&adapter, &device, &queue, format).await;
         assert_gpu_stroke_pixel_matrix(&adapter, &device, &queue, format).await;
+        exact_markers::assert_gpu_pixels(&device, &queue, format, sample_count);
+        image::verify_retained_ui_updates(
+            &device,
+            &queue,
+            &recovery_device,
+            &recovery_queue,
+            format,
+            sample_count,
+        )
+        .await;
         mesh3d::assert_gpu_depth_contract(&device, &queue, format);
         mesh3d::assert_gpu_scene_recovery_contract(
             &device,

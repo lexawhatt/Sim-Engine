@@ -14,6 +14,9 @@ mod screen;
 mod tween;
 mod units;
 
+#[cfg(test)]
+mod test_allocations;
+
 #[cfg(feature = "wgpu")]
 mod renderer;
 
@@ -38,8 +41,8 @@ pub use scene::{
     Circle, DrawCommand, Fill, Layer, Line, LinearGradient, MAX_STROKE_DASH_SUBSEGMENTS, Polyline,
     PrimitiveCommandCounts, RadialGradient, RectShape, Scene, SceneBudget, SceneBudgetResource,
     SceneCommand, SceneError, ScenePrimitive, SceneStatistics, ScreenClipRect, Shadow, ShapeStyle,
-    Stroke, StrokeCap2d, StrokeDashPattern2d, StrokeJoin2d, StrokeMarker2d, StrokeStyle2d,
-    StrokeStyleError, StrokeWidthMode2d,
+    Stroke, StrokeCap2d, StrokeDashPattern2d, StrokeJoin2d, StrokeMarker2d, StrokeMarkerAnchor2d,
+    StrokeStyle2d, StrokeStyleError, StrokeWidthMode2d,
 };
 pub use screen::ScreenScene;
 pub use tween::{Interpolate, Tween, TweenError};
@@ -49,21 +52,24 @@ pub use units::{LogicalPixels, PhysicalPerLogical, UnitError, WorldLength};
 pub use renderer::{
     BlendMode, DynamicMesh2d, DynamicMeshBudget, DynamicMeshBudgetResource, DynamicMeshError,
     DynamicMeshRenderError, DynamicMeshUpdateReport, DynamicVertex2d, FrameBudget,
-    FrameBudgetResource, FrameComposer, FrameComposerError, FramePassOptions, FrameReport,
-    FrameSourceKind, FrameSourceStatistics, FrameStatistics, GlyphAtlas2d, GlyphAtlasBudget,
-    GlyphAtlasEntry, GlyphError, GlyphId, GlyphRun2d, GlyphRunBounds, GlyphRunBudget,
-    GlyphRunStatistics, GlyphUploadReport, Image2d, ImageBatch2d, ImageBatchBudget,
-    ImageBatchUploadReport, ImageBudget, ImageError, ImageSampling, ImageSprite2d, ImageTexelRect,
-    ImageUploadReport, LayeredVisualizationError, LayeredVisualizationOptions,
-    LayeredVisualizationReport, Mesh3dInstance, Mesh3dRenderError, Mesh3dRenderReport,
-    Mesh3dResourceError, Object3dId, ParticleBudgetError, ParticleField2d, ParticleFieldError,
-    ParticleFieldRenderError, ParticleFieldUpdateReport, ParticleRenderBudget, ParticleStatistics,
-    PositionedGlyph2d, PreparedScene, PreparedSceneError, PreparedSceneRenderError,
-    PreparedScreenScene, RenderReport, RenderStatus, RenderTarget2d, RenderTarget3d,
-    RenderTargetError, RenderTargetLoad, RendererConfigurationError, RendererCoordinateError,
-    RendererFrameError, RendererFrameMetrics, RendererInitError, RendererPresentMode,
-    RendererSurfacePresentMode, RendererSurfaceStatus, RetainedMesh3d, ScalarFieldRenderError,
-    ScalarFieldSampling, ScalarFieldTexture, ScalarFieldTextureError, ScalarFieldUploadReport,
-    Scene3d, Scene3dError, Scene3dRestoreReport, TessellationStats, TrailBuffer2d, WgpuRenderer,
-    WgpuRendererOptions,
+    FrameBudgetResource, FrameCacheBudget, FrameCacheStatistics, FrameComposer, FrameComposerError,
+    FramePassOptions, FrameReport, FrameSourceKind, FrameSourceStatistics, FrameStatistics,
+    GlyphAtlas2d, GlyphAtlasBudget, GlyphAtlasEntry, GlyphError, GlyphId, GlyphRun2d,
+    GlyphRunBounds, GlyphRunBudget, GlyphRunStatistics, GlyphRunUploadReport, GlyphUploadReport,
+    Image2d, ImageBatch2d, ImageBatchBudget, ImageBatchPlacement, ImageBatchUploadReport,
+    ImageBudget, ImageError, ImageSampling, ImageSprite2d, ImageTexelRect, ImageUploadReport,
+    LayeredVisualizationError, LayeredVisualizationOptions, LayeredVisualizationReport,
+    Mesh3dInstance, Mesh3dObjectError, Mesh3dPreflightReport, Mesh3dRenderBudget,
+    Mesh3dRenderError, Mesh3dRenderReport, Mesh3dResourceError, Mesh3dUploadBudget,
+    Mesh3dUploadBudgetResource, Mesh3dUploadReport, Object3dId, ParticleBudgetError,
+    ParticleField2d, ParticleFieldError, ParticleFieldRenderError, ParticleFieldUpdateReport,
+    ParticleRenderBudget, ParticleStatistics, PositionedGlyph2d, PreparedScene, PreparedSceneError,
+    PreparedSceneRenderError, PreparedScreenScene, RenderReport, RenderStatus, RenderTarget2d,
+    RenderTarget3d, RenderTargetError, RenderTargetLoad, RendererConfigurationError,
+    RendererCoordinateError, RendererFrameError, RendererFrameMetrics, RendererInitError,
+    RendererPresentMode, RendererSurfacePresentMode, RendererSurfaceStatus, RetainedMesh3d,
+    ScalarFieldRenderError, ScalarFieldSampling, ScalarFieldTexture, ScalarFieldTextureError,
+    ScalarFieldUploadReport, Scene3d, Scene3dBudget, Scene3dBudgetResource, Scene3dError,
+    Scene3dMeshUpdateReport, Scene3dRestoreReport, Scene3dStatistics, TessellationStats,
+    TrailBuffer2d, WgpuRenderer, WgpuRendererOptions,
 };
