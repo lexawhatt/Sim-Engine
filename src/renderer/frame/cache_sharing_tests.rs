@@ -1,5 +1,8 @@
 use super::*;
 
+#[path = "cache_uniform_upload_tests.rs"]
+mod uniform_upload_tests;
+
 #[test]
 fn shared_binding_key_requires_kind_identity_sampling_and_exact_uniform_bytes() {
     let image = Arc::new(());
@@ -145,6 +148,7 @@ pub(in crate::renderer) fn assert_gpu_binding_sharing_contract(
         );
     }
     assert_gpu_texture_sharing_accounting(device, queue);
+    uniform_upload_tests::assert_cache_uniform_upload_contract(device, queue);
 }
 
 fn build_bindings(

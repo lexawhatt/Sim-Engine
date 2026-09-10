@@ -8,10 +8,13 @@ mod encoding;
 #[cfg(test)]
 pub(super) use encoding::assert_gpu_encoding_contract;
 mod streaming;
+mod uniform_uploads;
 pub(super) use cache::FrameCache;
 #[cfg(test)]
 pub(super) use cache::assert_gpu_binding_sharing_contract;
 pub use cache::{FrameCacheBudget, FrameCacheStatistics};
+#[cfg(test)]
+pub(super) use uniform_uploads::assert_gpu_uniform_upload_contract;
 
 /// Work category constrained by a [`FrameBudget`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2253,6 +2256,7 @@ fn present_frame_with_vertices<'frame>(
                 .saturating_mul(std::mem::size_of::<FrameBinding>()),
         })?;
     cache.reserve_slots(ready.len())?;
+    cache.prepare_uniform_uploads(ready, renderer.device.limits().max_buffer_size);
     let tessellation = tessellation_started_at.elapsed();
 
     // Surface availability is resolved after all fallible CPU preparation but
@@ -2375,7 +2379,7 @@ fn present_frame_with_vertices<'frame>(
             }
         }
     }
-    let upload = upload_started_at.elapsed() + binding_upload;
+    let mut upload = upload_started_at.elapsed() + binding_upload;
     let encode_started_at = Instant::now();
     let surface_view = surface_texture
         .texture
@@ -2389,6 +2393,10 @@ fn present_frame_with_vertices<'frame>(
         .create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("sim-engine composed frame encoder"),
         });
+    let uniform_batch_started_at = Instant::now();
+    cache.flush_uniform_uploads(&renderer.device, &renderer.queue, &mut encoder, bindings);
+    let uniform_batch_upload = uniform_batch_started_at.elapsed();
+    upload += uniform_batch_upload;
     {
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("sim-engine composed frame pass"),
@@ -2412,7 +2420,9 @@ fn present_frame_with_vertices<'frame>(
     renderer.notify_before_present();
     renderer.queue.present(surface_texture);
     set_particle_rendered(ready, true);
-    let encode_submit_present = encode_started_at.elapsed();
+    let encode_submit_present = encode_started_at
+        .elapsed()
+        .saturating_sub(uniform_batch_upload);
     Ok(frame_report(
         RenderStatus::Drawn,
         statistics,

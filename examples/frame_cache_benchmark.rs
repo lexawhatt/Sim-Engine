@@ -151,6 +151,10 @@ struct Samples {
     tessellation: Duration,
     upload: Duration,
     camera_upload: Duration,
+    uniform_calls: usize,
+    uniform_copies: usize,
+    uniform_copy_bytes: usize,
+    staging_buffers: usize,
     encode: Duration,
     outside_report: Duration,
     measured_started: Option<Instant>,
@@ -183,6 +187,7 @@ struct Benchmark {
     samples: Samples,
     measured_frames: usize,
     trials: usize,
+    upload_staging_bytes: Option<usize>,
 }
 
 impl Benchmark {
@@ -284,7 +289,7 @@ impl Benchmark {
             }
             mixed_panels.push(scene);
         }
-        renderer.set_frame_cache_budget(cases[0].cache_budget());
+        renderer.set_frame_cache_budget(cases[0].cache_budget(selection.upload_staging_bytes));
         Ok(Self {
             window,
             renderer,
@@ -300,6 +305,7 @@ impl Benchmark {
             samples: Samples::new(measured_frames),
             measured_frames,
             trials: selection.trials,
+            upload_staging_bytes: selection.upload_staging_bytes,
         })
     }
 
@@ -343,8 +349,14 @@ impl Benchmark {
         let cache = self.renderer.frame_cache_statistics();
         if self.samples.draws > WARMUP {
             self.samples.measured_started.get_or_insert(started);
-            if case.cached && (cache.created_buffers() != 0 || cache.created_bind_groups() != 0) {
-                return Err("warmed composition created a new uniform buffer or bind group".into());
+            if case.cached
+                && (cache.created_buffers() != 0
+                    || cache.created_bind_groups() != 0
+                    || cache.created_upload_staging_buffers() != 0)
+            {
+                return Err(
+                    "warmed composition created a new uniform/staging buffer or bind group".into(),
+                );
             }
             if case.cached
                 && matches!(
@@ -363,6 +375,10 @@ impl Benchmark {
             self.samples.allocated_bytes += allocated_bytes;
             self.samples.buffers += cache.created_buffers();
             self.samples.groups += cache.created_bind_groups();
+            self.samples.uniform_calls += cache.uniform_upload_calls();
+            self.samples.uniform_copies += cache.batched_uniform_copies();
+            self.samples.uniform_copy_bytes += cache.batched_uniform_bytes();
+            self.samples.staging_buffers += cache.created_upload_staging_buffers();
             self.samples.uploads += report.statistics().upload_bytes();
             self.samples.elapsed += elapsed;
             self.samples.acquire += report.metrics().surface_acquire();
@@ -431,13 +447,29 @@ impl Benchmark {
             self.samples.encode.as_secs_f64() * 1000.0 / count,
             self.samples.outside_report.as_secs_f64() * 1000.0 / count,
         );
+        println!(
+            "uniform_uploads case={} labels={} cache={} queue_writes_per_frame={:.2} buffer_copies_per_frame={:.2} buffer_copy_bytes_per_frame={:.0} new_staging_buffers_per_frame={:.2} retained_staging_bytes={} peak_staging_bytes={} staging_limit={}",
+            case.content.name(),
+            case.labels,
+            case.cached,
+            self.samples.uniform_calls as f64 / count,
+            self.samples.uniform_copies as f64 / count,
+            self.samples.uniform_copy_bytes as f64 / count,
+            self.samples.staging_buffers as f64 / count,
+            cache.upload_staging_bytes(),
+            cache.peak_upload_staging_bytes(),
+            self.renderer
+                .frame_cache_budget()
+                .max_upload_staging_bytes(),
+        );
         self.samples = Samples::new(self.measured_frames);
         self.case_index += 1;
         if self.case_index == self.cases.len() {
             return Ok(true);
         }
-        self.renderer
-            .set_frame_cache_budget(self.cases[self.case_index].cache_budget());
+        self.renderer.set_frame_cache_budget(
+            self.cases[self.case_index].cache_budget(self.upload_staging_bytes),
+        );
         Ok(false)
     }
 
@@ -633,9 +665,17 @@ fn main() -> Result<()> {
                     .ok_or("--trials requires a count")?
                     .parse()?
             }
+            "--upload-staging" => {
+                selection.upload_staging_bytes = Some(
+                    arguments
+                        .next()
+                        .ok_or("--upload-staging requires bytes (0 disables batching)")?
+                        .parse()?,
+                );
+            }
             "--help" => {
                 println!(
-                    "frame_cache_benchmark [--frames 1..10000] [--quick] [--case world|world_screen|mixed64_images128rects|unchanged|recolored|moved|mixed] [--labels 0|1|100|1000] [--cache on|off|both] [--trials 1..100]\nEach trial warms up 20 presents; trial order alternates. Defaults retain all 30 cases. This is diagnostic, not a release gate."
+                    "frame_cache_benchmark [--frames 1..10000] [--quick] [--case world|world_screen|mixed64_images128rects|unchanged|recolored|moved|mixed] [--labels 0|1|100|1000] [--cache on|off|both] [--trials 1..100] [--upload-staging BYTES]\nEach trial warms up 20 presents; trial order alternates. Defaults retain all 30 cases. --upload-staging 0 keeps the cache but disables packed uniform uploads. This is diagnostic, not a release gate."
                 );
                 return Ok(());
             }

@@ -505,6 +505,26 @@ encoding, surface acquisition, and currently uncached scalar bindings remain
 separate costs. Keep mixed item order intact; regrouping by texture would change
 alpha composition.
 
+Changed retained uniforms can use one packed host upload followed by copies
+into their existing independent GPU buffers. The default cache permits a
+256 KiB transfer buffer. `FrameCacheBudget::new(...)` leaves this optimization
+disabled; opt in with `.with_upload_staging_bytes(bytes)`, or pass zero to keep
+direct writes while retaining other caches. Batches smaller than 32 changed
+slots, larger than the cap/device limit, or unable to reserve optional CPU
+scratch fall back to direct writes. No shader layout or draw ordering changes.
+
+Packing trades fewer queue staging allocations for bounded CPU scratch, a GPU
+transfer buffer and extra GPU-to-GPU copy work. `upload_staging_bytes()` and
+`peak_upload_staging_bytes()` report that buffer separately from uniforms;
+payload/copy-record capacities count in cache CPU bytes and idle eviction.
+`created_upload_staging_buffers()`, `uniform_upload_calls()`,
+`batched_uniform_copies()` and `batched_uniform_bytes()` expose the work.
+Actual host-upload bytes are counted once, not again for the internal copies;
+construction upload budgets remain unchanged. Scratch is reserved before
+surface acquisition, but queued writes and copies occur only after success.
+Skipped/rejected frames do not publish pending uniform changes. Clear/recovery
+releases transfer storage along with the other cached resources.
+
 For a paired measurement, run `frame_cache_benchmark --frames 120` through
 `cargo run --release --example frame_cache_benchmark -- --frames 120`. It
 compares disabled/enabled caching on 1/100/1000 independent 32-glyph labels,
@@ -527,6 +547,17 @@ Filtering does not reduce source counts or quality. Every trial starts with
 reported separately, including slow trials. With no filters, all 30 original
 cases remain enabled. `--cache on` focuses on warmed behavior. This is a diagnostic
 benchmark, not a GPU-timestamp measurement or a universal 60 FPS promise.
+
+For a same-binary comparison of changing text, keep cache retention enabled and
+compare the following command with and without `--upload-staging 0`:
+
+```bash
+cargo run --release --example frame_cache_benchmark -- \
+  --case recolored --labels 1000 --cache on --trials 3 --frames 120
+```
+
+The `uniform_uploads` line distinguishes queue writes, internal copies and
+retained transfer-buffer bytes; the existing upload count remains host bytes.
 
 The 0.3 CPU validation path avoids duplicate position proofs and memoizes eight
 exact position keys within each call, including the shared world-anchor
@@ -1572,6 +1603,7 @@ composed, drawn, measured, and recovered.
 | `renderer/mesh3d_texture.rs` | opaque texture/material ownership and recovery |
 | `renderer/frame/cache.rs` | bounded frame scratch, uniform and binding reuse |
 | `renderer/frame/encoding.rs` | ordered mixed-source draw encoding and pass-local state reuse |
+| `renderer/frame/uniform_uploads.rs` | bounded packed transfers into independent retained uniforms |
 | `renderer/primitive.wgsl` | 2D, particle, heatmap, and composition shaders |
 | `renderer/mesh3d.wgsl` | 3D projection and screen-space edge expansion |
 

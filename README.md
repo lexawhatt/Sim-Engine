@@ -132,6 +132,10 @@ cargo run --release --example editable_textured_3d -- --acceptance
 The text demo owns its tiny numeric font; Engine adds no font shaping, UI
 navigation, audio, or game-domain dependency. `--acceptance` exercises public
 update, composition and recovery routes and requires actual presented frames.
+For changing-text diagnostics, use `frame_cache_benchmark --case recolored
+--labels 1000 --cache on`; compare with `--upload-staging 0` to isolate bounded
+uniform-upload packing without disabling the other caches. Transfer memory and
+GPU copy work are reported separately from host-upload bytes.
 
 ## Quick Start
 

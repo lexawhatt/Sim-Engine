@@ -91,6 +91,17 @@ from the official 0.2.0 release; a development version is not release sign-off.
 - Frame-cache diagnostics support case/count/cache filters and repeated,
   independently reported trials with alternating case order and unchanged
   workload sizes. CPU time outside the renderer report is reported separately.
+- Changed retained uniforms can be packed into one bounded upload, then copied
+  to their existing independent buffers before drawing. Default cache staging
+  is capped at 256 KiB; custom `FrameCacheBudget::new` stays disabled unless
+  configured with `with_upload_staging_bytes`. Small/oversized batches and
+  optional scratch-allocation failures fall back to the direct-write path.
+- Frame-cache statistics expose uniform queue-write calls, internal copy counts
+  and bytes, transfer-buffer creations and current/peak transfer-buffer bytes.
+  CPU staging capacity remains part of the CPU cache budget. Host uploads are
+  counted once; additional GPU copy traffic is explicitly separate.
+- Frame-cache benchmark `--upload-staging 0` disables only packed uploads for
+  same-workload comparisons while retaining scene/binding caches.
 - Shared world-anchor projections are computed once per consecutive fan in
   2D validation. Interval analysis counts terms in one pass and precomputes
   exact rounding coefficients; frozen-reference tests compare output bits,

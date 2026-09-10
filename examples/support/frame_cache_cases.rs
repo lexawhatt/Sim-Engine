@@ -7,6 +7,7 @@ pub(super) struct Selection {
     pub(super) quick: bool,
     pub(super) labels: Option<usize>,
     pub(super) trials: usize,
+    pub(super) upload_staging_bytes: Option<usize>,
     content: Option<Content>,
     cached: Option<bool>,
 }
@@ -17,6 +18,7 @@ impl Default for Selection {
             quick: false,
             labels: None,
             trials: 1,
+            upload_staging_bytes: None,
             content: None,
             cached: None,
         }
@@ -24,12 +26,13 @@ impl Default for Selection {
 }
 
 impl Case {
-    pub(super) fn cache_budget(self) -> FrameCacheBudget {
-        if self.cached {
+    pub(super) fn cache_budget(self, upload_staging_bytes: Option<usize>) -> FrameCacheBudget {
+        let budget = if self.cached {
             FrameCacheBudget::default()
         } else {
             FrameCacheBudget::new(0, 0, 0, 0)
-        }
+        };
+        upload_staging_bytes.map_or(budget, |bytes| budget.with_upload_staging_bytes(bytes))
     }
 }
 
@@ -155,8 +158,20 @@ mod tests {
                 .cases()
                 .unwrap()
                 .iter()
-                .all(|case| case.cache_budget() == FrameCacheBudget::default())
+                .all(|case| case.cache_budget(None) == FrameCacheBudget::default())
         );
+        for case in selection.cases().unwrap() {
+            let direct = case.cache_budget(Some(0));
+            assert_eq!(direct.max_upload_staging_bytes(), 0);
+            assert_eq!(
+                direct.max_bindings(),
+                FrameCacheBudget::default().max_bindings()
+            );
+            assert_eq!(
+                direct.max_uniform_bytes(),
+                FrameCacheBudget::default().max_uniform_bytes()
+            );
+        }
     }
 
     #[test]
