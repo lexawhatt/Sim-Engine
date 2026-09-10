@@ -5,10 +5,11 @@ uses a Keep a Changelog-style structure and Semantic Versioning. While the
 public API is pre-1.0, minor releases may contain documented source-breaking
 changes.
 
-## Unreleased
+## 0.3.0 - 2026-09-11
 
-Development target: **0.3.0**, not yet published. This section describes changes
-from the official 0.2.0 release; a development version is not release sign-off.
+Retained text and scene editing, real-font rendering, and bounded composition
+optimizations for Linux integrations. This section describes the complete
+user-visible delta from 0.2.0; migration notes follow the additions.
 
 ### Added
 
@@ -141,8 +142,9 @@ from the official 0.2.0 release; a development version is not release sign-off.
 Mesh replacement is immutable, not in-place topology streaming. Cache metrics
 exclude opaque driver allocations; no whole-frame zero-allocation or universal
 FPS claim follows from library staging reuse. Performance comparisons require
-the same workload, adapter, format and presentation mode. 0.3 release evidence
-will be recorded after integration and independent review.
+the same workload, adapter, format and presentation mode. Release qualification
+requires the complete Linux gate on the exact clean source commit; focused
+tests, development benchmarks or a version heading alone are not release evidence.
 
 ## 0.2.0 - 2026-09-02
 

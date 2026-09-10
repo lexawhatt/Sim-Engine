@@ -1,9 +1,10 @@
-# Sim;Engine v0.3.0 Development Documentation
+# Sim;Engine v0.3.0 Documentation
 
 This document is the integration guide and engineering reference for the
-unreleased Sim;Engine v0.3.0 checkout. The published version is still 0.2.0;
-its [frozen guide](https://github.com/lexawhatt/Sim-Engine/blob/v0.2.0/DOCUMENTATION.md)
-describes that package. This guide is divided into two parts:
+Sim;Engine v0.3.0 API. For older integrations, use the
+[archived 0.2 guide](https://github.com/lexawhatt/Sim-Engine/blob/v0.2.0/DOCUMENTATION.md).
+The [0.3.0 changelog](CHANGELOG.md#030---2026-09-11) includes migration notes.
+This guide is divided into two parts:
 
 - [Integration Handbook](#part-i-integration-handbook) - how to add the crate,
   construct visual state, choose a rendering path, recover resources, and
@@ -47,19 +48,18 @@ submit GPU work, without normally waiting for its completion.
 
 ### 2. Installation and features
 
-Until 0.3 is published, use a local checkout for the APIs in this guide. The
-default feature set includes the `wgpu` backend:
+The default feature set includes the `wgpu` backend:
 
 ```toml
 [dependencies]
-sim-engine = { path = "../Sim-Engine" }
+sim-engine = "0.3"
 ```
 
 Use the CPU-side visual-state APIs without GPU dependencies:
 
 ```toml
 [dependencies]
-sim-engine = { path = "../Sim-Engine", default-features = false }
+sim-engine = { version = "0.3", default-features = false }
 ```
 
 | Configuration | Provides |
@@ -885,12 +885,11 @@ No system font is implicitly selected, and no font is included in the library
 binary. The demonstration font and its license live under `examples/assets/fonts`.
 
 ```toml
-sim-engine = { path = "../Sim-Engine", features = ["text"] }
+sim-engine = { version = "0.3", features = ["text"] }
 ```
 
-After publication, replace the path with `version = "0.3"`. The default
-`wgpu` feature alone still accepts host-shaped glyph atlases and does not
-enable the font loader or shaping dependencies.
+The default `wgpu` feature alone still accepts host-shaped glyph atlases and
+does not enable the font loader or shaping dependencies.
 
 Load a trusted, licensed TrueType or OpenType outline font from bytes:
 
@@ -2012,7 +2011,8 @@ Patch releases preserve these behavioral contracts:
 - public colors are straight linear RGBA and target alpha is premultiplied;
 - GPU resources reject foreign renderer identities;
 - recovery behavior and retained snapshots match their documentation;
-- failed updates do not partially mutate retained state;
+- failed updates preserve previous drawable resources; bounded text cache
+  warming may retain new glyphs without changing an old run;
 - the crate accepts visual state and does not own application domain rules.
 
 Public fields are avoided so validation, units, transforms, and future
@@ -2027,7 +2027,7 @@ automation are repeatable.
 ### 28. Known boundaries
 
 - Linux with Vulkan is the only release-gated platform/backend contract.
-- A Vulkan adapter is supported for 0.2 only when the mandatory semantic
+- A Vulkan adapter is supported only when the mandatory semantic
   fixture passes on that concrete adapter/driver. CI records Mesa software
   evidence and the release evidence records the exact tested adapter; untested
   AMD/NVIDIA drivers are not silently certified by those results.
@@ -2092,8 +2092,10 @@ and measurement method.
 
 ### 30. Official release procedure
 
-The commands below target the planned 0.3.0 release. Do not run publication or
-create its tag while the changelog still says Unreleased or review is pending.
+The commands below target the 0.3.0 release. For a later release, substitute its
+version and finish its dated changelog and migration notes first. Do not run
+publication or create a tag while review or the exact-commit release gate is
+pending.
 
 Publishing a crates.io version is permanent: the same version cannot be
 overwritten or deleted. A broken version can be yanked, but its archive remains

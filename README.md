@@ -10,40 +10,33 @@ clipping, interpolation, GPU resources, composition, recovery, and rendering
 diagnostics. Physics, simulation stepping, domain entities, UI navigation, and
 plugins remain in the host application.
 
-This branch develops **0.3.0**; **0.2.0** remains the published release. The crate remains
-pre-1.0, and its supported release target is Linux with Vulkan. A concrete
-adapter/driver is supported when the mandatory semantic fixture passes on it;
+This guide describes **Sim;Engine 0.3.0**. The crate remains pre-1.0, and its
+supported release target is Linux with Vulkan. A concrete adapter/driver is
+supported when the mandatory semantic fixture passes on it;
 untested drivers are not inferred from Mesa evidence. The minimum supported
 Rust version is 1.90.
 
 The software-Vulkan CI fixture uses Mesa 25.3+ lavapipe. Mesa 25.2.8 llvmpipe
-has a reproduced MSAA scissor leak and does not pass the development contract;
+has a reproduced MSAA scissor leak and does not pass the 0.3 rendering contract;
 its upstream fix is included in [Mesa 25.3](https://docs.mesa3d.org/relnotes/25.3.0.html).
 This does not impose an Ubuntu-version requirement on host applications.
 
-Version 0.2.0 adds the bounded Sim;X integration foundation: fixed-screen
-scenes, positioned 2D viewports, offscreen scene rendering, a heterogeneous
-single-present frame composer, retained RGBA images and atlas batches,
-host-shaped glyph runs, explicitly budgeted dynamic triangles, richer bounded
-2D strokes, and a named rendering benchmark matrix. See the
-[0.2.0 changelog](https://github.com/lexawhatt/Sim-Engine/blob/v0.2.0/CHANGELOG.md#020---2026-09-02) for the complete delta from
-0.1.0.
-
-The 0.3 work adds capacity-aware glyph/sprite updates, independent per-draw
+Version 0.3.0 builds on the composed-frame and scientific-visualization foundation
+of 0.2.0. It adds capacity-aware glyph/sprite updates, independent per-draw
 placement and tint, bounded reusable composition storage, portable filled-3D
 clipping with object-attributed errors, indexed editable 3D scenes, shared
 opaque UV textures, exact-tip scientific arrows, and optional antialiased TTF/OTF
 text with cached glyphs and logical baseline metrics. CPU optimizations reuse
 exact text/geometry validation results without reordering draws or weakening
-precision checks. These APIs require this checkout until 0.3 is published;
-they are not capabilities of the crates.io 0.2 package.
+precision checks. See the [0.3.0 changelog](CHANGELOG.md#030---2026-09-11)
+for the complete delta and migration notes from 0.2.0.
 
 ## Documentation
 
-- [Development documentation](DOCUMENTATION.md) - installation, concepts, every
+- [Library documentation](DOCUMENTATION.md) - installation, concepts, every
   rendering path, recovery, performance, architecture, and examples.
-- [Changelog](CHANGELOG.md) - release history, migration, and unreleased changes.
-- [Published 0.2 documentation](https://github.com/lexawhatt/Sim-Engine/blob/v0.2.0/DOCUMENTATION.md) - the frozen guide for crates.io users.
+- [Changelog](CHANGELOG.md) - release history and migration notes.
+- [Archived 0.2 documentation](https://github.com/lexawhatt/Sim-Engine/blob/v0.2.0/DOCUMENTATION.md) - the guide for integrations that have not upgraded.
 - Generated API reference:
 
   ```bash
@@ -103,29 +96,27 @@ it does not add lighting, alpha-cutout, PBR, or a voxel/domain model.
 
 ## Installation
 
-The commands below install the published **0.2** release, not the development
-APIs described above. The default feature set includes the `wgpu` renderer:
+The default feature set includes the `wgpu` renderer:
 
 ```bash
-cargo add sim-engine@0.2
+cargo add sim-engine@0.3
 ```
 
 or add it directly to `Cargo.toml`:
 
 ```toml
 [dependencies]
-sim-engine = "0.2"
+sim-engine = "0.3"
 ```
 
 Use core visual-state APIs without GPU dependencies:
 
 ```toml
 [dependencies]
-sim-engine = { version = "0.2", default-features = false }
+sim-engine = { version = "0.3", default-features = false }
 ```
 
-For 0.3 development, depend on your checked-out source and pin its commit in
-your integration's lockfile/repository. Run the new fixtures from this checkout:
+Run the examples from a repository checkout matching the library version:
 
 ```bash
 cargo run --release --features text --example text_ui_updates
@@ -148,21 +139,21 @@ the initial page. Licensed font fixtures are embedded, including an 89 KiB
 Japanese **example subset**, not a full CJK font. `--font` replaces the selected
 font comparison and motion samples with your TTF/OTF file. Font support
 is opt-in; the default renderer and core-only builds retain their dependency
-boundary. UI navigation, audio, and domain logic stay in the host. `--acceptance` exercises public
-update, composition and recovery routes and requires 40 actual presented
-frames on each page. Automatic font fallback and mixed-script paragraph layout
+boundary. UI navigation, audio, and domain logic stay in the host. `--acceptance`
+exercises public update, composition and recovery routes and requires 40 actual
+presented frames on each page. Automatic font fallback and mixed-script paragraph layout
 are not implied by these independently shaped, explicitly font-selected rows.
 For changing-text diagnostics, use `frame_cache_benchmark --case recolored
 --labels 1000 --cache on`; compare with `--upload-staging 0` to isolate bounded
 uniform-upload packing without disabling the other caches. Transfer memory and
 GPU copy work are reported separately from host-upload bytes.
 
-### Loading a font (0.3 development)
+### Loading a font
 
-Enable `features = ["text"]` on your checkout dependency:
+Enable the optional `text` feature:
 
 ```toml
-sim-engine = { path = "../Sim-Engine", features = ["text"] }
+sim-engine = { version = "0.3", features = ["text"] }
 ```
 
 ```rust,no_run
@@ -248,6 +239,7 @@ let report = frame.present()?;
 | Static geometry with a moving camera | `PreparedScene` |
 | Frequently changing triangles | `DynamicMesh2d` |
 | Images and atlas sprites | `Image2d` plus `ImageBatch2d` |
+| TTF/OTF labels and counters (`text` feature) | `FontFace`, `TextAtlas2d` and `TextRun2d` |
 | Host-shaped scientific text | `GlyphAtlas2d` plus `GlyphRun2d` |
 | Large point or circle population | `ParticleField2d` |
 | Dense scalar grid | `ScalarFieldTexture` |
@@ -337,20 +329,20 @@ crashed runs cannot leave a bundle that claims success. A nonblocking process
 lock rejects concurrent release gates before either invocation can invalidate
 or publish evidence.
 
-`stroke_gallery` is the visual oracle for the v0.2 stroke contract. Pages 1-4
+`stroke_gallery` is the visual oracle for the stroke contract. Pages 1-4
 show every cap/join, half-alpha overlap probes, bounded animated dashes,
 outward endpoint arrow markers, miter fallback, camera rotation, and the
 accepted 0.005-world-unit line at zoom 10,000. Press `Space`, arrows, `+`/`-`, or `R`
-to pause, scrub, zoom, and reset.
+to pause, scrub, zoom, and reset. Page 5 adds the exact-tip scientific arrows
+introduced in 0.3.
 
 `ui_demo` includes a retained host-rasterized scientific glyph probe above all
 four independently changing scene workloads. It demonstrates one-time atlas
-and run creation without making the engine responsible for font selection or
-text shaping.
+and run creation without requiring the optional font loader or shaping path.
 
 ## Verification
 
-From a clean Sim;Engine repository checkout, the v0.2.0 Linux release gate
+From a clean Sim;Engine repository checkout, the Linux release gate
 checks the declared Rust 1.90 MSRV, all targets
 with and without the renderer, strict clippy, rustdoc, Vulkan semantic GPU
 readback with a backend assertion, the Vulkan performance matrix on a real
@@ -370,7 +362,7 @@ fixture counters, timings, thresholds, and passed verdicts for all nine
 surface runs instead of leaving them only in terminal output.
 
 Maintainers should follow the complete
-[official release procedure](https://github.com/lexawhatt/Sim-Engine/blob/v0.2.0/DOCUMENTATION.md#30-official-release-procedure).
+[official release procedure](DOCUMENTATION.md#30-official-release-procedure).
 Publishing is complete only when crates.io exposes the immutable package, the
 annotated Git tag points at the evidenced commit, and the matching GitHub
 Release is public.
