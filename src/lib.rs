@@ -31,7 +31,7 @@ pub use field::{ColorMap, ColorMapError, ColorStop, ScalarField, ScalarFieldErro
 pub use math::{Rect, Vec2};
 pub use mesh3d::{
     Mesh3d, Mesh3dError, Mesh3dStyleError, MeshEdge3d, MeshStyle3d, SurfaceStyle3d,
-    WireframeStyle3d,
+    TextureCoordinate2d, WireframeStyle3d,
 };
 pub use particle::{ParticleInstance2d, ParticleInstanceError};
 pub use pseudo3d::{
@@ -70,6 +70,6 @@ pub use renderer::{
     RendererPresentMode, RendererSurfacePresentMode, RendererSurfaceStatus, RetainedMesh3d,
     ScalarFieldRenderError, ScalarFieldSampling, ScalarFieldTexture, ScalarFieldTextureError,
     ScalarFieldUploadReport, Scene3d, Scene3dBudget, Scene3dBudgetResource, Scene3dError,
-    Scene3dMeshUpdateReport, Scene3dRestoreReport, Scene3dStatistics, TessellationStats,
-    TrailBuffer2d, WgpuRenderer, WgpuRendererOptions,
+    Scene3dMeshUpdateReport, Scene3dRestoreReport, Scene3dStatistics, TessellationStats, Texture3d,
+    Texture3dError, TextureMaterial3d, TrailBuffer2d, WgpuRenderer, WgpuRendererOptions,
 };

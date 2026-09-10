@@ -76,6 +76,7 @@ static ALLOCATOR: CountingAllocator = CountingAllocator;
 enum Content {
     World,
     WorldScreen,
+    Mixed64,
     Labels,
     Recolored,
     Moved,
@@ -87,6 +88,7 @@ impl Content {
         match self {
             Self::World => "world",
             Self::WorldScreen => "world_screen",
+            Self::Mixed64 => "mixed64_images128rects",
             Self::Labels => "unchanged",
             Self::Recolored => "recolored",
             Self::Moved => "moved",
@@ -102,6 +104,32 @@ struct Case {
     cached: bool,
 }
 
+fn expected_counts(case: Case) -> (usize, usize, usize, usize, usize) {
+    match case.content {
+        Content::World => (1, 0, 0, 100, 1),
+        Content::WorldScreen => (2, 0, 0, 356, 2),
+        Content::Mixed64 => (65, 64, 0, 292, 129),
+        Content::Labels | Content::Recolored | Content::Moved => {
+            (0, 0, case.labels, case.labels, case.labels)
+        }
+        Content::Mixed => (
+            1 + case.labels,
+            case.labels,
+            case.labels,
+            100 + 3 * case.labels,
+            1 + 3 * case.labels,
+        ),
+    }
+}
+
+fn p95(samples: &mut [Duration]) -> Duration {
+    samples.sort_unstable();
+    samples
+        .get((samples.len() * 95).div_ceil(100).saturating_sub(1))
+        .copied()
+        .unwrap_or_default()
+}
+
 #[derive(Default)]
 struct Samples {
     draws: usize,
@@ -114,6 +142,18 @@ struct Samples {
     elapsed: Duration,
     acquire: Duration,
     measured_started: Option<Instant>,
+    work_times: Vec<Duration>,
+    acquire_times: Vec<Duration>,
+}
+
+impl Samples {
+    fn new(frames: usize) -> Self {
+        Self {
+            work_times: Vec::with_capacity(frames),
+            acquire_times: Vec::with_capacity(frames),
+            ..Self::default()
+        }
+    }
 }
 
 struct Benchmark {
@@ -124,6 +164,8 @@ struct Benchmark {
     image: Image2d,
     world: Scene,
     panel: ScreenScene,
+    hud: ScreenScene,
+    mixed_panels: Vec<ScreenScene>,
     cases: Vec<Case>,
     case_index: usize,
     samples: Samples,
@@ -151,11 +193,20 @@ impl Benchmark {
         let notify = window.clone();
         renderer.set_pre_present_notify(move || notify.pre_present_notify());
         println!(
-            "frame_cache_benchmark backend={} adapter={:?} present={:?} scale={} allocation_scope=event_loop_thread baseline=cache_disabled",
+            "frame_cache_benchmark backend={} adapter={:?} pci_bus_id={} vendor={} device={} driver={:?} driver_info={:?} format={:?} msaa={} present={:?} scale={} physical_width={} physical_height={} allocation_scope=event_loop_thread baseline=cache_disabled gpu_timestamps=false",
             renderer.adapter_backend(),
             renderer.adapter_name(),
+            renderer.adapter_pci_bus_id(),
+            renderer.adapter_vendor_id(),
+            renderer.adapter_device_id(),
+            renderer.adapter_driver(),
+            renderer.adapter_driver_info(),
+            renderer.surface_format(),
+            renderer.surface_sample_count(),
             renderer.surface_present_mode(),
-            renderer.scale_factor()
+            renderer.scale_factor(),
+            size.width,
+            size.height,
         );
         let atlas = renderer.create_glyph_atlas(
             1,
@@ -204,8 +255,23 @@ impl Benchmark {
             LogicalScreenVector::new(24.0, 12.0),
             ShapeStyle::filled(Color::rgb(0.0, 0.1, 0.2).with_alpha(0.5)),
         )?;
+        let hud = ScreenScene::new(Color::BLACK)?;
+        let mut mixed_panels = Vec::new();
+        for index in 0..64 {
+            let mut scene = ScreenScene::new(Color::BLACK)?;
+            let x = (index % 8) as f32 * 140.0;
+            let y = (index / 8) as f32 * 80.0;
+            for offset in [0.0, 14.0] {
+                scene.try_square_rect(
+                    LogicalScreenPosition::new(x, y + offset),
+                    LogicalScreenVector::new(104.0, 12.0),
+                    ShapeStyle::filled(Color::rgb(0.0, 0.1, 0.2).with_alpha(0.5)),
+                )?;
+            }
+            mixed_panels.push(scene);
+        }
         let mut cases = Vec::new();
-        for content in [Content::World, Content::WorldScreen] {
+        for content in [Content::World, Content::WorldScreen, Content::Mixed64] {
             for cached in [false, true] {
                 cases.push(Case {
                     content,
@@ -240,9 +306,11 @@ impl Benchmark {
             image,
             world,
             panel,
+            hud,
+            mixed_panels,
             cases,
             case_index: 0,
-            samples: Samples::default(),
+            samples: Samples::new(measured_frames),
             measured_frames,
         })
     }
@@ -268,6 +336,22 @@ impl Benchmark {
             return Ok(false);
         }
         self.samples.draws += 1;
+        let sources = report.statistics().source_counts();
+        let observed = (
+            sources.streaming_scenes(),
+            sources.images(),
+            sources.glyph_runs(),
+            report.statistics().command_count(),
+            report.statistics().pass_count(),
+        );
+        if observed != expected_counts(case) {
+            return Err(format!(
+                "case {} source/command counts {observed:?} != {:?}",
+                case.content.name(),
+                expected_counts(case)
+            )
+            .into());
+        }
         let cache = self.renderer.frame_cache_statistics();
         if self.samples.draws > WARMUP {
             self.samples.measured_started.get_or_insert(started);
@@ -277,7 +361,11 @@ impl Benchmark {
             if case.cached
                 && matches!(
                     case.content,
-                    Content::World | Content::WorldScreen | Content::Labels | Content::Mixed
+                    Content::World
+                        | Content::WorldScreen
+                        | Content::Mixed64
+                        | Content::Labels
+                        | Content::Mixed
                 )
                 && cache.uploaded_uniform_bytes() != 0
             {
@@ -290,6 +378,12 @@ impl Benchmark {
             self.samples.uploads += report.statistics().upload_bytes();
             self.samples.elapsed += elapsed;
             self.samples.acquire += report.metrics().surface_acquire();
+            self.samples
+                .work_times
+                .push(elapsed.saturating_sub(report.metrics().surface_acquire()));
+            self.samples
+                .acquire_times
+                .push(report.metrics().surface_acquire());
         }
         if self.samples.draws < WARMUP + self.measured_frames {
             return Ok(false);
@@ -300,8 +394,10 @@ impl Benchmark {
             .measured_started
             .map(|started| started.elapsed().as_secs_f64())
             .unwrap_or(0.0);
+        let work_p95 = p95(&mut self.samples.work_times).as_secs_f64() * 1000.0;
+        let acquire_p95 = p95(&mut self.samples.acquire_times).as_secs_f64() * 1000.0;
         println!(
-            "case={} labels={} glyphs_per_label=32 cache={} drawn={} presented_fps={:.2} main_thread_allocations_per_frame={:.2} allocated_bytes_per_frame={:.0} new_uniform_buffers_per_frame={:.2} new_bind_groups_per_frame={:.2} upload_bytes_per_frame={:.0} renderer_and_build_ms={:.3} acquire_ms={:.3} cache_cpu_bytes={} cache_uniform_bytes={} cache_texture_bytes={} cache_bindings={} cache_peak_cpu_bytes={} cache_peak_uniform_bytes={}",
+            "case={} labels={} glyphs_per_label=32 cache={} drawn={} presented_fps={:.2} main_thread_allocations_per_frame={:.2} allocated_bytes_per_frame={:.0} new_uniform_buffers_per_frame={:.2} new_bind_groups_per_frame={:.2} upload_bytes_per_frame={:.0} renderer_and_build_ms={:.3} acquire_ms={:.3} cache_cpu_bytes={} cache_uniform_bytes={} cache_texture_bytes={} cache_bindings={} cache_peak_cpu_bytes={} cache_peak_uniform_bytes={} source_scenes={} source_images={} source_glyph_runs={} commands={} passes={} renderer_and_build_p95_ms={:.3} acquire_p95_ms={:.3}",
             case.content.name(),
             case.labels,
             case.cached,
@@ -320,9 +416,16 @@ impl Benchmark {
             cache.texture_bytes(),
             cache.binding_count(),
             cache.peak_cpu_bytes(),
-            cache.peak_uniform_bytes()
+            cache.peak_uniform_bytes(),
+            report.statistics().source_counts().streaming_scenes(),
+            report.statistics().source_counts().images(),
+            report.statistics().source_counts().glyph_runs(),
+            report.statistics().command_count(),
+            report.statistics().pass_count(),
+            work_p95,
+            acquire_p95,
         );
-        self.samples = Samples::default();
+        self.samples = Samples::new(self.measured_frames);
         self.case_index += 1;
         if self.case_index == self.cases.len() {
             return Ok(true);
@@ -337,6 +440,20 @@ impl Benchmark {
     }
 
     fn draw(&mut self, case: Case) -> Result<sim_engine::FrameReport> {
+        if matches!(case.content, Content::WorldScreen) {
+            self.hud.clear();
+            let phase = self.samples.draws as f32;
+            for index in 0..256 {
+                self.hud.try_square_rect(
+                    LogicalScreenPosition::new(
+                        (index % 16) as f32 * 64.0 + phase.sin() * 2.0,
+                        (index / 16) as f32 * 32.0,
+                    ),
+                    LogicalScreenVector::new(48.0, 24.0),
+                    ShapeStyle::filled(Color::rgb(0.1, 0.3 + phase.sin() * 0.1, 0.6)),
+                )?;
+            }
+        }
         let mut frame = self.renderer.begin_frame(
             Color::BLACK,
             FrameBudget::new(
@@ -348,9 +465,33 @@ impl Benchmark {
                 65536,
             ),
         )?;
-        frame.draw_scene(&self.world, Camera2d::default(), FramePassOptions::new(0))?;
+        if matches!(
+            case.content,
+            Content::World | Content::WorldScreen | Content::Mixed64 | Content::Mixed
+        ) {
+            frame.draw_scene(&self.world, Camera2d::default(), FramePassOptions::new(0))?;
+        }
         if matches!(case.content, Content::WorldScreen) {
-            frame.draw_screen_scene(&self.panel, FramePassOptions::new(1))?;
+            frame.draw_screen_scene(&self.hud, FramePassOptions::new(1))?;
+        }
+        if matches!(case.content, Content::Mixed64) {
+            for (index, panel) in self.mixed_panels.iter().enumerate() {
+                let order = 1 + index as i32 * 2;
+                frame.draw_screen_scene(panel, FramePassOptions::new(order))?;
+                frame.draw_image(
+                    &self.image,
+                    None,
+                    Color::WHITE,
+                    ImageSampling::Nearest,
+                    FramePassOptions::new(order + 1).with_viewport(LogicalViewportRegion::new(
+                        LogicalScreenPosition::new(
+                            (index % 8) as f32 * 140.0,
+                            (index / 8) as f32 * 80.0 + 32.0,
+                        ),
+                        LogicalViewport::new(24.0, 24.0)?,
+                    )?),
+                )?;
+            }
         }
         let tick = self.samples.draws as f32;
         for (index, run) in self.runs[..case.labels].iter().enumerate() {
@@ -493,4 +634,50 @@ fn main() -> Result<()> {
         return Err(error.into());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fixed_controls_keep_requested_scene_and_image_command_counts() {
+        assert_eq!(
+            expected_counts(Case {
+                content: Content::WorldScreen,
+                labels: 0,
+                cached: true
+            }),
+            (2, 0, 0, 356, 2)
+        );
+        assert_eq!(
+            expected_counts(Case {
+                content: Content::Mixed64,
+                labels: 0,
+                cached: true
+            }),
+            (65, 64, 0, 292, 129)
+        );
+        assert_eq!(
+            expected_counts(Case {
+                content: Content::Labels,
+                labels: 1000,
+                cached: true
+            }),
+            (0, 0, 1000, 1000, 1000)
+        );
+    }
+
+    #[test]
+    fn percentile_uses_nearest_rank_without_dropping_the_last_sample() {
+        let mut times = (1..=20)
+            .rev()
+            .map(Duration::from_millis)
+            .collect::<Vec<_>>();
+        assert_eq!(p95(&mut times), Duration::from_millis(19));
+        assert_eq!(
+            p95(&mut [Duration::from_millis(7)]),
+            Duration::from_millis(7)
+        );
+    }
 }

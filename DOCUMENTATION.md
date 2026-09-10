@@ -198,7 +198,7 @@ independent: `StrokeStyle2d::logical` stays constant under camera zoom, while
 `StrokeStyle2d::world` uses a validated `WorldLength` and scales with the
 camera. `ScreenScene` rejects `StrokeStyle2d::world`; its styled path widths
 must also use `LogicalPixels`. Endpoint markers always use logical pixels so annotations remain
-readable. A marker's base is the path endpoint and its tip extends outward;
+readable. By default (`BaseAtEndpoint`), a marker's base is the path endpoint and its tip extends outward;
 the marked body endpoint is forced to a butt boundary. Marker length therefore
 cannot invert a short body or collide with a terminal join. Exact or
 numerically indistinguishable 180-degree retraces, almost-collinear turns whose
@@ -227,6 +227,10 @@ clamped to one quarter of the projected dominant-axis span, so even two inward
 markers on a very short vector leave a non-inverted, disjoint shaft. Widths may
 be logical or world units; marker dimensions remain logical pixels. There is
 no camera-dependent world-endpoint adjustment in host visual state.
+`cargo run --release --example stroke_gallery -- --page 5` shows exact tips
+against mathematical endpoint crosshairs, including reversed and very short
+dual arrows. Cyan is logical width, orange world width; Space pauses and +/-
+changes zoom. The page keeps its illustrative vectors within the viewport.
 
 #### Bounded scenes
 
@@ -470,6 +474,10 @@ referenced textures and binding slots. `set_frame_cache_budget` configures it;
 unboundedly afterwards. `frame_cache_statistics` reports current capacities,
 last-frame buffer/bind-group creation, reused bindings, uniform writes and
 nominal transient peaks. Zero limits disable retention for paired comparisons.
+The CPU peak is a conservative capacity bound, not a sampled allocator peak:
+initial retained bytes plus twice final owned capacities covers transient Vec
+growth. Even late rejected streaming geometry returns its batch scratch before
+this accounting and idle-budget eviction.
 Frame construction still reserves conservative uniform-upload budget before
 cache lookup; an eventual cache hit reduces reported actual upload, not the
 minimum construction budget required for that item.
@@ -482,6 +490,23 @@ uploaded. This is not a promise of zero backend allocations: queue staging,
 encoding, surface acquisition, and currently uncached scalar bindings remain
 separate costs. Keep mixed item order intact; regrouping by texture would change
 alpha composition.
+
+For a paired measurement, run `frame_cache_benchmark --frames 120` through
+`cargo run --release --example frame_cache_benchmark -- --frames 120`. It
+compares disabled/enabled caching on 1/100/1000 independent 32-glyph labels,
+unchanged/recolored/moved and mixed-order variants, a 100-circle world pass,
+world plus 256 changing HUD rectangles, and 64 images interleaved with 128
+rectangles. It asserts source/command counts and warmed uniform-creation
+invariants and reports actual presented FPS, build/renderer CPU time, acquire
+time, main-thread allocations and cache bytes separately. This is a diagnostic
+benchmark, not a GPU-timestamp measurement or a universal 60 FPS promise.
+
+The 0.3 CPU validation path avoids duplicate position proofs and memoizes eight
+exact position keys within each call. It reuses the same interval arithmetic;
+inconclusive or overflowing geometry is still rejected. Image/glyph batches
+likewise receive one per-sprite preflight proof, not a duplicate proof while
+constructing ready draw items. Differential tests retain the previous geometry
+validator as an independent behavioral reference.
 
 ### 7. Cameras and motion
 
@@ -1098,6 +1123,69 @@ hardware depth, solid visible edges, and dashed hidden edges. Translucent or
 hatched sections, projected label anchors, text, and 3D picking are not in this
 release.
 
+#### Opaque textured surfaces
+
+`Mesh3d::textured(vertices, uvs, triangles, display_edges)` accepts one
+`TextureCoordinate2d` per vertex. UVs are finite normalized coordinates in
+`[0, 1]`, with `(0, 0)` at the image's top-left and positive V downward. The
+core topology API works without `wgpu`; the renderer additionally checks the
+portable shader envelope. Duplicate vertices at texture seams so each face
+can have independent UVs. Existing constructors still create untextured
+meshes without a UV GPU buffer; display edges do not sample a texture.
+
+```rust,ignore
+let texture = renderer.create_texture3d_rgba8(
+    atlas_width, atlas_height, opaque_srgb_rgba8_pixels, ImageBudget::default(),
+)?;
+let material = TextureMaterial3d::new(
+    &texture, ImageSampling::Nearest, Color::WHITE,
+)?;
+let topology = Mesh3d::textured(vertices, uvs, triangles, display_edges)?;
+let geometry = renderer.create_mesh3d(topology)?;
+let textured = renderer.with_mesh3d_material(&geometry, &material)?;
+let object = scene.try_push(
+    &textured,
+    Transform3d::IDENTITY,
+    MeshStyle3d::surface(SurfaceStyle3d::opaque(Color::WHITE)?),
+)?;
+```
+
+The source is row-major, top-to-bottom, straight sRGB RGBA8, with alpha **255
+in every texel**. Nonopaque pixels fail with their source texel index before
+texture creation. Sampling decodes RGB to linear light, then multiplies it by
+both the material tint and the instance's surface color. Both tints must be
+normalized and opaque. Surfaces keep the existing depth-writing, no-culling
+semantics: winding is not silently reinterpreted for game meshes.
+
+Textures have one mip level, clamp-to-edge addressing and nearest or linear
+filtering. `texture.region_coordinates(region)` returns corners in TL, TR,
+BR, BL order, inset to the atlas cell's outer texel centers. Use those UVs
+instead of the cell's outer boundaries; nearest sampling then stays inside
+the selected cell. Mipmap generation, repeat addressing and automatic atlas
+padding are not provided. High-quality minification or a different sampling
+policy requires host-owned asset preparation, not undocumented engine padding.
+
+`Texture3d` clones share immutable CPU pixels, GPU texels and sampling
+bindings. `with_mesh3d_material` creates a new mesh handle sharing the original
+topology buffers; it does not mutate existing clones. To change a single
+object's material, create that handle and call `scene.set_mesh(id, &handle)`.
+Both the mesh and texture must belong to the current renderer generation.
+Texture dimensions, pixel bytes and CPU retention are bounded by `ImageBudget`;
+scene accounting counts shared textures separately from shared mesh buffers.
+`Scene3dBudget::with_texture_limits(cpu_bytes, gpu_bytes)` sets these separate
+scene ceilings (each defaults to 64 MiB; zero disallows textured resources).
+`Scene3dStatistics` reports `texture_count`, `texture_cpu_bytes` and
+`texture_gpu_bytes`, including references from hidden objects. The rebind
+report exposes `peak_texture_cpu_bytes` and `peak_texture_gpu_bytes` for
+old/new overlap. These are library-retained capacity and nominal texel bytes,
+not driver allocation-page measurements.
+
+UVs travel through the same bounded homogeneous clipping path as positions,
+then use perspective-correct GPU interpolation. Generated clip-space vertices
+contain four position and two UV floats (24 bytes); generated-work limits use
+that actual stride, including for untextured crossing surfaces. This does not
+change the 12-byte retained untextured position buffer.
+
 ### 15. Recovery
 
 `recover_device_and_surface().await` replaces the device, queue, pipelines,
@@ -1117,8 +1205,9 @@ resources from the previous identity are rejected until restored.
 | `ScalarFieldTexture` | `restore_scalar_field_texture` | exact scalar grid |
 | `RenderTarget2d` | `restore_render_target` | empty target; redraw required |
 | `TrailBuffer2d` | `restore_trail_buffer` | empty history; redraw required |
-| `RetainedMesh3d` | `restore_mesh3d` | exact topology and display edges |
-| `Scene3d` | `restore_scene3d` | stable IDs plus exact transform/style/visibility; shared meshes uploaded once |
+| `Texture3d` | `restore_texture3d` | exact opaque sRGB pixels and original limits; new device identity |
+| `RetainedMesh3d` | `restore_mesh3d` | exact topology, UVs, display edges and optional material |
+| `Scene3d` | `restore_scene3d` | stable IDs plus exact transform/style/visibility/material; shared meshes and textures restored once |
 | `RenderTarget3d` | `restore_render_target3d` | empty color/depth; redraw required |
 
 For a retained 3D scene, restore the scene and target after device recovery:
@@ -1135,6 +1224,10 @@ scene.set_visible(selected_object, true)?;
 `restore_scene3d` is atomic at the scene boundary. It recreates every distinct
 stale mesh once and commits replacements only after all uploads succeed, while
 preserving object IDs, order, transforms, styles, visibility, and next-ID state.
+Shared texture restoration is deduplicated independently of mesh geometry, so
+different mesh/material variants using one atlas keep one restored atlas.
+External old handles remain stale: obtain current mesh/material handles from
+the restored scene or explicitly restore them before reuse.
 
 CPU-retained resources can recreate their exact content. GPU-only targets and
 history cannot reconstruct prior pixels. Recovery is exceptional; it is not a
@@ -1345,6 +1438,20 @@ cargo run --release --example rendering_benchmark_suite -- --fixture ui_90_10
 # Interactive pixel-level gallery for caps, joins, alpha, dashes, and markers
 cargo run --release --example stroke_gallery -- --uncapped
 
+# Exact-tip scientific vectors, both width modes and short reversed paths
+cargo run --release --example stroke_gallery -- --page 5
+
+# Changing labels and independently placed/tinted retained copies
+cargo run --release --example text_ui_updates
+cargo run --release --example text_ui_updates -- --acceptance
+
+# Paired cache off/on surface workloads (not a universal FPS guarantee)
+cargo run --release --example frame_cache_benchmark
+
+# Six textured faces, a bounded 16-object pool, edits and recovery
+cargo run --release --example editable_textured_3d
+cargo run --release --example editable_textured_3d -- --acceptance
+
 # Complete named performance/contract matrix (repository checkout only)
 ./scripts/rendering_benchmark_matrix.sh
 
@@ -1359,6 +1466,20 @@ The interactive 3D, gallery, and stress examples print their controls at
 startup. `rendering_benchmark_suite --help` lists its fixture and gate flags;
 the minimal `demo` and menu-driven `ui_demo` do not print a universal help
 banner.
+
+In `editable_textured_3d`, use N for nearest/linear filtering, E for a mesh
+revision, R for removal/reinsertion, A/D to orbit, W/S to move the camera,
+H for mathematical edges, Space to pause and F5 for device recovery. The atlas
+and fixed 16-object pool belong to the example, not to the library. Its
+`--acceptance` path requires actual presents, clipping, changed target size and
+one recovery with preserved live IDs. It is not a replacement for pixel readback.
+
+This is not unrestricted free-camera rendering: numerically ambiguous clipped
+slivers/corners or mathematical-edge projections can still return an attributed
+error, even with finite inputs. The interactive example logs the error and
+keeps its last valid image so the camera can be corrected. Disable H when
+inspecting close solid-only views; the bounded automatic fixture tests these
+two presentation modes separately. No precision guard is disabled for a demo.
 
 ## Part II: Engineering Reference
 
@@ -1396,6 +1517,11 @@ composed, drawn, measured, and recovered.
 | `renderer/tessellation.rs` | 2D scene command to triangle conversion |
 | `renderer/visualization.rs` | fused scientific visualization path |
 | `renderer/mesh3d.rs` | retained mesh resources and depth/edge passes |
+| `renderer/mesh3d_objects.rs` | indexed object IDs, lifetime and shared-resource accounting |
+| `renderer/mesh3d_upload.rs` | bounded immutable mesh upload/replacement |
+| `renderer/mesh3d_surface.rs` | interval-proven bounded surface clipping and preflight |
+| `renderer/mesh3d_texture.rs` | opaque texture/material ownership and recovery |
+| `renderer/frame/cache.rs` | bounded frame scratch, uniform and binding reuse |
 | `renderer/primitive.wgsl` | 2D, particle, heatmap, and composition shaders |
 | `renderer/mesh3d.wgsl` | 3D projection and screen-space edge expansion |
 

@@ -224,9 +224,12 @@ pub(super) fn assert_lifetime_contract(
         .collect();
     let original_stats = scene.statistics();
     let recovery_identity = Arc::new(());
+    let texture_renderer =
+        Mesh3dRenderer::new(recovery_device, wgpu::TextureFormat::Rgba8UnormSrgb);
     let recovery = restore_scene3d_resources(
         recovery_device,
         recovery_queue,
+        &texture_renderer.textures.layout,
         Arc::clone(&recovery_identity),
         &mut scene,
     )

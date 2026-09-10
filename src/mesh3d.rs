@@ -272,6 +272,41 @@ struct Mesh3dStorage {
     vertices: Vec<Vec3>,
     triangle_indices: Vec<u32>,
     display_edges: Vec<MeshEdge3d>,
+    texture_coordinates: Vec<TextureCoordinate2d>,
+}
+
+/// Normalized texture coordinate with a top-left origin and downward V axis.
+///
+/// Both components are finite in `0..=1`. The textured 3D path uses mip level
+/// zero and clamp-to-edge addressing. Atlas cells should map geometry to their
+/// edge texel centers for nearest sampling. Strict linear-filter isolation also
+/// requires host-owned extruded gutters to tolerate interpolation rounding.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TextureCoordinate2d {
+    u: f32,
+    v: f32,
+}
+
+impl TextureCoordinate2d {
+    /// Validates normalized U/V without clamping invalid caller input.
+    pub fn new(u: f32, v: f32) -> Result<Self, Mesh3dError> {
+        if !u.is_finite()
+            || !v.is_finite()
+            || !(0.0..=1.0).contains(&u)
+            || !(0.0..=1.0).contains(&v)
+        {
+            return Err(Mesh3dError::InvalidTextureCoordinate);
+        }
+        Ok(Self { u, v })
+    }
+    /// Horizontal normalized texture coordinate, increasing toward the right.
+    pub const fn u(self) -> f32 {
+        self.u
+    }
+    /// Vertical normalized texture coordinate, increasing toward the bottom.
+    pub const fn v(self) -> f32 {
+        self.v
+    }
 }
 
 /// Immutable validated topology for retained stereometry rendering.
@@ -308,6 +343,41 @@ impl Mesh3d {
         vertices: Vec<Vec3>,
         triangle_indices: Vec<u32>,
         display_edges: Vec<MeshEdge3d>,
+    ) -> Result<Self, Mesh3dError> {
+        Self::with_attributes(vertices, triangle_indices, display_edges, Vec::new())
+    }
+
+    /// Builds surfaces with one validated texture coordinate per model vertex.
+    ///
+    /// Duplicate model positions with different UVs are valid for atlas seams.
+    /// Winding and explicit display edges keep the untextured mesh contract.
+    /// A texture/material is attached only when uploading or binding to a
+    /// renderer; constructing this data requires no GPU dependencies.
+    pub fn textured(
+        vertices: Vec<Vec3>,
+        texture_coordinates: Vec<TextureCoordinate2d>,
+        triangle_indices: Vec<u32>,
+        display_edges: Vec<MeshEdge3d>,
+    ) -> Result<Self, Mesh3dError> {
+        if texture_coordinates.len() != vertices.len() {
+            return Err(Mesh3dError::TextureCoordinateCountMismatch {
+                vertex_count: vertices.len(),
+                coordinate_count: texture_coordinates.len(),
+            });
+        }
+        Self::with_attributes(
+            vertices,
+            triangle_indices,
+            display_edges,
+            texture_coordinates,
+        )
+    }
+
+    fn with_attributes(
+        vertices: Vec<Vec3>,
+        triangle_indices: Vec<u32>,
+        display_edges: Vec<MeshEdge3d>,
+        texture_coordinates: Vec<TextureCoordinate2d>,
     ) -> Result<Self, Mesh3dError> {
         if vertices.is_empty() {
             return Err(Mesh3dError::EmptyVertices);
@@ -385,6 +455,7 @@ impl Mesh3d {
                 vertices,
                 triangle_indices,
                 display_edges,
+                texture_coordinates,
             }),
             bounds_min,
             bounds_max,
@@ -404,6 +475,11 @@ impl Mesh3d {
     /// Returns explicit mathematical edges, excluding triangulation diagonals.
     pub fn display_edges(&self) -> &[MeshEdge3d] {
         &self.storage.display_edges
+    }
+
+    /// Returns per-vertex normalized UVs, or an empty slice for untextured data.
+    pub fn texture_coordinates(&self) -> &[TextureCoordinate2d] {
+        &self.storage.texture_coordinates
     }
 
     /// Returns the number of retained triangles.
@@ -439,12 +515,27 @@ impl Mesh3d {
                     .capacity()
                     .saturating_mul(std::mem::size_of::<MeshEdge3d>()),
             )
+            .saturating_add(
+                self.storage
+                    .texture_coordinates
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<TextureCoordinate2d>()),
+            )
     }
 }
 
 /// Rejection reason for retained 3D topology.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mesh3dError {
+    /// A U/V component was non-finite or outside normalized `0..=1` bounds.
+    InvalidTextureCoordinate,
+    /// Textured topology must supply exactly one UV for each model vertex.
+    TextureCoordinateCountMismatch {
+        /// Number of model-space vertices.
+        vertex_count: usize,
+        /// Number of normalized texture coordinates provided.
+        coordinate_count: usize,
+    },
     /// A retained mesh requires at least one model-space vertex.
     EmptyVertices,
     /// A retained mesh requires at least one triangle or display edge.
@@ -490,6 +581,16 @@ pub enum Mesh3dError {
 impl fmt::Display for Mesh3dError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidTextureCoordinate => {
+                write!(formatter, "texture coordinates must be finite in 0..=1")
+            }
+            Self::TextureCoordinateCountMismatch {
+                vertex_count,
+                coordinate_count,
+            } => write!(
+                formatter,
+                "{vertex_count} mesh vertices require matching UVs, got {coordinate_count}"
+            ),
             Self::EmptyVertices => write!(formatter, "3D mesh requires at least one vertex"),
             Self::EmptyGeometry => {
                 write!(formatter, "3D mesh requires triangles or display edges")
@@ -583,6 +684,44 @@ mod tests {
 
     fn logical(value: f32) -> LogicalPixels {
         LogicalPixels::new(value).unwrap()
+    }
+
+    #[test]
+    fn texture_coordinates_are_finite_normalized_and_match_vertices() {
+        use super::TextureCoordinate2d;
+        for value in [f32::NAN, f32::INFINITY, -f32::INFINITY, -0.01, 1.01] {
+            assert_eq!(
+                TextureCoordinate2d::new(value, 0.0),
+                Err(Mesh3dError::InvalidTextureCoordinate)
+            );
+            assert_eq!(
+                TextureCoordinate2d::new(0.0, value),
+                Err(Mesh3dError::InvalidTextureCoordinate)
+            );
+        }
+        let uv = TextureCoordinate2d::new(0.0, 1.0).unwrap();
+        assert_eq!((uv.u(), uv.v()), (0.0, 1.0));
+        let vertices = vec![Vec3::ZERO, Vec3::X, Vec3::Y];
+        for count in [0, 2, 4] {
+            assert_eq!(
+                Mesh3d::textured(vertices.clone(), vec![uv; count], vec![0, 1, 2], Vec::new()),
+                Err(Mesh3dError::TextureCoordinateCountMismatch {
+                    vertex_count: 3,
+                    coordinate_count: count
+                })
+            );
+        }
+        let bare = Mesh3d::new(vertices.clone(), vec![0, 1, 2]).unwrap();
+        let mesh = Mesh3d::textured(vertices, vec![uv; 3], vec![0, 1, 2], Vec::new()).unwrap();
+        assert_eq!(mesh.texture_coordinates(), &[uv; 3]);
+        assert_eq!(
+            mesh.recovery_memory_bytes(),
+            bare.recovery_memory_bytes() + 3 * std::mem::size_of::<TextureCoordinate2d>()
+        );
+        assert_eq!(
+            mesh.clone().texture_coordinates().as_ptr(),
+            mesh.texture_coordinates().as_ptr()
+        );
     }
 
     #[test]

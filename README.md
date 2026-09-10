@@ -26,8 +26,8 @@ host-shaped glyph runs, explicitly budgeted dynamic triangles, richer bounded
 
 The 0.3 work adds capacity-aware glyph/sprite updates, independent per-draw
 placement and tint, bounded reusable composition storage, portable filled-3D
-clipping with object-attributed errors, indexed editable 3D scenes, and exact-tip
-scientific arrows. These APIs require this checkout until 0.3 is published;
+clipping with object-attributed errors, indexed editable 3D scenes, shared
+opaque UV textures, and exact-tip scientific arrows. These APIs require this checkout until 0.3 is published;
 they are not capabilities of the crates.io 0.2 package.
 
 ## Documentation
@@ -88,7 +88,8 @@ normalized render targets. This intentionally prefers a clear rejection over
 backend-dependent geometry disappearance or topology.
 
 Translucent section materials, hatching, projected 3D anchors, and 3D picking
-are not part of v0.2.0.
+remain outside this release's scope. The new texture path is unlit and opaque;
+it does not add lighting, alpha-cutout, PBR, or a voxel/domain model.
 
 ## Installation
 
@@ -120,6 +121,9 @@ your integration's lockfile/repository. Run the new fixtures from this checkout:
 cargo run --release --example text_ui_updates
 cargo run --release --example text_ui_updates -- --acceptance
 cargo run --release --example frame_cache_benchmark
+cargo run --release --example stroke_gallery -- --page 5
+cargo run --release --example editable_textured_3d
+cargo run --release --example editable_textured_3d -- --acceptance
 ```
 
 The text demo owns its tiny numeric font; Engine adds no font shaping, UI

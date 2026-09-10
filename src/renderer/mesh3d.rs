@@ -10,6 +10,11 @@ mod surface;
 pub use surface::{Mesh3dPreflightReport, Mesh3dRenderBudget};
 use surface::{SurfaceClipEdge, SurfaceClipVertex, SurfaceFrame, SurfaceObject};
 
+#[path = "mesh3d_texture.rs"]
+mod texture;
+use texture::{MeshTextureRenderer, MeshUvGpu};
+pub use texture::{Texture3d, Texture3dError, TextureMaterial3d};
+
 #[cfg(test)]
 use crate::{MeshEdge3d, Projection3d, Rotation3d, SurfaceStyle3d, WorldLength};
 
@@ -171,6 +176,7 @@ struct ClipProbeOutputGpu {
 }
 
 pub(super) struct Mesh3dRenderer {
+    textures: MeshTextureRenderer,
     pipeline: wgpu::RenderPipeline,
     clipped_surface_pipeline: wgpu::RenderPipeline,
     clipped_surface_buffer: Option<wgpu::Buffer>,
@@ -375,6 +381,7 @@ impl Mesh3dRenderer {
             true,
         );
         Self {
+            textures: MeshTextureRenderer::new(device, format, &camera_layout),
             pipeline,
             clipped_surface_pipeline,
             clipped_surface_buffer: None,
@@ -502,6 +509,8 @@ pub struct RetainedMesh3d {
     vertex_buffer: Arc<wgpu::Buffer>,
     index_buffer: Option<Arc<wgpu::Buffer>>,
     edge_buffer: Option<Arc<wgpu::Buffer>>,
+    texture_coordinate_buffer: Option<Arc<wgpu::Buffer>>,
+    material: Option<TextureMaterial3d>,
     source: Mesh3d,
     index_count: u32,
     edge_count: u32,
@@ -510,6 +519,11 @@ pub struct RetainedMesh3d {
 }
 
 impl RetainedMesh3d {
+    /// Returns the optional opaque shared texture material for this handle.
+    /// Mesh clones share buffers while retaining independent material selection.
+    pub const fn material(&self) -> Option<&TextureMaterial3d> {
+        self.material.as_ref()
+    }
     /// Returns this revision's upload and restoration capacity limits.
     pub const fn budget(&self) -> Mesh3dUploadBudget {
         self.budget
@@ -524,12 +538,14 @@ impl RetainedMesh3d {
         self.source.triangle_count()
     }
 
-    /// Returns exact vertex, triangle-index, and display-edge buffer bytes.
+    /// Returns exact vertex, optional UV, triangle-index and display-edge buffer
+    /// bytes. Shared material texels are reported separately by `Texture3d`.
     pub const fn gpu_allocation_bytes(&self) -> usize {
         self.gpu_allocation_bytes
     }
 
-    /// Returns CPU topology bytes retained for device-loss restoration.
+    /// Returns CPU topology/UV bytes retained for device-loss restoration.
+    /// Shared material pixels are reported separately by `Texture3d`.
     pub fn recovery_memory_bytes(&self) -> usize {
         self.source.recovery_memory_bytes()
     }
@@ -613,6 +629,10 @@ fn validate_scene3d_transform(transform: Transform3d) -> Result<(), Scene3dError
 /// Resource creation or ownership failure for retained 3D rendering.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Mesh3dResourceError {
+    /// Texture creation, restoration or material validation failed.
+    Texture(Texture3dError),
+    /// A retained UV is subnormal and outside the portable shader envelope.
+    NonPortableTextureCoordinate,
     /// Explicit mesh upload limits must be nonzero.
     InvalidBudget,
     /// The replaced resource belongs to another logical renderer generation.
@@ -644,6 +664,11 @@ pub enum Mesh3dResourceError {
 impl fmt::Display for Mesh3dResourceError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Texture(error) => write!(formatter, "{error}"),
+            Self::NonPortableTextureCoordinate => write!(
+                formatter,
+                "3D texture coordinate is outside the portable shader envelope"
+            ),
             Self::InvalidBudget => write!(formatter, "3D mesh upload limits must be nonzero"),
             Self::RendererMismatch => {
                 write!(formatter, "3D mesh belongs to another renderer generation")
@@ -850,9 +875,19 @@ pub struct Scene3dRestoreReport {
     migrated_object_count: usize,
     restored_mesh_count: usize,
     restored_gpu_bytes: usize,
+    restored_texture_count: usize,
+    restored_texture_bytes: usize,
 }
 
 impl Scene3dRestoreReport {
+    /// Returns distinct shared textures recreated on the active device.
+    pub const fn restored_texture_count(self) -> usize {
+        self.restored_texture_count
+    }
+    /// Returns nominal texel bytes recreated across distinct shared textures.
+    pub const fn restored_texture_bytes(self) -> usize {
+        self.restored_texture_bytes
+    }
     /// Returns all scene objects whose stable IDs and visual state were preserved.
     pub const fn object_count(self) -> usize {
         self.object_count
@@ -895,12 +930,37 @@ impl WgpuRenderer {
         &self,
         source: &RetainedMesh3d,
     ) -> Result<RetainedMesh3d, Mesh3dResourceError> {
-        self.create_mesh3d_with_budget(source.source.clone(), source.budget)
+        let prepared =
+            upload::prepare_with_budget(&self.device, source.source.clone(), source.budget)?;
+        let restored_material = if let Some(material) = source.material() {
+            Some(
+                TextureMaterial3d::new(
+                    &self
+                        .restore_texture3d(material.texture())
+                        .map_err(Mesh3dResourceError::Texture)?,
+                    material.sampling(),
+                    material.tint(),
+                )
+                .map_err(Mesh3dResourceError::Texture)?,
+            )
+        } else {
+            None
+        };
+        let mut restored = upload_prepared_retained_mesh(
+            &self.device,
+            &self.queue,
+            Arc::clone(&self.renderer_identity),
+            prepared,
+        );
+        restored.material = restored_material;
+        Ok(restored)
     }
 
     /// Atomically restores every stale retained mesh referenced by a 3D scene.
     ///
-    /// Distinct shared mesh resources are uploaded once. Object IDs, insertion
+    /// Distinct shared mesh and texture resources are uploaded once. Per-handle
+    /// texture/filter/tint choices remain independent when topology is shared.
+    /// Object IDs, insertion
     /// order, transforms, styles, visibility, scene provenance, and the next ID
     /// remain unchanged. If any capacity or host-staging allocation fails, the
     /// original scene is not modified. Targets remain separate resources and
@@ -912,6 +972,7 @@ impl WgpuRenderer {
         restore_scene3d_resources(
             &self.device,
             &self.queue,
+            &self.mesh3d_renderer.textures.layout,
             Arc::clone(&self.renderer_identity),
             scene,
         )
@@ -1142,11 +1203,19 @@ impl Mesh3dRenderer {
                 model_row_0: model_rows[0],
                 model_row_1: model_rows[1],
                 model_row_2: model_rows[2],
-                color: instance
-                    .style
-                    .surface_style()
-                    .map_or(Color::BLACK, |surface| surface.color())
-                    .to_array(),
+                color: {
+                    let color = instance
+                        .style
+                        .surface_style()
+                        .map_or(Color::BLACK, |surface| surface.color())
+                        .to_array();
+                    let tint = instance
+                        .mesh
+                        .material()
+                        .map_or(Color::WHITE, TextureMaterial3d::tint)
+                        .to_array();
+                    std::array::from_fn(|index| color[index] * tint[index])
+                },
             });
             if instance.style.surface_style().is_some() {
                 let generated = self.clipped_surface_objects[object_index]
@@ -1260,6 +1329,7 @@ struct PreparedRetainedMeshUpload {
     layout: Mesh3dUploadLayout,
     vertices: Vec<MeshVertexGpu>,
     edges: Vec<MeshEdgeGpu>,
+    texture_coordinates: Vec<MeshUvGpu>,
     budget: Mesh3dUploadBudget,
 }
 
@@ -1267,15 +1337,29 @@ fn prepare_retained_mesh_upload(
     device: &wgpu::Device,
     source: Mesh3d,
 ) -> Result<PreparedRetainedMeshUpload, Mesh3dResourceError> {
-    let layout = preflight_mesh3d_upload(
-        source.vertices().len(),
-        source.triangle_indices().len(),
-        source.display_edges().len(),
-        device.limits().max_buffer_size,
-    )?;
+    let layout = preflight_mesh3d_source(&source, device.limits().max_buffer_size)?;
     if !mesh3d_source_is_portable(&source) {
         return Err(Mesh3dResourceError::NonPortableVertex);
     }
+    if source.texture_coordinates().iter().any(|coordinate| {
+        !is_portable_shader_source(coordinate.u()) || !is_portable_shader_source(coordinate.v())
+    }) {
+        return Err(Mesh3dResourceError::NonPortableTextureCoordinate);
+    }
+    let mut texture_coordinates = Vec::new();
+    texture_coordinates
+        .try_reserve_exact(source.texture_coordinates().len())
+        .map_err(|_| Mesh3dResourceError::HostAllocationFailed {
+            requested_bytes: layout.texture_coordinate_bytes,
+        })?;
+    texture_coordinates.extend(
+        source
+            .texture_coordinates()
+            .iter()
+            .map(|coordinate| MeshUvGpu {
+                coordinate: [coordinate.u(), coordinate.v()],
+            }),
+    );
     let mut vertices = Vec::new();
     vertices
         .try_reserve_exact(source.vertices().len())
@@ -1304,6 +1388,7 @@ fn prepare_retained_mesh_upload(
         layout,
         vertices,
         edges,
+        texture_coordinates,
         budget: Mesh3dUploadBudget::default(),
     })
 }
@@ -1327,6 +1412,7 @@ fn upload_prepared_retained_mesh(
         layout,
         vertices,
         edges,
+        texture_coordinates,
         budget,
     } = prepared;
     let vertex_buffer = Arc::new(device.create_buffer(&wgpu::BufferDescriptor {
@@ -1365,12 +1451,26 @@ fn upload_prepared_retained_mesh(
         queue.write_buffer(&buffer, 0, bytemuck::cast_slice(&edges));
         Some(buffer)
     };
+    let texture_coordinate_buffer = if layout.texture_coordinate_bytes == 0 {
+        None
+    } else {
+        let buffer = Arc::new(device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("sim-engine 3D UV buffer"),
+            size: layout.texture_coordinate_bytes,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        }));
+        queue.write_buffer(&buffer, 0, bytemuck::cast_slice(&texture_coordinates));
+        Some(buffer)
+    };
     submit_pending_uploads(queue);
     RetainedMesh3d {
         renderer_identity,
         vertex_buffer,
         index_buffer,
         edge_buffer,
+        texture_coordinate_buffer,
+        material: None,
         source,
         index_count: layout.index_count,
         edge_count: layout.edge_count,
@@ -1382,9 +1482,20 @@ fn upload_prepared_retained_mesh(
 fn restore_scene3d_resources(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
+    texture_layout: &wgpu::BindGroupLayout,
     renderer_identity: Arc<()>,
     scene: &mut Scene3d,
 ) -> Result<Scene3dRestoreReport, Mesh3dResourceError> {
+    let prepared_textures = texture::prepare_scene_restoration(device, &renderer_identity, scene)?;
+    let mut restored_textures = Vec::new();
+    restored_textures
+        .try_reserve_exact(prepared_textures.len())
+        .map_err(|_| Mesh3dResourceError::HostAllocationFailed {
+            requested_bytes: prepared_textures
+                .len()
+                .saturating_mul(std::mem::size_of::<(usize, Texture3d)>())
+                as u64,
+        })?;
     let pending_staging_bytes = scene
         .instances
         .len()
@@ -1470,15 +1581,43 @@ fn restore_scene3d_resources(
             upload_prepared_retained_mesh(device, queue, Arc::clone(&renderer_identity), upload);
         restored.push((key, replacement));
     }
+    for prepared in prepared_textures {
+        let (width, height) = prepared.source.size();
+        let restored = texture::create_texture(
+            device,
+            queue,
+            &renderer_identity,
+            texture_layout,
+            width,
+            height,
+            prepared.pixels,
+            prepared.source.budget(),
+        )
+        .map_err(Mesh3dResourceError::Texture)?;
+        restored_textures.push((prepared.key, restored));
+    }
 
     let mut migrated_object_count = 0;
     for instance in &mut replacement_instances {
         let key = Arc::as_ptr(&instance.mesh.vertex_buffer) as usize;
-        let Ok(index) = restored.binary_search_by_key(&key, |entry| entry.0) else {
-            continue;
-        };
-        instance.mesh = restored[index].1.clone();
-        migrated_object_count += 1;
+        let previous_material = instance.mesh.material.clone();
+        let mut migrated = false;
+        if let Ok(index) = restored.binary_search_by_key(&key, |entry| entry.0) {
+            instance.mesh = restored[index].1.clone();
+            migrated = true;
+        }
+        if let Some(material) = previous_material {
+            if let Ok(index) = restored_textures
+                .binary_search_by_key(&material.texture().identity_key(), |entry| entry.0)
+            {
+                instance.mesh.material =
+                    Some(material.with_restored_texture(&restored_textures[index].1));
+                migrated = true;
+            } else {
+                instance.mesh.material = Some(material);
+            }
+        }
+        migrated_object_count += usize::from(migrated);
     }
     let restored_gpu_bytes = restored.iter().fold(0_usize, |total, (_, mesh)| {
         total.saturating_add(mesh.gpu_allocation_bytes())
@@ -1491,6 +1630,11 @@ fn restore_scene3d_resources(
         migrated_object_count,
         restored_mesh_count: restored.len(),
         restored_gpu_bytes,
+        restored_texture_count: restored_textures.len(),
+        restored_texture_bytes: restored_textures
+            .iter()
+            .map(|(_, texture)| texture.gpu_allocation_bytes())
+            .sum(),
     })
 }
 
@@ -1499,9 +1643,35 @@ struct Mesh3dUploadLayout {
     vertex_bytes: u64,
     index_bytes: u64,
     edge_bytes: u64,
+    texture_coordinate_bytes: u64,
     total_bytes: u64,
     index_count: u32,
     edge_count: u32,
+}
+
+fn preflight_mesh3d_source(
+    source: &Mesh3d,
+    max_buffer_size: u64,
+) -> Result<Mesh3dUploadLayout, Mesh3dResourceError> {
+    let mut layout = preflight_mesh3d_upload(
+        source.vertices().len(),
+        source.triangle_indices().len(),
+        source.display_edges().len(),
+        max_buffer_size,
+    )?;
+    layout.texture_coordinate_bytes = source
+        .texture_coordinates()
+        .len()
+        .checked_mul(std::mem::size_of::<MeshUvGpu>())
+        .and_then(|bytes| u64::try_from(bytes).ok())
+        .filter(|bytes| *bytes <= max_buffer_size)
+        .ok_or(Mesh3dResourceError::CapacityTooLarge)?;
+    layout.total_bytes = layout
+        .total_bytes
+        .checked_add(layout.texture_coordinate_bytes)
+        .filter(|bytes| usize::try_from(*bytes).is_ok())
+        .ok_or(Mesh3dResourceError::CapacityTooLarge)?;
+    Ok(layout)
 }
 
 fn preflight_mesh3d_upload(
@@ -1533,6 +1703,7 @@ fn preflight_mesh3d_upload(
         vertex_bytes,
         index_bytes,
         edge_bytes,
+        texture_coordinate_bytes: 0,
         total_bytes,
         index_count: draw_index_count,
         edge_count: draw_edge_count,
@@ -1737,9 +1908,12 @@ fn validate_mesh_identity(
     renderer_identity: &Arc<()>,
     mesh: &RetainedMesh3d,
 ) -> Result<(), Mesh3dRenderError> {
-    Arc::ptr_eq(renderer_identity, &mesh.renderer_identity)
-        .then_some(())
-        .ok_or(Mesh3dRenderError::RendererMismatch)
+    (Arc::ptr_eq(renderer_identity, &mesh.renderer_identity)
+        && mesh
+            .material()
+            .is_none_or(|material| material.texture().belongs_to(renderer_identity)))
+    .then_some(())
+    .ok_or(Mesh3dRenderError::RendererMismatch)
 }
 
 #[cfg(test)]
@@ -2740,6 +2914,36 @@ fn encode_scene_pass(
             1,
             renderer.instance_buffer.slice(instance_start..instance_end),
         );
+        if let Some(material) = instance.mesh.material() {
+            pass.set_bind_group(1, material.bind_group(), &[]);
+            if let Some(range) = renderer
+                .clipped_surface_objects
+                .get(instance_index)
+                .and_then(|object| object.generated.as_ref())
+            {
+                if let Some(buffer) = &renderer.clipped_surface_buffer
+                    && !range.is_empty()
+                {
+                    pass.set_pipeline(&renderer.textures.clipped_pipeline);
+                    pass.set_vertex_buffer(0, buffer.slice(..));
+                    pass.draw(range.clone(), 0..1);
+                }
+            } else if let (Some(index_buffer), Some(coordinates)) = (
+                &instance.mesh.index_buffer,
+                &instance.mesh.texture_coordinate_buffer,
+            ) {
+                pass.set_pipeline(&renderer.textures.retained_pipeline);
+                pass.set_vertex_buffer(0, instance.mesh.vertex_buffer.slice(..));
+                pass.set_vertex_buffer(1, coordinates.slice(..));
+                pass.set_vertex_buffer(
+                    2,
+                    renderer.instance_buffer.slice(instance_start..instance_end),
+                );
+                pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..instance.mesh.index_count, 0, 0..1);
+            }
+            continue;
+        }
         if let Some(range) = renderer
             .clipped_surface_objects
             .get(instance_index)
@@ -2838,6 +3042,7 @@ pub(super) fn assert_gpu_depth_contract(
     format: wgpu::TextureFormat,
 ) {
     surface::assert_gpu_surface_contract(device, queue, format);
+    texture::assert_gpu_texture_contract(device, queue, format);
     assert_gpu_clip_equivalence(device, queue);
     let identity = Arc::new(());
     let mut renderer = Mesh3dRenderer::new(device, format);
@@ -3282,6 +3487,12 @@ pub(super) fn assert_gpu_scene_recovery_contract(
         recovery_device,
         recovery_queue,
     );
+    texture::assert_gpu_textured_recovery(
+        source_device,
+        source_queue,
+        recovery_device,
+        recovery_queue,
+    );
     let source_identity = Arc::new(());
     let recovery_identity = Arc::new(());
     let topology = Mesh3d::with_display_edges(
@@ -3322,6 +3533,9 @@ pub(super) fn assert_gpu_scene_recovery_contract(
     let report = restore_scene3d_resources(
         recovery_device,
         recovery_queue,
+        &Mesh3dRenderer::new(recovery_device, wgpu::TextureFormat::Rgba8UnormSrgb)
+            .textures
+            .layout,
         Arc::clone(&recovery_identity),
         &mut scene,
     )
@@ -3359,6 +3573,9 @@ pub(super) fn assert_gpu_scene_recovery_contract(
     let no_op_report = restore_scene3d_resources(
         recovery_device,
         recovery_queue,
+        &Mesh3dRenderer::new(recovery_device, wgpu::TextureFormat::Rgba8UnormSrgb)
+            .textures
+            .layout,
         recovery_identity,
         &mut scene,
     )

@@ -104,7 +104,9 @@ impl FrameCacheStatistics {
     pub const fn uploaded_uniform_bytes(self) -> usize {
         self.uploaded_uniform_bytes
     }
-    /// Conservative old-plus-new owned allocation peak; excludes driver staging.
+    /// Conservative CPU scratch bound: initial retained bytes plus twice the
+    /// final owned capacities, covering transient old/new Vec growth. This is
+    /// not an allocator high-water measurement and excludes driver staging.
     pub const fn peak_cpu_bytes(self) -> usize {
         self.peak_cpu_bytes
     }
@@ -218,7 +220,9 @@ impl FrameCache {
     }
 
     pub(super) fn finish(&mut self) {
-        self.statistics.peak_cpu_bytes = self.initial_cpu_bytes.saturating_add(self.cpu_bytes());
+        self.statistics.peak_cpu_bytes = self
+            .initial_cpu_bytes
+            .saturating_add(self.cpu_bytes().saturating_mul(2));
         if self.cpu_bytes() > self.budget.max_cpu_bytes {
             self.items = Vec::new();
             self.retained_resources = Vec::new();
@@ -519,6 +523,93 @@ mod tests {
         cache.finish();
         assert_eq!(cache.statistics.cpu_bytes(), 0);
         assert!(cache.statistics.peak_cpu_bytes() > 0);
+    }
+
+    #[test]
+    fn late_transform_failure_accounts_grown_batches_before_idle_eviction() {
+        let mut scene = Scene::new(Color::BLACK).unwrap();
+        for index in 0..256 {
+            scene
+                .set_screen_clip(Some(
+                    ScreenClipRect::from_min_size(
+                        LogicalScreenPosition::new((index % 2) as f32, 0.0),
+                        crate::LogicalScreenVector::new(32.0, 32.0),
+                    )
+                    .unwrap(),
+                ))
+                .unwrap();
+            scene
+                .try_line(
+                    Vec2::new(1.0e30, 0.0),
+                    Vec2::new(1.1e30, 0.0),
+                    1.0,
+                    Color::WHITE,
+                )
+                .unwrap();
+        }
+        let viewport = LogicalViewport::new(64.0, 64.0).unwrap();
+        let camera = Camera2d::new(Vec2::ZERO, 1.0e10).unwrap();
+        let uniform = CameraUniform::new(camera, viewport).unwrap();
+        let resolved = ResolvedViewport {
+            viewport,
+            origin: Vec2::ZERO,
+            scissor: ScissorRect {
+                x: 0,
+                y: 0,
+                width: 64,
+                height: 64,
+            },
+            item_clip: None,
+            item_clipped_out: false,
+        };
+        for budget in [
+            FrameCacheBudget::default(),
+            FrameCacheBudget::new(0, 0, 0, 0),
+        ] {
+            let mut cache = FrameCache {
+                budget,
+                ..FrameCache::default()
+            };
+            cache.begin();
+            // Production reserves the outer pool for the complete frame first.
+            cache.batches.try_reserve(1).unwrap();
+            let mut vertices = Vec::new();
+            let mut ready = Vec::new();
+            let mut statistics = FrameStatistics::default();
+            let mut aggregate = TessellationStats::default();
+            let result = with_streaming_batches(&mut cache.batches, |batches| {
+                prepare_streaming_scene_resolved(
+                    &scene,
+                    uniform,
+                    resolved,
+                    &mut vertices,
+                    &mut ready,
+                    &mut statistics,
+                    &mut aggregate,
+                    batches,
+                )
+            });
+            assert_eq!(
+                result,
+                Err(RendererFrameError::InvalidGeometryTransform.into())
+            );
+            assert!(vertices.is_empty() && ready.is_empty());
+            assert_eq!(statistics, FrameStatistics::default());
+            assert_eq!(aggregate, TessellationStats::default());
+            assert_eq!(cache.batches.len(), 1);
+            assert!(cache.batches[0].is_empty());
+            assert!(cache.batches[0].capacity() >= scene.command_count());
+            let owned = cache.cpu_bytes();
+            assert!(owned >= scene.command_count() * std::mem::size_of::<PreparedDrawBatch>());
+            cache.finish();
+            assert!(cache.statistics.peak_cpu_bytes() >= owned * 2);
+            if budget.max_cpu_bytes() == 0 {
+                assert_eq!(cache.statistics.cpu_bytes(), 0);
+                assert!(cache.batches.is_empty());
+            } else {
+                assert_eq!(cache.statistics.cpu_bytes(), owned);
+            }
+        }
     }
 
     #[test]

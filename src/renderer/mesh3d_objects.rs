@@ -114,6 +114,8 @@ pub struct Scene3dBudget {
     max_storage_bytes: usize,
     max_mesh_cpu_bytes: usize,
     max_mesh_gpu_bytes: usize,
+    max_texture_cpu_bytes: usize,
+    max_texture_gpu_bytes: usize,
 }
 
 impl Scene3dBudget {
@@ -139,6 +141,8 @@ impl Scene3dBudget {
             max_storage_bytes,
             max_mesh_cpu_bytes,
             max_mesh_gpu_bytes,
+            max_texture_cpu_bytes: 64 * 1024 * 1024,
+            max_texture_gpu_bytes: 64 * 1024 * 1024,
         })
     }
     /// Maximum simultaneous live objects; removed lookup slots can be reused.
@@ -157,6 +161,21 @@ impl Scene3dBudget {
     pub const fn max_mesh_gpu_bytes(self) -> usize {
         self.max_mesh_gpu_bytes
     }
+    /// Sets deduplicated texture recovery/GPU texel limits; zero prohibits
+    /// textured resources. Mesh and bookkeeping limits remain independent.
+    pub const fn with_texture_limits(mut self, cpu_bytes: usize, gpu_bytes: usize) -> Self {
+        self.max_texture_cpu_bytes = cpu_bytes;
+        self.max_texture_gpu_bytes = gpu_bytes;
+        self
+    }
+    /// Maximum distinct retained texture-pixel capacity in bytes.
+    pub const fn max_texture_cpu_bytes(self) -> usize {
+        self.max_texture_cpu_bytes
+    }
+    /// Maximum distinct nominal GPU texture texel bytes.
+    pub const fn max_texture_gpu_bytes(self) -> usize {
+        self.max_texture_gpu_bytes
+    }
 }
 
 impl Default for Scene3dBudget {
@@ -166,6 +185,8 @@ impl Default for Scene3dBudget {
             max_storage_bytes: 64 * 1024 * 1024,
             max_mesh_cpu_bytes: 256 * 1024 * 1024,
             max_mesh_gpu_bytes: 256 * 1024 * 1024,
+            max_texture_cpu_bytes: 64 * 1024 * 1024,
+            max_texture_gpu_bytes: 64 * 1024 * 1024,
         }
     }
 }
@@ -173,6 +194,10 @@ impl Default for Scene3dBudget {
 /// Bounded scene resource whose limit rejected a mutation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scene3dBudgetResource {
+    /// Distinct retained CPU texture-pixel capacities.
+    TextureCpuBytes,
+    /// Distinct nominal GPU texture texel-storage bytes.
+    TextureGpuBytes,
     /// Simultaneously live object count.
     Objects,
     /// Dense instances, lookup slots and allocation-accounting storage.
@@ -192,9 +217,24 @@ pub struct Scene3dStatistics {
     mesh_count: usize,
     mesh_cpu_bytes: usize,
     mesh_gpu_bytes: usize,
+    texture_count: usize,
+    texture_cpu_bytes: usize,
+    texture_gpu_bytes: usize,
 }
 
 impl Scene3dStatistics {
+    /// Distinct shared textures referenced by live objects, including hidden ones.
+    pub const fn texture_count(self) -> usize {
+        self.texture_count
+    }
+    /// Unique retained texture-pixel capacity, excluding fixed binding metadata.
+    pub const fn texture_cpu_bytes(self) -> usize {
+        self.texture_cpu_bytes
+    }
+    /// Unique nominal GPU texel storage, excluding driver overhead.
+    pub const fn texture_gpu_bytes(self) -> usize {
+        self.texture_gpu_bytes
+    }
     /// Number of live objects, including hidden ones.
     pub const fn object_count(self) -> usize {
         self.object_count
@@ -227,9 +267,19 @@ pub struct Scene3dMeshUpdateReport {
     statistics: Scene3dStatistics,
     peak_mesh_cpu_bytes: usize,
     peak_mesh_gpu_bytes: usize,
+    peak_texture_cpu_bytes: usize,
+    peak_texture_gpu_bytes: usize,
 }
 
 impl Scene3dMeshUpdateReport {
+    /// Unique old-plus-new texture-pixel capacity during rebinding.
+    pub const fn peak_texture_cpu_bytes(self) -> usize {
+        self.peak_texture_cpu_bytes
+    }
+    /// Unique old-plus-new GPU texel bytes during rebinding, not driver retirement.
+    pub const fn peak_texture_gpu_bytes(self) -> usize {
+        self.peak_texture_gpu_bytes
+    }
     /// Accepted scene capacities and unique resource bytes.
     pub const fn statistics(self) -> Scene3dStatistics {
         self.statistics
@@ -350,6 +400,19 @@ impl Scene3d {
     /// Returns deduplicated allocation accounting without allocating scratch.
     pub fn statistics(&self) -> Scene3dStatistics {
         Scene3dStatistics {
+            texture_count: self.resources.iter().filter(|r| r.key.0 == 3).count(),
+            texture_cpu_bytes: self
+                .resources
+                .iter()
+                .filter(|r| r.key.0 == 2)
+                .map(|r| r.bytes)
+                .sum(),
+            texture_gpu_bytes: self
+                .resources
+                .iter()
+                .filter(|r| r.key.0 == 3)
+                .map(|r| r.bytes)
+                .sum(),
             object_count: self.instances.len(),
             slot_capacity: self.slots.capacity(),
             storage_bytes: storage_bytes(
@@ -421,8 +484,12 @@ impl Scene3d {
         validate_mesh_style(mesh, self.instances[index].style)?;
         let incoming = mesh_resources(mesh);
         let outgoing = mesh_resources(&self.instances[index].mesh);
-        let (peak_mesh_cpu_bytes, peak_mesh_gpu_bytes) =
-            self.validate_resource_change(&incoming, Some(&outgoing))?;
+        let [
+            peak_mesh_cpu_bytes,
+            peak_mesh_gpu_bytes,
+            peak_texture_cpu_bytes,
+            peak_texture_gpu_bytes,
+        ] = self.validate_resource_change(&incoming, Some(&outgoing))?;
         let removed_keys = outgoing
             .iter()
             .filter(|resource| {
@@ -451,6 +518,8 @@ impl Scene3d {
             statistics: self.statistics(),
             peak_mesh_cpu_bytes,
             peak_mesh_gpu_bytes,
+            peak_texture_cpu_bytes,
+            peak_texture_gpu_bytes,
         })
     }
 
@@ -537,6 +606,12 @@ impl Scene3d {
     }
 
     fn validate_mesh_owner(&self, mesh: &RetainedMesh3d) -> Result<(), Scene3dError> {
+        if mesh
+            .material()
+            .is_some_and(|material| !material.texture().belongs_to(&mesh.renderer_identity))
+        {
+            return Err(Scene3dError::RendererMismatch);
+        }
         if self
             .renderer_identity
             .as_ref()
@@ -552,14 +627,19 @@ impl Scene3d {
         incoming
             .iter()
             .filter(|r| {
-                self.resources
-                    .binary_search_by_key(&r.key, |r| r.key)
-                    .is_err()
+                r.bytes > 0
+                    && self
+                        .resources
+                        .binary_search_by_key(&r.key, |r| r.key)
+                        .is_err()
             })
             .count()
     }
 
     fn add_resource(&mut self, resource: ResourceUsage) {
+        if resource.bytes == 0 {
+            return;
+        }
         match self
             .resources
             .binary_search_by_key(&resource.key, |r| r.key)
@@ -582,9 +662,14 @@ impl Scene3d {
         &self,
         incoming: &[ResourceUsage],
         outgoing: Option<&[ResourceUsage]>,
-    ) -> Result<(usize, usize), Scene3dError> {
+    ) -> Result<[usize; 4], Scene3dError> {
         let stats = self.statistics();
-        let mut bytes = [stats.mesh_cpu_bytes, stats.mesh_gpu_bytes];
+        let mut bytes = [
+            stats.mesh_cpu_bytes,
+            stats.mesh_gpu_bytes,
+            stats.texture_cpu_bytes,
+            stats.texture_gpu_bytes,
+        ];
         for resource in incoming {
             if self
                 .resources
@@ -617,7 +702,17 @@ impl Scene3d {
             self.budget.max_mesh_gpu_bytes,
             bytes[1],
         )?;
-        Ok((peak[0], peak[1]))
+        check_scene_limit(
+            Scene3dBudgetResource::TextureCpuBytes,
+            self.budget.max_texture_cpu_bytes,
+            bytes[2],
+        )?;
+        check_scene_limit(
+            Scene3dBudgetResource::TextureGpuBytes,
+            self.budget.max_texture_gpu_bytes,
+            bytes[3],
+        )?;
+        Ok(peak)
     }
 
     fn reserve_storage(
@@ -632,7 +727,7 @@ impl Scene3d {
             planned_capacity(
                 &self.resources,
                 resources,
-                self.budget.max_objects.saturating_mul(2),
+                self.budget.max_objects.saturating_mul(4),
             ),
         ];
         if storage_bytes(capacities[0], capacities[1], capacities[2])
@@ -700,7 +795,7 @@ impl Scene3d {
     }
 }
 
-fn mesh_resources(mesh: &RetainedMesh3d) -> [ResourceUsage; 2] {
+fn mesh_resources(mesh: &RetainedMesh3d) -> [ResourceUsage; 4] {
     [
         ResourceUsage {
             key: (0, mesh.source.vertices().as_ptr() as usize),
@@ -711,6 +806,28 @@ fn mesh_resources(mesh: &RetainedMesh3d) -> [ResourceUsage; 2] {
             key: (1, Arc::as_ptr(&mesh.vertex_buffer) as usize),
             references: 1,
             bytes: mesh.gpu_allocation_bytes(),
+        },
+        ResourceUsage {
+            key: (
+                2,
+                mesh.material()
+                    .map_or(0, |material| material.texture().identity_key()),
+            ),
+            references: 1,
+            bytes: mesh
+                .material()
+                .map_or(0, |material| material.texture().recovery_memory_bytes()),
+        },
+        ResourceUsage {
+            key: (
+                3,
+                mesh.material()
+                    .map_or(0, |material| material.texture().identity_key()),
+            ),
+            references: 1,
+            bytes: mesh
+                .material()
+                .map_or(0, |material| material.texture().gpu_allocation_bytes()),
         },
     ]
 }

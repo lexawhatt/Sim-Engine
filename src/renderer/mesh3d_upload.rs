@@ -7,7 +7,7 @@ use super::*;
 pub enum Mesh3dUploadBudgetResource {
     /// Retained source-topology capacities.
     RecoveryBytes,
-    /// Vertex/index/display-edge GPU buffer bytes.
+    /// Vertex/UV/index/display-edge GPU buffer bytes; excludes material texels.
     GpuBytes,
     /// Temporary CPU conversion-array bytes.
     StagingBytes,
@@ -41,11 +41,11 @@ impl Mesh3dUploadBudget {
     pub const fn max_recovery_bytes(self) -> usize {
         self.max_recovery_bytes
     }
-    /// Maximum vertex/index/display-edge buffer bytes for the accepted revision.
+    /// Maximum vertex/UV/index/display-edge bytes for the accepted revision.
     pub const fn max_gpu_bytes(self) -> usize {
         self.max_gpu_bytes
     }
-    /// Maximum temporary CPU vertex/edge conversion bytes.
+    /// Maximum temporary CPU vertex/UV/edge conversion bytes.
     pub const fn max_staging_bytes(self) -> usize {
         self.max_staging_bytes
     }
@@ -76,7 +76,7 @@ impl Mesh3dUploadReport {
     pub const fn recovery_bytes(self) -> usize {
         self.recovery_bytes
     }
-    /// Bytes uploaded to newly allocated vertex/index/display-edge buffers.
+    /// Bytes uploaded to new vertex/UV/index/display-edge buffers.
     pub const fn uploaded_bytes(self) -> usize {
         self.uploaded_bytes
     }
@@ -144,12 +144,7 @@ pub(super) fn prepare_with_budget(
     source: Mesh3d,
     budget: Mesh3dUploadBudget,
 ) -> Result<PreparedRetainedMeshUpload, Mesh3dResourceError> {
-    let layout = preflight_mesh3d_upload(
-        source.vertices().len(),
-        source.triangle_indices().len(),
-        source.display_edges().len(),
-        device.limits().max_buffer_size,
-    )?;
+    let layout = preflight_mesh3d_source(&source, device.limits().max_buffer_size)?;
     for (resource, limit, actual) in [
         (
             Mesh3dUploadBudgetResource::RecoveryBytes,
@@ -164,7 +159,10 @@ pub(super) fn prepare_with_budget(
         (
             Mesh3dUploadBudgetResource::StagingBytes,
             budget.max_staging_bytes,
-            layout.vertex_bytes.saturating_add(layout.edge_bytes) as usize,
+            layout
+                .vertex_bytes
+                .saturating_add(layout.edge_bytes)
+                .saturating_add(layout.texture_coordinate_bytes) as usize,
         ),
     ] {
         if actual > limit {
@@ -191,6 +189,14 @@ pub(super) fn replace_resources(
     if !Arc::ptr_eq(identity, &mesh.renderer_identity) {
         return Err(Mesh3dResourceError::RendererMismatch);
     }
+    if mesh.material().is_some()
+        && (source.texture_coordinates().len() != source.vertices().len()
+            || source.triangle_count() == 0)
+    {
+        return Err(Mesh3dResourceError::Texture(
+            Texture3dError::MissingTextureCoordinates,
+        ));
+    }
     let prepared = prepare_with_budget(device, source, budget)?;
     let report = Mesh3dUploadReport {
         recovery_bytes: prepared.source.recovery_memory_bytes(),
@@ -198,7 +204,9 @@ pub(super) fn replace_resources(
         staging_bytes: prepared
             .layout
             .vertex_bytes
-            .saturating_add(prepared.layout.edge_bytes) as usize,
+            .saturating_add(prepared.layout.edge_bytes)
+            .saturating_add(prepared.layout.texture_coordinate_bytes)
+            as usize,
         peak_recovery_bytes: mesh.recovery_memory_bytes().saturating_add(
             if mesh.source.vertices().as_ptr() == prepared.source.vertices().as_ptr() {
                 0
@@ -210,7 +218,9 @@ pub(super) fn replace_resources(
             .gpu_allocation_bytes()
             .saturating_add(prepared.layout.total_bytes as usize),
     };
-    let replacement = upload_prepared_retained_mesh(device, queue, Arc::clone(identity), prepared);
+    let mut replacement =
+        upload_prepared_retained_mesh(device, queue, Arc::clone(identity), prepared);
+    replacement.material = mesh.material.clone();
     *mesh = replacement;
     Ok(report)
 }

@@ -8,6 +8,9 @@ use super::config::recovery_quarantine_has_capacity;
 use super::*;
 use crate::LogicalScreenVector;
 
+#[path = "cpu_validation_diagnostics.rs"]
+mod cpu_validation_diagnostics;
+
 fn tessellate_for_test(scene: &Scene) -> (Vec<Vertex>, Vec<PreparedDrawBatch>) {
     let mut vertices = Vec::new();
     let mut draw_batches = Vec::new();

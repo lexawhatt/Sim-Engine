@@ -1,6 +1,6 @@
 use super::*;
 
-fn target(
+pub(in crate::renderer::mesh3d) fn target(
     device: &wgpu::Device,
     identity: &Arc<()>,
     format: wgpu::TextureFormat,
@@ -42,7 +42,11 @@ fn target(
     }
 }
 
-fn read_pixels(device: &wgpu::Device, queue: &wgpu::Queue, target: &RenderTarget3d) -> Vec<u8> {
+pub(in crate::renderer::mesh3d) fn read_pixels(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    target: &RenderTarget3d,
+) -> Vec<u8> {
     let stride = (target.width() * 4).div_ceil(256) * 256;
     let buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("surface clipping pixel readback"),
@@ -492,6 +496,7 @@ pub(in crate::renderer::mesh3d) fn assert_gpu_clipped_recovery(
     let restore = restore_scene3d_resources(
         recovery_device,
         recovery_queue,
+        &recovery_renderer.textures.layout,
         Arc::clone(&recovery_identity),
         &mut scene,
     )

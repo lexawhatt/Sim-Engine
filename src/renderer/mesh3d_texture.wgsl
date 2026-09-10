@@ -1,0 +1,37 @@
+struct Camera3dUniform {
+    clip_row_0: vec4<f32>, clip_row_1: vec4<f32>,
+    clip_row_2: vec4<f32>, clip_row_3: vec4<f32>, viewport: vec4<f32>,
+};
+@group(0) @binding(0) var<uniform> camera3d: Camera3dUniform;
+@group(1) @binding(0) var material_texture: texture_2d<f32>;
+@group(1) @binding(1) var material_sampler: sampler;
+
+struct SurfaceOut {
+    @builtin(position) position: vec4<f32>,
+    @location(0) color: vec4<f32>,
+    @location(1) uv: vec2<f32>,
+};
+
+@vertex
+fn retained_vs_main(
+    @location(0) position: vec3<f32>,
+    @location(1) row0: vec4<f32>, @location(2) row1: vec4<f32>,
+    @location(3) row2: vec4<f32>, @location(4) color: vec4<f32>,
+    @location(5) uv: vec2<f32>,
+) -> SurfaceOut {
+    let model = vec4<f32>(position, 1.0);
+    let world = vec4<f32>(dot(row0, model), dot(row1, model), dot(row2, model), 1.0);
+    let clip = vec4<f32>(dot(camera3d.clip_row_0, world), dot(camera3d.clip_row_1, world),
+        dot(camera3d.clip_row_2, world), dot(camera3d.clip_row_3, world));
+    return SurfaceOut(clip, color, uv);
+}
+
+@vertex
+fn clipped_vs_main(@location(0) clip: vec4<f32>, @location(4) color: vec4<f32>, @location(5) uv: vec2<f32>) -> SurfaceOut {
+    return SurfaceOut(clip, color, uv);
+}
+
+@fragment
+fn fs_main(input: SurfaceOut) -> @location(0) vec4<f32> {
+    return vec4<f32>(textureSampleLevel(material_texture, material_sampler, input.uv, 0.0).rgb * input.color.rgb, 1.0);
+}

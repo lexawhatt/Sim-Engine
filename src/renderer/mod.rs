@@ -1010,8 +1010,7 @@ fn geometry_is_safe_for(
     geometry_sources_are_portable(source)
         && match source {
             GeometryValidationSource::Tessellated(vertices) => {
-                geometry_vertex_centers_are_portable(source, uniform)
-                    && tessellated_triangle_topology_is_portable(vertices, uniform)
+                geometry::tessellated_topology_is_portable(vertices, uniform)
                     && vertices
                         .iter()
                         .all(|vertex| logical_stroke_branches_are_stable(*vertex, uniform))
@@ -1058,6 +1057,8 @@ fn dynamic_triangle_topology_is_portable(vertices: &[DynamicGpu], uniform: Camer
     true
 }
 
+// Frozen pre-optimization topology reference for differential regression tests.
+#[cfg(test)]
 fn tessellated_triangle_topology_is_portable(vertices: &[Vertex], uniform: CameraUniform) -> bool {
     if !vertices.len().is_multiple_of(3) {
         return false;
@@ -1660,6 +1661,7 @@ fn shader_interval_product(left: (f64, f64), right: (f64, f64)) -> Option<(f64, 
     )])
 }
 
+#[cfg(test)]
 fn geometry_vertex_centers_are_portable(
     source: GeometryValidationSource<'_>,
     uniform: CameraUniform,
@@ -8032,6 +8034,7 @@ fn create_particle_instance_buffer(device: &wgpu::Device, capacity: usize) -> wg
 mod config;
 mod exact_markers;
 mod frame;
+mod geometry;
 mod glyph;
 mod image;
 mod mesh3d;
@@ -8063,7 +8066,7 @@ pub use mesh3d::{
     Mesh3dRenderError, Mesh3dRenderReport, Mesh3dResourceError, Mesh3dUploadBudget,
     Mesh3dUploadBudgetResource, Mesh3dUploadReport, Object3dId, RenderTarget3d, RetainedMesh3d,
     Scene3d, Scene3dBudget, Scene3dBudgetResource, Scene3dError, Scene3dMeshUpdateReport,
-    Scene3dRestoreReport, Scene3dStatistics,
+    Scene3dRestoreReport, Scene3dStatistics, Texture3d, Texture3dError, TextureMaterial3d,
 };
 use tessellation::{
     logical_viewport_scissor, offset_scissor, screen_clip_to_scissor, tessellate_scene,

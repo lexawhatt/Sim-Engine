@@ -11,7 +11,10 @@ mod gpu_tests;
 mod red_tests;
 
 #[cfg(test)]
-pub(super) use gpu_tests::{assert_gpu_clipped_recovery, assert_gpu_surface_contract};
+pub(super) use gpu_tests::{
+    assert_gpu_clipped_recovery, assert_gpu_surface_contract, read_pixels as test_read_pixels,
+    target as test_target,
+};
 
 /// Limits additional clip-space surface topology generated during one 3D draw.
 ///
@@ -110,6 +113,7 @@ impl Mesh3dPreflightReport {
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub(super) struct SurfaceClipVertex {
     pub(super) clip: [f32; 4],
+    pub(super) uv: [f32; 2],
 }
 
 impl SurfaceClipVertex {
@@ -119,6 +123,14 @@ impl SurfaceClipVertex {
         step_mode: wgpu::VertexStepMode::Vertex,
         attributes: &Self::ATTRIBUTES,
     };
+    const TEXTURED_ATTRIBUTES: [wgpu::VertexAttribute; 2] =
+        wgpu::vertex_attr_array![0 => Float32x4, 5 => Float32x2];
+    pub(super) const TEXTURED_LAYOUT: wgpu::VertexBufferLayout<'static> =
+        wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<Self>() as u64,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &Self::TEXTURED_ATTRIBUTES,
+        };
 }
 
 pub(super) struct SurfaceFrame {
@@ -329,12 +341,14 @@ struct ClipVertex {
     ranges: [ShaderValueRange; 4],
     planes: u8,
     provenance: u8,
+    uv: [f32; 2],
 }
 
 impl ClipVertex {
     fn same_proven_vertex(self, other: Self) -> bool {
         self.provenance == other.provenance
             && self.planes == other.planes
+            && self.uv == other.uv
             && self
                 .ranges
                 .into_iter()
@@ -428,6 +442,16 @@ fn intersection(
         };
     }
     let planes = (start.planes & end.planes) | (1 << plane);
+    let uv = std::array::from_fn(|axis| {
+        (f64::from(start.uv[axis])
+            + (f64::from(end.uv[axis]) - f64::from(start.uv[axis])) * fixed_amount) as f32
+    });
+    if uv
+        .into_iter()
+        .any(|value| !is_portable_shader_source(value) || !(0.0..=1.0).contains(&value))
+    {
+        return Err(error);
+    }
     // Preserve the exact plane relation, including corners shared by two
     // previously clipped planes. This prevents a second hardware clip caused
     // only by independently rounding x and w at the boundary.
@@ -461,16 +485,26 @@ fn intersection(
         ranges,
         planes,
         provenance,
+        uv,
     })
 }
 
+#[cfg(test)]
 fn clipped_triangle(
     clips: [[ShaderValueRange; 4]; 3],
+) -> Result<ClippedTriangle, Mesh3dRenderError> {
+    clipped_triangle_with_uv(clips, [[0.0; 2]; 3])
+}
+
+fn clipped_triangle_with_uv(
+    clips: [[ShaderValueRange; 4]; 3],
+    uv: [[f32; 2]; 3],
 ) -> Result<ClippedTriangle, Mesh3dRenderError> {
     let empty = ClipVertex {
         ranges: [ShaderValueRange::exact(0.0); 4],
         planes: 0,
         provenance: 0,
+        uv: [0.0; 2],
     };
     let mut result = ClippedTriangle {
         vertices: [empty; MAX_POLYGON_VERTICES],
@@ -489,6 +523,7 @@ fn clipped_triangle(
             ranges,
             planes,
             provenance: provenance as u8,
+            uv: uv[provenance],
         };
     }
     // Common-plane rejection does not need a projected orientation proof.
@@ -597,8 +632,16 @@ pub(super) fn classify_surface(
                 camera_rows,
             )?;
         }
-        let polygon = clipped_triangle(clips)?;
-        let mut emitted = [SurfaceClipVertex { clip: [0.0; 4] }; 21];
+        let uv = std::array::from_fn(|index| {
+            mesh.texture_coordinates()
+                .get(triangle[index] as usize)
+                .map_or([0.0, 0.0], |coordinate| [coordinate.u(), coordinate.v()])
+        });
+        let polygon = clipped_triangle_with_uv(clips, uv)?;
+        let mut emitted = [SurfaceClipVertex {
+            clip: [0.0; 4],
+            uv: [0.0; 2],
+        }; 21];
         let mut count = 0;
         for fan in 1..polygon.count.saturating_sub(1) {
             for vertex in [
@@ -608,6 +651,7 @@ pub(super) fn classify_surface(
             ] {
                 emitted[count] = SurfaceClipVertex {
                     clip: vertex.ranges.map(|range| range.fixed),
+                    uv: vertex.uv,
                 };
                 count += 1;
             }

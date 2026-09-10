@@ -33,6 +33,13 @@ from the official 0.2.0 release; a development version is not release sign-off.
   preserves survivor IDs and insertion order; freed slots do not revive old IDs.
 - Budgeted immutable mesh creation/replacement with nominal staging and old/new
   overlap reports. Replacing one handle does not mutate its existing clones.
+- Optional per-vertex `TextureCoordinate2d` data on `Mesh3d::textured`, shared
+  immutable `Texture3d` resources and `TextureMaterial3d` for unlit opaque
+  surfaces. Materials provide nearest/linear mip-zero sampling and linear tint;
+  the existing untextured and edge-only paths remain available.
+- Textured surfaces carry UVs through six-plane clipping, retain sRGB RGBA8
+  pixels for recovery and expose separate mesh/texture accounting. Material
+  variants share topology buffers; scene recovery deduplicates shared textures.
 - `StrokeMarkerAnchor2d::TipAtEndpoint` for exact scientific vectors. The
   existing outward `BaseAtEndpoint` remains the default. Exact-tip markers
   currently require undashed two-point paths and use a butt-ended shaft.
@@ -56,6 +63,12 @@ from the official 0.2.0 release; a development version is not release sign-off.
 - Monotonically ordered Scene insertion appends directly, with the existing
   ordering fallback for out-of-order input. Paired warmed tests preserve exact
   command order, statistics, budgets and zero allocation counts.
+- Tessellated geometry validation reuses exact per-call position proofs and
+  removes a redundant projection pass; image/glyph composition no longer
+  repeats its completed per-sprite preflight. Conservative arithmetic and
+  rejection behavior are retained through differential tests.
+- Frame-cache peak accounting includes scratch retained after late transform
+  rejection and conservative old/new Vec growth headroom before idle eviction.
 
 ### Scope and measurement
 

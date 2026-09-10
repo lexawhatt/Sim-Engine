@@ -1,15 +1,15 @@
-//! Interactive visual oracle for the v0.2 stroke and frame-composition paths.
+//! Interactive visual oracle for stroke and frame-composition paths.
 //!
-//! Controls: 1-4 pages, Space pause, Left/Right scrub dash phase, +/- zoom,
+//! Controls: 1-5 pages, Space pause, Left/Right scrub dash phase, +/- zoom,
 //! R reset, Esc exit. Pass `--uncapped` to inspect throughput without FIFO pacing.
 
 use std::{error::Error, sync::Arc, time::Instant};
 
 use sim_engine::{
     Camera2d, Color, FrameBudget, FramePassOptions, LogicalPixels, LogicalScreenPosition,
-    LogicalScreenVector, RendererPresentMode, Scene, ScreenScene, ShapeStyle, StrokeCap2d,
-    StrokeDashPattern2d, StrokeJoin2d, StrokeMarker2d, StrokeStyle2d, Vec2, WgpuRenderer,
-    WgpuRendererOptions,
+    LogicalScreenVector, LogicalViewport, RenderStatus, RendererPresentMode, Scene, ScreenScene,
+    ShapeStyle, StrokeCap2d, StrokeDashPattern2d, StrokeJoin2d, StrokeMarker2d,
+    StrokeMarkerAnchor2d, StrokeStyle2d, Vec2, WgpuRenderer, WgpuRendererOptions, WorldLength,
 };
 use winit::{
     application::ApplicationHandler,
@@ -32,13 +32,26 @@ fn main() -> Result<(), Box<dyn Error>> {
             "2" => Some(GalleryPage::AlphaContract),
             "3" => Some(GalleryPage::DashesAndMarkers),
             "4" => Some(GalleryPage::CameraAndEdges),
+            "5" => Some(GalleryPage::ExactVectors),
             _ => None,
         })
         .unwrap_or(GalleryPage::CapsAndJoins);
+    let frame_limit = arguments
+        .windows(2)
+        .find(|pair| pair[0] == "--frames")
+        .map(|pair| pair[1].parse::<usize>())
+        .transpose()?;
+    if frame_limit == Some(0) {
+        return Err("--frames must be positive".into());
+    }
     let event_loop = EventLoop::new()?;
     event_loop.set_control_flow(ControlFlow::Poll);
     let mut application = GalleryApplication::new(uncapped, initial_page);
+    application.frame_limit = frame_limit;
     event_loop.run_app(&mut application)?;
+    if let Some(error) = application.failure {
+        return Err(error.into());
+    }
     Ok(())
 }
 
@@ -48,6 +61,7 @@ enum GalleryPage {
     AlphaContract,
     DashesAndMarkers,
     CameraAndEdges,
+    ExactVectors,
 }
 
 impl GalleryPage {
@@ -57,6 +71,7 @@ impl GalleryPage {
             Self::AlphaContract => 2,
             Self::DashesAndMarkers => 3,
             Self::CameraAndEdges => 4,
+            Self::ExactVectors => 5,
         }
     }
 
@@ -66,6 +81,9 @@ impl GalleryPage {
             Self::AlphaContract => "translucent joins: body and corner must match",
             Self::DashesAndMarkers => "bounded dashes + outward arrow markers",
             Self::CameraAndEdges => "camera stress + short accepted geometry",
+            Self::ExactVectors => {
+                "exact tips at crosshairs: cyan logical width, orange world width"
+            }
         }
     }
 }
@@ -83,6 +101,9 @@ struct GalleryApplication {
     metric_frames: usize,
     metric_work_seconds: f64,
     metric_acquire_seconds: f64,
+    frame_limit: Option<usize>,
+    drawn_frames: usize,
+    failure: Option<String>,
 }
 
 impl GalleryApplication {
@@ -101,6 +122,9 @@ impl GalleryApplication {
             metric_frames: 0,
             metric_work_seconds: 0.0,
             metric_acquire_seconds: 0.0,
+            frame_limit: None,
+            drawn_frames: 0,
+            failure: None,
         }
     }
 
@@ -175,7 +199,7 @@ impl ApplicationHandler for GalleryApplication {
         let notify_window = Arc::clone(&window);
         renderer.set_pre_present_notify(move || notify_window.pre_present_notify());
         println!(
-            "stroke gallery: 1 caps/joins, 2 alpha, 3 dash/markers, 4 camera edge cases; Space pause, Left/Right scrub, +/- zoom, R reset, Esc exit"
+            "stroke gallery: 1 caps/joins, 2 alpha, 3 dash/markers, 4 camera edge cases, 5 exact scientific vectors; Space pause, Left/Right scrub, +/- zoom, R reset, Esc exit"
         );
         self.window = Some(window);
         self.renderer = Some(renderer);
@@ -228,6 +252,7 @@ impl ApplicationHandler for GalleryApplication {
                     KeyCode::Digit2 => self.page = GalleryPage::AlphaContract,
                     KeyCode::Digit3 => self.page = GalleryPage::DashesAndMarkers,
                     KeyCode::Digit4 => self.page = GalleryPage::CameraAndEdges,
+                    KeyCode::Digit5 => self.page = GalleryPage::ExactVectors,
                     KeyCode::Space => self.paused = !self.paused,
                     KeyCode::ArrowLeft => self.animation -= 0.15,
                     KeyCode::ArrowRight => self.animation += 0.15,
@@ -247,6 +272,17 @@ impl ApplicationHandler for GalleryApplication {
             WindowEvent::RedrawRequested => {
                 if let Err(error) = self.draw_frame() {
                     eprintln!("stroke gallery frame failed: {error}");
+                    self.failure = Some(error.to_string());
+                    event_loop.exit();
+                } else if self
+                    .frame_limit
+                    .is_some_and(|limit| self.drawn_frames >= limit)
+                {
+                    println!(
+                        "stroke gallery page {}: {} presented frames",
+                        self.page.number(),
+                        self.drawn_frames
+                    );
                     event_loop.exit();
                 }
             }
@@ -269,7 +305,10 @@ impl GalleryApplication {
         if !self.paused {
             self.animation += delta.as_secs_f32();
         }
-        if self.page == GalleryPage::CameraAndEdges {
+        if matches!(
+            self.page,
+            GalleryPage::CameraAndEdges | GalleryPage::ExactVectors
+        ) {
             self.camera
                 .set_rotation((self.animation * 0.35).sin() * 0.22)?;
         }
@@ -278,16 +317,32 @@ impl GalleryApplication {
             .as_mut()
             .ok_or("renderer is not initialized")?;
         let (width, height) = renderer.logical_size();
-        let screen = build_screen_page(self.page, width, height, self.animation)?;
-        let world = (self.page == GalleryPage::CameraAndEdges)
-            .then(|| build_world_edge_scene())
-            .transpose()?;
+        let mut screen = build_screen_page(self.page, width, height, self.animation)?;
+        let mut camera = self.camera;
+        let world = match self.page {
+            GalleryPage::CameraAndEdges => Some(build_world_edge_scene()?),
+            GalleryPage::ExactVectors => {
+                // Keep the complete illustrative vectors inside the target at
+                // every window size. Zooming out still demonstrates world width.
+                camera.set_zoom(camera.zoom().min(width.min(height) * 0.38 / 0.03).max(1.0))?;
+                add_exact_vector_guides(&mut screen, camera, LogicalViewport::new(width, height)?)?;
+                Some(build_exact_vector_scene()?)
+            }
+            _ => None,
+        };
         let mut frame = renderer.begin_frame(screen.background(), FrameBudget::default())?;
         frame.draw_screen_scene(&screen, FramePassOptions::new(0))?;
         if let Some(world) = &world {
-            frame.draw_scene(world, self.camera, FramePassOptions::new(1))?;
+            frame.draw_scene(world, camera, FramePassOptions::new(1))?;
         }
         let report = frame.present()?;
+        if report.status() != RenderStatus::Drawn {
+            if self.frame_limit.is_some() {
+                return Err("bounded gallery run requires every frame to be drawn".into());
+            }
+            return Ok(());
+        }
+        self.drawn_frames += 1;
         let metrics = report.metrics();
         self.update_title(
             now,
@@ -321,6 +376,7 @@ fn build_screen_page(
             draw_dashes_and_markers(&mut scene, width, height, animation)?
         }
         GalleryPage::CameraAndEdges => draw_camera_frame(&mut scene, width, height)?,
+        GalleryPage::ExactVectors => {}
     }
     Ok(scene)
 }
@@ -506,6 +562,82 @@ fn build_world_edge_scene() -> Result<Scene, Box<dyn Error>> {
 
 const fn p(x: f32, y: f32) -> LogicalScreenPosition {
     LogicalScreenPosition::new(x, y)
+}
+
+const EXACT_VECTORS: [(Vec2, Vec2); 5] = [
+    (Vec2::new(-0.020, 0.020), Vec2::new(0.020, 0.020)),
+    (Vec2::new(0.020, 0.010), Vec2::new(-0.020, 0.010)),
+    (Vec2::new(-0.020, 0.001), Vec2::new(0.020, -0.009)),
+    (Vec2::new(-0.010, -0.020), Vec2::new(-0.0096, -0.020)),
+    (Vec2::new(0.0104, -0.020), Vec2::new(0.010, -0.020)),
+];
+
+fn build_exact_vector_scene() -> Result<Scene, Box<dyn Error>> {
+    let mut scene = Scene::new(Color::BLACK)?;
+    let marker =
+        StrokeMarker2d::arrow(px(30.0), px(20.0)).with_anchor(StrokeMarkerAnchor2d::TipAtEndpoint);
+    for (index, (start, end)) in EXACT_VECTORS.into_iter().enumerate() {
+        let style = if matches!(index, 1 | 4) {
+            StrokeStyle2d::world(
+                WorldLength::new(0.0012)?,
+                Color::rgb8(255, 176, 70).with_alpha(0.5),
+            )
+        } else {
+            StrokeStyle2d::logical(px(12.0), Color::rgb8(65, 196, 255).with_alpha(0.5))
+        };
+        scene.try_styled_line(
+            start,
+            end,
+            style.with_start_marker(marker).with_end_marker(marker),
+        )?;
+    }
+    Ok(scene)
+}
+
+fn add_exact_vector_guides(
+    scene: &mut ScreenScene,
+    camera: Camera2d,
+    viewport: LogicalViewport,
+) -> Result<(), Box<dyn Error>> {
+    let guide = StrokeStyle2d::logical(px(1.0), Color::rgb8(180, 190, 210).with_alpha(0.5))
+        .with_cap(StrokeCap2d::Butt);
+    for (start, end) in EXACT_VECTORS {
+        for world in [start, end] {
+            let point = camera.world_to_screen(world, viewport)?.to_vec2();
+            scene.try_styled_line(
+                p(point.x() - 9.0, point.y()),
+                p(point.x() + 9.0, point.y()),
+                guide,
+            )?;
+            scene.try_styled_line(
+                p(point.x(), point.y() - 9.0),
+                p(point.x(), point.y() + 9.0),
+                guide,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod exact_vector_tests {
+    use super::*;
+
+    #[test]
+    fn exact_vector_page_accepts_both_widths_reversed_and_short_segments() {
+        assert_eq!(build_exact_vector_scene().unwrap().command_count(), 5);
+        for (width, height) in [(640.0, 480.0), (1280.0, 760.0)] {
+            let mut scene =
+                build_screen_page(GalleryPage::ExactVectors, width, height, 0.0).unwrap();
+            let camera = Camera2d::new(Vec2::ZERO, 6000.0).unwrap();
+            add_exact_vector_guides(
+                &mut scene,
+                camera,
+                LogicalViewport::new(width, height).unwrap(),
+            )
+            .unwrap();
+        }
+    }
 }
 
 fn px(value: f32) -> LogicalPixels {

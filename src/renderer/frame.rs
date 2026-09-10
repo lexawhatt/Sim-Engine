@@ -1,6 +1,9 @@
 use super::*;
 
 mod cache;
+#[cfg(test)]
+#[path = "frame/dedup_diagnostics.rs"]
+mod dedup_diagnostics;
 pub(super) use cache::FrameCache;
 pub use cache::{FrameCacheBudget, FrameCacheStatistics};
 
@@ -1785,18 +1788,20 @@ fn present_frame_with_vertices<'frame>(
                 options,
                 ..
             } => {
-                prepare_streaming_scene(
-                    scene,
-                    camera,
-                    options,
-                    renderer,
-                    target_viewport,
-                    &mut *streaming_vertices,
-                    ready,
-                    &mut statistics,
-                    &mut tessellation_stats,
-                    cache.batches.pop().unwrap_or_default(),
-                )?;
+                with_streaming_batches(&mut cache.batches, |batches| {
+                    prepare_streaming_scene(
+                        scene,
+                        camera,
+                        options,
+                        renderer,
+                        target_viewport,
+                        &mut *streaming_vertices,
+                        ready,
+                        &mut statistics,
+                        &mut tessellation_stats,
+                        batches,
+                    )
+                })?;
                 geometry_streamed = true;
             }
             FrameItem::ScreenScene { scene, options, .. } => {
@@ -1818,16 +1823,18 @@ fn present_frame_with_vertices<'frame>(
                 ) {
                     return Err(RendererFrameError::GeometryCapacityTooLarge.into());
                 }
-                prepare_streaming_scene_resolved(
-                    scene.as_scene(),
-                    camera_uniform,
-                    viewport,
-                    &mut *streaming_vertices,
-                    ready,
-                    &mut statistics,
-                    &mut tessellation_stats,
-                    cache.batches.pop().unwrap_or_default(),
-                )?;
+                with_streaming_batches(&mut cache.batches, |batches| {
+                    prepare_streaming_scene_resolved(
+                        scene.as_scene(),
+                        camera_uniform,
+                        viewport,
+                        &mut *streaming_vertices,
+                        ready,
+                        &mut statistics,
+                        &mut tessellation_stats,
+                        batches,
+                    )
+                })?;
                 geometry_streamed = true;
             }
             FrameItem::Prepared {
@@ -2137,13 +2144,11 @@ fn present_frame_with_vertices<'frame>(
             } => {
                 let viewport = resolve_viewport(renderer, target_viewport, options)?;
                 let uniform = image::batch_uniform(target_viewport, viewport.origin, placement)?;
-                if !image_sprites_are_safe_for_target(
-                    batch.sprites(),
-                    Vec2::new(uniform.uv_rect[0], uniform.uv_rect[1]),
-                    uniform.destination,
-                ) {
-                    return Err(RendererFrameError::InvalidGeometryTransform.into());
-                }
+                // Preflight already proved every sprite against this exact
+                // uniform. Items keep immutable batch borrows, and neither the
+                // target viewport nor the surface configuration changes between
+                // preflight and this ready-item construction. Do not repeat the
+                // per-glyph interval proof here (it dominates large HUD frames).
                 let vertex_count = batch.sprite_count().saturating_mul(6);
                 statistics = statistics.adding(FrameStatistics {
                     pass_count: 1,
@@ -2851,6 +2856,21 @@ fn visible_particle_count_for_frame(
     Ok(visible)
 }
 
+// Keep grown scratch reachable on every structured failure, both for reuse
+// and for the cache's conservative owned-capacity peak accounting.
+fn with_streaming_batches(
+    pool: &mut Vec<Vec<PreparedDrawBatch>>,
+    prepare: impl FnOnce(&mut Vec<PreparedDrawBatch>) -> Result<(), FrameComposerError>,
+) -> Result<(), FrameComposerError> {
+    let mut batches = pool.pop().unwrap_or_default();
+    let result = prepare(&mut batches);
+    if batches.capacity() > 0 {
+        batches.clear();
+        pool.push(batches);
+    }
+    result
+}
+
 #[allow(clippy::too_many_arguments)]
 fn prepare_streaming_scene<'frame>(
     scene: &Scene,
@@ -2862,7 +2882,7 @@ fn prepare_streaming_scene<'frame>(
     ready: &mut Vec<ReadyItem<'frame>>,
     statistics: &mut FrameStatistics,
     aggregate: &mut TessellationStats,
-    batches: Vec<PreparedDrawBatch>,
+    batches: &mut Vec<PreparedDrawBatch>,
 ) -> Result<(), FrameComposerError> {
     let viewport = resolve_viewport(renderer, target_viewport, options)?;
     let camera_uniform =
@@ -2897,11 +2917,11 @@ fn prepare_streaming_scene_resolved<'frame>(
     ready: &mut Vec<ReadyItem<'frame>>,
     statistics: &mut FrameStatistics,
     aggregate: &mut TessellationStats,
-    mut batches: Vec<PreparedDrawBatch>,
+    batches: &mut Vec<PreparedDrawBatch>,
 ) -> Result<(), FrameComposerError> {
     let vertex_start = streaming_vertices.len();
-    let stats = tessellate_scene(scene, streaming_vertices, &mut batches)
-        .map_err(RendererFrameError::from)?;
+    let stats =
+        tessellate_scene(scene, streaming_vertices, batches).map_err(RendererFrameError::from)?;
     let vertices = &streaming_vertices[vertex_start..];
     let extents = GeometryExtents::from_vertices(vertices);
     if !geometry_is_safe_for(
@@ -2932,7 +2952,7 @@ fn prepare_streaming_scene_resolved<'frame>(
     ready.push(ReadyItem::Geometry(ReadyGeometry {
         source: ReadySource::Streaming,
         vertex_count: vertices.len(),
-        batches,
+        batches: std::mem::take(batches),
         camera_uniform,
         viewport,
     }));
@@ -3721,7 +3741,7 @@ mod tests {
                 &mut ready,
                 &mut statistics,
                 &mut aggregate,
-                Vec::new(),
+                &mut Vec::new(),
             ),
             Err(FrameComposerError::Frame(
                 RendererFrameError::InvalidGeometryTransform
@@ -3772,7 +3792,7 @@ mod tests {
                 &mut ready,
                 &mut statistics,
                 &mut aggregate,
-                Vec::new(),
+                &mut Vec::new(),
             ),
             Err(FrameComposerError::Frame(
                 RendererFrameError::InvalidGeometryTransform
