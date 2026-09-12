@@ -19,8 +19,12 @@ pub(super) fn surface_parameters(style: Option<crate::SurfaceStyle3d>) -> [f32; 
                 SurfaceAlphaMode3d::Blend => 2.0,
             },
             style.mask_cutoff().unwrap_or(0.0),
-            0.0,
-            0.0,
+            if style.lighting() == SurfaceLighting3d::Lambert {
+                1.0
+            } else {
+                0.0
+            },
+            if style.fog_enabled() { 1.0 } else { 0.0 },
         ]
     })
 }

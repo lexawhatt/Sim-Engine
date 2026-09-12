@@ -13,6 +13,7 @@ fn rounded_coincident_clip_intersections_do_not_discard_uncertain_sliver() {
     let vertices = std::array::from_fn::<_, 3, _>(|index| ClipVertex {
         uv: [0.0; 2],
         color: [1.0; 4],
+        lighting: [0.0; 4],
         ranges: points[index].map(ShaderValueRange::exact),
         planes: 0,
         provenance: index as u8,
@@ -87,6 +88,7 @@ fn boundary_identity_requires_the_entire_uncertainty_envelope() {
     let original = ClipVertex {
         uv: [0.0; 2],
         color: [1.0; 4],
+        lighting: [0.0; 4],
         ranges: [-1.0, 0.5, 0.5, 1.0].map(ShaderValueRange::exact),
         planes: 1,
         provenance: 4,

@@ -81,6 +81,8 @@ impl Mesh3dInstance {
 pub struct Scene3d {
     pub(super) scene_id: u64,
     pub(super) background: Color,
+    pub(super) lighting: Lighting3d,
+    pub(super) fog: Option<Fog3d>,
     pub(super) instances: Vec<Mesh3dInstance>,
     pub(super) next_object_id: u64,
     pub(super) renderer_identity: Option<Arc<()>>,
@@ -337,6 +339,8 @@ impl Scene3d {
         Ok(Self {
             scene_id,
             background,
+            lighting: Lighting3d::default(),
+            fog: None,
             instances: Vec::new(),
             next_object_id: 0,
             renderer_identity: None,
@@ -345,6 +349,23 @@ impl Scene3d {
             resources: Vec::new(),
             budget,
         })
+    }
+
+    /// Replaces validated ambient and directional scene illumination.
+    pub fn set_lighting(&mut self, lighting: Lighting3d) {
+        self.lighting = lighting;
+    }
+    /// Returns scene illumination; surfaces remain Unlit unless explicitly opted in.
+    pub const fn lighting(&self) -> Lighting3d {
+        self.lighting
+    }
+    /// Replaces or disables camera-forward distance fog without changing topology.
+    pub fn set_fog(&mut self, fog: Option<Fog3d>) {
+        self.fog = fog;
+    }
+    /// Returns optional scene fog; only explicitly participating surfaces use it.
+    pub const fn fog(&self) -> Option<Fog3d> {
+        self.fog
     }
 
     /// Adds a retained object and returns a stable handle for later updates.
@@ -999,6 +1020,8 @@ fn planned_capacity<T>(current: &Vec<T>, additional: usize, maximum: usize) -> u
 /// Rejection reason for 3D scene visual state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scene3dError {
+    /// Lambert surface requires one normalized model normal per source vertex.
+    MissingNormals,
     /// Each explicit scene budget limit must be nonzero.
     InvalidBudget,
     /// The incoming mesh belongs to another logical renderer generation.
@@ -1039,6 +1062,10 @@ pub enum Scene3dError {
 impl fmt::Display for Scene3dError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::MissingNormals => write!(
+                formatter,
+                "Lambert surface requires application-supplied model normals"
+            ),
             Self::InvalidBudget => write!(formatter, "3D scene budget limits must be nonzero"),
             Self::RendererMismatch => {
                 write!(formatter, "3D mesh belongs to another renderer generation")

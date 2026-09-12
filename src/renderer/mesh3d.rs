@@ -22,9 +22,19 @@ use texture::{MeshTextureRenderer, MeshUvGpu};
 mod colors;
 use crate::mesh3d::{SurfaceAlphaMode3d, SurfaceSidedness3d};
 use colors::MeshColorGpu;
+#[path = "mesh3d_normals.rs"]
+mod normals;
+use normals::MeshNormalGpu;
+#[path = "mesh3d_lighting.rs"]
+mod lighting;
+use crate::mesh3d::{Fog3d, Lighting3d, SurfaceLighting3d};
+use lighting::{SurfaceEnvironmentGpu, SurfaceLightingVertex, SurfaceTransport};
 #[path = "mesh3d_surface_pipeline.rs"]
 mod surface_pipeline;
 use surface_pipeline::{SurfaceLayout, SurfacePipelines, create_surface_pipelines};
+#[cfg(test)]
+#[path = "mesh3d_lighting_tests.rs"]
+mod lighting_tests;
 #[path = "mesh3d_material.rs"]
 mod material;
 #[cfg(test)]
@@ -99,10 +109,13 @@ struct MeshInstanceGpu {
     model_row_2: [f32; 4],
     color: [f32; 4],
     surface: [f32; 4],
+    normal_row_0: [f32; 4],
+    normal_row_1: [f32; 4],
+    normal_row_2: [f32; 4],
 }
 
 impl MeshInstanceGpu {
-    const ATTRIBUTES: [wgpu::VertexAttribute; 5] = wgpu::vertex_attr_array![1 => Float32x4, 2 => Float32x4, 3 => Float32x4, 4 => Float32x4, 7 => Float32x4];
+    const ATTRIBUTES: [wgpu::VertexAttribute; 8] = wgpu::vertex_attr_array![1 => Float32x4, 2 => Float32x4, 3 => Float32x4, 4 => Float32x4, 7 => Float32x4, 9 => Float32x4, 10 => Float32x4, 11 => Float32x4];
     const LAYOUT: wgpu::VertexBufferLayout<'static> = wgpu::VertexBufferLayout {
         array_stride: std::mem::size_of::<Self>() as wgpu::BufferAddress,
         step_mode: wgpu::VertexStepMode::Instance,
@@ -118,6 +131,7 @@ struct Camera3dUniform {
     clip_row_2: [f32; 4],
     clip_row_3: [f32; 4],
     viewport: [f32; 4],
+    environment: SurfaceEnvironmentGpu,
 }
 
 impl Camera3dUniform {
@@ -136,6 +150,7 @@ impl Camera3dUniform {
             clip_row_2: rows[2],
             clip_row_3: rows[3],
             viewport: [width as f32, height as f32, scale_factor.get(), 0.0],
+            environment: SurfaceEnvironmentGpu::default(),
         };
         uniform
             .rows()
@@ -212,6 +227,8 @@ pub(super) struct Mesh3dRenderer {
     colored_clipped_pipeline: SurfacePipelines,
     clipped_color_buffer: Option<wgpu::Buffer>,
     clipped_color_capacity: usize,
+    clipped_lighting_buffer: Option<wgpu::Buffer>,
+    clipped_lighting_capacity: usize,
     clipped_surface_pipeline: SurfacePipelines,
     clipped_surface_buffer: Option<wgpu::Buffer>,
     clipped_surface_capacity: usize,
@@ -239,7 +256,7 @@ impl Mesh3dRenderer {
     pub(super) fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("sim-engine retained 3D mesh shader"),
-            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("mesh3d.wgsl"))),
+            source: wgpu::ShaderSource::Wgsl(lighting::shader_source(include_str!("mesh3d.wgsl"))),
         });
         let camera_uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("sim-engine 3D camera uniform buffer"),
@@ -251,7 +268,7 @@ impl Mesh3dRenderer {
             label: Some("sim-engine 3D camera bind group layout"),
             entries: &[wgpu::BindGroupLayoutEntry {
                 binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
                     has_dynamic_offset: false,
@@ -392,6 +409,8 @@ impl Mesh3dRenderer {
             ),
             clipped_color_buffer: None,
             clipped_color_capacity: 0,
+            clipped_lighting_buffer: None,
+            clipped_lighting_capacity: 0,
             clipped_surface_pipeline,
             clipped_surface_buffer: None,
             clipped_surface_capacity: 0,
@@ -520,6 +539,7 @@ pub struct RetainedMesh3d {
     edge_buffer: Option<Arc<wgpu::Buffer>>,
     texture_coordinate_buffer: Option<Arc<wgpu::Buffer>>,
     color_buffer: Option<Arc<wgpu::Buffer>>,
+    normal_buffer: Option<Arc<wgpu::Buffer>>,
     material: Option<TextureMaterial3d>,
     source: Mesh3d,
     index_count: u32,
@@ -631,6 +651,14 @@ fn validate_mesh_style(mesh: &RetainedMesh3d, style: MeshStyle3d) -> Result<(), 
 
 fn validate_mesh_source_style(source: &Mesh3d, style: MeshStyle3d) -> Result<(), Scene3dError> {
     let has_surface = style.surface_style().is_some() && source.triangle_count() > 0;
+    if has_surface
+        && style
+            .surface_style()
+            .is_some_and(|surface| surface.lighting() == SurfaceLighting3d::Lambert)
+        && source.normals().is_empty()
+    {
+        return Err(Scene3dError::MissingNormals);
+    }
     let has_wireframe = style.wireframe_style().is_some() && !source.display_edges().is_empty();
     (has_surface || has_wireframe)
         .then_some(())
@@ -1199,7 +1227,7 @@ impl Mesh3dRenderer {
     ) -> Result<(Camera3dUniform, SurfaceFrame), Mesh3dRenderError> {
         validate_target_identity(renderer_identity, target)?;
         validate_camera_target_aspect(camera, target.logical_viewport())?;
-        let camera_uniform = Camera3dUniform::new(
+        let mut camera_uniform = Camera3dUniform::new(
             camera,
             target.width(),
             target.height(),
@@ -1219,6 +1247,7 @@ impl Mesh3dRenderer {
         {
             return Err(Mesh3dRenderError::InstanceCapacityTooLarge);
         }
+        camera_uniform.environment = SurfaceEnvironmentGpu::new(scene, camera);
         let order = material::prepare_order(scene, camera, budget)?;
         let mut frame = surface::preflight(
             renderer_identity,
@@ -1259,6 +1288,19 @@ impl Mesh3dRenderer {
             } else {
                 None
             };
+        let replacement_lighting_buffer = if surface_frame.lighting.len()
+            > self.clipped_lighting_capacity
+        {
+            Some(device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("sim-engine canonical 3D lighting attributes"),
+                size: (surface_frame.lighting.len() * std::mem::size_of::<SurfaceLightingVertex>())
+                    as u64,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }))
+        } else {
+            None
+        };
         let replacement_color_buffer = if surface_frame.colors.len() > self.clipped_color_capacity {
             Some(device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("sim-engine clipped 3D vertex color buffer"),
@@ -1287,6 +1329,15 @@ impl Mesh3dRenderer {
         if let Some(buffer) = replacement_edge_buffer {
             self.clipped_edge_buffer = Some(buffer);
             self.clipped_edge_capacity = surface_frame.edges.len();
+        }
+        if let Some(buffer) = replacement_lighting_buffer {
+            self.clipped_lighting_buffer = Some(buffer);
+            self.clipped_lighting_capacity = surface_frame.lighting.len();
+        }
+        if let Some(buffer) = &self.clipped_lighting_buffer
+            && !surface_frame.lighting.is_empty()
+        {
+            queue.write_buffer(buffer, 0, bytemuck::cast_slice(&surface_frame.lighting));
         }
         if let Some(buffer) = replacement_color_buffer {
             self.clipped_color_buffer = Some(buffer);
@@ -1322,7 +1373,13 @@ impl Mesh3dRenderer {
             .enumerate()
         {
             let model_rows = self.clipped_surface_objects[object_index].model_rows;
+            let normal_rows = self.clipped_surface_objects[object_index]
+                .transport
+                .normal_rows;
             self.instances.push(MeshInstanceGpu {
+                normal_row_0: normal_rows[0],
+                normal_row_1: normal_rows[1],
+                normal_row_2: normal_rows[2],
                 model_row_0: model_rows[0],
                 model_row_1: model_rows[1],
                 model_row_2: model_rows[2],
@@ -1450,6 +1507,7 @@ struct PreparedRetainedMeshUpload {
     edges: Vec<MeshEdgeGpu>,
     texture_coordinates: Vec<MeshUvGpu>,
     colors: Vec<MeshColorGpu>,
+    normals: Vec<MeshNormalGpu>,
     budget: Mesh3dUploadBudget,
 }
 
@@ -1473,6 +1531,11 @@ impl PreparedRetainedMeshUpload {
                     .capacity()
                     .saturating_mul(std::mem::size_of::<MeshColorGpu>()),
             )
+            .saturating_add(
+                self.normals
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<MeshNormalGpu>()),
+            )
     }
 }
 
@@ -1489,6 +1552,13 @@ fn prepare_retained_mesh_upload(
     }) {
         return Err(Mesh3dResourceError::NonPortableTextureCoordinate);
     }
+    let mut normals = Vec::new();
+    normals
+        .try_reserve_exact(source.normals().len())
+        .map_err(|_| Mesh3dResourceError::HostAllocationFailed {
+            requested_bytes: layout.normal_bytes,
+        })?;
+    normals.extend(source.normals().iter().map(MeshNormalGpu::from_source));
     let mut colors = Vec::new();
     colors
         .try_reserve_exact(source.vertex_colors().len())
@@ -1543,6 +1613,7 @@ fn prepare_retained_mesh_upload(
         edges,
         texture_coordinates,
         colors,
+        normals,
         budget: Mesh3dUploadBudget::default(),
     })
 }
@@ -1569,6 +1640,7 @@ fn upload_prepared_retained_mesh(
         edges,
         texture_coordinates,
         colors,
+        normals,
         budget,
     } = prepared;
     let mesh = allocate_retained_mesh(
@@ -1586,6 +1658,7 @@ fn upload_prepared_retained_mesh(
         &edges,
         &texture_coordinates,
         &colors,
+        &normals,
     );
     submit_pending_uploads(queue);
     mesh
@@ -1645,6 +1718,14 @@ fn allocate_retained_mesh(
             mapped_at_creation: false,
         }))
     });
+    let normal_buffer = (allocation.normal_bytes > 0).then(|| {
+        Arc::new(device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("sim-engine 3D normal buffer"),
+            size: allocation.normal_bytes,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        }))
+    });
     RetainedMesh3d {
         renderer_identity,
         vertex_buffer,
@@ -1652,6 +1733,7 @@ fn allocate_retained_mesh(
         edge_buffer,
         texture_coordinate_buffer,
         color_buffer,
+        normal_buffer,
         material: None,
         source,
         index_count: live.index_count,
@@ -1662,6 +1744,7 @@ fn allocate_retained_mesh(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_retained_mesh_uploads(
     queue: &wgpu::Queue,
     mesh: &RetainedMesh3d,
@@ -1669,6 +1752,7 @@ fn write_retained_mesh_uploads(
     edges: &[MeshEdgeGpu],
     coordinates: &[MeshUvGpu],
     colors: &[MeshColorGpu],
+    normals: &[MeshNormalGpu],
 ) -> usize {
     let mut calls = 0;
     for (buffer, bytes) in [
@@ -1679,6 +1763,7 @@ fn write_retained_mesh_uploads(
         ),
         (mesh.edge_buffer.as_ref(), bytemuck::cast_slice(edges)),
         (mesh.color_buffer.as_ref(), bytemuck::cast_slice(colors)),
+        (mesh.normal_buffer.as_ref(), bytemuck::cast_slice(normals)),
         (
             mesh.texture_coordinate_buffer.as_ref(),
             bytemuck::cast_slice(coordinates),
@@ -1851,6 +1936,7 @@ struct Mesh3dUploadLayout {
     edge_bytes: u64,
     texture_coordinate_bytes: u64,
     color_bytes: u64,
+    normal_bytes: u64,
     total_bytes: u64,
     index_count: u32,
     edge_count: u32,
@@ -1880,10 +1966,18 @@ fn preflight_mesh3d_source(
         .and_then(|bytes| u64::try_from(bytes).ok())
         .filter(|bytes| *bytes <= max_buffer_size)
         .ok_or(Mesh3dResourceError::CapacityTooLarge)?;
+    layout.normal_bytes = source
+        .normals()
+        .len()
+        .checked_mul(std::mem::size_of::<MeshNormalGpu>())
+        .and_then(|bytes| u64::try_from(bytes).ok())
+        .filter(|bytes| *bytes <= max_buffer_size)
+        .ok_or(Mesh3dResourceError::CapacityTooLarge)?;
     layout.total_bytes = layout
         .total_bytes
         .checked_add(layout.texture_coordinate_bytes)
         .and_then(|bytes| bytes.checked_add(layout.color_bytes))
+        .and_then(|bytes| bytes.checked_add(layout.normal_bytes))
         .filter(|bytes| usize::try_from(*bytes).is_ok())
         .ok_or(Mesh3dResourceError::CapacityTooLarge)?;
     Ok(layout)
@@ -1920,6 +2014,7 @@ fn preflight_mesh3d_upload(
         edge_bytes,
         texture_coordinate_bytes: 0,
         color_bytes: 0,
+        normal_bytes: 0,
         total_bytes,
         index_count: draw_index_count,
         edge_count: draw_edge_count,
@@ -3202,6 +3297,18 @@ fn encode_ordered_scene_pass(
                     buffer.slice(u64::from(colors.start) * stride..u64::from(colors.end) * stride),
                 );
             }
+            if let (Some(buffer), Some(lighting)) = (
+                &renderer.clipped_lighting_buffer,
+                object.and_then(|object| object.generated_lighting.as_ref()),
+            ) {
+                let stride = std::mem::size_of::<SurfaceLightingVertex>() as u64;
+                pass.set_vertex_buffer(
+                    2 + u32::from(colored),
+                    buffer.slice(
+                        u64::from(lighting.start) * stride..u64::from(lighting.end) * stride,
+                    ),
+                );
+            }
             pass.draw(0..range.end - range.start, 0..1);
             continue;
         }
@@ -3230,6 +3337,11 @@ fn encode_ordered_scene_pass(
         );
         if let Some(buffer) = &instance.mesh.color_buffer {
             pass.set_vertex_buffer(instance_slot + 1, buffer.slice(..));
+        }
+        if surface_style.lighting() == SurfaceLighting3d::Lambert
+            && let Some(buffer) = &instance.mesh.normal_buffer
+        {
+            pass.set_vertex_buffer(instance_slot + 1 + u32::from(colored), buffer.slice(..));
         }
         pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
         pass.draw_indexed(0..instance.mesh.index_count, 0, 0..1);
@@ -3312,6 +3424,7 @@ pub(super) fn assert_gpu_depth_contract(
     dynamic::assert_gpu_dynamic_contract(device, queue, format);
     vertex_color_tests::assert_gpu_vertex_color_contract(device, queue, format);
     material_tests::assert_gpu_material_contract(device, queue, format);
+    lighting_tests::assert_gpu_lighting_contract(device, queue, format);
     material_resource_tests::assert_gpu_sort_budget(device, queue, format);
     color_budget_tests::assert_gpu_color_budget(device, queue, format);
     surface::assert_gpu_surface_contract(device, queue, format);
@@ -3520,6 +3633,9 @@ pub(super) fn assert_gpu_depth_contract(
         .map(|instance| {
             let rows = instance.transform.model_rows().unwrap();
             MeshInstanceGpu {
+                normal_row_0: [0.0; 4],
+                normal_row_1: [0.0; 4],
+                normal_row_2: [0.0; 4],
                 model_row_0: rows[0],
                 model_row_1: rows[1],
                 model_row_2: rows[2],
@@ -3901,7 +4017,7 @@ fn assert_gpu_clip_equivalence(device: &wgpu::Device, queue: &wgpu::Queue) {
 
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("sim-engine 3D clip equivalence shader"),
-        source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("mesh3d.wgsl"))),
+        source: wgpu::ShaderSource::Wgsl(lighting::shader_source(include_str!("mesh3d.wgsl"))),
     });
     let empty_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("sim-engine empty clip probe layout"),

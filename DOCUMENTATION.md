@@ -2,7 +2,7 @@
 
 This document contains the published 0.3.0 integration guide plus the explicit
 [0.4 development preview](#04-development-preview) below. The checkout version
-is `0.4.0-dev.2`; it is not a final 0.4.0 release. For older integrations, use the
+is `0.4.0-dev.3`; it is not a final 0.4.0 release. For older integrations, use the
 [archived 0.2 guide](https://github.com/lexawhatt/Sim-Engine/blob/v0.2.0/DOCUMENTATION.md).
 The [0.3.0 changelog](CHANGELOG.md#030---2026-09-11) includes migration notes.
 This guide is divided into two parts:
@@ -27,7 +27,8 @@ Rust version.
 ## 0.4 development preview
 
 Only the additions below are implemented in this development slice.
-The remaining 0.4 lighting/fog/texture-lifecycle roadmap is not a shipped capability.
+The remaining 0.4 texture-lifecycle roadmap and full measurement coverage are
+not shipped capabilities.
 Development handoff uses a tested git commit, pinned with Cargo's `rev` field
 and the host lockfile, not an assumed stable `master` branch. A moving `_DEV`
 label is a convenience, not reproducible release evidence. The maintainer will
@@ -255,13 +256,101 @@ panels. The acceptance mode requires 120 confirmed presents and exercises
 material, sidedness, projection and recovery transitions; it is not an FPS gate
 or a substitute for the automated pixel tests.
 
+### Normals, lighting and distance fog (dev.3)
+
+Lighting is opt-in and does not change the default scientific/stylized color
+path. Supply one nonzero model-space normal per source vertex through
+`Mesh3dAttributes::with_normals`; Engine robustly normalizes these directions
+but does not generate face normals or smoothing groups. Duplicate vertices
+along hard normal seams. Supplied arrays include unused vertices and must
+match the vertex count exactly; omission is different from an empty array.
+
+```rust
+use sim_engine::{AmbientLight3d, Color, DirectionalLight3d, Fog3d, Lighting3d,
+    Mesh3d, Mesh3dAttributes, SurfaceLighting3d, SurfaceStyle3d, Vec3};
+
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+let attributes = Mesh3dAttributes::new().with_normals(vec![Vec3::Z; 3])?;
+let source = Mesh3d::with_attributes(
+    vec![Vec3::ZERO, Vec3::X, Vec3::Y], vec![0, 1, 2], vec![], attributes,
+)?;
+let style = SurfaceStyle3d::opaque(Color::rgb(0.5, 0.7, 0.9))?
+    .with_lighting(SurfaceLighting3d::Lambert)
+    .with_fog(true);
+let ambient = AmbientLight3d::new(Color::WHITE, 0.2)?;
+// World-space direction from the surface toward the light, not a position.
+let sunlight = DirectionalLight3d::new(Vec3::new(1.0, 2.0, 3.0)?, Color::WHITE, 0.7)?;
+let lighting = Lighting3d::new(ambient).with_directional(Some(sunlight));
+// Start is world distance; density has inverse-world-distance units.
+let fog = Fog3d::new(Color::rgb(0.15, 0.2, 0.3), 20.0, 0.025)?;
+# let _ = (source, style, lighting, fog);
+# Ok(())
+# }
+```
+
+Apply these values with `scene.set_lighting(lighting)` and
+`scene.set_fog(Some(fog))`. The default environment is white ambient at intensity
+one, no directional light and no fog; materials default to `Unlit` and
+`with_fog(false)`. `Lighting3d::with_directional(None)` removes the directional
+term; `scene.set_fog(None)` disables scene fog. These are ready visual settings,
+not Engine-owned light entities or simulation state.
+
+Light colors are normalized opaque linear RGB and intensities are finite in
+`0..=1`. The Lambert term uses the nonnegative dot product of the world normal
+and direction toward the light, plus ambient illumination. RGB is intentionally
+saturated to the normalized LDR range. Lighting multiplies the base
+surface/vertex/texture/material RGB; it never changes their combined alpha.
+Opaque, Mask and Blend keep the coverage/depth behavior described above.
+There is no PBR, specular reflection, refraction, shadowing or point-light array.
+
+Normals use inverse-transpose direction transport under nonuniform scale.
+The same unnormalized transformed attributes interpolate through Native and
+StrictPortable surfaces, then normalize in the fragment; an exactly cancelled
+interpolated normal receives ambient illumination only. Two-sided back faces
+flip the shading normal. `FrontOnly` still uses source winding for culling,
+not the supplied normals. Unusable transformed source normals fail before
+render submission when Lambert is active; `Unlit` does not evaluate them.
+
+Fog is applied after lighting to RGB using:
+
+```text
+amount = 1 - exp(-density * max(camera_forward_world_distance - start, 0))
+rgb = illuminated_rgb * (1 - amount) + fog_rgb * amount
+```
+
+This is distance along the camera's forward direction, not radial distance,
+clip W or normalized depth; orthographic cameras follow the same rule. Start
+and density must be zero or positive normal finite values. At/before the start,
+or at zero density, the original color is preserved. Very dense fog saturates
+without overflowing the shader product. `Unlit` materials can still opt into
+fog, or keep exact colors by opting out. Mathematical edges and the scene clear
+color are not lit or fogged. Fog does not cull geometry, reduce uploads or hide
+it from resource/submission budgets.
+
+Normal arrays and active environments survive scene restoration. Normal buffers
+participate in source/upload/generated-geometry budgets and dynamic whole-bundle
+copy-on-write. Updating a Lambert object must retain usable normals; change its
+style to Unlit before removing that attribute. No normal buffer is allocated
+for a legacy normal-less mesh.
+
+```bash
+cargo run --release --example lighting_3d
+cargo run --release --example lighting_3d -- --acceptance
+```
+
+The gallery compares Unlit/Lambert objects and fog-participating/control rows.
+L toggles sunlight, F fog, N nonuniform scale, M alpha mode, C sidedness and P
+projection. Use arrows to orbit, Space to pause, R to reset, F5 to recover and
+Esc to exit. The bounded acceptance run counts confirmed presents across these
+states and recovery; analytic GPU pixel tests separately verify the formulas.
+
 ### Dynamic mesh revisions and capacity reuse
 
 Use `renderer.update_scene3d_mesh(&mut scene, object_id, new_source, budget)`
 to change one object's geometry. `new_source` is an already validated, nonempty
 `Mesh3d`; its construction stays in the host. Hide or remove an empty chunk.
 Object ID, transform, visibility, style and texture material are preserved.
-A textured material still requires source UVs.
+A textured material still requires source UVs; Lambert requires source normals.
 
 `DynamicMesh3dBudget::new(Mesh3dUploadBudget::default())` accepts explicit
 `with_minimum_capacity(vertices, indices, display_edges)` reserves. Indices
@@ -277,7 +366,7 @@ detachment, later unique updates reuse capacity. Creating a snapshot with
 `scene.instance(id)?.mesh().clone()` deliberately restores copy-on-write behavior
 for the next update. CPU source snapshots do not by themselves prevent GPU reuse.
 
-Growth or adding/removing UV/color layout also replaces the complete bundle, keeping
+Growth or adding/removing UV/color/normal layout also replaces the complete bundle, keeping
 unique allocation accounting correct. Synchronous validation/allocation errors
 preserve the prior drawable; GPU device loss follows the existing asynchronous
 recovery contract. Both `restore_mesh3d` and `restore_scene3d` preserve reserved

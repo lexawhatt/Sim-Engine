@@ -27,6 +27,10 @@ pub enum SurfaceRasterization3d {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Mesh3dSurfaceError {
+    /// An active Lambert source normal loses a provably usable transformed direction.
+    NormalTransform,
+    /// Active fog camera-forward world-distance arithmetic leaves the finite envelope.
+    FogArithmetic,
     /// Model/camera products or sums leave the finite portable shader envelope.
     TransformArithmetic,
     /// A vertex's side of a clipping plane cannot be proved consistently.

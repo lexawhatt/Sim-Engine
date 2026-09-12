@@ -2,7 +2,7 @@
 
 use super::*;
 
-pub(super) struct SurfacePipelines([wgpu::RenderPipeline; 4]);
+pub(super) struct SurfacePipelines([wgpu::RenderPipeline; 8], bool);
 
 impl std::ops::Deref for SurfacePipelines {
     type Target = wgpu::RenderPipeline;
@@ -15,7 +15,10 @@ impl SurfacePipelines {
     pub(super) fn for_style(&self, style: crate::SurfaceStyle3d) -> &wgpu::RenderPipeline {
         let blend = usize::from(style.alpha_mode() == SurfaceAlphaMode3d::Blend);
         let cull = usize::from(style.sidedness() == SurfaceSidedness3d::FrontOnly);
-        &self.0[blend * 2 + cull]
+        let enhanced = usize::from(
+            style.lighting() == SurfaceLighting3d::Lambert || (self.1 && style.fog_enabled()),
+        );
+        &self.0[enhanced * 4 + blend * 2 + cull]
     }
 }
 
@@ -55,47 +58,64 @@ pub(super) fn create_surface_pipelines(
         (true, true, false) => "clipped_vs_main",
         (true, true, true) => "colored_clipped_vs_main",
     };
-    SurfacePipelines(std::array::from_fn(|index| {
-        let blended = index >= 2;
-        let front_only = index % 2 == 1;
-        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("sim-engine 3D surface material pipeline"),
-            layout: Some(layout),
-            vertex: wgpu::VertexState {
-                module: shader,
-                entry_point: Some(vertex_entry),
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-                buffers: &buffers,
-            },
-            primitive: wgpu::PrimitiveState {
-                front_face: wgpu::FrontFace::Ccw,
-                cull_mode: front_only.then_some(wgpu::Face::Back),
-                ..Default::default()
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: DEPTH_FORMAT,
-                depth_write_enabled: Some(!blended),
-                depth_compare: Some(wgpu::CompareFunction::Less),
-                stencil: wgpu::StencilState::default(),
-                bias: wgpu::DepthBiasState::default(),
-            }),
-            multisample: wgpu::MultisampleState::default(),
-            fragment: Some(wgpu::FragmentState {
-                module: shader,
-                entry_point: Some(if source.textured {
-                    "fs_main"
+    SurfacePipelines(
+        std::array::from_fn(|index| {
+            let enhanced = index >= 4;
+            let mut buffers = buffers.clone();
+            if enhanced {
+                buffers.push(Some(if source.clipped {
+                    SurfaceLightingVertex::LAYOUT
                 } else {
-                    "mesh3d_fs_main"
+                    MeshNormalGpu::LAYOUT
+                }));
+            }
+            let vertex_entry = if enhanced {
+                vertex_entry.replace("_vs_main", "_enhanced_vs_main")
+            } else {
+                vertex_entry.to_owned()
+            };
+            let blended = index % 4 >= 2;
+            let front_only = index % 2 == 1;
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("sim-engine 3D surface material pipeline"),
+                layout: Some(layout),
+                vertex: wgpu::VertexState {
+                    module: shader,
+                    entry_point: Some(&vertex_entry),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    buffers: &buffers,
+                },
+                primitive: wgpu::PrimitiveState {
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: front_only.then_some(wgpu::Face::Back),
+                    ..Default::default()
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: DEPTH_FORMAT,
+                    depth_write_enabled: Some(!blended),
+                    depth_compare: Some(wgpu::CompareFunction::Less),
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
                 }),
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: blended.then_some(wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            multiview_mask: None,
-            cache: None,
-        })
-    }))
+                multisample: wgpu::MultisampleState::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: shader,
+                    entry_point: Some(if source.textured {
+                        "fs_main"
+                    } else {
+                        "mesh3d_fs_main"
+                    }),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format,
+                        blend: blended.then_some(wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                multiview_mask: None,
+                cache: None,
+            })
+        }),
+        source.clipped,
+    )
 }

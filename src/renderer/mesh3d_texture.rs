@@ -263,7 +263,9 @@ impl MeshTextureRenderer {
         });
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("sim-engine textured 3D surfaces"),
-            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("mesh3d_texture.wgsl"))),
+            source: wgpu::ShaderSource::Wgsl(lighting::shader_source(include_str!(
+                "mesh3d_texture.wgsl"
+            ))),
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("sim-engine textured 3D pipeline layout"),

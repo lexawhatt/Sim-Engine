@@ -42,8 +42,9 @@ pub use easing::Easing;
 pub use field::{ColorMap, ColorMapError, ColorStop, ScalarField, ScalarFieldError};
 pub use math::{Rect, Vec2};
 pub use mesh3d::{
-    Mesh3d, Mesh3dAttributes, Mesh3dError, Mesh3dStyleError, MeshEdge3d, MeshStyle3d,
-    SurfaceAlphaMode3d, SurfaceSidedness3d, SurfaceStyle3d, TextureCoordinate2d, WireframeStyle3d,
+    AmbientLight3d, DirectionalLight3d, Fog3d, Fog3dError, Lighting3d, Lighting3dError, Mesh3d,
+    Mesh3dAttributes, Mesh3dError, Mesh3dStyleError, MeshEdge3d, MeshStyle3d, SurfaceAlphaMode3d,
+    SurfaceLighting3d, SurfaceSidedness3d, SurfaceStyle3d, TextureCoordinate2d, WireframeStyle3d,
 };
 pub use particle::{ParticleInstance2d, ParticleInstanceError};
 pub use pseudo3d::{

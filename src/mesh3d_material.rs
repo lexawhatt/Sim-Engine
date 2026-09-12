@@ -1,6 +1,6 @@
 //! Explicit surface alpha and face-visibility policy, independent of wireframes.
 
-use super::{Color, Mesh3dStyleError};
+use super::{Color, Mesh3dStyleError, SurfaceLighting3d};
 
 /// Coverage/depth behavior for a retained surface.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -34,13 +34,16 @@ pub enum SurfaceSidedness3d {
 /// intersecting/cyclic overlap or triangle ordering inside one mesh. Blend
 /// surfaces do not occlude mathematical hidden-line edges; edges render last.
 /// Positive-scale transforms preserve source orientation; reflections are not
-/// accepted by `Transform3d`. No lighting or physically based glass is implied.
+/// accepted by `Transform3d`. Lighting and fog are explicit opt-ins; no physically
+/// based glass, shadows or automatic normals are implied.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SurfaceStyle3d {
     color: Color,
     alpha_mode: SurfaceAlphaMode3d,
     mask_cutoff: f32,
     sidedness: SurfaceSidedness3d,
+    lighting: SurfaceLighting3d,
+    fog: bool,
 }
 
 impl SurfaceStyle3d {
@@ -55,6 +58,8 @@ impl SurfaceStyle3d {
             alpha_mode: SurfaceAlphaMode3d::Opaque,
             mask_cutoff: 0.0,
             sidedness: SurfaceSidedness3d::TwoSided,
+            lighting: SurfaceLighting3d::Unlit,
+            fog: false,
         })
     }
 
@@ -77,6 +82,8 @@ impl SurfaceStyle3d {
             alpha_mode: SurfaceAlphaMode3d::Mask,
             mask_cutoff: cutoff,
             sidedness: SurfaceSidedness3d::TwoSided,
+            lighting: SurfaceLighting3d::Unlit,
+            fog: false,
         })
     }
 
@@ -91,6 +98,8 @@ impl SurfaceStyle3d {
             alpha_mode: SurfaceAlphaMode3d::Blend,
             mask_cutoff: 0.0,
             sidedness: SurfaceSidedness3d::TwoSided,
+            lighting: SurfaceLighting3d::Unlit,
+            fog: false,
         })
     }
 
@@ -98,6 +107,25 @@ impl SurfaceStyle3d {
     pub const fn with_sidedness(mut self, sidedness: SurfaceSidedness3d) -> Self {
         self.sidedness = sidedness;
         self
+    }
+    /// Selects RGB illumination. Lambert requires application-supplied model normals.
+    /// Two-sided back-facing fragments reverse the interpolated shading normal.
+    pub const fn with_lighting(mut self, lighting: SurfaceLighting3d) -> Self {
+        self.lighting = lighting;
+        self
+    }
+    /// Returns illumination policy; Unlit is the default and bypasses normal math.
+    pub const fn lighting(self) -> SurfaceLighting3d {
+        self.lighting
+    }
+    /// Selects scene fog participation independently of lighting; disabled by default.
+    pub const fn with_fog(mut self, enabled: bool) -> Self {
+        self.fog = enabled;
+        self
+    }
+    /// Returns explicit participation in optional scene fog.
+    pub const fn fog_enabled(self) -> bool {
+        self.fog
     }
     /// Returns the normalized straight-linear multiplicative RGBA tint.
     pub const fn color(self) -> Color {

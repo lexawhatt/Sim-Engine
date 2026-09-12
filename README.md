@@ -1,15 +1,16 @@
 # Sim;Engine
 
-Development checkout: **0.4.0-dev.2**, not a published 0.4.0 release.
+Development checkout: **0.4.0-dev.3**, not a published 0.4.0 release.
 Stable installation examples below remain on 0.3.0. See the
 [development integration notes](DOCUMENTATION.md#04-development-preview)
 and [unreleased changelog](CHANGELOG.md#unreleased---040-development)
-for the implemented subset and source migrations. Sim;Logic's first 0.4
-handoff will be an exact tested git revision before crates.io publication.
+for the implemented subset and source migrations. Sim;Logic's 0.4 handoffs
+use exact tested git revisions before crates.io publication.
 The preview includes reusable CPU/prepared text, explicit 3D surface policies,
 capacity-reusing mesh updates, vertex colors, Opaque/Mask/Blend materials and
-explicit surface sidedness. Lighting, mipmapped texture updates and fog are
-still in development.
+explicit surface sidedness. The dev.3 slice adds optional model normals,
+ambient/directional Lambert lighting and camera-distance fog. Mipmapped
+texture updates and repeating atlas tiles remain in development.
 The 0.4.0 priority is completing the integration requirements and measurement
 baselines; intensive performance optimization is planned for 0.4.1.
 
@@ -104,8 +105,9 @@ normalized render targets. This intentionally prefers a clear rejection over
 backend-dependent geometry disappearance or topology.
 
 Translucent section materials, hatching, projected 3D anchors, and 3D picking
-remain outside this release's scope. The new texture path is unlit and opaque;
-it does not add lighting, alpha-cutout, PBR, or a voxel/domain model.
+remain outside 0.3.0's scope. Its texture path is unlit and opaque; the separate
+0.4 development preview above adds explicit alpha modes and simple lighting,
+not PBR or a voxel/domain model.
 
 ## Installation
 

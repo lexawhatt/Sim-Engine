@@ -20,6 +20,7 @@ pub(super) struct DynamicMesh3dScratch {
     edges: Vec<MeshEdgeGpu>,
     coordinates: Vec<MeshUvGpu>,
     colors: Vec<MeshColorGpu>,
+    normals: Vec<MeshNormalGpu>,
 }
 
 impl WgpuRenderer {
@@ -43,7 +44,7 @@ impl WgpuRenderer {
     /// aliases cause one whole-bundle copy-on-write. Once only this scene object
     /// owns the new bundle, subsequent fitting updates allocate no GPU buffers.
     /// Growth or an optional-attribute layout change replaces the whole bundle; all live vertices,
-    /// indices, UVs, colors and edges are uploaded even for an identical source.
+    /// indices, UVs, colors, normals and edges are uploaded even for an identical source.
     ///
     /// Limits include retained capacity and old/new overlap. Validation, scene
     /// accounting and every fallible host preparation complete before GPU writes.
@@ -120,6 +121,7 @@ fn bundle_is_unique(mesh: &RetainedMesh3d) -> bool {
             &mesh.edge_buffer,
             &mesh.texture_coordinate_buffer,
             &mesh.color_buffer,
+            &mesh.normal_buffer,
         ]
         .into_iter()
         .all(|buffer| {
@@ -166,6 +168,18 @@ fn planned_allocation(
         allocation.total_bytes = allocation
             .total_bytes
             .checked_add(allocation.color_bytes)
+            .filter(|bytes| usize::try_from(*bytes).is_ok())
+            .ok_or(Mesh3dResourceError::CapacityTooLarge)?;
+    }
+    if !source.normals().is_empty() {
+        allocation.normal_bytes = u64::try_from(vertices)
+            .ok()
+            .and_then(|count| count.checked_mul(std::mem::size_of::<MeshNormalGpu>() as u64))
+            .filter(|bytes| *bytes <= max_buffer_size)
+            .ok_or(Mesh3dResourceError::CapacityTooLarge)?;
+        allocation.total_bytes = allocation
+            .total_bytes
+            .checked_add(allocation.normal_bytes)
             .filter(|bytes| usize::try_from(*bytes).is_ok())
             .ok_or(Mesh3dResourceError::CapacityTooLarge)?;
     }
@@ -228,6 +242,7 @@ fn update_scene_mesh(
         (allocation.index_bytes, old.allocation.index_bytes),
         (allocation.edge_bytes, old.allocation.edge_bytes),
         (allocation.color_bytes, old.allocation.color_bytes),
+        (allocation.normal_bytes, old.allocation.normal_bytes),
         (
             allocation.texture_coordinate_bytes,
             old.allocation.texture_coordinate_bytes,
@@ -294,6 +309,7 @@ fn update_scene_mesh(
             allocation.edge_bytes,
             allocation.texture_coordinate_bytes,
             allocation.color_bytes,
+            allocation.normal_bytes,
         ]
         .into_iter()
         .filter(|bytes| *bytes > 0)
@@ -308,6 +324,7 @@ fn update_scene_mesh(
         &scratch.edges,
         &scratch.coordinates,
         &scratch.colors,
+        &scratch.normals,
     );
     submit_pending_uploads(queue);
     let scene_statistics = scene.commit_dynamic_mesh_change(change, candidate);
@@ -333,6 +350,7 @@ impl DynamicMesh3dScratch {
             + self.edges.capacity() * std::mem::size_of::<MeshEdgeGpu>()
             + self.coordinates.capacity() * std::mem::size_of::<MeshUvGpu>()
             + self.colors.capacity() * std::mem::size_of::<MeshColorGpu>()
+            + self.normals.capacity() * std::mem::size_of::<MeshNormalGpu>()
     }
 
     fn prepare(
@@ -345,21 +363,24 @@ impl DynamicMesh3dScratch {
             source.display_edges().len(),
             source.texture_coordinates().len(),
             source.vertex_colors().len(),
+            source.normals().len(),
         ];
         let capacities = [
             self.vertices.capacity(),
             self.edges.capacity(),
             self.coordinates.capacity(),
             self.colors.capacity(),
+            self.normals.capacity(),
         ];
         let strides = [
             std::mem::size_of::<MeshVertexGpu>(),
             std::mem::size_of::<MeshEdgeGpu>(),
             std::mem::size_of::<MeshUvGpu>(),
             std::mem::size_of::<MeshColorGpu>(),
+            std::mem::size_of::<MeshNormalGpu>(),
         ];
-        let planned = std::array::from_fn::<_, 4, _>(|index| capacities[index].max(counts[index]));
-        let bytes = |values: [usize; 4]| -> Result<usize, DynamicMesh3dError> {
+        let planned = std::array::from_fn::<_, 5, _>(|index| capacities[index].max(counts[index]));
+        let bytes = |values: [usize; 5]| -> Result<usize, DynamicMesh3dError> {
             let mut total = 0usize;
             for (count, stride) in values.into_iter().zip(strides) {
                 total = count
@@ -393,17 +414,20 @@ impl DynamicMesh3dScratch {
         let edges = reserve_conversion::<MeshEdgeGpu>(capacities[1], counts[1])?;
         let coordinates = reserve_conversion::<MeshUvGpu>(capacities[2], counts[2])?;
         let colors = reserve_conversion::<MeshColorGpu>(capacities[3], counts[3])?;
+        let normals = reserve_conversion::<MeshNormalGpu>(capacities[4], counts[4])?;
         let actual = [
             vertices.as_ref().map_or(capacities[0], Vec::capacity),
             edges.as_ref().map_or(capacities[1], Vec::capacity),
             coordinates.as_ref().map_or(capacities[2], Vec::capacity),
             colors.as_ref().map_or(capacities[3], Vec::capacity),
+            normals.as_ref().map_or(capacities[4], Vec::capacity),
         ];
         let actual_new = [
             vertices.as_ref().map_or(0, Vec::capacity),
             edges.as_ref().map_or(0, Vec::capacity),
             coordinates.as_ref().map_or(0, Vec::capacity),
             colors.as_ref().map_or(0, Vec::capacity),
+            normals.as_ref().map_or(0, Vec::capacity),
         ];
         let peak = checked_sum([old_bytes, bytes(actual_new)?])?;
         final_limit(
@@ -419,7 +443,8 @@ impl DynamicMesh3dScratch {
         let reallocations = usize::from(vertices.is_some())
             + usize::from(edges.is_some())
             + usize::from(coordinates.is_some())
-            + usize::from(colors.is_some());
+            + usize::from(colors.is_some())
+            + usize::from(normals.is_some());
         if let Some(vertices) = vertices {
             self.vertices = vertices;
         }
@@ -432,6 +457,12 @@ impl DynamicMesh3dScratch {
         if let Some(colors) = colors {
             self.colors = colors;
         }
+        if let Some(normals) = normals {
+            self.normals = normals;
+        }
+        self.normals.clear();
+        self.normals
+            .extend(source.normals().iter().map(MeshNormalGpu::from_source));
         self.colors.clear();
         self.colors
             .extend(source.vertex_colors().iter().map(|color| MeshColorGpu {

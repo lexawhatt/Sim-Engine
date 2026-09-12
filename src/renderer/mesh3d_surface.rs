@@ -49,7 +49,7 @@ pub struct Mesh3dRenderBudget {
 
 impl Mesh3dRenderBudget {
     /// Sets exact generated surface vertex, triangle, and total upload-byte
-    /// ceilings. Upload bytes include optional vertex colors and canonical
+    /// ceilings. Upload bytes include optional vertex colors, lighting/depth attributes and canonical
     /// display-edge endpoints. The
     /// total submitted surface count is unlimited unless explicitly bounded by
     /// [`Self::with_max_surface_triangles`].
@@ -138,6 +138,7 @@ pub struct Mesh3dPreflightReport {
     pub(super) generated_triangles: usize,
     pub(super) generated_upload_bytes: usize,
     pub(super) generated_edges: usize,
+    pub(super) generated_lighting_vertices: usize,
     pub(super) clipped_source_triangles: usize,
     pub(super) discarded_source_triangles: usize,
 }
@@ -177,7 +178,7 @@ impl Mesh3dPreflightReport {
         self.generated_triangles
     }
 
-    /// Returns exact additional surface, optional color and display-edge upload bytes.
+    /// Returns exact additional surface, optional color/lighting and display-edge upload bytes.
     pub const fn generated_upload_bytes(self) -> usize {
         self.generated_upload_bytes
     }
@@ -237,6 +238,7 @@ pub(super) struct SurfaceFrame {
     pub(super) report: Mesh3dPreflightReport,
     pub(super) vertices: Vec<SurfaceClipVertex>,
     pub(super) colors: Vec<MeshColorGpu>,
+    pub(super) lighting: Vec<SurfaceLightingVertex>,
     pub(super) edges: Vec<SurfaceClipEdge>,
     pub(super) objects: Vec<SurfaceObject>,
     pub(super) order: Vec<material::SurfaceDraw>,
@@ -245,6 +247,8 @@ pub(super) struct SurfaceFrame {
 pub(super) struct SurfaceObject {
     pub(super) generated: Option<std::ops::Range<u32>>,
     pub(super) generated_colors: Option<std::ops::Range<u32>>,
+    pub(super) generated_lighting: Option<std::ops::Range<u32>>,
+    pub(super) transport: SurfaceTransport,
     pub(super) model_rows: [[f32; 4]; 3],
     pub(super) generated_edges: Option<std::ops::Range<u32>>,
 }
@@ -288,6 +292,7 @@ pub(super) fn preflight(
         },
         vertices: Vec::new(),
         colors: Vec::new(),
+        lighting: Vec::new(),
         edges: Vec::new(),
         objects: Vec::new(),
         order: Vec::new(),
@@ -303,6 +308,8 @@ pub(super) fn preflight(
                 .transform
                 .model_rows()
                 .map_err(|_| Mesh3dRenderError::InvalidGeometryTransform)?;
+            let transport = SurfaceTransport::new(instance, camera.environment)?;
+            transport.validate(instance, model)?;
             validate_points_for_policy(
                 instance.mesh.source(),
                 model,
@@ -329,7 +336,8 @@ pub(super) fn preflight(
                     model,
                     camera.rows(),
                     instance.id,
-                    |_, vertices, _, clipped| {
+                    transport,
+                    |_, vertices, _, _, clipped| {
                         crossing |= clipped;
                         vertex_count = vertex_count
                             .checked_add(vertices.len())
@@ -372,6 +380,17 @@ pub(super) fn preflight(
                 let color_bytes = color_end
                     .checked_mul(std::mem::size_of::<MeshColorGpu>())
                     .ok_or(capacity_error)?;
+                let lighting_start = frame.report.generated_lighting_vertices;
+                let lighting_end = lighting_start
+                    .checked_add(if transport.generated_attributes {
+                        vertex_count
+                    } else {
+                        0
+                    })
+                    .ok_or(capacity_error)?;
+                let lighting_bytes = lighting_end
+                    .checked_mul(std::mem::size_of::<SurfaceLightingVertex>())
+                    .ok_or(capacity_error)?;
                 let edge_start = frame.report.generated_edges;
                 let edge_count = if instance.wireframe().is_some() {
                     instance.mesh.source().display_edges().len()
@@ -385,12 +404,18 @@ pub(super) fn preflight(
                 let bytes = vertex_bytes
                     .checked_add(edge_bytes)
                     .and_then(|bytes| bytes.checked_add(color_bytes))
+                    .and_then(|bytes| bytes.checked_add(lighting_bytes))
                     .ok_or(capacity_error)?;
                 if count > budget.max_generated_vertices
                     || count / 3 > budget.max_generated_triangles
                     || bytes > budget.max_generated_upload_bytes
-                    || u64::try_from(vertex_bytes.max(edge_bytes).max(color_bytes))
-                        .map_or(true, |bytes| bytes > max_buffer_size)
+                    || u64::try_from(
+                        vertex_bytes
+                            .max(edge_bytes)
+                            .max(color_bytes)
+                            .max(lighting_bytes),
+                    )
+                    .map_or(true, |bytes| bytes > max_buffer_size)
                     || count > u32::MAX as usize
                     || edge_end > u32::MAX as usize
                 {
@@ -398,12 +423,17 @@ pub(super) fn preflight(
                 }
                 frame.report.generated_vertices = count;
                 frame.report.generated_color_vertices = color_end;
+                frame.report.generated_lighting_vertices = lighting_end;
                 frame.report.generated_triangles = count / 3;
                 frame.report.generated_upload_bytes = bytes;
                 frame.report.generated_edges = edge_end;
                 frame.objects.push(SurfaceObject {
                     generated: Some(start as u32..count as u32),
                     generated_colors: has_colors.then_some(color_start as u32..color_end as u32),
+                    generated_lighting: transport
+                        .generated_attributes
+                        .then_some(lighting_start as u32..lighting_end as u32),
+                    transport,
                     model_rows: model,
                     generated_edges: Some(edge_start as u32..edge_end as u32),
                 });
@@ -411,6 +441,8 @@ pub(super) fn preflight(
                 frame.objects.push(SurfaceObject {
                     generated: None,
                     generated_colors: None,
+                    generated_lighting: None,
+                    transport,
                     model_rows: model,
                     generated_edges: None,
                 });
@@ -430,6 +462,10 @@ pub(super) fn preflight(
         .try_reserve_exact(frame.report.generated_color_vertices)
         .map_err(|_| capacity_error)?;
     frame
+        .lighting
+        .try_reserve_exact(frame.report.generated_lighting_vertices)
+        .map_err(|_| capacity_error)?;
+    frame
         .edges
         .try_reserve_exact(frame.report.generated_edges)
         .map_err(|_| capacity_error)?;
@@ -447,8 +483,12 @@ pub(super) fn preflight(
             object.model_rows,
             camera.rows(),
             instance.id,
-            |_, vertices, colors, _| {
+            object.transport,
+            |_, vertices, colors, lighting, _| {
                 frame.vertices.extend_from_slice(vertices);
+                if object.generated_lighting.is_some() {
+                    frame.lighting.extend_from_slice(lighting);
+                }
                 if object.generated_colors.is_some() {
                     frame.colors.extend_from_slice(colors);
                 }
@@ -515,6 +555,7 @@ struct ClipVertex {
     provenance: u8,
     uv: [f32; 2],
     color: [f32; 4],
+    lighting: [f32; 4],
 }
 
 impl ClipVertex {
@@ -523,6 +564,7 @@ impl ClipVertex {
             && self.planes == other.planes
             && self.uv == other.uv
             && self.color == other.color
+            && self.lighting == other.lighting
             && self
                 .ranges
                 .into_iter()
@@ -639,6 +681,14 @@ fn intersection(
     {
         return Err(error);
     }
+    let lighting = std::array::from_fn(|channel| {
+        (f64::from(start.lighting[channel])
+            + (f64::from(end.lighting[channel]) - f64::from(start.lighting[channel]))
+                * fixed_amount) as f32
+    });
+    if lighting.into_iter().any(|value| !value.is_finite()) {
+        return Err(error);
+    }
     // Preserve the exact plane relation, including corners shared by two
     // previously clipped planes. This prevents a second hardware clip caused
     // only by independently rounding x and w at the boundary.
@@ -674,6 +724,7 @@ fn intersection(
         provenance,
         uv,
         color,
+        lighting,
     })
 }
 
@@ -689,13 +740,14 @@ fn clipped_triangle_with_uv(
     clips: [[ShaderValueRange; 4]; 3],
     uv: [[f32; 2]; 3],
 ) -> Result<ClippedTriangle, Mesh3dSurfaceError> {
-    clipped_triangle_with_attributes(clips, uv, [[1.0; 4]; 3])
+    clipped_triangle_with_attributes(clips, uv, [[1.0; 4]; 3], [[0.0; 4]; 3])
 }
 
 fn clipped_triangle_with_attributes(
     clips: [[ShaderValueRange; 4]; 3],
     uv: [[f32; 2]; 3],
     colors: [[f32; 4]; 3],
+    lighting: [[f32; 4]; 3],
 ) -> Result<ClippedTriangle, Mesh3dSurfaceError> {
     let empty = ClipVertex {
         ranges: [ShaderValueRange::exact(0.0); 4],
@@ -703,6 +755,7 @@ fn clipped_triangle_with_attributes(
         provenance: 0,
         uv: [0.0; 2],
         color: [1.0; 4],
+        lighting: [0.0; 4],
     };
     let mut result = ClippedTriangle {
         vertices: [empty; MAX_POLYGON_VERTICES],
@@ -724,6 +777,7 @@ fn clipped_triangle_with_attributes(
             provenance: provenance as u8,
             uv: uv[provenance],
             color: colors[provenance],
+            lighting: lighting[provenance],
         };
     }
     // Common-plane rejection does not need a projected orientation proof.
@@ -829,8 +883,9 @@ pub(super) fn classify_surface(
         mesh,
         model_rows,
         camera_rows,
+        SurfaceTransport::default(),
         |_, reason| reason.legacy(),
-        |index, vertices, _, clipped| visit(index, vertices, clipped),
+        |index, vertices, _, _, clipped| visit(index, vertices, clipped),
     )
 }
 
@@ -839,10 +894,12 @@ fn classify_surface_for_object(
     model_rows: [[f32; 4]; 3],
     camera_rows: [[f32; 4]; 4],
     object_id: Object3dId,
+    transport: SurfaceTransport,
     visit: impl FnMut(
         usize,
         &[SurfaceClipVertex],
         &[MeshColorGpu],
+        &[SurfaceLightingVertex],
         bool,
     ) -> Result<(), Mesh3dRenderError>,
 ) -> Result<(), Mesh3dRenderError> {
@@ -850,6 +907,7 @@ fn classify_surface_for_object(
         mesh,
         model_rows,
         camera_rows,
+        transport,
         |index, reason| reason.for_triangle(object_id, index),
         visit,
     )
@@ -859,11 +917,13 @@ fn classify_surface_impl(
     mesh: &Mesh3d,
     model_rows: [[f32; 4]; 3],
     camera_rows: [[f32; 4]; 4],
+    transport: SurfaceTransport,
     failure: impl Fn(usize, Mesh3dSurfaceError) -> Mesh3dRenderError,
     mut visit: impl FnMut(
         usize,
         &[SurfaceClipVertex],
         &[MeshColorGpu],
+        &[SurfaceLightingVertex],
         bool,
     ) -> Result<(), Mesh3dRenderError>,
 ) -> Result<(), Mesh3dRenderError> {
@@ -887,13 +947,20 @@ fn classify_surface_impl(
                 .get(triangle[index] as usize)
                 .map_or([1.0; 4], |color| color.to_array())
         });
-        let polygon = clipped_triangle_with_attributes(clips, uv, colors)
+        let mut auxiliary = [[0.0; 4]; 3];
+        for (value, vertex) in auxiliary.iter_mut().zip(triangle) {
+            *value = transport
+                .vertex(mesh, *vertex as usize, model_rows)
+                .map_err(|reason| failure(index, reason))?;
+        }
+        let polygon = clipped_triangle_with_attributes(clips, uv, colors, auxiliary)
             .map_err(|reason| failure(index, reason))?;
         let mut emitted = [SurfaceClipVertex {
             clip: [0.0; 4],
             uv: [0.0; 2],
         }; 21];
         let mut emitted_colors = [MeshColorGpu { color: [1.0; 4] }; 21];
+        let mut emitted_lighting = [SurfaceLightingVertex::default(); 21];
         let mut count = 0;
         for fan in 1..polygon.count.saturating_sub(1) {
             for vertex in [
@@ -908,6 +975,9 @@ fn classify_surface_impl(
                 emitted_colors[count] = MeshColorGpu {
                     color: vertex.color,
                 };
+                emitted_lighting[count] = SurfaceLightingVertex {
+                    normal_depth: vertex.lighting,
+                };
                 count += 1;
             }
         }
@@ -915,6 +985,7 @@ fn classify_surface_impl(
             index,
             &emitted[..count],
             &emitted_colors[..count],
+            &emitted_lighting[..count],
             polygon.crossing,
         )?;
     }

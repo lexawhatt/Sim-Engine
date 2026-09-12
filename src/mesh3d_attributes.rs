@@ -1,6 +1,6 @@
 //! Optional, validated application-owned model-vertex attributes.
 
-use super::{Color, Mesh3dError, TextureCoordinate2d};
+use super::{Color, Mesh3dError, TextureCoordinate2d, Vec3};
 
 /// Extensible model-vertex data for [`super::Mesh3d::with_attributes`].
 ///
@@ -23,6 +23,7 @@ use super::{Color, Mesh3dError, TextureCoordinate2d};
 pub struct Mesh3dAttributes {
     pub(super) texture_coordinates: Option<Vec<TextureCoordinate2d>>,
     pub(super) vertex_colors: Option<Vec<Color>>,
+    pub(super) normals: Option<Vec<Vec3>>,
 }
 
 impl Mesh3dAttributes {
@@ -31,6 +32,7 @@ impl Mesh3dAttributes {
         Self {
             texture_coordinates: None,
             vertex_colors: None,
+            normals: None,
         }
     }
 
@@ -55,6 +57,26 @@ impl Mesh3dAttributes {
         Ok(self)
     }
 
+    /// Supplies finite nonzero model normals, normalized robustly in place.
+    /// No face normals are inferred. Every value, including unused vertices, is
+    /// validated; mesh construction separately requires an exact vertex count.
+    /// Nonuniform transforms use inverse-transpose direction transport, followed
+    /// by perspective interpolation and fragment normalization, not vertex normalization.
+    pub fn with_normals(mut self, mut normals: Vec<Vec3>) -> Result<Self, Mesh3dError> {
+        for (vertex_index, normal) in normals.iter_mut().enumerate() {
+            *normal = normal
+                .normalized()
+                .map_err(|_| Mesh3dError::InvalidVertexNormal { vertex_index })?;
+        }
+        self.normals = Some(normals);
+        Ok(self)
+    }
+
+    /// Supplied normalized model normals, distinguishing omission from empty.
+    pub fn normals(&self) -> Option<&[Vec3]> {
+        self.normals.as_deref()
+    }
+
     /// Supplied UVs, distinguishing omission from an explicit empty array.
     pub fn texture_coordinates(&self) -> Option<&[TextureCoordinate2d]> {
         self.texture_coordinates.as_deref()
@@ -70,6 +92,59 @@ impl Mesh3dAttributes {
 mod tests {
     use super::*;
     use crate::{Mesh3d, Vec3};
+
+    #[test]
+    fn normals_validate_exact_count_and_normalize_extreme_directions() {
+        let normal = Vec3::new(f32::MAX, f32::MAX, f32::MAX).unwrap();
+        let attributes = Mesh3dAttributes::new()
+            .with_normals(vec![normal; 3])
+            .unwrap();
+        let normalized = attributes.normals().unwrap()[0];
+        assert!((normalized.x() - 1.0 / 3.0_f32.sqrt()).abs() < 1e-6);
+        let tiny = Vec3::new(f32::from_bits(1), 0.0, 0.0).unwrap();
+        assert_eq!(
+            Mesh3dAttributes::new()
+                .with_normals(vec![tiny])
+                .unwrap()
+                .normals()
+                .unwrap(),
+            &[Vec3::X]
+        );
+        assert_eq!(
+            Mesh3dAttributes::new().with_normals(vec![normal, Vec3::ZERO]),
+            Err(Mesh3dError::InvalidVertexNormal { vertex_index: 1 })
+        );
+        for count in [0, 1, 2, 4] {
+            assert_eq!(
+                Mesh3d::with_attributes(
+                    vec![Vec3::ZERO, Vec3::X, Vec3::Y],
+                    vec![0, 1, 2],
+                    vec![],
+                    Mesh3dAttributes::new()
+                        .with_normals(vec![Vec3::Z; count])
+                        .unwrap()
+                ),
+                Err(Mesh3dError::NormalCountMismatch {
+                    vertex_count: 3,
+                    normal_count: count
+                })
+            );
+        }
+        let mesh = Mesh3d::with_attributes(
+            vec![Vec3::ZERO, Vec3::X, Vec3::Y],
+            vec![0, 1, 2],
+            vec![],
+            attributes,
+        )
+        .unwrap();
+        assert_eq!(mesh.normals().as_ptr(), mesh.clone().normals().as_ptr());
+        let plain = Mesh3d::new(vec![Vec3::ZERO, Vec3::X, Vec3::Y], vec![0, 1, 2]).unwrap();
+        assert_eq!(
+            mesh.recovery_memory_bytes(),
+            plain.recovery_memory_bytes() + 3 * std::mem::size_of::<Vec3>()
+        );
+        assert!(plain.normals().is_empty());
+    }
 
     #[test]
     fn vertex_colors_validate_all_channels_and_attribute_indices() {

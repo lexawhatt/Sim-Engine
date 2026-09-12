@@ -7,6 +7,12 @@ const MAX_LOGICAL_EDGE_METRIC: f32 = 1_048_576.0;
 #[path = "mesh3d_material.rs"]
 mod material;
 pub use material::{SurfaceAlphaMode3d, SurfaceSidedness3d, SurfaceStyle3d};
+#[path = "mesh3d_environment.rs"]
+mod environment;
+pub use environment::{
+    AmbientLight3d, DirectionalLight3d, Fog3d, Fog3dError, Lighting3d, Lighting3dError,
+    SurfaceLighting3d,
+};
 
 /// Extensible visual material bundle for a retained 3D object.
 ///
@@ -265,6 +271,7 @@ struct Mesh3dStorage {
     display_edges: Vec<MeshEdge3d>,
     texture_coordinates: Vec<TextureCoordinate2d>,
     vertex_colors: Vec<Color>,
+    normals: Vec<Vec3>,
 }
 
 #[path = "mesh3d_attributes.rs"]
@@ -400,6 +407,14 @@ impl Mesh3d {
                 color_count: colors.len(),
             });
         }
+        if let Some(normals) = &attributes.normals
+            && normals.len() != vertices.len()
+        {
+            return Err(Mesh3dError::NormalCountMismatch {
+                vertex_count: vertices.len(),
+                normal_count: normals.len(),
+            });
+        }
         if vertices.is_empty() {
             return Err(Mesh3dError::EmptyVertices);
         }
@@ -478,6 +493,7 @@ impl Mesh3d {
                 display_edges,
                 texture_coordinates: attributes.texture_coordinates.unwrap_or_default(),
                 vertex_colors: attributes.vertex_colors.unwrap_or_default(),
+                normals: attributes.normals.unwrap_or_default(),
             }),
             bounds_min,
             bounds_max,
@@ -508,6 +524,12 @@ impl Mesh3d {
     /// The opaque surface pass ignores alpha; mathematical edges are unaffected.
     pub fn vertex_colors(&self) -> &[Color] {
         &self.storage.vertex_colors
+    }
+
+    /// Returns normalized application-supplied model normals, or an empty slice.
+    /// Lambert surfaces require normals; Unlit surfaces never evaluate them.
+    pub fn normals(&self) -> &[Vec3] {
+        &self.storage.normals
     }
 
     /// Returns the number of retained triangles.
@@ -555,12 +577,30 @@ impl Mesh3d {
                     .capacity()
                     .saturating_mul(std::mem::size_of::<Color>()),
             )
+            .saturating_add(
+                self.storage
+                    .normals
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<Vec3>()),
+            )
     }
 }
 
 /// Rejection reason for retained 3D topology.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mesh3dError {
+    /// A supplied normal is zero or cannot be normalized to a finite direction.
+    InvalidVertexNormal {
+        /// Source attribute index, including unused vertices.
+        vertex_index: usize,
+    },
+    /// Explicit normals must match every model vertex, including unused ones.
+    NormalCountMismatch {
+        /// Number of model vertices.
+        vertex_count: usize,
+        /// Number of supplied normals.
+        normal_count: usize,
+    },
     /// A vertex color contains a non-finite or non-normalized channel.
     InvalidVertexColor {
         /// Zero-based source vertex/attribute index, including unused vertices.
@@ -627,6 +667,17 @@ pub enum Mesh3dError {
 impl fmt::Display for Mesh3dError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidVertexNormal { vertex_index } => write!(
+                formatter,
+                "3D vertex {vertex_index} normal must be a nonzero finite direction"
+            ),
+            Self::NormalCountMismatch {
+                vertex_count,
+                normal_count,
+            } => write!(
+                formatter,
+                "{vertex_count} mesh vertices require matching normals, got {normal_count}"
+            ),
             Self::InvalidVertexColor { vertex_index } => write!(
                 formatter,
                 "3D vertex {vertex_index} color must be finite straight-linear RGBA in 0..=1"

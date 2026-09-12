@@ -1,80 +1,30 @@
-struct Camera3dUniform {
-    clip_row_0: vec4<f32>,
-    clip_row_1: vec4<f32>,
-    clip_row_2: vec4<f32>,
-    clip_row_3: vec4<f32>,
-    viewport: vec4<f32>,
-};
-
-@group(0) @binding(0)
-var<uniform> camera3d: Camera3dUniform;
-
-struct Mesh3dVertexIn {
-    @location(0) model_position: vec3<f32>,
-    @location(1) model_row_0: vec4<f32>,
-    @location(2) model_row_1: vec4<f32>,
-    @location(3) model_row_2: vec4<f32>,
-    @location(4) color: vec4<f32>,
-    @location(7) surface: vec4<f32>,
-};
-
-struct Mesh3dVertexOut {
-    @builtin(position) position: vec4<f32>,
-    @location(0) color: vec4<f32>,
-    @location(2) @interpolate(flat) surface: vec2<f32>,
-};
-
-fn mesh3d_transform(input: Mesh3dVertexIn) -> Mesh3dVertexOut {
-    let model = vec4<f32>(input.model_position, 1.0);
-    let world = vec4<f32>(
-        dot(input.model_row_0, model),
-        dot(input.model_row_1, model),
-        dot(input.model_row_2, model),
-        1.0,
-    );
-    var output: Mesh3dVertexOut;
-    output.position = vec4<f32>(
-        dot(camera3d.clip_row_0, world),
-        dot(camera3d.clip_row_1, world),
-        dot(camera3d.clip_row_2, world),
-        dot(camera3d.clip_row_3, world),
-    );
-    output.color = input.color;
-    output.surface = input.surface.xy;
-    return output;
+@vertex fn mesh3d_vs_main(input: SurfaceVertexIn) -> SurfaceOut {
+    return surface_retained(input, vec2<f32>(0.0), vec4<f32>(1.0), vec3<f32>(0.0));
 }
-
-@vertex
-fn mesh3d_vs_main(input: Mesh3dVertexIn) -> Mesh3dVertexOut {
-    return mesh3d_transform(input);
+@vertex fn mesh3d_enhanced_vs_main(input: SurfaceVertexIn, @location(8) normal: vec3<f32>) -> SurfaceOut {
+    return surface_retained(input, vec2<f32>(0.0), vec4<f32>(1.0), normal);
 }
-@vertex
-fn mesh3d_colored_vs_main(input: Mesh3dVertexIn, @location(6) vertex_color: vec4<f32>) -> Mesh3dVertexOut {
-    var output = mesh3d_transform(input);
-    output.color *= vertex_color;
-    return output;
+@vertex fn mesh3d_colored_vs_main(input: SurfaceVertexIn, @location(6) vertex_color: vec4<f32>) -> SurfaceOut {
+    return surface_retained(input, vec2<f32>(0.0), vertex_color, vec3<f32>(0.0));
 }
-@vertex
-fn mesh3d_colored_clipped_vs_main(@location(0) clip_position: vec4<f32>, @location(4) color: vec4<f32>, @location(6) vertex_color: vec4<f32>, @location(7) surface: vec4<f32>) -> Mesh3dVertexOut {
-    return Mesh3dVertexOut(clip_position, color * vertex_color, surface.xy);
+@vertex fn mesh3d_colored_enhanced_vs_main(input: SurfaceVertexIn, @location(6) vertex_color: vec4<f32>, @location(8) normal: vec3<f32>) -> SurfaceOut {
+    return surface_retained(input, vec2<f32>(0.0), vertex_color, normal);
 }
-
-@fragment
-fn mesh3d_fs_main(input: Mesh3dVertexOut) -> @location(0) vec4<f32> {
-    if input.surface.x == 1.0 && input.color.a < input.surface.y { discard; }
-    if input.surface.x == 2.0 { return input.color; }
-    return vec4<f32>(input.color.rgb, 1.0);
+@vertex fn mesh3d_clipped_surface_vs_main(@location(0) clip: vec4<f32>, @location(4) color: vec4<f32>, @location(7) surface: vec4<f32>) -> SurfaceOut {
+    return SurfaceOut(clip, color * vec4<f32>(1.0), vec2<f32>(0.0), surface, vec4<f32>(0.0));
 }
-
-// Crossing surfaces arrive as a bounded, CPU-proven homogeneous triangle list.
-// Keeping clip w preserves perspective-correct depth and interpolation.
-@vertex
-fn mesh3d_clipped_surface_vs_main(
-    @location(0) clip_position: vec4<f32>,
-    @location(4) color: vec4<f32>,
-    @location(7) surface: vec4<f32>,
-) -> Mesh3dVertexOut {
-    return Mesh3dVertexOut(clip_position, color, surface.xy);
+@vertex fn mesh3d_clipped_surface_enhanced_vs_main(@location(0) clip: vec4<f32>, @location(4) color: vec4<f32>, @location(7) surface: vec4<f32>, @location(8) auxiliary: vec4<f32>) -> SurfaceOut {
+    return SurfaceOut(clip, color * vec4<f32>(1.0), vec2<f32>(0.0), surface, auxiliary);
+}
+@vertex fn mesh3d_colored_clipped_vs_main(@location(0) clip: vec4<f32>, @location(4) color: vec4<f32>, @location(7) surface: vec4<f32>, @location(6) vertex_color: vec4<f32>) -> SurfaceOut {
+    return SurfaceOut(clip, color * vertex_color, vec2<f32>(0.0), surface, vec4<f32>(0.0));
+}
+@vertex fn mesh3d_colored_clipped_enhanced_vs_main(@location(0) clip: vec4<f32>, @location(4) color: vec4<f32>, @location(7) surface: vec4<f32>, @location(6) vertex_color: vec4<f32>, @location(8) auxiliary: vec4<f32>) -> SurfaceOut {
+    return SurfaceOut(clip, color * vertex_color, vec2<f32>(0.0), surface, auxiliary);
+}
+@fragment fn mesh3d_fs_main(input: SurfaceOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {
+    let color = input.color;
+    return surface_fragment(color, input.surface, input.normal_depth, front);
 }
 
 struct Mesh3dEdgeIn {

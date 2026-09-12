@@ -4,7 +4,7 @@ use super::*;
 ///
 /// GPU reserve grows exactly to the larger of the current capacity, incoming
 /// live length and requested minimum. No geometric over-allocation is hidden.
-/// UV/color capacities follow vertex capacity while their attributes are present.
+/// UV/color/normal capacities follow vertex capacity while their attributes are present.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DynamicMesh3dBudget {
     pub(super) upload: Mesh3dUploadBudget,

@@ -7,7 +7,7 @@ use super::*;
 pub enum Mesh3dUploadBudgetResource {
     /// Retained source-topology capacities.
     RecoveryBytes,
-    /// Vertex/UV/color/index/display-edge GPU buffer bytes; excludes material texels.
+    /// Vertex/UV/color/normal/index/display-edge GPU buffer bytes; excludes material texels.
     GpuBytes,
     /// Temporary CPU conversion-array bytes.
     StagingBytes,
@@ -41,11 +41,11 @@ impl Mesh3dUploadBudget {
     pub const fn max_recovery_bytes(self) -> usize {
         self.max_recovery_bytes
     }
-    /// Maximum vertex/UV/color/index/display-edge bytes for the accepted revision.
+    /// Maximum vertex/UV/color/normal/index/display-edge bytes for the accepted revision.
     pub const fn max_gpu_bytes(self) -> usize {
         self.max_gpu_bytes
     }
-    /// Maximum temporary CPU vertex/UV/color/edge conversion bytes.
+    /// Maximum temporary CPU vertex/UV/color/normal/edge conversion bytes.
     pub const fn max_staging_bytes(self) -> usize {
         self.max_staging_bytes
     }
@@ -76,7 +76,7 @@ impl Mesh3dUploadReport {
     pub const fn recovery_bytes(self) -> usize {
         self.recovery_bytes
     }
-    /// Bytes uploaded to new vertex/UV/color/index/display-edge buffers.
+    /// Bytes uploaded to new vertex/UV/color/normal/index/display-edge buffers.
     pub const fn uploaded_bytes(self) -> usize {
         self.uploaded_bytes
     }
@@ -163,7 +163,8 @@ pub(super) fn prepare_with_budget(
                 .vertex_bytes
                 .saturating_add(layout.edge_bytes)
                 .saturating_add(layout.texture_coordinate_bytes)
-                .saturating_add(layout.color_bytes) as usize,
+                .saturating_add(layout.color_bytes)
+                .saturating_add(layout.normal_bytes) as usize,
         ),
     ] {
         if actual > limit {
@@ -208,6 +209,7 @@ pub(super) fn validate_allocation(
         allocation.edge_bytes,
         allocation.texture_coordinate_bytes,
         allocation.color_bytes,
+        allocation.normal_bytes,
     ]
     .into_iter()
     .any(|bytes| bytes > device.limits().max_buffer_size)

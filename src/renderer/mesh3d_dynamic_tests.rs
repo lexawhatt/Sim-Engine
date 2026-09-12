@@ -1,4 +1,6 @@
 use super::*;
+#[path = "mesh3d_dynamic_normals_tests.rs"]
+mod normal_tests;
 
 fn point(x: f32, y: f32) -> Vec3 {
     Vec3::new(x, y, 0.0).unwrap()
@@ -420,6 +422,7 @@ pub(in crate::renderer::mesh3d) fn assert_gpu_dynamic_contract(
     );
     assert_gpu_dynamic_layout(device, queue, format);
     assert_gpu_dynamic_colors(device, queue, format);
+    normal_tests::assert_gpu_normals(device, queue, format);
 }
 
 fn assert_gpu_dynamic_colors(
@@ -836,10 +839,31 @@ pub(in crate::renderer::mesh3d) fn assert_gpu_dynamic_recovery(
             &mut renderer.dynamic_scratch,
             &mut scene,
             id,
-            colored_source_with_uv(true, true, Color::rgba(0.25, 1.0, 0.5, 0.0), textured),
+            normal_tests::recovery_source(colored_source_with_uv(
+                true,
+                true,
+                Color::rgba(0.25, 1.0, 0.5, 0.0),
+                textured,
+            )),
             budget,
         )
         .unwrap();
+        normal_tests::illuminate(&mut scene);
+        scene.set_fog(Some(
+            Fog3d::new(Color::rgb(0.1, 0.2, 0.3), 0.5, 0.2).unwrap(),
+        ));
+        scene
+            .set_style(
+                id,
+                MeshStyle3d::surface(
+                    SurfaceStyle3d::opaque(Color::WHITE)
+                        .unwrap()
+                        .with_lighting(SurfaceLighting3d::Lambert)
+                        .with_fog(true),
+                ),
+            )
+            .unwrap();
+        let environment_before = (scene.lighting(), scene.fog());
         let before_pixels = pixels(
             &mut renderer,
             source_device,
@@ -850,6 +874,7 @@ pub(in crate::renderer::mesh3d) fn assert_gpu_dynamic_recovery(
         );
         let allocation = scene.instance(id).unwrap().mesh.allocation;
         assert!(allocation.color_bytes > 0);
+        assert_eq!(allocation.normal_bytes, 16 * 12);
         assert_eq!(allocation.texture_coordinate_bytes > 0, textured);
         assert_eq!(scene.statistics().texture_count(), usize::from(textured));
         let source = scene.instance(id).unwrap().mesh.source().clone();
@@ -874,6 +899,7 @@ pub(in crate::renderer::mesh3d) fn assert_gpu_dynamic_recovery(
         )
         .unwrap();
         assert_eq!(scene.instance(id).unwrap().mesh.allocation, allocation);
+        assert_eq!((scene.lighting(), scene.fog()), environment_before);
         assert_eq!(scene.instance(id).unwrap().mesh.source(), &source);
         assert_eq!(
             scene.instance(id).unwrap().mesh.material().is_some(),
