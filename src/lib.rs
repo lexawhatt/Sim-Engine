@@ -14,14 +14,16 @@ mod screen;
 mod tween;
 mod units;
 
-#[cfg(feature = "text")]
+#[cfg(feature = "fonts")]
 mod text;
 #[cfg(feature = "text")]
-pub use renderer::{TextAtlas2d, TextAtlasBudget, TextError, TextRun2d, TextUpdateReport};
-#[cfg(feature = "text")]
+pub use renderer::{
+    PreparedTextError, TextAtlas2d, TextAtlasBudget, TextError, TextRun2d, TextUpdateReport,
+};
+#[cfg(feature = "fonts")]
 pub use text::{
     FontBudget, FontBudgetResource, FontError, FontFace, RasterizedGlyph, ShapedGlyph, ShapedLine,
-    TextDirection, TextLayoutBudget, TextStyle,
+    ShapedLineError, TextDirection, TextLayoutBudget, TextShapingSession, TextStyle,
 };
 
 #[cfg(test)]
@@ -70,16 +72,17 @@ pub use renderer::{
     ImageBudget, ImageError, ImageSampling, ImageSprite2d, ImageTexelRect, ImageUploadReport,
     LayeredVisualizationError, LayeredVisualizationOptions, LayeredVisualizationReport,
     Mesh3dInstance, Mesh3dObjectError, Mesh3dPreflightReport, Mesh3dRenderBudget,
-    Mesh3dRenderError, Mesh3dRenderReport, Mesh3dResourceError, Mesh3dUploadBudget,
-    Mesh3dUploadBudgetResource, Mesh3dUploadReport, Object3dId, ParticleBudgetError,
-    ParticleField2d, ParticleFieldError, ParticleFieldRenderError, ParticleFieldUpdateReport,
-    ParticleRenderBudget, ParticleStatistics, PositionedGlyph2d, PreparedScene, PreparedSceneError,
-    PreparedSceneRenderError, PreparedScreenScene, RenderReport, RenderStatus, RenderTarget2d,
-    RenderTarget3d, RenderTargetError, RenderTargetLoad, RendererConfigurationError,
-    RendererCoordinateError, RendererFrameError, RendererFrameMetrics, RendererInitError,
-    RendererPresentMode, RendererSurfacePresentMode, RendererSurfaceStatus, RetainedMesh3d,
-    ScalarFieldRenderError, ScalarFieldSampling, ScalarFieldTexture, ScalarFieldTextureError,
-    ScalarFieldUploadReport, Scene3d, Scene3dBudget, Scene3dBudgetResource, Scene3dError,
-    Scene3dMeshUpdateReport, Scene3dRestoreReport, Scene3dStatistics, TessellationStats, Texture3d,
-    Texture3dError, TextureMaterial3d, TrailBuffer2d, WgpuRenderer, WgpuRendererOptions,
+    Mesh3dRenderError, Mesh3dRenderReport, Mesh3dResourceError, Mesh3dSurfaceError,
+    Mesh3dUploadBudget, Mesh3dUploadBudgetResource, Mesh3dUploadReport, Object3dId,
+    ParticleBudgetError, ParticleField2d, ParticleFieldError, ParticleFieldRenderError,
+    ParticleFieldUpdateReport, ParticleRenderBudget, ParticleStatistics, PositionedGlyph2d,
+    PreparedScene, PreparedSceneError, PreparedSceneRenderError, PreparedScreenScene, RenderReport,
+    RenderStatus, RenderTarget2d, RenderTarget3d, RenderTargetError, RenderTargetLoad,
+    RendererConfigurationError, RendererCoordinateError, RendererFrameError, RendererFrameMetrics,
+    RendererInitError, RendererPresentMode, RendererSurfacePresentMode, RendererSurfaceStatus,
+    RetainedMesh3d, ScalarFieldRenderError, ScalarFieldSampling, ScalarFieldTexture,
+    ScalarFieldTextureError, ScalarFieldUploadReport, Scene3d, Scene3dBudget,
+    Scene3dBudgetResource, Scene3dError, Scene3dMeshUpdateReport, Scene3dRestoreReport,
+    Scene3dStatistics, SurfaceRasterization3d, TessellationStats, Texture3d, Texture3dError,
+    TextureMaterial3d, TrailBuffer2d, WgpuRenderer, WgpuRendererOptions,
 };

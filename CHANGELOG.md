@@ -5,6 +5,51 @@ uses a Keep a Changelog-style structure and Semantic Versioning. While the
 public API is pre-1.0, minor releases may contain documented source-breaking
 changes.
 
+## Unreleased - 0.4.0 development
+
+Current development version: `0.4.0-dev.1`. This is an incomplete integration
+preview, not the official 0.4.0 release. The first external handoff will use an
+exact tested git revision for Sim;Logic; registry publication follows integration
+feedback and separate release qualification.
+
+### Added
+
+- `fonts` feature exposes CPU font loading, shaping and rasterization without
+  wgpu dependencies. `text` continues to include fonts and GPU atlas integration.
+- `TextShapingSession` retains a parsed face, one property-matched shaping plan
+  and reusable transactional scratch for changing lines, without a global cache.
+- `TextAtlas2d::prepare_from_shaped` and `update_from_shaped` consume validated
+  CPU layout by reference without shaping again. Font/style provenance, failure
+  preservation and compatible zero-work updates are explicit.
+- `SurfaceRasterization3d::Native` opts filled surfaces into native hardware
+  clipping/rasterization while preserving finite shader-arithmetic checks.
+  `StrictPortable` remains the default; mathematical-edge validation is separate.
+- Exact combined retained/generated triangle limits through
+  `Mesh3dRenderBudget::with_max_surface_triangles`, with authoritative preflight
+  submission and generated-object counts consumed directly by rendering.
+- Object-attributed surface failures include original triangle index and a
+  detailed arithmetic/clipping/orientation reason. Non-triangle vertex failures
+  preserve their vertex index and reason.
+- CPU-only `text_shaping_benchmark` and prepared-line checks in the real-font
+  example's acceptance mode; expanded CPU/GPU surface-policy and budget tests.
+
+### Migration notes from 0.3.0
+
+- `ShapedLine` now retains its UTF-8 and shared font/style provenance. Its
+  `allocation_bytes` includes the owned string, but not shared font storage.
+  One-shot shaping therefore has one additional allocation; use a warmed
+  `TextShapingSession` when repeatedly replacing line content.
+- CPU clipped/discarded source counts in `Mesh3dPreflightReport` now return
+  `Option<usize>`: `Some` for strict classification and `None` for Native.
+  Hardware visibility must not be inferred from submitted triangle counts.
+- Exhaustive matches on `Mesh3dObjectError`/`Mesh3dRenderError` need the new
+  source-context and total-budget variants. Use diagnostic accessors when an
+  exhaustive category match is unnecessary.
+
+The remaining 0.4.0 material, lighting, dynamic-mesh, texture-lifecycle and fog
+work is not delivered by this initial slice. No general performance or release
+readiness claim follows from these additions.
+
 ## 0.3.0 - 2026-09-11
 
 Retained text and scene editing, real-font rendering, and bounded composition

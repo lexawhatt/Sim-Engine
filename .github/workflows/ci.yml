@@ -17,10 +17,11 @@ jobs:
         with:
           toolchain: 1.90.0
       - run: cargo check --all-targets --no-default-features
+      - run: cargo check --all-targets --no-default-features --features fonts
       - run: cargo check --all-targets --all-features
 
   quality:
-    name: format and core/default/all-feature lint
+    name: format and core/fonts/default/all-feature lint
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -30,7 +31,9 @@ jobs:
           components: rustfmt, clippy
       - run: cargo fmt --all -- --check
       - run: cargo test --all-targets --no-default-features
+      - run: cargo test --all-targets --no-default-features --features fonts
       - run: cargo clippy --all-targets --no-default-features -- -D warnings
+      - run: cargo clippy --all-targets --no-default-features --features fonts -- -D warnings
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo clippy --all-targets --all-features -- -D warnings
 
@@ -55,7 +58,9 @@ jobs:
           toolchain: 1.96.0
       - run: cargo test --doc --all-features
       - run: cargo test --doc --no-default-features
+      - run: cargo test --doc --no-default-features --features fonts
       - run: RUSTDOCFLAGS="-D warnings" cargo doc --no-default-features --no-deps
+      - run: RUSTDOCFLAGS="-D warnings" cargo doc --no-default-features --features fonts --no-deps
       - run: RUSTDOCFLAGS="-D warnings" cargo doc --all-features --no-deps
       - name: Verify package boundary and archive
         run: |

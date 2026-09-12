@@ -1,6 +1,6 @@
 [package]
 name = "sim-engine"
-version = "0.3.0"
+version = "0.4.0-dev.1"
 edition = "2024"
 rust-version = "1.90"
 license = "MIT OR Apache-2.0"
@@ -31,7 +31,8 @@ path = "src/lib.rs"
 [features]
 default = ["wgpu"]
 wgpu = ["dep:bytemuck", "dep:wgpu"]
-text = ["wgpu", "dep:ab_glyph", "dep:rustybuzz"]
+fonts = ["dep:ab_glyph", "dep:rustybuzz"]
+text = ["wgpu", "fonts"]
 
 [dependencies]
 bytemuck = { version = "1.25.2", features = ["derive"], optional = true }
@@ -84,6 +85,10 @@ required-features = ["wgpu"]
 [[example]]
 name = "text_ui_updates"
 required-features = ["text"]
+
+[[example]]
+name = "text_shaping_benchmark"
+required-features = ["fonts"]
 
 [[example]]
 name = "frame_cache_benchmark"

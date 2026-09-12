@@ -4,6 +4,9 @@ use ab_glyph::Font;
 
 mod config;
 mod raster;
+mod session;
+#[cfg(test)]
+mod session_tests;
 #[cfg(test)]
 mod tests;
 pub use config::{
@@ -11,6 +14,7 @@ pub use config::{
 };
 use config::{check, reserve};
 pub use raster::RasterizedGlyph;
+pub use session::{ShapedLineError, TextShapingSession};
 
 /// One owned TTF/OpenType outline face (collection index zero).
 ///
@@ -86,70 +90,7 @@ impl FontFace {
         style: &TextStyle,
         budget: &TextLayoutBudget,
     ) -> Result<ShapedLine, FontError> {
-        check(
-            FontBudgetResource::TextBytes,
-            text.len(),
-            budget.max_text_bytes().min(u32::MAX as usize),
-        )?;
-        for (byte_index, character) in text.char_indices() {
-            if character.is_control() || matches!(character, '\u{2028}' | '\u{2029}') {
-                return Err(FontError::UnsupportedText { byte_index });
-            }
-        }
-        let face =
-            rustybuzz::Face::from_slice(self.font.as_slice(), 0).ok_or(FontError::InvalidFont)?;
-        let factor = f64::from(style.logical_em_size().get()) / f64::from(face.units_per_em());
-        let ascent = represent(f64::from(face.ascender()) * factor)?;
-        let descent = represent(f64::from(face.descender()) * factor)?;
-        let line_height = represent(
-            (f64::from(face.ascender()) - f64::from(face.descender()) + f64::from(face.line_gap()))
-                * factor,
-        )?;
-        if line_height <= 0.0 {
-            return Err(FontError::InvalidFont);
-        }
-        let mut input = rustybuzz::UnicodeBuffer::new();
-        input.push_str(text);
-        match style.direction() {
-            TextDirection::Auto => {}
-            TextDirection::Ltr => input.set_direction(rustybuzz::Direction::LeftToRight),
-            TextDirection::Rtl => input.set_direction(rustybuzz::Direction::RightToLeft),
-        }
-        input.guess_segment_properties();
-        let output = rustybuzz::shape(&face, &[], input);
-        check(
-            FontBudgetResource::ShapedGlyphs,
-            output.len(),
-            budget.max_shaped_glyphs(),
-        )?;
-        let mut glyphs = Vec::new();
-        reserve(&mut glyphs, output.len())?;
-        let mut pen_x = 0.0f64;
-        let mut pen_y = 0.0f64;
-        for (information, position) in output.glyph_infos().iter().zip(output.glyph_positions()) {
-            if information.glyph_id == 0 {
-                return Err(FontError::MissingGlyph {
-                    byte_index: information.cluster as usize,
-                });
-            }
-            let glyph_id =
-                u16::try_from(information.glyph_id).map_err(|_| FontError::InvalidGeometry)?;
-            glyphs.push(ShapedGlyph {
-                glyph_id,
-                logical_x: represent((pen_x + f64::from(position.x_offset)) * factor)?,
-                logical_y: represent(-(pen_y + f64::from(position.y_offset)) * factor)?,
-                cluster: information.cluster as usize,
-            });
-            pen_x += f64::from(position.x_advance);
-            pen_y += f64::from(position.y_advance);
-        }
-        Ok(ShapedLine {
-            glyphs,
-            advance: represent(pen_x * factor)?,
-            ascent,
-            descent,
-            line_height,
-        })
+        TextShapingSession::new(self, *style, *budget)?.shape_line(text)
     }
 
     /// Rasterizes one glyph at physical em size and baseline `(0, 0)`.
@@ -198,6 +139,9 @@ impl ShapedGlyph {
 /// Immutable shaped placement; rasterization and GPU ownership are separate.
 #[derive(Debug)]
 pub struct ShapedLine {
+    font: FontFace,
+    style: TextStyle,
+    text: String,
     glyphs: Vec<ShapedGlyph>,
     advance: f32,
     ascent: f32,
@@ -206,6 +150,54 @@ pub struct ShapedLine {
 }
 
 impl ShapedLine {
+    /// Original UTF-8 input; retained so prepared text needs no second shaping pass.
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+    /// Immutable font shared with the original face, not a duplicate byte buffer.
+    pub const fn font(&self) -> &FontFace {
+        &self.font
+    }
+    /// Exact em size, DPI and requested direction used for this line.
+    pub const fn style(&self) -> &TextStyle {
+        &self.style
+    }
+    /// Checks font identity, exact style and input/output limits without reshaping.
+    /// Clones of a face share identity; separately loaded identical bytes do not.
+    /// Raster limits apply later when an atlas encounters an uncached glyph.
+    pub fn validate_for(
+        &self,
+        font: &FontFace,
+        style: &TextStyle,
+        budget: &TextLayoutBudget,
+    ) -> Result<(), ShapedLineError> {
+        self.validate_provenance(font, style)?;
+        check(
+            FontBudgetResource::TextBytes,
+            self.text.len(),
+            budget.max_text_bytes(),
+        )?;
+        check(
+            FontBudgetResource::ShapedGlyphs,
+            self.glyphs.len(),
+            budget.max_shaped_glyphs(),
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn validate_provenance(
+        &self,
+        font: &FontFace,
+        style: &TextStyle,
+    ) -> Result<(), ShapedLineError> {
+        if !std::sync::Arc::ptr_eq(&self.font.font, &font.font) {
+            return Err(ShapedLineError::FontMismatch);
+        }
+        if self.style != *style {
+            return Err(ShapedLineError::StyleMismatch);
+        }
+        Ok(())
+    }
     /// Shaper output order. Drawing this sequence at its offsets preserves marks.
     pub fn glyphs(&self) -> &[ShapedGlyph] {
         &self.glyphs
@@ -226,11 +218,12 @@ impl ShapedLine {
     pub const fn line_height(&self) -> f32 {
         self.line_height
     }
-    /// Library-owned glyph metadata Vec capacity in bytes.
+    /// Owned UTF-8 and glyph metadata capacity in bytes, excluding the shared font.
     pub fn allocation_bytes(&self) -> usize {
         self.glyphs
             .capacity()
             .saturating_mul(std::mem::size_of::<ShapedGlyph>())
+            .saturating_add(self.text.capacity())
     }
 }
 

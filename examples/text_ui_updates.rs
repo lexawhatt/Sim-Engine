@@ -5,6 +5,8 @@
 mod retained_ui_acceptance;
 #[path = "support/text_font_gallery.rs"]
 mod text_font_gallery;
+#[path = "support/text_prepared_acceptance.rs"]
+mod text_prepared_acceptance;
 #[path = "support/text_ui_acceptance.rs"]
 mod text_ui_acceptance;
 #[path = "support/text_ui_content.rs"]
@@ -157,6 +159,9 @@ impl Demo {
         ))?;
         let notify = window.clone();
         renderer.set_pre_present_notify(move || notify.pre_present_notify());
+        if options.acceptance {
+            text_prepared_acceptance::verify(&renderer)?;
+        }
         let text_acceptance = options
             .acceptance
             .then(|| text_ui_acceptance::TextAcceptance::new(&renderer, font.clone()))

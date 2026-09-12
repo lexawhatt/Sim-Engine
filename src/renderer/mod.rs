@@ -8060,7 +8060,9 @@ mod tessellation;
 #[cfg(feature = "text")]
 mod text;
 #[cfg(feature = "text")]
-pub use text::{TextAtlas2d, TextAtlasBudget, TextError, TextRun2d, TextUpdateReport};
+pub use text::{
+    PreparedTextError, TextAtlas2d, TextAtlasBudget, TextError, TextRun2d, TextUpdateReport,
+};
 mod visualization;
 use config::{
     MultisampleTarget, create_multisample_target, logical_to_physical_screen,
@@ -8085,10 +8087,11 @@ use image::{ImageRenderer, ImageUniform};
 use mesh3d::Mesh3dRenderer;
 pub use mesh3d::{
     Mesh3dInstance, Mesh3dObjectError, Mesh3dPreflightReport, Mesh3dRenderBudget,
-    Mesh3dRenderError, Mesh3dRenderReport, Mesh3dResourceError, Mesh3dUploadBudget,
-    Mesh3dUploadBudgetResource, Mesh3dUploadReport, Object3dId, RenderTarget3d, RetainedMesh3d,
-    Scene3d, Scene3dBudget, Scene3dBudgetResource, Scene3dError, Scene3dMeshUpdateReport,
-    Scene3dRestoreReport, Scene3dStatistics, Texture3d, Texture3dError, TextureMaterial3d,
+    Mesh3dRenderError, Mesh3dRenderReport, Mesh3dResourceError, Mesh3dSurfaceError,
+    Mesh3dUploadBudget, Mesh3dUploadBudgetResource, Mesh3dUploadReport, Object3dId, RenderTarget3d,
+    RetainedMesh3d, Scene3d, Scene3dBudget, Scene3dBudgetResource, Scene3dError,
+    Scene3dMeshUpdateReport, Scene3dRestoreReport, Scene3dStatistics, SurfaceRasterization3d,
+    Texture3d, Texture3dError, TextureMaterial3d,
 };
 use tessellation::{
     logical_viewport_scissor, offset_scissor, screen_clip_to_scissor, tessellate_scene,

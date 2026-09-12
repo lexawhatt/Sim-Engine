@@ -2,5 +2,5 @@ mod font;
 
 pub use font::{
     FontBudget, FontBudgetResource, FontError, FontFace, RasterizedGlyph, ShapedGlyph, ShapedLine,
-    TextDirection, TextLayoutBudget, TextStyle,
+    ShapedLineError, TextDirection, TextLayoutBudget, TextShapingSession, TextStyle,
 };

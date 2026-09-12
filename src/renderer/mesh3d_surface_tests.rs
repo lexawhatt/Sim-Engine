@@ -312,6 +312,272 @@ pub(in crate::renderer::mesh3d) fn assert_gpu_surface_contract(
         }
     }
     assert_attribution(device, queue, format, &identity, &mut renderer);
+    assert_total_surface_budget(device, queue, format, &identity);
+}
+
+fn assert_total_surface_budget(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    format: wgpu::TextureFormat,
+    identity: &Arc<()>,
+) {
+    let mut renderer = Mesh3dRenderer::new(device, format);
+    let target = target(device, identity, format, 64, 64);
+    let camera = Camera3d::look_at(
+        Vec3::new(0.0, 0.0, 2.0).unwrap(),
+        Vec3::ZERO,
+        Vec3::Y,
+        Projection3d::orthographic(world(2.0), 1.0, world(0.5), world(4.0)).unwrap(),
+    )
+    .unwrap();
+    let surface = MeshStyle3d::surface(SurfaceStyle3d::opaque(Color::WHITE).unwrap());
+    let triangle = |positions: [[f32; 2]; 3]| {
+        create_retained_mesh(
+            device,
+            queue,
+            Arc::clone(identity),
+            Mesh3d::new(
+                positions
+                    .into_iter()
+                    .map(|[x, y]| Vec3::new(x, y, 0.0).unwrap())
+                    .collect(),
+                vec![0, 1, 2],
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    };
+    let inside = triangle([[-0.5, -0.5], [0.5, -0.5], [0.0, 0.5]]);
+    let crossing = triangle([[-2.0, -0.5], [0.5, -0.5], [0.5, 0.5]]);
+    let outside = triangle([[3.0, -0.5], [4.0, -0.5], [3.0, 0.5]]);
+    let fully_clipped = triangle([[1.5, 0.75], [0.75, 1.5], [1.5, 1.5]]);
+    let edge = create_retained_mesh(
+        device,
+        queue,
+        Arc::clone(identity),
+        Mesh3d::with_display_edges(
+            vec![
+                Vec3::new(-0.5, 0.0, 0.0).unwrap(),
+                Vec3::new(0.5, 0.0, 0.0).unwrap(),
+            ],
+            Vec::new(),
+            vec![MeshEdge3d::new(0, 1).unwrap()],
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let mut empty = Scene3d::new(Color::rgb(0.25, 0.0, 0.25)).unwrap();
+    renderer
+        .render_scene3d(
+            device,
+            queue,
+            identity,
+            &target,
+            &empty,
+            camera,
+            Mesh3dRenderBudget::default().with_max_surface_triangles(0),
+        )
+        .unwrap();
+    let initial_pixels = read_pixels(device, queue, &target);
+    let mut scene = Scene3d::new(Color::BLACK).unwrap();
+    for mesh in [&inside, &crossing, &outside] {
+        scene
+            .try_push(mesh, Transform3d::IDENTITY, surface)
+            .unwrap();
+    }
+    let hidden = scene
+        .try_push(&crossing, Transform3d::IDENTITY, surface)
+        .unwrap();
+    scene.set_visible(hidden, false).unwrap();
+    scene
+        .try_push(
+            &edge,
+            Transform3d::IDENTITY,
+            MeshStyle3d::wireframe(WireframeStyle3d::visible(Color::WHITE, logical(1.0)).unwrap()),
+        )
+        .unwrap();
+    let exact = Mesh3dRenderBudget::new(6, 2, 6 * std::mem::size_of::<SurfaceClipVertex>())
+        .with_max_surface_triangles(4);
+    let checked = renderer
+        .preflight_scene3d(device, identity, &target, &scene, camera, exact)
+        .unwrap()
+        .1
+        .report;
+    assert_eq!(checked.submitted_triangle_count(), 4);
+    assert_eq!(checked.generated_object_count(), 1);
+    assert_eq!(checked.generated_triangle_count(), 2);
+    assert_eq!(checked.clipped_source_triangle_count(), Some(1));
+    assert_eq!(checked.discarded_source_triangle_count(), Some(1));
+    assert_eq!(
+        renderer.render_scene3d(
+            device,
+            queue,
+            identity,
+            &target,
+            &scene,
+            camera,
+            exact.with_max_surface_triangles(3),
+        ),
+        Err(Mesh3dRenderError::SurfaceTriangleBudgetExceeded {
+            limit: 3,
+            actual: 4
+        }),
+    );
+    assert!(renderer.clipped_surface_buffer.is_none());
+    assert_eq!(renderer.clipped_surface_capacity, 0);
+    assert_eq!(read_pixels(device, queue, &target), initial_pixels);
+    let rendered = renderer
+        .render_scene3d(device, queue, identity, &target, &scene, camera, exact)
+        .unwrap();
+    assert_eq!(
+        rendered.triangle_count(),
+        checked.submitted_triangle_count()
+    );
+    assert_eq!(rendered.preflight(), checked);
+
+    for (mesh, submitted, generated_objects) in [(&outside, 1, 0), (&fully_clipped, 0, 1)] {
+        let mut scene = Scene3d::new(Color::BLACK).unwrap();
+        scene
+            .try_push(mesh, Transform3d::IDENTITY, surface)
+            .unwrap();
+        let checked = renderer
+            .preflight_scene3d(
+                device,
+                identity,
+                &target,
+                &scene,
+                camera,
+                Mesh3dRenderBudget::new(0, 0, 0).with_max_surface_triangles(submitted),
+            )
+            .unwrap()
+            .1
+            .report;
+        assert_eq!(checked.submitted_triangle_count(), submitted);
+        assert_eq!(checked.generated_object_count(), generated_objects);
+        assert_eq!(checked.generated_triangle_count(), 0);
+        assert_eq!(checked.discarded_source_triangle_count(), Some(1));
+    }
+    empty
+        .try_push(
+            &edge,
+            Transform3d::IDENTITY,
+            MeshStyle3d::wireframe(WireframeStyle3d::visible(Color::WHITE, logical(1.0)).unwrap()),
+        )
+        .unwrap();
+    assert_eq!(
+        renderer
+            .preflight_scene3d(
+                device,
+                identity,
+                &target,
+                &empty,
+                camera,
+                Mesh3dRenderBudget::new(0, 0, 0).with_max_surface_triangles(0),
+            )
+            .unwrap()
+            .1
+            .report
+            .submitted_triangle_count(),
+        0,
+    );
+}
+
+#[test]
+fn total_surface_budget_fixture_has_exact_strict_classification() {
+    let camera = Camera3d::look_at(
+        Vec3::new(0.0, 0.0, 2.0).unwrap(),
+        Vec3::ZERO,
+        Vec3::Y,
+        Projection3d::orthographic(world(2.0), 1.0, world(0.5), world(4.0)).unwrap(),
+    )
+    .unwrap();
+    let camera = Camera3dUniform::new(camera, 64, 64, physical_per_logical(1.0)).unwrap();
+    let model = Transform3d::IDENTITY.model_rows().unwrap();
+    for (positions, expected_vertices, expected_crossing) in [
+        ([[-0.5, -0.5], [0.5, -0.5], [0.0, 0.5]], 3, false),
+        ([[-2.0, -0.5], [0.5, -0.5], [0.5, 0.5]], 6, true),
+        ([[3.0, -0.5], [4.0, -0.5], [3.0, 0.5]], 0, false),
+        ([[1.5, 0.75], [0.75, 1.5], [1.5, 1.5]], 0, true),
+    ] {
+        let mesh = Mesh3d::new(
+            positions
+                .into_iter()
+                .map(|[x, y]| Vec3::new(x, y, 0.0).unwrap())
+                .collect(),
+            vec![0, 1, 2],
+        )
+        .unwrap();
+        validate_shader_points(&mesh, model, camera.rows()).unwrap();
+        let mut visited = 0;
+        classify_surface(&mesh, model, camera.rows(), |index, vertices, crossing| {
+            assert_eq!(index, 0);
+            assert_eq!(vertices.len(), expected_vertices, "{positions:?}");
+            assert_eq!(crossing, expected_crossing, "{positions:?}");
+            visited += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(visited, 1);
+    }
+}
+
+#[test]
+fn total_surface_budget_preserves_generated_constructor_and_strict_default() {
+    let budget = Mesh3dRenderBudget::new(12, 4, 288);
+    assert_eq!(budget.max_surface_triangles(), usize::MAX);
+    assert_eq!(
+        budget.surface_policy(),
+        SurfaceRasterization3d::StrictPortable
+    );
+    let bounded = budget.with_max_surface_triangles(8);
+    assert_eq!(bounded.max_surface_triangles(), 8);
+    assert_eq!(bounded.max_generated_vertices(), 12);
+    assert_eq!(bounded.max_generated_triangles(), 4);
+    assert_eq!(bounded.max_generated_upload_bytes(), 288);
+}
+
+#[test]
+fn total_surface_budget_reports_exact_limits_without_partial_accounting() {
+    let mut report = Mesh3dPreflightReport::default();
+    let budget = Mesh3dRenderBudget::default().with_max_surface_triangles(4);
+    record_surface_submission(&mut report, 1, false, budget).unwrap();
+    record_surface_submission(&mut report, 2, true, budget).unwrap();
+    record_surface_submission(&mut report, 1, false, budget).unwrap();
+    assert_eq!(report.submitted_triangle_count(), 4);
+    assert_eq!(report.generated_object_count(), 1);
+    let before = report;
+    assert_eq!(
+        record_surface_submission(&mut report, 1, true, budget),
+        Err(Mesh3dRenderError::SurfaceTriangleBudgetExceeded {
+            limit: 4,
+            actual: 5
+        }),
+    );
+    assert_eq!(report, before);
+    record_surface_submission(&mut report, 0, true, budget).unwrap();
+    assert_eq!(report.submitted_triangle_count(), 4);
+    assert_eq!(report.generated_object_count(), 2);
+}
+
+#[test]
+fn total_surface_accounting_rejects_integer_overflow() {
+    let mut report = Mesh3dPreflightReport {
+        submitted_triangles: usize::MAX,
+        ..Mesh3dPreflightReport::default()
+    };
+    let before = report;
+    assert_eq!(
+        record_surface_submission(&mut report, 1, false, Mesh3dRenderBudget::default()),
+        Err(Mesh3dRenderError::GeneratedGeometryCapacityTooLarge),
+    );
+    assert_eq!(report, before);
+    report.generated_objects = usize::MAX;
+    let before = report;
+    assert_eq!(
+        record_surface_submission(&mut report, 0, true, Mesh3dRenderBudget::default()),
+        Err(Mesh3dRenderError::GeneratedGeometryCapacityTooLarge),
+    );
+    assert_eq!(report, before);
 }
 
 fn assert_attribution(
@@ -380,7 +646,10 @@ fn assert_attribution(
         assert!(matches!(
             error,
             Mesh3dRenderError::ObjectFailure {
-                reason: Mesh3dObjectError::InvalidGeometryTransform,
+                reason: Mesh3dObjectError::SurfaceTriangle {
+                    triangle_index: 0,
+                    reason: Mesh3dSurfaceError::TransformArithmetic,
+                },
                 ..
             }
         ));

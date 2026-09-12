@@ -5,6 +5,11 @@ use crate::{
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[path = "mesh3d_validation.rs"]
+mod validation;
+use validation::validate_points_for_policy;
+pub use validation::{Mesh3dSurfaceError, SurfaceRasterization3d};
+
 #[path = "mesh3d_surface.rs"]
 mod surface;
 pub use surface::{Mesh3dPreflightReport, Mesh3dRenderBudget};
@@ -722,11 +727,18 @@ pub enum Mesh3dRenderError {
     ObjectFailure {
         /// Complete scene-provenance-bearing object handle.
         object_id: Object3dId,
-        /// Existing numerical validation category for this object.
+        /// Source-context or object-level numerical validation failure.
         reason: Mesh3dObjectError,
     },
     /// Generated clipping topology exceeds a caller budget or device capacity.
     GeneratedGeometryCapacityTooLarge,
+    /// Exact retained plus generated surface submissions exceed the caller limit.
+    SurfaceTriangleBudgetExceeded {
+        /// Configured maximum surface submissions for this frame.
+        limit: usize,
+        /// Submitted count reached by authoritative preflight before rejection.
+        actual: usize,
+    },
 }
 
 /// Instance-local numerical rejection category from authoritative 3D preflight.
@@ -738,6 +750,21 @@ pub enum Mesh3dObjectError {
     UnportableSurfaceTopology,
     /// Display-edge clipping or extrusion cannot be represented portably.
     InvalidEdgeProjection,
+    /// A source surface triangle failed authoritative validation. The index is
+    /// zero-based in the source mesh, not in a generated clipping fan.
+    SurfaceTriangle {
+        /// Original index into `Mesh3d::triangle_indices().chunks_exact(3)`.
+        triangle_index: usize,
+        /// Specific arithmetic or topology proof that failed.
+        reason: Mesh3dSurfaceError,
+    },
+    /// A source vertex not referenced by any surface triangle failed validation.
+    Vertex {
+        /// Zero-based position in the source mesh vertex array.
+        vertex_index: usize,
+        /// Specific arithmetic or clip-classification failure.
+        reason: Mesh3dSurfaceError,
+    },
 }
 
 impl Mesh3dRenderError {
@@ -757,6 +784,44 @@ impl Mesh3dRenderError {
     pub const fn object_id(self) -> Option<Object3dId> {
         match self {
             Self::ObjectFailure { object_id, .. } => Some(object_id),
+            _ => None,
+        }
+    }
+
+    /// Returns the original source triangle index for a surface-local failure.
+    /// Unused-vertex, edge, scene capacity and resource ownership failures have
+    /// no source triangle and return `None`.
+    pub const fn source_triangle_index(self) -> Option<usize> {
+        match self {
+            Self::ObjectFailure {
+                reason: Mesh3dObjectError::SurfaceTriangle { triangle_index, .. },
+                ..
+            } => Some(triangle_index),
+            _ => None,
+        }
+    }
+
+    /// Returns the source vertex index for failures without a surface triangle.
+    /// A referenced vertex is attributed to its first source triangle instead.
+    pub const fn source_vertex_index(self) -> Option<usize> {
+        match self {
+            Self::ObjectFailure {
+                reason: Mesh3dObjectError::Vertex { vertex_index, .. },
+                ..
+            } => Some(vertex_index),
+            _ => None,
+        }
+    }
+
+    /// Returns the specific source-surface or vertex rejection reason, when available.
+    pub const fn surface_reason(self) -> Option<Mesh3dSurfaceError> {
+        match self {
+            Self::ObjectFailure {
+                reason:
+                    Mesh3dObjectError::SurfaceTriangle { reason, .. }
+                    | Mesh3dObjectError::Vertex { reason, .. },
+                ..
+            } => Some(reason),
             _ => None,
         }
     }
@@ -798,6 +863,10 @@ impl fmt::Display for Mesh3dRenderError {
             Self::GeneratedGeometryCapacityTooLarge => write!(
                 formatter,
                 "generated 3D surface topology exceeds frame or device capacity"
+            ),
+            Self::SurfaceTriangleBudgetExceeded { limit, actual } => write!(
+                formatter,
+                "3D surface submissions {actual} exceed frame triangle limit {limit}"
             ),
         }
     }
@@ -1037,12 +1106,14 @@ impl WgpuRenderer {
         )
     }
 
-    /// Validates every visible object and exact generated clipping work without
+    /// Validates every visible object and exact submitted/generated work without
     /// changing target pixels, retained resources or submitting GPU work.
     ///
     /// This is the same authoritative preflight used by rendering. Private
     /// bounded scratch may be allocated; the report is not a reusable draw
     /// authorization after the scene, target or camera changes.
+    /// [`Mesh3dRenderBudget::surface_policy`] controls filled surfaces only.
+    /// Native mode reports no CPU clipped/discarded source counts.
     pub fn validate_scene3d_for_target(
         &self,
         target: &RenderTarget3d,
@@ -1062,12 +1133,15 @@ impl WgpuRenderer {
             .map(|(_, frame)| frame.report)
     }
 
-    /// Draws a scene with explicit additional clipping topology limits.
+    /// Draws a scene with explicit surface policy and submitted/generated limits.
     ///
     /// All validation, generated counts and host/GPU capacity checks complete
     /// before the first GPU write or target mutation. Numerical ambiguity is
     /// attributed to the exact visible object; aggregate capacity remains a
     /// scene-level error. Wholly inside objects retain their indexed GPU path.
+    /// With [`SurfaceRasterization3d::Native`], all filled surfaces keep their
+    /// original indices and hardware clipping defines boundary coverage. Finite
+    /// shader arithmetic and independent mathematical-edge proofs still apply.
     pub fn render_scene3d_to_target_with_budget(
         &mut self,
         target: &RenderTarget3d,
@@ -1189,7 +1263,7 @@ impl Mesh3dRenderer {
         self.edge_object_bytes.clear();
         self.edge_object_bytes
             .resize(visible_count.saturating_mul(self.edge_object_stride), 0);
-        let mut triangle_count = 0usize;
+        let triangle_count = surface_frame.report.submitted_triangle_count();
         let mut edge_count = 0usize;
         let mut draw_call_count = 0usize;
         for (object_index, instance) in scene
@@ -1221,11 +1295,6 @@ impl Mesh3dRenderer {
                 let generated = self.clipped_surface_objects[object_index]
                     .generated
                     .as_ref();
-                triangle_count = triangle_count.saturating_add(
-                    generated.map_or(instance.mesh.triangle_count(), |range| {
-                        (range.end - range.start) as usize / 3
-                    }),
-                );
                 if generated.map_or(instance.mesh.index_buffer.is_some(), |range| {
                     !range.is_empty()
                 }) {
@@ -1926,6 +1995,7 @@ fn validate_shader_transform(
     validate_surface_triangle_topology(mesh, model_rows, camera_rows)
 }
 
+#[cfg(test)]
 fn validate_shader_points(
     mesh: &Mesh3d,
     model_rows: [[f32; 4]; 3],
@@ -1995,6 +2065,7 @@ fn validate_projected_triangle_orientation(
     Ok(())
 }
 
+#[cfg(test)]
 fn validate_shader_point(
     point: Vec3,
     model_rows: [[f32; 4]; 3],
@@ -3042,6 +3113,8 @@ pub(super) fn assert_gpu_depth_contract(
     format: wgpu::TextureFormat,
 ) {
     surface::assert_gpu_surface_contract(device, queue, format);
+    surface::assert_gpu_native_surface_policy(device, queue, format);
+    surface::assert_gpu_native_edge_validation(device, queue, format);
     texture::assert_gpu_texture_contract(device, queue, format);
     assert_gpu_clip_equivalence(device, queue);
     let identity = Arc::new(());

@@ -1,7 +1,9 @@
 use super::*;
 use crate::{FontError, FontFace, RasterizedGlyph, ShapedLine, TextLayoutBudget, TextStyle};
 
+mod prepared;
 mod types;
+pub use prepared::PreparedTextError;
 pub use types::{TextAtlasBudget, TextError, TextUpdateReport};
 
 #[derive(Clone, Copy)]
@@ -246,8 +248,17 @@ impl TextAtlas2d {
     ) -> Result<TextRun2d, TextError> {
         renderer.validate_image(&self.atlas.image)?;
         let shaped = self.font.shape_line(text, &self.style, &layout_budget)?;
-        let owned = owned_text(text)?;
-        let glyphs = self.position_glyphs(renderer, &shaped, &layout_budget)?;
+        self.prepare_validated(renderer, &shaped, layout_budget)
+    }
+
+    fn prepare_validated(
+        &mut self,
+        renderer: &WgpuRenderer,
+        shaped: &ShapedLine,
+        layout_budget: TextLayoutBudget,
+    ) -> Result<TextRun2d, TextError> {
+        let owned = owned_text(shaped.text())?;
+        let glyphs = self.position_glyphs(renderer, shaped, &layout_budget)?;
         let run = renderer.create_glyph_run(&self.atlas, glyphs, self.budget.run_budget())?;
         Ok(TextRun2d {
             run,
@@ -279,9 +290,19 @@ impl TextAtlas2d {
             return Ok(TextUpdateReport::default());
         }
         let shaped = self.font.shape_line(text, &self.style, &layout_budget)?;
-        let owned = owned_text(text)?;
+        self.update_validated(renderer, run, &shaped, layout_budget)
+    }
+
+    fn update_validated(
+        &mut self,
+        renderer: &WgpuRenderer,
+        run: &mut TextRun2d,
+        shaped: &ShapedLine,
+        layout_budget: TextLayoutBudget,
+    ) -> Result<TextUpdateReport, TextError> {
+        let owned = owned_text(shaped.text())?;
         let old_cache_count = self.cached.len();
-        let glyphs = self.position_glyphs(renderer, &shaped, &layout_budget)?;
+        let glyphs = self.position_glyphs(renderer, shaped, &layout_budget)?;
         let upload = renderer.update_glyph_run(&self.atlas, &mut run.run, &glyphs)?;
         run.text = owned;
         run.advance = shaped.advance();

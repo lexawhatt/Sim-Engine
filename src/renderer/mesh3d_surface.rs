@@ -11,33 +11,82 @@ mod gpu_tests;
 mod red_tests;
 
 #[cfg(test)]
+#[path = "mesh3d_policy_tests.rs"]
+mod policy_tests;
+
+#[cfg(test)]
+#[path = "mesh3d_native_edge_tests.rs"]
+mod native_edge_tests;
+
+#[cfg(test)]
+pub(super) use policy_tests::assert_gpu_native_surface_policy;
+
+#[cfg(test)]
+pub(super) use native_edge_tests::assert_gpu_native_edge_validation;
+
+#[cfg(test)]
 pub(super) use gpu_tests::{
     assert_gpu_clipped_recovery, assert_gpu_surface_contract, read_pixels as test_read_pixels,
     target as test_target,
 };
 
-/// Limits additional clip-space surface topology generated during one 3D draw.
+/// Limits submitted surfaces and additional clip-space topology in one 3D draw.
 ///
 /// Retained, wholly inside objects need no generated vertices. A crossing
 /// object's surfaces are transformed and clipped together so one draw preserves
 /// their shared depth interpolation. Limits apply before GPU writes or clearing
-/// the target, and may be zero to disallow generated topology.
+/// the target, and may be zero to disallow generated topology. The total surface
+/// limit includes both retained indices and newly generated triangles.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Mesh3dRenderBudget {
     max_generated_vertices: usize,
     max_generated_triangles: usize,
     max_generated_upload_bytes: usize,
+    max_surface_triangles: usize,
+    surface_policy: SurfaceRasterization3d,
 }
 
 impl Mesh3dRenderBudget {
     /// Sets exact generated surface vertex, triangle, and total upload-byte
-    /// ceilings. Upload bytes include canonical display-edge endpoints.
+    /// ceilings. Upload bytes include canonical display-edge endpoints. The
+    /// total submitted surface count is unlimited unless explicitly bounded by
+    /// [`Self::with_max_surface_triangles`].
     pub const fn new(vertices: usize, triangles: usize, upload_bytes: usize) -> Self {
         Self {
             max_generated_vertices: vertices,
             max_generated_triangles: triangles,
             max_generated_upload_bytes: upload_bytes,
+            max_surface_triangles: usize::MAX,
+            surface_policy: SurfaceRasterization3d::StrictPortable,
         }
+    }
+
+    /// Chooses surface raster portability for this draw. The default preserves
+    /// strict cross-backend topology proofs. Display-edge validation remains
+    /// independent of the selected surface policy.
+    pub const fn with_surface_policy(mut self, policy: SurfaceRasterization3d) -> Self {
+        self.surface_policy = policy;
+        self
+    }
+
+    /// Returns the explicitly selected surface rasterization policy.
+    pub const fn surface_policy(self) -> SurfaceRasterization3d {
+        self.surface_policy
+    }
+
+    /// Limits the combined retained and generated surface triangles submitted
+    /// to the GPU. Zero permits edge-only or empty submissions. Retained indices
+    /// still submitted for hardware clipping count even when outside the view.
+    /// Failure occurs before generated staging allocations, uploads or target
+    /// mutation and returns [`Mesh3dRenderError::SurfaceTriangleBudgetExceeded`].
+    pub const fn with_max_surface_triangles(mut self, triangles: usize) -> Self {
+        self.max_surface_triangles = triangles;
+        self
+    }
+
+    /// Returns the maximum combined retained and generated surface submissions.
+    pub const fn max_surface_triangles(self) -> usize {
+        self.max_surface_triangles
     }
 
     /// Returns the maximum generated clip-space vertices in one frame.
@@ -65,6 +114,9 @@ impl Default for Mesh3dRenderBudget {
 /// Non-mutating preflight counts for the exact scene, camera, target and budget.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Mesh3dPreflightReport {
+    pub(super) surface_policy: SurfaceRasterization3d,
+    pub(super) submitted_triangles: usize,
+    pub(super) generated_objects: usize,
     pub(super) generated_vertices: usize,
     pub(super) generated_triangles: usize,
     pub(super) generated_upload_bytes: usize,
@@ -74,6 +126,24 @@ pub struct Mesh3dPreflightReport {
 }
 
 impl Mesh3dPreflightReport {
+    /// Returns the surface policy used by this authoritative preflight.
+    pub const fn surface_policy(self) -> SurfaceRasterization3d {
+        self.surface_policy
+    }
+
+    /// Returns exact retained plus generated surface triangles submitted to
+    /// the GPU. This is not a visible-fragment count: wholly outside retained
+    /// index ranges still count when they are submitted for hardware clipping.
+    pub const fn submitted_triangle_count(self) -> usize {
+        self.submitted_triangles
+    }
+
+    /// Returns objects whose retained surfaces are replaced with generated
+    /// clip-space geometry for this draw, including empty generated ranges.
+    pub const fn generated_object_count(self) -> usize {
+        self.generated_objects
+    }
+
     /// Returns uploaded clip-space vertices, including unchanged triangles in
     /// objects that also contain crossing triangles.
     pub const fn generated_vertex_count(self) -> usize {
@@ -98,14 +168,22 @@ impl Mesh3dPreflightReport {
     }
 
     /// Returns original triangles that intersect the frustum boundary and
-    /// produce a nonempty clipped polygon.
-    pub const fn clipped_source_triangle_count(self) -> usize {
-        self.clipped_source_triangles
+    /// produce a nonempty clipped polygon under strict CPU classification.
+    /// Native rasterization returns `None`: hardware clipping is not observed.
+    pub const fn clipped_source_triangle_count(self) -> Option<usize> {
+        match self.surface_policy {
+            SurfaceRasterization3d::StrictPortable => Some(self.clipped_source_triangles),
+            SurfaceRasterization3d::Native => None,
+        }
     }
 
-    /// Returns original triangles proven entirely outside the frustum.
-    pub const fn discarded_source_triangle_count(self) -> usize {
-        self.discarded_source_triangles
+    /// Returns original triangles proven entirely outside the frustum by CPU
+    /// classification. Native rasterization returns `None`, not a visibility count.
+    pub const fn discarded_source_triangle_count(self) -> Option<usize> {
+        match self.surface_policy {
+            SurfaceRasterization3d::StrictPortable => Some(self.discarded_source_triangles),
+            SurfaceRasterization3d::Native => None,
+        }
     }
 }
 
@@ -179,7 +257,10 @@ pub(super) fn preflight(
         return Err(Mesh3dRenderError::InstanceCapacityTooLarge);
     }
     let mut frame = SurfaceFrame {
-        report: Mesh3dPreflightReport::default(),
+        report: Mesh3dPreflightReport {
+            surface_policy: budget.surface_policy(),
+            ..Mesh3dPreflightReport::default()
+        },
         vertices: Vec::new(),
         edges: Vec::new(),
         objects: Vec::new(),
@@ -195,7 +276,13 @@ pub(super) fn preflight(
                 .transform
                 .model_rows()
                 .map_err(|_| Mesh3dRenderError::InvalidGeometryTransform)?;
-            validate_shader_points(instance.mesh.source(), model, camera.rows())?;
+            validate_points_for_policy(
+                instance.mesh.source(),
+                model,
+                camera.rows(),
+                budget.surface_policy(),
+                instance.id,
+            )?;
             if let Some(style) = instance.wireframe() {
                 validate_edge_projection(
                     instance.mesh.source(),
@@ -207,11 +294,14 @@ pub(super) fn preflight(
             }
             let mut crossing = false;
             let mut vertex_count = 0usize;
-            if instance.style.surface_style().is_some() {
-                classify_surface(
+            if instance.style.surface_style().is_some()
+                && budget.surface_policy() == SurfaceRasterization3d::StrictPortable
+            {
+                classify_surface_for_object(
                     instance.mesh.source(),
                     model,
                     camera.rows(),
+                    instance.id,
                     |_, vertices, clipped| {
                         crossing |= clipped;
                         vertex_count = vertex_count
@@ -234,6 +324,14 @@ pub(super) fn preflight(
                     },
                 )?;
             }
+            let submitted_triangles = if instance.style.surface_style().is_none() {
+                0
+            } else if crossing {
+                vertex_count / 3
+            } else {
+                instance.mesh.triangle_count()
+            };
+            record_surface_submission(&mut frame.report, submitted_triangles, crossing, budget)?;
             if crossing {
                 let start = frame.report.generated_vertices;
                 let count = start.checked_add(vertex_count).ok_or(capacity_error)?;
@@ -300,10 +398,11 @@ pub(super) fn preflight(
         if object.generated.is_none() {
             continue;
         }
-        classify_surface(
+        classify_surface_for_object(
             instance.mesh.source(),
             object.model_rows,
             camera.rows(),
+            instance.id,
             |_, vertices, _| {
                 frame.vertices.extend_from_slice(vertices);
                 Ok(())
@@ -331,6 +430,32 @@ pub(super) fn preflight(
         }
     }
     Ok(frame)
+}
+
+fn record_surface_submission(
+    report: &mut Mesh3dPreflightReport,
+    submitted_triangles: usize,
+    generated_object: bool,
+    budget: Mesh3dRenderBudget,
+) -> Result<(), Mesh3dRenderError> {
+    let capacity_error = Mesh3dRenderError::GeneratedGeometryCapacityTooLarge;
+    let submitted_triangles = report
+        .submitted_triangles
+        .checked_add(submitted_triangles)
+        .ok_or(capacity_error)?;
+    if submitted_triangles > budget.max_surface_triangles {
+        return Err(Mesh3dRenderError::SurfaceTriangleBudgetExceeded {
+            limit: budget.max_surface_triangles,
+            actual: submitted_triangles,
+        });
+    }
+    let generated_objects = report
+        .generated_objects
+        .checked_add(usize::from(generated_object))
+        .ok_or(capacity_error)?;
+    report.submitted_triangles = submitted_triangles;
+    report.generated_objects = generated_objects;
+    Ok(())
 }
 
 // A triangle intersected with six convex half-spaces has at most nine vertices.
@@ -383,14 +508,16 @@ struct ClippedTriangle {
     crossing: bool,
 }
 
-fn inside(vertex: ClipVertex, plane: usize) -> Result<bool, Mesh3dRenderError> {
-    let range = vertex.plane_range(plane)?;
+fn inside(vertex: ClipVertex, plane: usize) -> Result<bool, Mesh3dSurfaceError> {
+    let range = vertex
+        .plane_range(plane)
+        .map_err(|_| Mesh3dSurfaceError::TransformArithmetic)?;
     if range.0 >= 0.0 {
         Ok(true)
     } else if range.1 <= -f64::from(f32::MIN_POSITIVE) {
         Ok(false)
     } else {
-        Err(Mesh3dRenderError::UnportableSurfaceTopology)
+        Err(Mesh3dSurfaceError::ClipPlaneClassification)
     }
 }
 
@@ -399,10 +526,10 @@ fn intersection(
     end: ClipVertex,
     plane: usize,
     provenance: u8,
-) -> Result<ClipVertex, Mesh3dRenderError> {
-    let error = Mesh3dRenderError::UnportableSurfaceTopology;
-    let start_distance = start.plane_range(plane)?;
-    let end_distance = end.plane_range(plane)?;
+) -> Result<ClipVertex, Mesh3dSurfaceError> {
+    let error = Mesh3dSurfaceError::ClipIntersection;
+    let start_distance = start.plane_range(plane).map_err(|_| error)?;
+    let end_distance = end.plane_range(plane).map_err(|_| error)?;
     if start_distance == (0.0, 0.0) {
         return Ok(start);
     }
@@ -493,13 +620,13 @@ fn intersection(
 fn clipped_triangle(
     clips: [[ShaderValueRange; 4]; 3],
 ) -> Result<ClippedTriangle, Mesh3dRenderError> {
-    clipped_triangle_with_uv(clips, [[0.0; 2]; 3])
+    clipped_triangle_with_uv(clips, [[0.0; 2]; 3]).map_err(Mesh3dSurfaceError::legacy)
 }
 
 fn clipped_triangle_with_uv(
     clips: [[ShaderValueRange; 4]; 3],
     uv: [[f32; 2]; 3],
-) -> Result<ClippedTriangle, Mesh3dRenderError> {
+) -> Result<ClippedTriangle, Mesh3dSurfaceError> {
     let empty = ClipVertex {
         ranges: [ShaderValueRange::exact(0.0); 4],
         planes: 0,
@@ -512,7 +639,8 @@ fn clipped_triangle_with_uv(
         crossing: false,
     };
     for (provenance, (destination, ranges)) in result.vertices.iter_mut().zip(clips).enumerate() {
-        let plane_ranges = clip_plane_ranges(ranges)?;
+        let plane_ranges =
+            clip_plane_ranges(ranges).map_err(|_| Mesh3dSurfaceError::TransformArithmetic)?;
         let planes = plane_ranges
             .iter()
             .enumerate()
@@ -568,12 +696,12 @@ fn clipped_triangle_with_uv(
                     // Only identical, proven boundary endpoints may collapse.
                     // An uncertainty envelope is never discarded as zero area.
                     if !result.vertices[result.count - 1].same_proven_vertex(vertex) {
-                        return Err(Mesh3dRenderError::UnportableSurfaceTopology);
+                        return Err(Mesh3dSurfaceError::ClippedVertexIdentity);
                     }
                     continue;
                 }
                 if result.count == MAX_POLYGON_VERTICES {
-                    return Err(Mesh3dRenderError::UnportableSurfaceTopology);
+                    return Err(Mesh3dSurfaceError::ClippedPolygonCapacity);
                 }
                 result.vertices[result.count] = vertex;
                 result.count += 1;
@@ -588,13 +716,13 @@ fn clipped_triangle_with_uv(
                     .map(|value| value.fixed)
         {
             if !result.vertices[0].same_proven_vertex(result.vertices[result.count - 1]) {
-                return Err(Mesh3dRenderError::UnportableSurfaceTopology);
+                return Err(Mesh3dSurfaceError::ClippedVertexIdentity);
             }
             result.count -= 1;
         }
     }
     if result.count > 0 && result.count < 3 {
-        return Err(Mesh3dRenderError::UnportableSurfaceTopology);
+        return Err(Mesh3dSurfaceError::ClippedPolygonDegenerate);
     }
     for index in 1..result.count.saturating_sub(1) {
         let vertices = [
@@ -604,23 +732,57 @@ fn clipped_triangle_with_uv(
         ];
         for vertex in vertices {
             if vertex.ranges[3].minimum < f64::from(f32::MIN_POSITIVE) {
-                return Err(Mesh3dRenderError::UnportableSurfaceTopology);
+                return Err(Mesh3dSurfaceError::PerspectiveDivide);
             }
             for plane in 0..6 {
                 if !inside(vertex, plane)? || vertex.plane_value(plane) < 0.0 {
-                    return Err(Mesh3dRenderError::UnportableSurfaceTopology);
+                    return Err(Mesh3dSurfaceError::ClippedVertexOutside);
                 }
             }
         }
-        validate_projected_triangle_orientation(vertices.map(|vertex| vertex.ranges))?;
+        validate_projected_triangle_orientation(vertices.map(|vertex| vertex.ranges))
+            .map_err(|_| Mesh3dSurfaceError::ProjectedOrientation)?;
     }
     Ok(result)
 }
 
+#[cfg(test)]
 pub(super) fn classify_surface(
     mesh: &Mesh3d,
     model_rows: [[f32; 4]; 3],
     camera_rows: [[f32; 4]; 4],
+    visit: impl FnMut(usize, &[SurfaceClipVertex], bool) -> Result<(), Mesh3dRenderError>,
+) -> Result<(), Mesh3dRenderError> {
+    classify_surface_impl(
+        mesh,
+        model_rows,
+        camera_rows,
+        |_, reason| reason.legacy(),
+        visit,
+    )
+}
+
+fn classify_surface_for_object(
+    mesh: &Mesh3d,
+    model_rows: [[f32; 4]; 3],
+    camera_rows: [[f32; 4]; 4],
+    object_id: Object3dId,
+    visit: impl FnMut(usize, &[SurfaceClipVertex], bool) -> Result<(), Mesh3dRenderError>,
+) -> Result<(), Mesh3dRenderError> {
+    classify_surface_impl(
+        mesh,
+        model_rows,
+        camera_rows,
+        |index, reason| reason.for_triangle(object_id, index),
+        visit,
+    )
+}
+
+fn classify_surface_impl(
+    mesh: &Mesh3d,
+    model_rows: [[f32; 4]; 3],
+    camera_rows: [[f32; 4]; 4],
+    failure: impl Fn(usize, Mesh3dSurfaceError) -> Mesh3dRenderError,
     mut visit: impl FnMut(usize, &[SurfaceClipVertex], bool) -> Result<(), Mesh3dRenderError>,
 ) -> Result<(), Mesh3dRenderError> {
     for (index, triangle) in mesh.triangle_indices().chunks_exact(3).enumerate() {
@@ -630,14 +792,16 @@ pub(super) fn classify_surface(
                 mesh.vertices()[*vertex as usize],
                 model_rows,
                 camera_rows,
-            )?;
+            )
+            .map_err(|_| failure(index, Mesh3dSurfaceError::TransformArithmetic))?;
         }
         let uv = std::array::from_fn(|index| {
             mesh.texture_coordinates()
                 .get(triangle[index] as usize)
                 .map_or([0.0, 0.0], |coordinate| [coordinate.u(), coordinate.v()])
         });
-        let polygon = clipped_triangle_with_uv(clips, uv)?;
+        let polygon =
+            clipped_triangle_with_uv(clips, uv).map_err(|reason| failure(index, reason))?;
         let mut emitted = [SurfaceClipVertex {
             clip: [0.0; 4],
             uv: [0.0; 2],

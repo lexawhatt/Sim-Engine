@@ -29,6 +29,7 @@ cargo fmt --all -- --check
 
 echo "[3/11] Rust 1.90 minimum version"
 cargo +1.90.0 check --all-targets --no-default-features
+cargo +1.90.0 check --all-targets --no-default-features --features fonts
 cargo +1.90.0 check --all-targets
 cargo +1.90.0 check --all-targets --all-features
 
@@ -36,18 +37,22 @@ echo "[4/11] all Linux targets"
 cargo test --all-targets --all-features
 cargo test --all-targets
 
-echo "[5/11] core-only"
+echo "[5/11] core-only and CPU fonts"
 cargo test --all-targets --no-default-features
+cargo test --all-targets --no-default-features --features fonts
 
 echo "[6/11] strict clippy"
 cargo clippy --all-targets --no-default-features -- -D warnings
+cargo clippy --all-targets --no-default-features --features fonts -- -D warnings
 cargo clippy --all-targets -- -D warnings
 cargo clippy --all-targets --all-features -- -D warnings
 
 echo "[7/11] public documentation"
 cargo test --doc --no-default-features
+cargo test --doc --no-default-features --features fonts
 cargo test --doc --all-features
 RUSTDOCFLAGS="-D warnings" cargo doc --no-default-features --no-deps
+RUSTDOCFLAGS="-D warnings" cargo doc --no-default-features --features fonts --no-deps
 RUSTDOCFLAGS="-D warnings" cargo doc --all-features --no-deps
 
 echo "[8/11] strict Linux Vulkan semantics"

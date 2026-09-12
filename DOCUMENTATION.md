@@ -1,7 +1,8 @@
-# Sim;Engine v0.3.0 Documentation
+# Sim;Engine Documentation
 
-This document is the integration guide and engineering reference for the
-Sim;Engine v0.3.0 API. For older integrations, use the
+This document contains the published 0.3.0 integration guide plus the explicit
+[0.4 development preview](#04-development-preview) below. The checkout version
+is `0.4.0-dev.1`; it is not a final 0.4.0 release. For older integrations, use the
 [archived 0.2 guide](https://github.com/lexawhatt/Sim-Engine/blob/v0.2.0/DOCUMENTATION.md).
 The [0.3.0 changelog](CHANGELOG.md#030---2026-09-11) includes migration notes.
 This guide is divided into two parts:
@@ -22,6 +23,99 @@ cargo doc --all-features --no-deps --open
 Sim;Engine remains pre-1.0. Linux with
 Vulkan is its supported release target, and Rust 1.90 is the minimum supported
 Rust version.
+
+## 0.4 development preview
+
+Only the additions below are implemented in this initial development slice.
+The broader 0.4 material/dynamic-resource roadmap is not a shipped capability.
+Development handoff uses a tested git commit, pinned with Cargo's `rev` field
+and the host lockfile, not an assumed stable `master` branch. A moving `_DEV`
+label is a convenience, not reproducible release evidence. The maintainer will
+provide the qualified revision after integration checks; do not publish this
+preview to crates.io as the completed release.
+
+### CPU shaping without GPU dependencies
+
+Enable `fonts` with default features disabled for CPU font/metrics work. The
+existing `text` feature still enables both fonts and wgpu text integration.
+`FontFace::shape_line` remains available. A caller-owned session reduces repeated
+face parsing, plan construction and storage allocation for changing labels:
+
+```rust
+use sim_engine::{FontBudget, FontFace, LogicalPixels, PhysicalPerLogical,
+    TextLayoutBudget, TextShapingSession, TextStyle};
+
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+let font = FontFace::from_bytes(std::fs::read("assets/Label.ttf")?, FontBudget::default())?;
+let style = TextStyle::new(LogicalPixels::new(24.0)?, PhysicalPerLogical::new(1.25)?)?;
+let budget = TextLayoutBudget::default();
+let mut shaping = TextShapingSession::new(&font, style, budget)?;
+let mut line = shaping.shape_line("Count: 100")?;
+shaping.update_line(&mut line, "Count: 101")?;
+# Ok(())
+# }
+```
+
+Each session fixes font/style/work limits, retains at most one shaping plan
+matched to resolved script/direction/language, and has no global string cache.
+Script changes may rebuild that plan and allocate. Engine scratch counters
+exclude dependency-owned face/plan/buffer allocations whose capacities are not
+exposed; this is not a hostile-font memory sandbox. `clear_scratch` releases the
+session's scratch/plan without invalidating previously returned lines.
+
+With `text`, pass the immutable CPU line to
+`TextAtlas2d::prepare_from_shaped(renderer, &line, budget)`, then update with
+`update_from_shaped(renderer, &mut run, &line, budget)`. These methods do not
+invoke shaping again. They require the exact originating font identity and
+style, including DPI and requested direction; font clones share identity,
+independently loaded identical font bytes do not. Changed-run failures preserve
+the old drawable, with the existing bounded atlas-cache-warming exception.
+Compatible unchanged GPU updates report zero work and do not consume the work
+budget; provenance checks still run first.
+
+Measure the named CPU workloads independently of a window/GPU:
+
+```bash
+cargo run --release --no-default-features --features fonts \
+  --example text_shaping_benchmark -- --iterations 1000
+```
+
+### Surface policy, preflight budgets and source diagnostics
+
+The default `StrictPortable` surface policy is unchanged. An application whose
+free camera routinely produces grazing/edge-on surfaces can explicitly select
+native rasterization:
+
+```rust
+use sim_engine::{Mesh3dRenderBudget, SurfaceRasterization3d};
+
+let budget = Mesh3dRenderBudget::new(0, 0, 0)
+    .with_surface_policy(SurfaceRasterization3d::Native)
+    .with_max_surface_triangles(200_000);
+```
+
+Pass this budget to `validate_scene3d_for_target` or
+`render_scene3d_to_target_with_budget`. Native keeps original indexed triangles
+and lets hardware clip them. It does not divide surface endpoints on the CPU,
+drop uncertain source triangles, or weaken overflow validation. Raster coverage
+at numerical boundaries is adapter-dependent. Display-edge clipping/extrusion
+remains independently validated and may still reject an object.
+
+`submitted_triangle_count` is the exact retained-plus-generated submission
+count, **not** the number of visible triangles. Outside retained indices count
+if submitted. `generated_object_count` describes objects replaced by canonical
+CPU clipping geometry. Native generates none and returns `None` from the CPU
+clipped/discarded-source count accessors; strict mode returns `Some(count)`.
+Budget failure occurs before generated staging reservation, uploads or target
+mutation, although bounded per-object preflight metadata may be allocated.
+
+For an error, `object_id`, `source_triangle_index`, `source_vertex_index` and
+`surface_reason` expose applicable source context without another clipping pass.
+Triangle indices refer to original index triples, not generated fans. A bad
+shared vertex is attributed to its first referencing source triangle; vertices
+with no surface reference retain vertex context. Camera/resource/aggregate
+capacity errors remain scene-level, and edge errors remain object-attributed.
+See the changelog for exhaustive-match and `Option` migrations from 0.3.0.
 
 ## Part I: Integration Handbook
 
