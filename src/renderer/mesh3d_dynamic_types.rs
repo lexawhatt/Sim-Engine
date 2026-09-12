@@ -4,7 +4,7 @@ use super::*;
 ///
 /// GPU reserve grows exactly to the larger of the current capacity, incoming
 /// live length and requested minimum. No geometric over-allocation is hidden.
-/// UV capacity follows vertex capacity while the incoming source has UVs.
+/// UV/color capacities follow vertex capacity while their attributes are present.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DynamicMesh3dBudget {
     pub(super) upload: Mesh3dUploadBudget,
@@ -161,7 +161,7 @@ pub struct DynamicMesh3dUpdateReport {
 }
 
 impl DynamicMesh3dUpdateReport {
-    /// Bytes enqueued for live vertices, indices, UVs and display edges.
+    /// Bytes enqueued for live vertices, indices, UVs, colors and display edges.
     pub const fn uploaded_bytes(self) -> usize {
         self.uploaded_bytes
     }

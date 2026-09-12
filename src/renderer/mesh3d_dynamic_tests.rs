@@ -44,6 +44,43 @@ fn camera() -> Camera3d {
     .unwrap()
 }
 
+fn colored_source_with_uv(right: bool, short: bool, color: Color, textured: bool) -> Mesh3d {
+    let source = source(right, short, textured);
+    let mut attributes = crate::Mesh3dAttributes::new()
+        .with_vertex_colors(vec![color; source.vertices().len()])
+        .unwrap();
+    if textured {
+        attributes = attributes.with_texture_coordinates(source.texture_coordinates().to_vec());
+    }
+    Mesh3d::with_attributes(
+        source.vertices().to_vec(),
+        source.triangle_indices().to_vec(),
+        source.display_edges().to_vec(),
+        attributes,
+    )
+    .unwrap()
+}
+
+fn test_material(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    identity: &Arc<()>,
+    renderer: &Mesh3dRenderer,
+) -> TextureMaterial3d {
+    let texture = texture::create_texture(
+        device,
+        queue,
+        identity,
+        &renderer.textures.layout,
+        2,
+        1,
+        vec![128, 192, 255, 255, 255, 128, 64, 255],
+        ImageBudget::default(),
+    )
+    .unwrap();
+    TextureMaterial3d::new(&texture, ImageSampling::Nearest, Color::rgb(0.75, 0.5, 1.0)).unwrap()
+}
+
 #[test]
 fn dynamic_capacity_accepts_non_triangle_reserve_and_rejects_overflow() {
     let source = source(false, true, true);
@@ -382,6 +419,255 @@ pub(in crate::renderer::mesh3d) fn assert_gpu_dynamic_contract(
         before
     );
     assert_gpu_dynamic_layout(device, queue, format);
+    assert_gpu_dynamic_colors(device, queue, format);
+}
+
+fn assert_gpu_dynamic_colors(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    format: wgpu::TextureFormat,
+) {
+    for textured in [false, true] {
+        let identity = Arc::new(());
+        let mut renderer = Mesh3dRenderer::new(device, format);
+        let target = surface::test_target(device, &identity, format, 64, 64);
+        let red = Color::rgb(1.0, 0.0, 0.0);
+        let green = Color::rgba(0.0, 1.0, 0.0, 0.0);
+        let blue = Color::rgba(0.0, 0.0, 1.0, 0.5);
+        let mesh = create_retained_mesh(
+            device,
+            queue,
+            Arc::clone(&identity),
+            colored_source_with_uv(false, false, red, textured),
+        )
+        .unwrap();
+        let mesh = if textured {
+            texture::attach_material(
+                &identity,
+                &mesh,
+                &test_material(device, queue, &identity, &renderer),
+            )
+            .unwrap()
+        } else {
+            mesh
+        };
+        let mut scene = Scene3d::new(Color::BLACK).unwrap();
+        let style = MeshStyle3d::surface(SurfaceStyle3d::opaque(Color::WHITE).unwrap());
+        let id = scene.try_push(&mesh, Transform3d::IDENTITY, style).unwrap();
+        drop(mesh);
+        let budget = DynamicMesh3dBudget::default().with_minimum_capacity(16, 25, 12);
+        let report = update_scene_mesh(
+            device,
+            queue,
+            &identity,
+            &mut renderer.dynamic_scratch,
+            &mut scene,
+            id,
+            colored_source_with_uv(false, false, green, textured),
+            budget,
+        )
+        .unwrap();
+        assert!(report.grew_capacity());
+        assert_eq!(report.gpu_allocation_count(), 4 + usize::from(textured));
+        assert_eq!(report.upload_calls(), 4 + usize::from(textured));
+        assert_eq!(
+            scene.instance(id).unwrap().mesh.allocation.color_bytes,
+            16 * 16
+        );
+        let pointer = Arc::as_ptr(
+            scene
+                .instance(id)
+                .unwrap()
+                .mesh
+                .color_buffer
+                .as_ref()
+                .unwrap(),
+        );
+        let green_pixels = pixels(&mut renderer, device, queue, &identity, &target, &scene);
+        let report = update_scene_mesh(
+            device,
+            queue,
+            &identity,
+            &mut renderer.dynamic_scratch,
+            &mut scene,
+            id,
+            colored_source_with_uv(true, true, blue, textured),
+            budget,
+        )
+        .unwrap();
+        assert!(report.reused_buffers());
+        assert_eq!(report.scratch_reallocations(), 0);
+        assert_eq!(
+            Arc::as_ptr(
+                scene
+                    .instance(id)
+                    .unwrap()
+                    .mesh
+                    .color_buffer
+                    .as_ref()
+                    .unwrap()
+            ),
+            pointer
+        );
+        assert_eq!(
+            report.uploaded_bytes(),
+            scene.instance(id).unwrap().mesh.source().vertices().len()
+                * (12 + 16 + usize::from(textured) * 8)
+                + 3 * 4
+                + 4 * 24
+        );
+        let blue_pixels = pixels(&mut renderer, device, queue, &identity, &target, &scene);
+        assert_ne!(green_pixels, blue_pixels);
+        let mut reference_scene = Scene3d::new(Color::BLACK).unwrap();
+        let reference = create_retained_mesh(
+            device,
+            queue,
+            Arc::clone(&identity),
+            colored_source_with_uv(true, true, blue, textured),
+        )
+        .unwrap();
+        let reference = if textured {
+            texture::attach_material(
+                &identity,
+                &reference,
+                &test_material(device, queue, &identity, &renderer),
+            )
+            .unwrap()
+        } else {
+            reference
+        };
+        let reference_id = reference_scene
+            .try_push(&reference, Transform3d::IDENTITY, style)
+            .unwrap();
+        assert_eq!(
+            pixels(
+                &mut renderer,
+                device,
+                queue,
+                &identity,
+                &target,
+                &reference_scene
+            ),
+            blue_pixels,
+            "reused color/UV content must match an independent immutable upload"
+        );
+        let snapshot = scene.instance(id).unwrap().mesh().clone();
+        let report = update_scene_mesh(
+            device,
+            queue,
+            &identity,
+            &mut renderer.dynamic_scratch,
+            &mut scene,
+            id,
+            colored_source_with_uv(true, true, red, textured),
+            budget,
+        )
+        .unwrap();
+        assert!(report.detached_aliases());
+        assert_eq!(report.gpu_allocation_count(), 4 + usize::from(textured));
+        let red_pixels = pixels(&mut renderer, device, queue, &identity, &target, &scene);
+        let reference = create_retained_mesh(
+            device,
+            queue,
+            Arc::clone(&identity),
+            colored_source_with_uv(true, true, red, textured),
+        )
+        .unwrap();
+        let reference = if textured {
+            texture::attach_material(
+                &identity,
+                &reference,
+                &test_material(device, queue, &identity, &renderer),
+            )
+            .unwrap()
+        } else {
+            reference
+        };
+        reference_scene.set_mesh(reference_id, &reference).unwrap();
+        assert_eq!(
+            pixels(
+                &mut renderer,
+                device,
+                queue,
+                &identity,
+                &target,
+                &reference_scene
+            ),
+            red_pixels,
+            "color-only COW update must match an independent immutable upload"
+        );
+        assert_ne!(red_pixels, blue_pixels);
+        let mut snapshot_scene = Scene3d::new(Color::BLACK).unwrap();
+        snapshot_scene
+            .try_push(&snapshot, Transform3d::IDENTITY, style)
+            .unwrap();
+        assert_eq!(
+            pixels(
+                &mut renderer,
+                device,
+                queue,
+                &identity,
+                &target,
+                &snapshot_scene
+            ),
+            blue_pixels
+        );
+        for colored in [false, true] {
+            let source = if colored {
+                colored_source_with_uv(false, true, green, textured)
+            } else {
+                source(false, true, textured)
+            };
+            let report = update_scene_mesh(
+                device,
+                queue,
+                &identity,
+                &mut renderer.dynamic_scratch,
+                &mut scene,
+                id,
+                source,
+                budget,
+            )
+            .unwrap();
+            assert!(!report.detached_aliases());
+            assert_eq!(
+                report.gpu_allocation_count(),
+                if colored { 4 } else { 3 } + usize::from(textured)
+            );
+            assert_eq!(
+                scene.instance(id).unwrap().mesh.color_buffer.is_some(),
+                colored
+            );
+        }
+        let before = pixels(&mut renderer, device, queue, &identity, &target, &scene);
+        let before_statistics = scene.statistics();
+        let capacity = scene.instance(id).unwrap().mesh.gpu_allocation_bytes();
+        let too_small =
+            DynamicMesh3dBudget::new(Mesh3dUploadBudget::new(4096, capacity - 1, 4096).unwrap());
+        assert!(matches!(
+            update_scene_mesh(
+                device,
+                queue,
+                &identity,
+                &mut renderer.dynamic_scratch,
+                &mut scene,
+                id,
+                colored_source_with_uv(true, false, blue, textured),
+                too_small
+            ),
+            Err(DynamicMesh3dError::Resource(
+                Mesh3dResourceError::BudgetExceeded {
+                    resource: Mesh3dUploadBudgetResource::GpuBytes,
+                    ..
+                }
+            ))
+        ));
+        assert_eq!(scene.statistics(), before_statistics);
+        assert_eq!(
+            pixels(&mut renderer, device, queue, &identity, &target, &scene),
+            before
+        );
+    }
 }
 
 fn assert_gpu_dynamic_layout(
@@ -507,98 +793,120 @@ pub(in crate::renderer::mesh3d) fn assert_gpu_dynamic_recovery(
     recovery_device: &wgpu::Device,
     recovery_queue: &wgpu::Queue,
 ) {
-    let format = wgpu::TextureFormat::Rgba8UnormSrgb;
-    let source_identity = Arc::new(());
-    let recovery_identity = Arc::new(());
-    let mut renderer = Mesh3dRenderer::new(source_device, format);
-    let mut recovered_renderer = Mesh3dRenderer::new(recovery_device, format);
-    let source_target = surface::test_target(source_device, &source_identity, format, 64, 64);
-    let recovery_target = surface::test_target(recovery_device, &recovery_identity, format, 64, 64);
-    let mesh = create_retained_mesh(
-        source_device,
-        source_queue,
-        Arc::clone(&source_identity),
-        source(false, false, false),
-    )
-    .unwrap();
-    let mut scene = Scene3d::new(Color::BLACK).unwrap();
-    let id = scene
-        .try_push(
-            &mesh,
-            Transform3d::IDENTITY,
-            MeshStyle3d::surface(SurfaceStyle3d::opaque(Color::WHITE).unwrap()),
+    for textured in [false, true] {
+        let format = wgpu::TextureFormat::Rgba8UnormSrgb;
+        let source_identity = Arc::new(());
+        let recovery_identity = Arc::new(());
+        let mut renderer = Mesh3dRenderer::new(source_device, format);
+        let mut recovered_renderer = Mesh3dRenderer::new(recovery_device, format);
+        let source_target = surface::test_target(source_device, &source_identity, format, 64, 64);
+        let recovery_target =
+            surface::test_target(recovery_device, &recovery_identity, format, 64, 64);
+        let mesh = create_retained_mesh(
+            source_device,
+            source_queue,
+            Arc::clone(&source_identity),
+            source(false, false, textured),
         )
         .unwrap();
-    drop(mesh);
-    let budget = DynamicMesh3dBudget::default().with_minimum_capacity(16, 25, 12);
-    update_scene_mesh(
-        source_device,
-        source_queue,
-        &source_identity,
-        &mut renderer.dynamic_scratch,
-        &mut scene,
-        id,
-        source(true, true, false),
-        budget,
-    )
-    .unwrap();
-    let before_pixels = pixels(
-        &mut renderer,
-        source_device,
-        source_queue,
-        &source_identity,
-        &source_target,
-        &scene,
-    );
-    let allocation = scene.instance(id).unwrap().mesh.allocation;
-    let source = scene.instance(id).unwrap().mesh.source().clone();
-    let prepared =
-        upload::prepare_restoration(recovery_device, scene.instance(id).unwrap().mesh()).unwrap();
-    assert_eq!(prepared.allocation, allocation);
-    let single = upload_prepared_retained_mesh(
-        recovery_device,
-        recovery_queue,
-        Arc::clone(&recovery_identity),
-        prepared,
-    );
-    assert_eq!(single.allocation, allocation);
-    assert_eq!(single.source(), &source);
-    restore_scene3d_resources(
-        recovery_device,
-        recovery_queue,
-        &recovered_renderer.textures.layout,
-        Arc::clone(&recovery_identity),
-        &mut scene,
-    )
-    .unwrap();
-    assert_eq!(scene.instance(id).unwrap().mesh.allocation, allocation);
-    assert_eq!(scene.instance(id).unwrap().mesh.source(), &source);
-    assert_eq!(
-        pixels(
-            &mut recovered_renderer,
+        let mesh = if textured {
+            texture::attach_material(
+                &source_identity,
+                &mesh,
+                &test_material(source_device, source_queue, &source_identity, &renderer),
+            )
+            .unwrap()
+        } else {
+            mesh
+        };
+        let mut scene = Scene3d::new(Color::BLACK).unwrap();
+        let id = scene
+            .try_push(
+                &mesh,
+                Transform3d::IDENTITY,
+                MeshStyle3d::surface(SurfaceStyle3d::opaque(Color::WHITE).unwrap()),
+            )
+            .unwrap();
+        drop(mesh);
+        let budget = DynamicMesh3dBudget::default().with_minimum_capacity(16, 25, 12);
+        update_scene_mesh(
+            source_device,
+            source_queue,
+            &source_identity,
+            &mut renderer.dynamic_scratch,
+            &mut scene,
+            id,
+            colored_source_with_uv(true, true, Color::rgba(0.25, 1.0, 0.5, 0.0), textured),
+            budget,
+        )
+        .unwrap();
+        let before_pixels = pixels(
+            &mut renderer,
+            source_device,
+            source_queue,
+            &source_identity,
+            &source_target,
+            &scene,
+        );
+        let allocation = scene.instance(id).unwrap().mesh.allocation;
+        assert!(allocation.color_bytes > 0);
+        assert_eq!(allocation.texture_coordinate_bytes > 0, textured);
+        assert_eq!(scene.statistics().texture_count(), usize::from(textured));
+        let source = scene.instance(id).unwrap().mesh.source().clone();
+        let prepared =
+            upload::prepare_restoration(recovery_device, scene.instance(id).unwrap().mesh())
+                .unwrap();
+        assert_eq!(prepared.allocation, allocation);
+        let single = upload_prepared_retained_mesh(
+            recovery_device,
+            recovery_queue,
+            Arc::clone(&recovery_identity),
+            prepared,
+        );
+        assert_eq!(single.allocation, allocation);
+        assert_eq!(single.source(), &source);
+        restore_scene3d_resources(
+            recovery_device,
+            recovery_queue,
+            &recovered_renderer.textures.layout,
+            Arc::clone(&recovery_identity),
+            &mut scene,
+        )
+        .unwrap();
+        assert_eq!(scene.instance(id).unwrap().mesh.allocation, allocation);
+        assert_eq!(scene.instance(id).unwrap().mesh.source(), &source);
+        assert_eq!(
+            scene.instance(id).unwrap().mesh.material().is_some(),
+            textured
+        );
+        assert_eq!(scene.statistics().texture_count(), usize::from(textured));
+        assert_eq!(
+            pixels(
+                &mut recovered_renderer,
+                recovery_device,
+                recovery_queue,
+                &recovery_identity,
+                &recovery_target,
+                &scene
+            ),
+            before_pixels
+        );
+        let pointer = Arc::as_ptr(&scene.instance(id).unwrap().mesh.vertex_buffer);
+        let report = update_scene_mesh(
             recovery_device,
             recovery_queue,
             &recovery_identity,
-            &recovery_target,
-            &scene
-        ),
-        before_pixels
-    );
-    let pointer = Arc::as_ptr(&scene.instance(id).unwrap().mesh.vertex_buffer);
-    let report = update_scene_mesh(
-        recovery_device,
-        recovery_queue,
-        &recovery_identity,
-        &mut recovered_renderer.dynamic_scratch,
-        &mut scene,
-        id,
-        source.clone(),
-        budget,
-    )
-    .unwrap();
-    assert!(report.reused_buffers());
-    assert_eq!(
-        Arc::as_ptr(&scene.instance(id).unwrap().mesh.vertex_buffer),
-        pointer
-    );
+            &mut recovered_renderer.dynamic_scratch,
+            &mut scene,
+            id,
+            source.clone(),
+            budget,
+        )
+        .unwrap();
+        assert!(report.reused_buffers());
+        assert_eq!(
+            Arc::as_ptr(&scene.instance(id).unwrap().mesh.vertex_buffer),
+            pointer
+        );
+    }
 }

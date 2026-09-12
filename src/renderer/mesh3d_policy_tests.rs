@@ -67,7 +67,7 @@ fn logic_free_camera_reproduces_source_triangle_orientation_failure() {
                     failure.set(Some((index, reason)));
                     reason.legacy()
                 },
-                |_, _, _| Ok(()),
+                |_, _, _, _| Ok(()),
             );
             if reverse && eye_z == 11.001 {
                 // Reversing a clipped polygon also changes fan arithmetic:

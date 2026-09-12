@@ -19,6 +19,7 @@ pub(super) struct DynamicMesh3dScratch {
     vertices: Vec<MeshVertexGpu>,
     edges: Vec<MeshEdgeGpu>,
     coordinates: Vec<MeshUvGpu>,
+    colors: Vec<MeshColorGpu>,
 }
 
 impl WgpuRenderer {
@@ -41,8 +42,8 @@ impl WgpuRenderer {
     /// Other objects and exported immutable mesh/instance clones remain unchanged:
     /// aliases cause one whole-bundle copy-on-write. Once only this scene object
     /// owns the new bundle, subsequent fitting updates allocate no GPU buffers.
-    /// Growth or a UV-layout change replaces the whole bundle; all live vertices,
-    /// indices, UVs and edges are uploaded even for an identical source.
+    /// Growth or an optional-attribute layout change replaces the whole bundle; all live vertices,
+    /// indices, UVs, colors and edges are uploaded even for an identical source.
     ///
     /// Limits include retained capacity and old/new overlap. Validation, scene
     /// accounting and every fallible host preparation complete before GPU writes.
@@ -118,6 +119,7 @@ fn bundle_is_unique(mesh: &RetainedMesh3d) -> bool {
             &mesh.index_buffer,
             &mesh.edge_buffer,
             &mesh.texture_coordinate_buffer,
+            &mesh.color_buffer,
         ]
         .into_iter()
         .all(|buffer| {
@@ -152,6 +154,18 @@ fn planned_allocation(
         allocation.total_bytes = allocation
             .total_bytes
             .checked_add(allocation.texture_coordinate_bytes)
+            .filter(|bytes| usize::try_from(*bytes).is_ok())
+            .ok_or(Mesh3dResourceError::CapacityTooLarge)?;
+    }
+    if !source.vertex_colors().is_empty() {
+        allocation.color_bytes = u64::try_from(vertices)
+            .ok()
+            .and_then(|count| count.checked_mul(std::mem::size_of::<MeshColorGpu>() as u64))
+            .filter(|bytes| *bytes <= max_buffer_size)
+            .ok_or(Mesh3dResourceError::CapacityTooLarge)?;
+        allocation.total_bytes = allocation
+            .total_bytes
+            .checked_add(allocation.color_bytes)
             .filter(|bytes| usize::try_from(*bytes).is_ok())
             .ok_or(Mesh3dResourceError::CapacityTooLarge)?;
     }
@@ -213,6 +227,7 @@ fn update_scene_mesh(
         (allocation.vertex_bytes, old.allocation.vertex_bytes),
         (allocation.index_bytes, old.allocation.index_bytes),
         (allocation.edge_bytes, old.allocation.edge_bytes),
+        (allocation.color_bytes, old.allocation.color_bytes),
         (
             allocation.texture_coordinate_bytes,
             old.allocation.texture_coordinate_bytes,
@@ -278,6 +293,7 @@ fn update_scene_mesh(
             allocation.index_bytes,
             allocation.edge_bytes,
             allocation.texture_coordinate_bytes,
+            allocation.color_bytes,
         ]
         .into_iter()
         .filter(|bytes| *bytes > 0)
@@ -291,6 +307,7 @@ fn update_scene_mesh(
         &scratch.vertices,
         &scratch.edges,
         &scratch.coordinates,
+        &scratch.colors,
     );
     submit_pending_uploads(queue);
     let scene_statistics = scene.commit_dynamic_mesh_change(change, candidate);
@@ -315,6 +332,7 @@ impl DynamicMesh3dScratch {
         self.vertices.capacity() * std::mem::size_of::<MeshVertexGpu>()
             + self.edges.capacity() * std::mem::size_of::<MeshEdgeGpu>()
             + self.coordinates.capacity() * std::mem::size_of::<MeshUvGpu>()
+            + self.colors.capacity() * std::mem::size_of::<MeshColorGpu>()
     }
 
     fn prepare(
@@ -326,19 +344,22 @@ impl DynamicMesh3dScratch {
             source.vertices().len(),
             source.display_edges().len(),
             source.texture_coordinates().len(),
+            source.vertex_colors().len(),
         ];
         let capacities = [
             self.vertices.capacity(),
             self.edges.capacity(),
             self.coordinates.capacity(),
+            self.colors.capacity(),
         ];
         let strides = [
             std::mem::size_of::<MeshVertexGpu>(),
             std::mem::size_of::<MeshEdgeGpu>(),
             std::mem::size_of::<MeshUvGpu>(),
+            std::mem::size_of::<MeshColorGpu>(),
         ];
-        let planned = std::array::from_fn::<_, 3, _>(|index| capacities[index].max(counts[index]));
-        let bytes = |values: [usize; 3]| -> Result<usize, DynamicMesh3dError> {
+        let planned = std::array::from_fn::<_, 4, _>(|index| capacities[index].max(counts[index]));
+        let bytes = |values: [usize; 4]| -> Result<usize, DynamicMesh3dError> {
             let mut total = 0usize;
             for (count, stride) in values.into_iter().zip(strides) {
                 total = count
@@ -371,15 +392,18 @@ impl DynamicMesh3dScratch {
         let vertices = reserve_conversion::<MeshVertexGpu>(capacities[0], counts[0])?;
         let edges = reserve_conversion::<MeshEdgeGpu>(capacities[1], counts[1])?;
         let coordinates = reserve_conversion::<MeshUvGpu>(capacities[2], counts[2])?;
+        let colors = reserve_conversion::<MeshColorGpu>(capacities[3], counts[3])?;
         let actual = [
             vertices.as_ref().map_or(capacities[0], Vec::capacity),
             edges.as_ref().map_or(capacities[1], Vec::capacity),
             coordinates.as_ref().map_or(capacities[2], Vec::capacity),
+            colors.as_ref().map_or(capacities[3], Vec::capacity),
         ];
         let actual_new = [
             vertices.as_ref().map_or(0, Vec::capacity),
             edges.as_ref().map_or(0, Vec::capacity),
             coordinates.as_ref().map_or(0, Vec::capacity),
+            colors.as_ref().map_or(0, Vec::capacity),
         ];
         let peak = checked_sum([old_bytes, bytes(actual_new)?])?;
         final_limit(
@@ -394,7 +418,8 @@ impl DynamicMesh3dScratch {
         )?;
         let reallocations = usize::from(vertices.is_some())
             + usize::from(edges.is_some())
-            + usize::from(coordinates.is_some());
+            + usize::from(coordinates.is_some())
+            + usize::from(colors.is_some());
         if let Some(vertices) = vertices {
             self.vertices = vertices;
         }
@@ -404,6 +429,14 @@ impl DynamicMesh3dScratch {
         if let Some(coordinates) = coordinates {
             self.coordinates = coordinates;
         }
+        if let Some(colors) = colors {
+            self.colors = colors;
+        }
+        self.colors.clear();
+        self.colors
+            .extend(source.vertex_colors().iter().map(|color| MeshColorGpu {
+                color: color.to_array(),
+            }));
         self.vertices.clear();
         self.vertices
             .extend(source.vertices().iter().map(|vertex| MeshVertexGpu {

@@ -273,7 +273,12 @@ struct Mesh3dStorage {
     triangle_indices: Vec<u32>,
     display_edges: Vec<MeshEdge3d>,
     texture_coordinates: Vec<TextureCoordinate2d>,
+    vertex_colors: Vec<Color>,
 }
+
+#[path = "mesh3d_attributes.rs"]
+mod attributes;
+pub use attributes::Mesh3dAttributes;
 
 /// Normalized texture coordinate with a top-left origin and downward V axis.
 ///
@@ -344,7 +349,12 @@ impl Mesh3d {
         triangle_indices: Vec<u32>,
         display_edges: Vec<MeshEdge3d>,
     ) -> Result<Self, Mesh3dError> {
-        Self::with_attributes(vertices, triangle_indices, display_edges, Vec::new())
+        Self::with_attributes(
+            vertices,
+            triangle_indices,
+            display_edges,
+            Mesh3dAttributes::new(),
+        )
     }
 
     /// Builds surfaces with one validated texture coordinate per model vertex.
@@ -369,16 +379,36 @@ impl Mesh3d {
             vertices,
             triangle_indices,
             display_edges,
-            texture_coordinates,
+            Mesh3dAttributes::new().with_texture_coordinates(texture_coordinates),
         )
     }
 
-    fn with_attributes(
+    /// Builds topology with optional UVs and normalized straight-linear colors.
+    /// Supplied attributes must match every vertex, including unused vertices.
+    /// Missing colors multiply by white; the opaque renderer ignores their
+    /// alpha. All buffers are moved into immutable shared storage without copies.
+    pub fn with_attributes(
         vertices: Vec<Vec3>,
         triangle_indices: Vec<u32>,
         display_edges: Vec<MeshEdge3d>,
-        texture_coordinates: Vec<TextureCoordinate2d>,
+        attributes: Mesh3dAttributes,
     ) -> Result<Self, Mesh3dError> {
+        if let Some(coordinates) = &attributes.texture_coordinates
+            && coordinates.len() != vertices.len()
+        {
+            return Err(Mesh3dError::TextureCoordinateCountMismatch {
+                vertex_count: vertices.len(),
+                coordinate_count: coordinates.len(),
+            });
+        }
+        if let Some(colors) = &attributes.vertex_colors
+            && colors.len() != vertices.len()
+        {
+            return Err(Mesh3dError::VertexColorCountMismatch {
+                vertex_count: vertices.len(),
+                color_count: colors.len(),
+            });
+        }
         if vertices.is_empty() {
             return Err(Mesh3dError::EmptyVertices);
         }
@@ -455,7 +485,8 @@ impl Mesh3d {
                 vertices,
                 triangle_indices,
                 display_edges,
-                texture_coordinates,
+                texture_coordinates: attributes.texture_coordinates.unwrap_or_default(),
+                vertex_colors: attributes.vertex_colors.unwrap_or_default(),
             }),
             bounds_min,
             bounds_max,
@@ -482,6 +513,12 @@ impl Mesh3d {
         &self.storage.texture_coordinates
     }
 
+    /// Returns normalized straight-linear vertex RGBA, or empty for white.
+    /// The opaque surface pass ignores alpha; mathematical edges are unaffected.
+    pub fn vertex_colors(&self) -> &[Color] {
+        &self.storage.vertex_colors
+    }
+
     /// Returns the number of retained triangles.
     pub fn triangle_count(&self) -> usize {
         self.storage.triangle_indices.len() / 3
@@ -497,7 +534,7 @@ impl Mesh3d {
         self.bounds_max
     }
 
-    /// Returns retained CPU bytes used by vertices, indices, and display edges.
+    /// Returns retained CPU capacity bytes for topology and optional attributes.
     pub fn recovery_memory_bytes(&self) -> usize {
         self.storage
             .vertices
@@ -521,12 +558,30 @@ impl Mesh3d {
                     .capacity()
                     .saturating_mul(std::mem::size_of::<TextureCoordinate2d>()),
             )
+            .saturating_add(
+                self.storage
+                    .vertex_colors
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<Color>()),
+            )
     }
 }
 
 /// Rejection reason for retained 3D topology.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mesh3dError {
+    /// A vertex color contains a non-finite or non-normalized channel.
+    InvalidVertexColor {
+        /// Zero-based source vertex/attribute index, including unused vertices.
+        vertex_index: usize,
+    },
+    /// An explicitly supplied color array must cover every model vertex.
+    VertexColorCountMismatch {
+        /// Number of model vertices.
+        vertex_count: usize,
+        /// Number of supplied straight-linear RGBA values.
+        color_count: usize,
+    },
     /// A U/V component was non-finite or outside normalized `0..=1` bounds.
     InvalidTextureCoordinate,
     /// Textured topology must supply exactly one UV for each model vertex.
@@ -581,6 +636,17 @@ pub enum Mesh3dError {
 impl fmt::Display for Mesh3dError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidVertexColor { vertex_index } => write!(
+                formatter,
+                "3D vertex {vertex_index} color must be finite straight-linear RGBA in 0..=1"
+            ),
+            Self::VertexColorCountMismatch {
+                vertex_count,
+                color_count,
+            } => write!(
+                formatter,
+                "{vertex_count} mesh vertices require matching colors, got {color_count}"
+            ),
             Self::InvalidTextureCoordinate => {
                 write!(formatter, "texture coordinates must be finite in 0..=1")
             }

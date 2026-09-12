@@ -477,8 +477,9 @@ impl Camera3d {
     /// `inside_view` set to false, allowing host-side classification without
     /// losing the projected anchor; extreme finite inputs may instead return
     /// [`Pseudo3dError::ArithmeticOverflow`]. In the v0.2 retained renderer,
-    /// explicit display edges are clipped while partially clipped surface
-    /// triangles are rejected fail-closed as unportable topology.
+    /// explicit display edges are clipped separately. StrictPortable surface
+    /// rendering generates bounded canonical clipping geometry, rejecting
+    /// uncertain topology; Native delegates surface clipping to the GPU.
     pub fn project_world(
         self,
         point: Vec3,

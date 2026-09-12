@@ -34,7 +34,7 @@ feedback and separate release qualification.
   example's acceptance mode; expanded CPU/GPU surface-policy and budget tests.
 - Scene-owned `update_scene3d_mesh` with explicit capacity and transient-overlap
   budgets. Unique fitting GPU bundles are reused; shared snapshots, capacity
-  growth and UV-layout changes cause whole-bundle replacement. Other objects
+  growth and UV/color-layout changes cause whole-bundle replacement. Other objects
   retain their old geometry, and recovery preserves reserved capacities.
 - `DynamicMesh3dUpdateReport` exposes live/reserved bytes, actual uploads,
   buffer allocations, alias detachment and reusable CPU scratch. Renderer
@@ -42,6 +42,12 @@ feedback and separate release qualification.
 - `mesh3d_scene_benchmark` compares repeated/outside/host-hidden geometry and
   immutable/dynamic single-object updates with confirmed presents and separated
   CPU/acquire metrics. It is a diagnostic fixture, not a GPU timestamp/FPS gate.
+- `Mesh3dAttributes` and `Mesh3d::with_attributes` accept normalized linear RGBA
+  vertex colors alongside optional UVs. Colors interpolate through both retained
+  and CPU-clipped surfaces and multiply surface/texture tints. Missing colors
+  preserve the colorless path; the current opaque pass ignores stored alpha.
+  Color storage participates in upload/clipping budgets, dynamic capacity reuse,
+  immutable-alias isolation and exact recovery.
 
 ### Migration notes from 0.3.0
 
@@ -55,6 +61,8 @@ feedback and separate release qualification.
 - Exhaustive matches on `Mesh3dObjectError`/`Mesh3dRenderError` need the new
   source-context and total-budget variants. Use diagnostic accessors when an
   exhaustive category match is unnecessary.
+- `Mesh3dError` adds source-indexed invalid vertex colors and color-count
+  mismatch errors. Existing mesh constructors still construct colorless data.
 
 The remaining 0.4.0 material, lighting, texture-lifecycle and fog
 work is not delivered by this initial slice. No general performance or release

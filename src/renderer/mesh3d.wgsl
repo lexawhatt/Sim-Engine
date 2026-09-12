@@ -22,8 +22,7 @@ struct Mesh3dVertexOut {
     @location(0) color: vec4<f32>,
 };
 
-@vertex
-fn mesh3d_vs_main(input: Mesh3dVertexIn) -> Mesh3dVertexOut {
+fn mesh3d_transform(input: Mesh3dVertexIn) -> Mesh3dVertexOut {
     let model = vec4<f32>(input.model_position, 1.0);
     let world = vec4<f32>(
         dot(input.model_row_0, model),
@@ -42,9 +41,24 @@ fn mesh3d_vs_main(input: Mesh3dVertexIn) -> Mesh3dVertexOut {
     return output;
 }
 
+@vertex
+fn mesh3d_vs_main(input: Mesh3dVertexIn) -> Mesh3dVertexOut {
+    return mesh3d_transform(input);
+}
+@vertex
+fn mesh3d_colored_vs_main(input: Mesh3dVertexIn, @location(6) vertex_color: vec4<f32>) -> Mesh3dVertexOut {
+    var output = mesh3d_transform(input);
+    output.color *= vertex_color;
+    return output;
+}
+@vertex
+fn mesh3d_colored_clipped_vs_main(@location(0) clip_position: vec4<f32>, @location(4) color: vec4<f32>, @location(6) vertex_color: vec4<f32>) -> Mesh3dVertexOut {
+    return Mesh3dVertexOut(clip_position, color * vertex_color);
+}
+
 @fragment
 fn mesh3d_fs_main(input: Mesh3dVertexOut) -> @location(0) vec4<f32> {
-    return input.color;
+    return vec4<f32>(input.color.rgb, 1.0);
 }
 
 // Crossing surfaces arrive as a bounded, CPU-proven homogeneous triangle list.

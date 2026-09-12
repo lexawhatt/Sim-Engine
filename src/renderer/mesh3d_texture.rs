@@ -205,6 +205,8 @@ pub(super) struct MeshTextureRenderer {
     pub(super) layout: wgpu::BindGroupLayout,
     pub(super) retained_pipeline: wgpu::RenderPipeline,
     pub(super) clipped_pipeline: wgpu::RenderPipeline,
+    pub(super) colored_retained_pipeline: wgpu::RenderPipeline,
+    pub(super) colored_clipped_pipeline: wgpu::RenderPipeline,
 }
 
 impl MeshTextureRenderer {
@@ -243,8 +245,8 @@ impl MeshTextureRenderer {
             bind_group_layouts: &[Some(camera_layout), Some(&layout)],
             immediate_size: 0,
         });
-        let pipeline = |clipped: bool| {
-            let buffers = if clipped {
+        let pipeline = |clipped: bool, colored: bool| {
+            let mut buffers = if clipped {
                 vec![
                     Some(SurfaceClipVertex::TEXTURED_LAYOUT),
                     Some(MeshInstanceGpu::LAYOUT),
@@ -256,15 +258,19 @@ impl MeshTextureRenderer {
                     Some(MeshInstanceGpu::LAYOUT),
                 ]
             };
+            if colored {
+                buffers.push(Some(MeshColorGpu::LAYOUT));
+            }
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some("sim-engine opaque textured 3D pipeline"),
                 layout: Some(&pipeline_layout),
                 vertex: wgpu::VertexState {
                     module: &shader,
-                    entry_point: Some(if clipped {
-                        "clipped_vs_main"
-                    } else {
-                        "retained_vs_main"
+                    entry_point: Some(match (clipped, colored) {
+                        (false, false) => "retained_vs_main",
+                        (true, false) => "clipped_vs_main",
+                        (false, true) => "colored_retained_vs_main",
+                        (true, true) => "colored_clipped_vs_main",
                     }),
                     compilation_options: wgpu::PipelineCompilationOptions::default(),
                     buffers: &buffers,
@@ -296,8 +302,10 @@ impl MeshTextureRenderer {
             })
         };
         Self {
-            retained_pipeline: pipeline(false),
-            clipped_pipeline: pipeline(true),
+            retained_pipeline: pipeline(false, false),
+            clipped_pipeline: pipeline(true, false),
+            colored_retained_pipeline: pipeline(false, true),
+            colored_clipped_pipeline: pipeline(true, true),
             layout,
         }
     }

@@ -6,6 +6,9 @@ Stable installation examples below remain on 0.3.0. See the
 and [unreleased changelog](CHANGELOG.md#unreleased---040-development)
 for the implemented subset and source migrations. Sim;Logic's first 0.4
 handoff will be an exact tested git revision before crates.io publication.
+The preview includes reusable CPU/prepared text, explicit 3D surface policies,
+capacity-reusing mesh updates and vertex colors. Alpha materials, lighting,
+mipmapped texture updates and fog are still in development.
 
 Sim;Engine is a validated visualization library built for simulation products.
 It provides a high-performance 2D renderer, scientific visualization paths,

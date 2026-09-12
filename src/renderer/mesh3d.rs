@@ -18,6 +18,9 @@ use surface::{SurfaceClipEdge, SurfaceClipVertex, SurfaceFrame, SurfaceObject};
 #[path = "mesh3d_texture.rs"]
 mod texture;
 use texture::{MeshTextureRenderer, MeshUvGpu};
+#[path = "mesh3d_colors.rs"]
+mod colors;
+use colors::MeshColorGpu;
 pub use texture::{Texture3d, Texture3dError, TextureMaterial3d};
 
 #[cfg(test)]
@@ -26,6 +29,14 @@ use crate::{MeshEdge3d, Projection3d, Rotation3d, SurfaceStyle3d, WorldLength};
 #[cfg(test)]
 #[path = "mesh3d_lifetime_tests.rs"]
 mod lifetime_tests;
+
+#[cfg(test)]
+#[path = "mesh3d_vertex_color_tests.rs"]
+mod vertex_color_tests;
+
+#[cfg(test)]
+#[path = "mesh3d_color_budget_tests.rs"]
+mod color_budget_tests;
 
 #[cfg(test)]
 fn logical(value: f32) -> LogicalPixels {
@@ -184,6 +195,10 @@ pub(super) struct Mesh3dRenderer {
     dynamic_scratch: dynamic::DynamicMesh3dScratch,
     textures: MeshTextureRenderer,
     pipeline: wgpu::RenderPipeline,
+    colored_pipeline: wgpu::RenderPipeline,
+    colored_clipped_pipeline: wgpu::RenderPipeline,
+    clipped_color_buffer: Option<wgpu::Buffer>,
+    clipped_color_capacity: usize,
     clipped_surface_pipeline: wgpu::RenderPipeline,
     clipped_surface_buffer: Option<wgpu::Buffer>,
     clipped_surface_capacity: usize,
@@ -390,6 +405,22 @@ impl Mesh3dRenderer {
             dynamic_scratch: dynamic::DynamicMesh3dScratch::default(),
             textures: MeshTextureRenderer::new(device, format, &camera_layout),
             pipeline,
+            colored_pipeline: colors::colored_pipeline(
+                device,
+                format,
+                &pipeline_layout,
+                &shader,
+                false,
+            ),
+            colored_clipped_pipeline: colors::colored_pipeline(
+                device,
+                format,
+                &pipeline_layout,
+                &shader,
+                true,
+            ),
+            clipped_color_buffer: None,
+            clipped_color_capacity: 0,
             clipped_surface_pipeline,
             clipped_surface_buffer: None,
             clipped_surface_capacity: 0,
@@ -517,6 +548,7 @@ pub struct RetainedMesh3d {
     index_buffer: Option<Arc<wgpu::Buffer>>,
     edge_buffer: Option<Arc<wgpu::Buffer>>,
     texture_coordinate_buffer: Option<Arc<wgpu::Buffer>>,
+    color_buffer: Option<Arc<wgpu::Buffer>>,
     material: Option<TextureMaterial3d>,
     source: Mesh3d,
     index_count: u32,
@@ -1240,6 +1272,16 @@ impl Mesh3dRenderer {
             } else {
                 None
             };
+        let replacement_color_buffer = if surface_frame.colors.len() > self.clipped_color_capacity {
+            Some(device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("sim-engine clipped 3D vertex color buffer"),
+                size: (surface_frame.colors.len() * std::mem::size_of::<MeshColorGpu>()) as u64,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }))
+        } else {
+            None
+        };
         let replacement_edge_buffer = if surface_frame.edges.len() > self.clipped_edge_capacity {
             Some(device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("sim-engine canonical clip-space 3D edge buffer"),
@@ -1259,7 +1301,16 @@ impl Mesh3dRenderer {
             self.clipped_edge_buffer = Some(buffer);
             self.clipped_edge_capacity = surface_frame.edges.len();
         }
+        if let Some(buffer) = replacement_color_buffer {
+            self.clipped_color_buffer = Some(buffer);
+            self.clipped_color_capacity = surface_frame.colors.len();
+        }
         self.clipped_surface_objects = surface_frame.objects;
+        if let Some(buffer) = &self.clipped_color_buffer
+            && !surface_frame.colors.is_empty()
+        {
+            queue.write_buffer(buffer, 0, bytemuck::cast_slice(&surface_frame.colors));
+        }
         if let Some(buffer) = &self.clipped_surface_buffer
             && !surface_frame.vertices.is_empty()
         {
@@ -1409,7 +1460,31 @@ struct PreparedRetainedMeshUpload {
     vertices: Vec<MeshVertexGpu>,
     edges: Vec<MeshEdgeGpu>,
     texture_coordinates: Vec<MeshUvGpu>,
+    colors: Vec<MeshColorGpu>,
     budget: Mesh3dUploadBudget,
+}
+
+impl PreparedRetainedMeshUpload {
+    fn staging_capacity_bytes(&self) -> usize {
+        self.vertices
+            .capacity()
+            .saturating_mul(std::mem::size_of::<MeshVertexGpu>())
+            .saturating_add(
+                self.edges
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<MeshEdgeGpu>()),
+            )
+            .saturating_add(
+                self.texture_coordinates
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<MeshUvGpu>()),
+            )
+            .saturating_add(
+                self.colors
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<MeshColorGpu>()),
+            )
+    }
 }
 
 fn prepare_retained_mesh_upload(
@@ -1425,6 +1500,15 @@ fn prepare_retained_mesh_upload(
     }) {
         return Err(Mesh3dResourceError::NonPortableTextureCoordinate);
     }
+    let mut colors = Vec::new();
+    colors
+        .try_reserve_exact(source.vertex_colors().len())
+        .map_err(|_| Mesh3dResourceError::HostAllocationFailed {
+            requested_bytes: layout.color_bytes,
+        })?;
+    colors.extend(source.vertex_colors().iter().map(|color| MeshColorGpu {
+        color: color.to_array(),
+    }));
     let mut texture_coordinates = Vec::new();
     texture_coordinates
         .try_reserve_exact(source.texture_coordinates().len())
@@ -1469,6 +1553,7 @@ fn prepare_retained_mesh_upload(
         vertices,
         edges,
         texture_coordinates,
+        colors,
         budget: Mesh3dUploadBudget::default(),
     })
 }
@@ -1494,6 +1579,7 @@ fn upload_prepared_retained_mesh(
         vertices,
         edges,
         texture_coordinates,
+        colors,
         budget,
     } = prepared;
     let mesh = allocate_retained_mesh(
@@ -1504,7 +1590,14 @@ fn upload_prepared_retained_mesh(
         allocation,
         budget,
     );
-    write_retained_mesh_uploads(queue, &mesh, &vertices, &edges, &texture_coordinates);
+    write_retained_mesh_uploads(
+        queue,
+        &mesh,
+        &vertices,
+        &edges,
+        &texture_coordinates,
+        &colors,
+    );
     submit_pending_uploads(queue);
     mesh
 }
@@ -1555,12 +1648,21 @@ fn allocate_retained_mesh(
         }));
         Some(buffer)
     };
+    let color_buffer = (allocation.color_bytes > 0).then(|| {
+        Arc::new(device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("sim-engine 3D vertex color buffer"),
+            size: allocation.color_bytes,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        }))
+    });
     RetainedMesh3d {
         renderer_identity,
         vertex_buffer,
         index_buffer,
         edge_buffer,
         texture_coordinate_buffer,
+        color_buffer,
         material: None,
         source,
         index_count: live.index_count,
@@ -1577,6 +1679,7 @@ fn write_retained_mesh_uploads(
     vertices: &[MeshVertexGpu],
     edges: &[MeshEdgeGpu],
     coordinates: &[MeshUvGpu],
+    colors: &[MeshColorGpu],
 ) -> usize {
     let mut calls = 0;
     for (buffer, bytes) in [
@@ -1586,6 +1689,7 @@ fn write_retained_mesh_uploads(
             bytemuck::cast_slice(mesh.source.triangle_indices()),
         ),
         (mesh.edge_buffer.as_ref(), bytemuck::cast_slice(edges)),
+        (mesh.color_buffer.as_ref(), bytemuck::cast_slice(colors)),
         (
             mesh.texture_coordinate_buffer.as_ref(),
             bytemuck::cast_slice(coordinates),
@@ -1756,6 +1860,7 @@ struct Mesh3dUploadLayout {
     index_bytes: u64,
     edge_bytes: u64,
     texture_coordinate_bytes: u64,
+    color_bytes: u64,
     total_bytes: u64,
     index_count: u32,
     edge_count: u32,
@@ -1778,9 +1883,17 @@ fn preflight_mesh3d_source(
         .and_then(|bytes| u64::try_from(bytes).ok())
         .filter(|bytes| *bytes <= max_buffer_size)
         .ok_or(Mesh3dResourceError::CapacityTooLarge)?;
+    layout.color_bytes = source
+        .vertex_colors()
+        .len()
+        .checked_mul(std::mem::size_of::<MeshColorGpu>())
+        .and_then(|bytes| u64::try_from(bytes).ok())
+        .filter(|bytes| *bytes <= max_buffer_size)
+        .ok_or(Mesh3dResourceError::CapacityTooLarge)?;
     layout.total_bytes = layout
         .total_bytes
         .checked_add(layout.texture_coordinate_bytes)
+        .and_then(|bytes| bytes.checked_add(layout.color_bytes))
         .filter(|bytes| usize::try_from(*bytes).is_ok())
         .ok_or(Mesh3dResourceError::CapacityTooLarge)?;
     Ok(layout)
@@ -1816,6 +1929,7 @@ fn preflight_mesh3d_upload(
         index_bytes,
         edge_bytes,
         texture_coordinate_bytes: 0,
+        color_bytes: 0,
         total_bytes,
         index_count: draw_index_count,
         edge_count: draw_edge_count,
@@ -3024,59 +3138,72 @@ fn encode_scene_pass(
             (instance_index * std::mem::size_of::<MeshInstanceGpu>()) as wgpu::BufferAddress;
         let instance_end =
             instance_start + std::mem::size_of::<MeshInstanceGpu>() as wgpu::BufferAddress;
-        pass.set_vertex_buffer(
-            1,
-            renderer.instance_buffer.slice(instance_start..instance_end),
-        );
-        if let Some(material) = instance.mesh.material() {
+        let material = instance.mesh.material();
+        let colored = instance.mesh.color_buffer.is_some();
+        if let Some(material) = material {
             pass.set_bind_group(1, material.bind_group(), &[]);
-            if let Some(range) = renderer
-                .clipped_surface_objects
-                .get(instance_index)
-                .and_then(|object| object.generated.as_ref())
-            {
-                if let Some(buffer) = &renderer.clipped_surface_buffer
-                    && !range.is_empty()
-                {
-                    pass.set_pipeline(&renderer.textures.clipped_pipeline);
-                    pass.set_vertex_buffer(0, buffer.slice(..));
-                    pass.draw(range.clone(), 0..1);
-                }
-            } else if let (Some(index_buffer), Some(coordinates)) = (
-                &instance.mesh.index_buffer,
-                &instance.mesh.texture_coordinate_buffer,
+        }
+        let object = renderer.clipped_surface_objects.get(instance_index);
+        if let Some(range) = object.and_then(|object| object.generated.as_ref()) {
+            if range.is_empty() {
+                continue;
+            }
+            let Some(buffer) = &renderer.clipped_surface_buffer else {
+                continue;
+            };
+            pass.set_pipeline(match (material.is_some(), colored) {
+                (false, false) => &renderer.clipped_surface_pipeline,
+                (false, true) => &renderer.colored_clipped_pipeline,
+                (true, false) => &renderer.textures.clipped_pipeline,
+                (true, true) => &renderer.textures.colored_clipped_pipeline,
+            });
+            let stride = std::mem::size_of::<SurfaceClipVertex>() as u64;
+            pass.set_vertex_buffer(
+                0,
+                buffer.slice(u64::from(range.start) * stride..u64::from(range.end) * stride),
+            );
+            pass.set_vertex_buffer(
+                1,
+                renderer.instance_buffer.slice(instance_start..instance_end),
+            );
+            if let (Some(buffer), Some(colors)) = (
+                &renderer.clipped_color_buffer,
+                object.and_then(|object| object.generated_colors.as_ref()),
             ) {
-                pass.set_pipeline(&renderer.textures.retained_pipeline);
-                pass.set_vertex_buffer(0, instance.mesh.vertex_buffer.slice(..));
-                pass.set_vertex_buffer(1, coordinates.slice(..));
+                let stride = std::mem::size_of::<MeshColorGpu>() as u64;
                 pass.set_vertex_buffer(
                     2,
-                    renderer.instance_buffer.slice(instance_start..instance_end),
+                    buffer.slice(u64::from(colors.start) * stride..u64::from(colors.end) * stride),
                 );
-                pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-                pass.draw_indexed(0..instance.mesh.index_count, 0, 0..1);
             }
+            pass.draw(0..range.end - range.start, 0..1);
             continue;
         }
-        if let Some(range) = renderer
-            .clipped_surface_objects
-            .get(instance_index)
-            .and_then(|object| object.generated.as_ref())
-        {
-            if let Some(buffer) = &renderer.clipped_surface_buffer
-                && !range.is_empty()
-            {
-                pass.set_pipeline(&renderer.clipped_surface_pipeline);
-                pass.set_vertex_buffer(0, buffer.slice(..));
-                pass.draw(range.clone(), 0..1);
-            }
-            continue;
-        }
-        let Some(index_buffer) = instance.mesh.index_buffer.as_ref() else {
+        let Some(index_buffer) = &instance.mesh.index_buffer else {
             continue;
         };
-        pass.set_pipeline(&renderer.pipeline);
+        pass.set_pipeline(match (material.is_some(), colored) {
+            (false, false) => &renderer.pipeline,
+            (false, true) => &renderer.colored_pipeline,
+            (true, false) => &renderer.textures.retained_pipeline,
+            (true, true) => &renderer.textures.colored_retained_pipeline,
+        });
         pass.set_vertex_buffer(0, instance.mesh.vertex_buffer.slice(..));
+        let instance_slot = if material.is_some() {
+            if let Some(coordinates) = &instance.mesh.texture_coordinate_buffer {
+                pass.set_vertex_buffer(1, coordinates.slice(..));
+            }
+            2
+        } else {
+            1
+        };
+        pass.set_vertex_buffer(
+            instance_slot,
+            renderer.instance_buffer.slice(instance_start..instance_end),
+        );
+        if let Some(buffer) = &instance.mesh.color_buffer {
+            pass.set_vertex_buffer(instance_slot + 1, buffer.slice(..));
+        }
         pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
         pass.draw_indexed(0..instance.mesh.index_count, 0, 0..1);
     }
@@ -3156,6 +3283,8 @@ pub(super) fn assert_gpu_depth_contract(
     format: wgpu::TextureFormat,
 ) {
     dynamic::assert_gpu_dynamic_contract(device, queue, format);
+    vertex_color_tests::assert_gpu_vertex_color_contract(device, queue, format);
+    color_budget_tests::assert_gpu_color_budget(device, queue, format);
     surface::assert_gpu_surface_contract(device, queue, format);
     surface::assert_gpu_native_surface_policy(device, queue, format);
     surface::assert_gpu_native_edge_validation(device, queue, format);

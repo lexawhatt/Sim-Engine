@@ -27,7 +27,7 @@ Rust version.
 ## 0.4 development preview
 
 Only the additions below are implemented in this initial development slice.
-The broader 0.4 material/dynamic-resource roadmap is not a shipped capability.
+The remaining 0.4 material/texture roadmap is not a shipped capability.
 Development handoff uses a tested git commit, pinned with Cargo's `rev` field
 and the host lockfile, not an assumed stable `master` branch. A moving `_DEV`
 label is a convenience, not reproducible release evidence. The maintainer will
@@ -117,6 +117,55 @@ with no surface reference retain vertex context. Camera/resource/aggregate
 capacity errors remain scene-level, and edge errors remain object-attributed.
 See the changelog for exhaustive-match and `Option` migrations from 0.3.0.
 
+### Application-supplied vertex colors
+
+`Mesh3dAttributes` accepts optional per-vertex linear RGBA colors and UVs without
+GPU dependencies. Attribute values are owned by the immutable source mesh;
+building it does not change any earlier CPU or retained GPU snapshot.
+
+```rust
+use sim_engine::{Color, Mesh3d, Mesh3dAttributes, Vec3};
+
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+let attributes = Mesh3dAttributes::new().with_vertex_colors(vec![
+    Color::rgb(1.0, 0.0, 0.0),
+    Color::rgb(0.0, 1.0, 0.0),
+    Color::rgb(0.0, 0.0, 1.0),
+])?;
+let mesh = Mesh3d::with_attributes(
+    vec![Vec3::ZERO, Vec3::X, Vec3::Y],
+    vec![0, 1, 2],
+    Vec::new(),
+    attributes,
+)?;
+# let _ = mesh;
+# Ok(())
+# }
+```
+
+All channels must be finite and normalized to `0..=1`; unsupported HDR or NaN
+values return an error with the source vertex index instead of being clamped.
+When supplied, the color array must have exactly one entry per vertex, including
+vertices unused by the index list. Missing colors multiply by white and preserve
+the colorless rendering path. Explicitly supplied empty colors are not a valid
+attribute array for a nonempty mesh. Use `with_texture_coordinates` on the same
+descriptor to supply UVs as well.
+
+Colors interpolate perspective-correctly. RGB multiplies the surface color,
+optional sampled texture and texture-material tint in linear space. Strict CPU
+clipping carries colors with the same intersection parameter as positions/UVs;
+Native leaves this interpolation to the GPU. Mathematical-edge colors remain
+independent. The current opaque material deliberately ignores vertex alpha and
+writes alpha one; the existing 3D texture API still requires opaque texels.
+Stored vertex alpha is not yet a transparency feature: Mask and Blend materials
+remain forthcoming.
+
+Meshes without colors allocate no color buffer. Colored sources, uploads,
+generated clipping streams and dynamic-update scratch count the additional
+storage in their existing budgets. Restoration preserves the exact colors and
+reserved capacity; color attribute layout changes follow the same whole-bundle
+replacement contract as UV changes.
+
 ### Dynamic mesh revisions and capacity reuse
 
 Use `renderer.update_scene3d_mesh(&mut scene, object_id, new_source, budget)`
@@ -139,13 +188,13 @@ detachment, later unique updates reuse capacity. Creating a snapshot with
 `scene.instance(id)?.mesh().clone()` deliberately restores copy-on-write behavior
 for the next update. CPU source snapshots do not by themselves prevent GPU reuse.
 
-Growth or adding/removing UV layout also replaces the complete bundle, keeping
+Growth or adding/removing UV/color layout also replaces the complete bundle, keeping
 unique allocation accounting correct. Synchronous validation/allocation errors
 preserve the prior drawable; GPU device loss follows the existing asynchronous
 recovery contract. Both `restore_mesh3d` and `restore_scene3d` preserve reserved
 buffer capacities, not just the current live topology.
 
-Every accepted update uploads all live positions, indices, UVs and display
+Every accepted update uploads all live positions, indices, UVs, colors and display
 edges, even when the supplied source is unchanged. Partial mesh edits and an
 unchanged-source no-op are not promised by this path. The returned report
 separates uploaded/live bytes, reserved bytes, buffer allocations, alias

@@ -7,7 +7,7 @@ use super::*;
 pub enum Mesh3dUploadBudgetResource {
     /// Retained source-topology capacities.
     RecoveryBytes,
-    /// Vertex/UV/index/display-edge GPU buffer bytes; excludes material texels.
+    /// Vertex/UV/color/index/display-edge GPU buffer bytes; excludes material texels.
     GpuBytes,
     /// Temporary CPU conversion-array bytes.
     StagingBytes,
@@ -41,11 +41,11 @@ impl Mesh3dUploadBudget {
     pub const fn max_recovery_bytes(self) -> usize {
         self.max_recovery_bytes
     }
-    /// Maximum vertex/UV/index/display-edge bytes for the accepted revision.
+    /// Maximum vertex/UV/color/index/display-edge bytes for the accepted revision.
     pub const fn max_gpu_bytes(self) -> usize {
         self.max_gpu_bytes
     }
-    /// Maximum temporary CPU vertex/UV/edge conversion bytes.
+    /// Maximum temporary CPU vertex/UV/color/edge conversion bytes.
     pub const fn max_staging_bytes(self) -> usize {
         self.max_staging_bytes
     }
@@ -76,7 +76,7 @@ impl Mesh3dUploadReport {
     pub const fn recovery_bytes(self) -> usize {
         self.recovery_bytes
     }
-    /// Bytes uploaded to new vertex/UV/index/display-edge buffers.
+    /// Bytes uploaded to new vertex/UV/color/index/display-edge buffers.
     pub const fn uploaded_bytes(self) -> usize {
         self.uploaded_bytes
     }
@@ -162,7 +162,8 @@ pub(super) fn prepare_with_budget(
             layout
                 .vertex_bytes
                 .saturating_add(layout.edge_bytes)
-                .saturating_add(layout.texture_coordinate_bytes) as usize,
+                .saturating_add(layout.texture_coordinate_bytes)
+                .saturating_add(layout.color_bytes) as usize,
         ),
     ] {
         if actual > limit {
@@ -174,6 +175,14 @@ pub(super) fn prepare_with_budget(
         }
     }
     let mut prepared = prepare_retained_mesh_upload(device, source)?;
+    let actual = prepared.staging_capacity_bytes();
+    if actual > budget.max_staging_bytes {
+        return Err(Mesh3dResourceError::BudgetExceeded {
+            resource: Mesh3dUploadBudgetResource::StagingBytes,
+            limit: budget.max_staging_bytes,
+            actual,
+        });
+    }
     prepared.budget = budget;
     Ok(prepared)
 }
@@ -198,6 +207,7 @@ pub(super) fn validate_allocation(
         allocation.index_bytes,
         allocation.edge_bytes,
         allocation.texture_coordinate_bytes,
+        allocation.color_bytes,
     ]
     .into_iter()
     .any(|bytes| bytes > device.limits().max_buffer_size)
@@ -238,12 +248,7 @@ pub(super) fn replace_resources(
     let report = Mesh3dUploadReport {
         recovery_bytes: prepared.source.recovery_memory_bytes(),
         uploaded_bytes: prepared.layout.total_bytes as usize,
-        staging_bytes: prepared
-            .layout
-            .vertex_bytes
-            .saturating_add(prepared.layout.edge_bytes)
-            .saturating_add(prepared.layout.texture_coordinate_bytes)
-            as usize,
+        staging_bytes: prepared.staging_capacity_bytes(),
         peak_recovery_bytes: mesh.recovery_memory_bytes().saturating_add(
             if mesh.source.vertices().as_ptr() == prepared.source.vertices().as_ptr() {
                 0

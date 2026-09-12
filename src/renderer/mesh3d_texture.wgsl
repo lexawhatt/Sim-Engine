@@ -12,18 +12,37 @@ struct SurfaceOut {
     @location(1) uv: vec2<f32>,
 };
 
-@vertex
-fn retained_vs_main(
-    @location(0) position: vec3<f32>,
-    @location(1) row0: vec4<f32>, @location(2) row1: vec4<f32>,
-    @location(3) row2: vec4<f32>, @location(4) color: vec4<f32>,
-    @location(5) uv: vec2<f32>,
+fn retained_transform(
+    position: vec3<f32>,
+    row0: vec4<f32>, row1: vec4<f32>,
+    row2: vec4<f32>, color: vec4<f32>,
+    uv: vec2<f32>,
 ) -> SurfaceOut {
     let model = vec4<f32>(position, 1.0);
     let world = vec4<f32>(dot(row0, model), dot(row1, model), dot(row2, model), 1.0);
     let clip = vec4<f32>(dot(camera3d.clip_row_0, world), dot(camera3d.clip_row_1, world),
         dot(camera3d.clip_row_2, world), dot(camera3d.clip_row_3, world));
     return SurfaceOut(clip, color, uv);
+}
+
+@vertex
+fn retained_vs_main(
+    @location(0) position: vec3<f32>, @location(1) row0: vec4<f32>, @location(2) row1: vec4<f32>,
+    @location(3) row2: vec4<f32>, @location(4) color: vec4<f32>, @location(5) uv: vec2<f32>,
+) -> SurfaceOut {
+    return retained_transform(position, row0, row1, row2, color, uv);
+}
+@vertex
+fn colored_retained_vs_main(
+    @location(0) position: vec3<f32>, @location(1) row0: vec4<f32>, @location(2) row1: vec4<f32>,
+    @location(3) row2: vec4<f32>, @location(4) color: vec4<f32>, @location(5) uv: vec2<f32>,
+    @location(6) vertex_color: vec4<f32>,
+) -> SurfaceOut {
+    return retained_transform(position, row0, row1, row2, color * vertex_color, uv);
+}
+@vertex
+fn colored_clipped_vs_main(@location(0) clip: vec4<f32>, @location(4) color: vec4<f32>, @location(5) uv: vec2<f32>, @location(6) vertex_color: vec4<f32>) -> SurfaceOut {
+    return SurfaceOut(clip, color * vertex_color, uv);
 }
 
 @vertex
