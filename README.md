@@ -1,14 +1,17 @@
 # Sim;Engine
 
-Development checkout: **0.4.0-dev.1**, not a published 0.4.0 release.
+Development checkout: **0.4.0-dev.2**, not a published 0.4.0 release.
 Stable installation examples below remain on 0.3.0. See the
 [development integration notes](DOCUMENTATION.md#04-development-preview)
 and [unreleased changelog](CHANGELOG.md#unreleased---040-development)
 for the implemented subset and source migrations. Sim;Logic's first 0.4
 handoff will be an exact tested git revision before crates.io publication.
 The preview includes reusable CPU/prepared text, explicit 3D surface policies,
-capacity-reusing mesh updates and vertex colors. Alpha materials, lighting,
-mipmapped texture updates and fog are still in development.
+capacity-reusing mesh updates, vertex colors, Opaque/Mask/Blend materials and
+explicit surface sidedness. Lighting, mipmapped texture updates and fog are
+still in development.
+The 0.4.0 priority is completing the integration requirements and measurement
+baselines; intensive performance optimization is planned for 0.4.1.
 
 Sim;Engine is a validated visualization library built for simulation products.
 It provides a high-performance 2D renderer, scientific visualization paths,

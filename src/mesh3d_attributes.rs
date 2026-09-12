@@ -44,8 +44,8 @@ impl Mesh3dAttributes {
     ///
     /// Reports the source vertex index of the first non-finite or out-of-range
     /// channel. Mesh construction separately checks the exact vertex count.
-    /// Today's opaque surface pass ignores vertex alpha and writes alpha one;
-    /// RGB is interpolated perspectively and multiplies surface/texture tint.
+    /// Opaque surfaces ignore vertex alpha; Mask and Blend use the combined
+    /// alpha. RGBA is interpolated perspectively and multiplies surface/texture tint.
     /// Mathematical display edges keep their independent wireframe colors.
     pub fn with_vertex_colors(mut self, colors: Vec<Color>) -> Result<Self, Mesh3dError> {
         if let Some(vertex_index) = colors.iter().position(|color| !color.is_normalized()) {

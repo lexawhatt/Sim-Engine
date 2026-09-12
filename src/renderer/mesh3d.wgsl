@@ -15,11 +15,13 @@ struct Mesh3dVertexIn {
     @location(2) model_row_1: vec4<f32>,
     @location(3) model_row_2: vec4<f32>,
     @location(4) color: vec4<f32>,
+    @location(7) surface: vec4<f32>,
 };
 
 struct Mesh3dVertexOut {
     @builtin(position) position: vec4<f32>,
     @location(0) color: vec4<f32>,
+    @location(2) @interpolate(flat) surface: vec2<f32>,
 };
 
 fn mesh3d_transform(input: Mesh3dVertexIn) -> Mesh3dVertexOut {
@@ -38,6 +40,7 @@ fn mesh3d_transform(input: Mesh3dVertexIn) -> Mesh3dVertexOut {
         dot(camera3d.clip_row_3, world),
     );
     output.color = input.color;
+    output.surface = input.surface.xy;
     return output;
 }
 
@@ -52,12 +55,14 @@ fn mesh3d_colored_vs_main(input: Mesh3dVertexIn, @location(6) vertex_color: vec4
     return output;
 }
 @vertex
-fn mesh3d_colored_clipped_vs_main(@location(0) clip_position: vec4<f32>, @location(4) color: vec4<f32>, @location(6) vertex_color: vec4<f32>) -> Mesh3dVertexOut {
-    return Mesh3dVertexOut(clip_position, color * vertex_color);
+fn mesh3d_colored_clipped_vs_main(@location(0) clip_position: vec4<f32>, @location(4) color: vec4<f32>, @location(6) vertex_color: vec4<f32>, @location(7) surface: vec4<f32>) -> Mesh3dVertexOut {
+    return Mesh3dVertexOut(clip_position, color * vertex_color, surface.xy);
 }
 
 @fragment
 fn mesh3d_fs_main(input: Mesh3dVertexOut) -> @location(0) vec4<f32> {
+    if input.surface.x == 1.0 && input.color.a < input.surface.y { discard; }
+    if input.surface.x == 2.0 { return input.color; }
     return vec4<f32>(input.color.rgb, 1.0);
 }
 
@@ -67,8 +72,9 @@ fn mesh3d_fs_main(input: Mesh3dVertexOut) -> @location(0) vec4<f32> {
 fn mesh3d_clipped_surface_vs_main(
     @location(0) clip_position: vec4<f32>,
     @location(4) color: vec4<f32>,
+    @location(7) surface: vec4<f32>,
 ) -> Mesh3dVertexOut {
-    return Mesh3dVertexOut(clip_position, color);
+    return Mesh3dVertexOut(clip_position, color, surface.xy);
 }
 
 struct Mesh3dEdgeIn {

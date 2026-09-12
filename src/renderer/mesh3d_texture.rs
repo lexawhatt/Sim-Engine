@@ -1,4 +1,4 @@
-//! Immutable opaque texture materials for the retained 3D surface path.
+//! Immutable straight-alpha texture materials for the retained 3D surface path.
 
 use super::*;
 use crate::mesh3d::TextureCoordinate2d;
@@ -12,7 +12,7 @@ mod tests;
 #[cfg(test)]
 pub(super) use tests::{assert_gpu_texture_contract, assert_gpu_textured_recovery};
 
-/// Validation or allocation failure for an opaque retained 3D texture/material.
+/// Validation or allocation failure for a retained 3D texture/material.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Texture3dError {
     /// Image dimensions, retained bytes, allocation or device limits failed.
@@ -22,7 +22,7 @@ pub enum Texture3dError {
         /// Zero-based source texel index.
         texel: usize,
     },
-    /// A material tint must be normalized linear RGBA with alpha exactly one.
+    /// Tint must be normalized linear RGBA; the legacy constructor also requires alpha one.
     InvalidTint,
     /// Attaching a texture requires a surface and one UV per mesh vertex.
     MissingTextureCoordinates,
@@ -39,7 +39,10 @@ impl fmt::Display for Texture3dError {
             Self::NonOpaquePixel { texel } => {
                 write!(formatter, "3D texture texel {texel} is not opaque")
             }
-            Self::InvalidTint => write!(formatter, "3D texture tint must be normalized and opaque"),
+            Self::InvalidTint => write!(
+                formatter,
+                "3D texture tint must be normalized; alpha requires the explicit with_alpha constructor"
+            ),
             Self::MissingTextureCoordinates => {
                 write!(formatter, "textured 3D surfaces require per-vertex UVs")
             }
@@ -57,13 +60,16 @@ struct TextureStorage {
     image: Image2d,
     nearest: wgpu::BindGroup,
     linear: wgpu::BindGroup,
+    preserve_alpha: bool,
+    first_nonopaque_texel: Option<usize>,
 }
 
-/// Cheap shared handle for immutable opaque, single-level sRGB RGBA8 texels.
+/// Cheap shared handle for immutable, single-level sRGB RGBA8 texels.
 ///
 /// Clones share CPU recovery pixels and the GPU allocation. U/V has a top-left
 /// origin; addressing clamps to the image boundary, with no mipmap generation.
-/// Only alpha 255 is accepted. Restoring returns a new device-owned handle;
+/// Legacy creation accepts alpha 255 only; explicit alpha creation preserves it.
+/// Restoring returns a new device-owned handle and replays the alpha policy;
 /// existing clones remain stale until explicitly rebound or scene-restored.
 #[derive(Clone)]
 pub struct Texture3d {
@@ -78,6 +84,10 @@ impl Texture3d {
     /// Returns immutable retained row-major, top-to-bottom sRGB RGBA8 texels.
     pub fn pixels(&self) -> &[u8] {
         self.storage.image.pixels()
+    }
+    /// Whether creation explicitly preserved arbitrary source alpha for mask/blend use.
+    pub fn preserves_alpha(&self) -> bool {
+        self.storage.preserve_alpha
     }
     /// Returns creation limits retained for restoration.
     pub fn budget(&self) -> ImageBudget {
@@ -133,12 +143,11 @@ impl Texture3d {
     }
 }
 
-/// Cheap immutable unlit material sharing one opaque texture and filter state.
+/// Cheap immutable unlit material sharing one texture and filter state.
 ///
-/// Sampled linear RGB is multiplied by this normalized opaque tint and the
-/// object's `SurfaceStyle3d` color. Depth writes/tests and no-culling winding
-/// semantics are identical to ordinary opaque surfaces. Transparency, lighting
-/// and alpha-cutout are intentionally separate capabilities.
+/// Sampled straight-linear RGBA multiplies vertex color, this tint and the
+/// object's surface tint. Surface style selects alpha coverage, depth-write
+/// behavior and projected sidedness. No lighting is implied.
 #[derive(Clone)]
 pub struct TextureMaterial3d {
     texture: Texture3d,
@@ -147,13 +156,29 @@ pub struct TextureMaterial3d {
 }
 
 impl TextureMaterial3d {
-    /// Creates an immutable material; tint is normalized and fully opaque.
+    /// Creates a legacy opaque material; tint must be normalized with alpha one,
+    /// and every source texel must have alpha 255, even for alpha-capable textures.
     pub fn new(
         texture: &Texture3d,
         sampling: ImageSampling,
         tint: Color,
     ) -> Result<Self, Texture3dError> {
         if !tint.is_normalized() || tint.alpha() != 1.0 {
+            return Err(Texture3dError::InvalidTint);
+        }
+        if let Some(texel) = texture.storage.first_nonopaque_texel {
+            return Err(Texture3dError::NonOpaquePixel { texel });
+        }
+        Self::with_alpha(texture, sampling, tint)
+    }
+    /// Creates a material preserving normalized straight-linear tint and texture alpha.
+    /// Coverage/depth behavior is chosen by each object's surface style.
+    pub fn with_alpha(
+        texture: &Texture3d,
+        sampling: ImageSampling,
+        tint: Color,
+    ) -> Result<Self, Texture3dError> {
+        if !tint.is_normalized() {
             return Err(Texture3dError::InvalidTint);
         }
         Ok(Self {
@@ -170,7 +195,7 @@ impl TextureMaterial3d {
     pub const fn sampling(&self) -> ImageSampling {
         self.sampling
     }
-    /// Returns multiplicative opaque linear-RGBA tint.
+    /// Returns the normalized multiplicative straight-linear RGBA tint.
     pub const fn tint(&self) -> Color {
         self.tint
     }
@@ -203,10 +228,10 @@ impl MeshUvGpu {
 
 pub(super) struct MeshTextureRenderer {
     pub(super) layout: wgpu::BindGroupLayout,
-    pub(super) retained_pipeline: wgpu::RenderPipeline,
-    pub(super) clipped_pipeline: wgpu::RenderPipeline,
-    pub(super) colored_retained_pipeline: wgpu::RenderPipeline,
-    pub(super) colored_clipped_pipeline: wgpu::RenderPipeline,
+    pub(super) retained_pipeline: SurfacePipelines,
+    pub(super) clipped_pipeline: SurfacePipelines,
+    pub(super) colored_retained_pipeline: SurfacePipelines,
+    pub(super) colored_clipped_pipeline: SurfacePipelines,
 }
 
 impl MeshTextureRenderer {
@@ -246,60 +271,17 @@ impl MeshTextureRenderer {
             immediate_size: 0,
         });
         let pipeline = |clipped: bool, colored: bool| {
-            let mut buffers = if clipped {
-                vec![
-                    Some(SurfaceClipVertex::TEXTURED_LAYOUT),
-                    Some(MeshInstanceGpu::LAYOUT),
-                ]
-            } else {
-                vec![
-                    Some(MeshVertexGpu::LAYOUT),
-                    Some(MeshUvGpu::LAYOUT),
-                    Some(MeshInstanceGpu::LAYOUT),
-                ]
-            };
-            if colored {
-                buffers.push(Some(MeshColorGpu::LAYOUT));
-            }
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("sim-engine opaque textured 3D pipeline"),
-                layout: Some(&pipeline_layout),
-                vertex: wgpu::VertexState {
-                    module: &shader,
-                    entry_point: Some(match (clipped, colored) {
-                        (false, false) => "retained_vs_main",
-                        (true, false) => "clipped_vs_main",
-                        (false, true) => "colored_retained_vs_main",
-                        (true, true) => "colored_clipped_vs_main",
-                    }),
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                    buffers: &buffers,
+            create_surface_pipelines(
+                device,
+                format,
+                &pipeline_layout,
+                &shader,
+                SurfaceLayout {
+                    clipped,
+                    colored,
+                    textured: true,
                 },
-                primitive: wgpu::PrimitiveState {
-                    topology: wgpu::PrimitiveTopology::TriangleList,
-                    ..Default::default()
-                },
-                depth_stencil: Some(wgpu::DepthStencilState {
-                    format: DEPTH_FORMAT,
-                    depth_write_enabled: Some(true),
-                    depth_compare: Some(wgpu::CompareFunction::Less),
-                    stencil: wgpu::StencilState::default(),
-                    bias: wgpu::DepthBiasState::default(),
-                }),
-                multisample: wgpu::MultisampleState::default(),
-                fragment: Some(wgpu::FragmentState {
-                    module: &shader,
-                    entry_point: Some("fs_main"),
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format,
-                        blend: None,
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                }),
-                multiview_mask: None,
-                cache: None,
-            })
+            )
         };
         Self {
             retained_pipeline: pipeline(false, false),
@@ -333,6 +315,27 @@ impl WgpuRenderer {
         )
     }
 
+    /// Creates sRGB RGBA8 texels with explicitly preserved straight alpha.
+    /// Mask/blend materials sample alpha; Opaque surfaces deliberately ignore it.
+    pub fn create_texture3d_rgba8_with_alpha(
+        &self,
+        width: u32,
+        height: u32,
+        pixels: Vec<u8>,
+        budget: ImageBudget,
+    ) -> Result<Texture3d, Texture3dError> {
+        create_texture_with_alpha(
+            &self.device,
+            &self.queue,
+            &self.renderer_identity,
+            &self.mesh3d_renderer.textures.layout,
+            width,
+            height,
+            pixels,
+            budget,
+        )
+    }
+
     /// Restores exact retained pixels on the current device. Existing handles
     /// remain unchanged; atomic `restore_scene3d` restores shared textures once.
     pub fn restore_texture3d(&self, source: &Texture3d) -> Result<Texture3d, Texture3dError> {
@@ -345,7 +348,17 @@ impl WgpuRenderer {
         )
         .map_err(Texture3dError::Image)?;
         let pixels = copy_recovery_pixels(source)?;
-        self.create_texture3d_rgba8(source.size().0, source.size().1, pixels, source.budget())
+        create_texture_impl(
+            &self.device,
+            &self.queue,
+            &self.renderer_identity,
+            &self.mesh3d_renderer.textures.layout,
+            source.size().0,
+            source.size().1,
+            pixels,
+            source.budget(),
+            source.preserves_alpha(),
+        )
     }
 
     /// Associates a shared material with a new retained mesh handle without
@@ -390,6 +403,39 @@ pub(super) fn create_texture(
     pixels: Vec<u8>,
     budget: ImageBudget,
 ) -> Result<Texture3d, Texture3dError> {
+    create_texture_impl(
+        device, queue, identity, layout, width, height, pixels, budget, false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn create_texture_with_alpha(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    identity: &Arc<()>,
+    layout: &wgpu::BindGroupLayout,
+    width: u32,
+    height: u32,
+    pixels: Vec<u8>,
+    budget: ImageBudget,
+) -> Result<Texture3d, Texture3dError> {
+    create_texture_impl(
+        device, queue, identity, layout, width, height, pixels, budget, true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn create_texture_impl(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    identity: &Arc<()>,
+    layout: &wgpu::BindGroupLayout,
+    width: u32,
+    height: u32,
+    pixels: Vec<u8>,
+    budget: ImageBudget,
+    preserve_alpha: bool,
+) -> Result<Texture3d, Texture3dError> {
     image::validate_image_shape(
         width,
         height,
@@ -398,7 +444,8 @@ pub(super) fn create_texture(
         device.limits().max_texture_dimension_2d,
     )
     .map_err(Texture3dError::Image)?;
-    if let Some(texel) = pixels.chunks_exact(4).position(|pixel| pixel[3] != 255) {
+    let first_nonopaque_texel = pixels.chunks_exact(4).position(|pixel| pixel[3] != 255);
+    if !preserve_alpha && let Some(texel) = first_nonopaque_texel {
         return Err(Texture3dError::NonOpaquePixel { texel });
     }
     let image = image::create_image_resources(
@@ -442,6 +489,8 @@ pub(super) fn create_texture(
         storage: Arc::new(TextureStorage {
             renderer_identity: Arc::clone(identity),
             image,
+            preserve_alpha,
+            first_nonopaque_texel,
             nearest,
             linear,
         }),

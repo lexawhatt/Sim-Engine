@@ -44,6 +44,7 @@ pub struct Mesh3dRenderBudget {
     max_generated_upload_bytes: usize,
     max_surface_triangles: usize,
     surface_policy: SurfaceRasterization3d,
+    max_sorting_bytes: usize,
 }
 
 impl Mesh3dRenderBudget {
@@ -59,7 +60,20 @@ impl Mesh3dRenderBudget {
             max_generated_upload_bytes: upload_bytes,
             max_surface_triangles: usize::MAX,
             surface_policy: SurfaceRasterization3d::StrictPortable,
+            max_sorting_bytes: 16 * 1024 * 1024,
         }
+    }
+
+    /// Limits transient order-record capacity in frames containing Blend objects.
+    /// Zero rejects such frames; opaque/masked-only frames allocate no order array.
+    /// Actual allocated Vec capacity is checked before GPU writes or clearing.
+    pub const fn with_max_sorting_bytes(mut self, bytes: usize) -> Self {
+        self.max_sorting_bytes = bytes;
+        self
+    }
+    /// Maximum transient sorting-array capacity, independent of generated geometry.
+    pub const fn max_sorting_bytes(self) -> usize {
+        self.max_sorting_bytes
     }
 
     /// Chooses surface raster portability for this draw. The default preserves
@@ -120,6 +134,7 @@ pub struct Mesh3dPreflightReport {
     pub(super) generated_objects: usize,
     pub(super) generated_vertices: usize,
     pub(super) generated_color_vertices: usize,
+    pub(super) sorting_capacity_bytes: usize,
     pub(super) generated_triangles: usize,
     pub(super) generated_upload_bytes: usize,
     pub(super) generated_edges: usize,
@@ -131,6 +146,11 @@ impl Mesh3dPreflightReport {
     /// Returns the surface policy used by this authoritative preflight.
     pub const fn surface_policy(self) -> SurfaceRasterization3d {
         self.surface_policy
+    }
+
+    /// Actual transient draw-order capacity, zero for opaque/masked-only frames.
+    pub const fn sorting_capacity_bytes(self) -> usize {
+        self.sorting_capacity_bytes
     }
 
     /// Returns exact retained plus generated surface triangles submitted to
@@ -219,6 +239,7 @@ pub(super) struct SurfaceFrame {
     pub(super) colors: Vec<MeshColorGpu>,
     pub(super) edges: Vec<SurfaceClipEdge>,
     pub(super) objects: Vec<SurfaceObject>,
+    pub(super) order: Vec<material::SurfaceDraw>,
 }
 
 pub(super) struct SurfaceObject {
@@ -269,6 +290,7 @@ pub(super) fn preflight(
         colors: Vec::new(),
         edges: Vec::new(),
         objects: Vec::new(),
+        order: Vec::new(),
     };
     frame
         .objects

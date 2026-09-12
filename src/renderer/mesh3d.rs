@@ -20,7 +20,20 @@ mod texture;
 use texture::{MeshTextureRenderer, MeshUvGpu};
 #[path = "mesh3d_colors.rs"]
 mod colors;
+use crate::mesh3d::{SurfaceAlphaMode3d, SurfaceSidedness3d};
 use colors::MeshColorGpu;
+#[path = "mesh3d_surface_pipeline.rs"]
+mod surface_pipeline;
+use surface_pipeline::{SurfaceLayout, SurfacePipelines, create_surface_pipelines};
+#[path = "mesh3d_material.rs"]
+mod material;
+#[cfg(test)]
+#[path = "mesh3d_material_tests.rs"]
+mod material_tests;
+
+#[cfg(test)]
+#[path = "mesh3d_material_resource_tests.rs"]
+mod material_resource_tests;
 pub use texture::{Texture3d, Texture3dError, TextureMaterial3d};
 
 #[cfg(test)]
@@ -85,11 +98,11 @@ struct MeshInstanceGpu {
     model_row_1: [f32; 4],
     model_row_2: [f32; 4],
     color: [f32; 4],
+    surface: [f32; 4],
 }
 
 impl MeshInstanceGpu {
-    const ATTRIBUTES: [wgpu::VertexAttribute; 4] =
-        wgpu::vertex_attr_array![1 => Float32x4, 2 => Float32x4, 3 => Float32x4, 4 => Float32x4];
+    const ATTRIBUTES: [wgpu::VertexAttribute; 5] = wgpu::vertex_attr_array![1 => Float32x4, 2 => Float32x4, 3 => Float32x4, 4 => Float32x4, 7 => Float32x4];
     const LAYOUT: wgpu::VertexBufferLayout<'static> = wgpu::VertexBufferLayout {
         array_stride: std::mem::size_of::<Self>() as wgpu::BufferAddress,
         step_mode: wgpu::VertexStepMode::Instance,
@@ -194,12 +207,12 @@ struct ClipProbeOutputGpu {
 pub(super) struct Mesh3dRenderer {
     dynamic_scratch: dynamic::DynamicMesh3dScratch,
     textures: MeshTextureRenderer,
-    pipeline: wgpu::RenderPipeline,
-    colored_pipeline: wgpu::RenderPipeline,
-    colored_clipped_pipeline: wgpu::RenderPipeline,
+    pipeline: SurfacePipelines,
+    colored_pipeline: SurfacePipelines,
+    colored_clipped_pipeline: SurfacePipelines,
     clipped_color_buffer: Option<wgpu::Buffer>,
     clipped_color_capacity: usize,
-    clipped_surface_pipeline: wgpu::RenderPipeline,
+    clipped_surface_pipeline: SurfacePipelines,
     clipped_surface_buffer: Option<wgpu::Buffer>,
     clipped_surface_capacity: usize,
     clipped_surface_objects: Vec<SurfaceObject>,
@@ -284,78 +297,28 @@ impl Mesh3dRenderer {
             bind_group_layouts: &[Some(&camera_layout)],
             immediate_size: 0,
         });
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("sim-engine retained 3D mesh pipeline"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("mesh3d_vs_main"),
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-                buffers: &[Some(MeshVertexGpu::LAYOUT), Some(MeshInstanceGpu::LAYOUT)],
+        let pipeline = create_surface_pipelines(
+            device,
+            format,
+            &pipeline_layout,
+            &shader,
+            SurfaceLayout {
+                clipped: false,
+                textured: false,
+                colored: false,
             },
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                ..Default::default()
+        );
+        let clipped_surface_pipeline = create_surface_pipelines(
+            device,
+            format,
+            &pipeline_layout,
+            &shader,
+            SurfaceLayout {
+                clipped: true,
+                textured: false,
+                colored: false,
             },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: DEPTH_FORMAT,
-                depth_write_enabled: Some(true),
-                depth_compare: Some(wgpu::CompareFunction::Less),
-                stencil: wgpu::StencilState::default(),
-                bias: wgpu::DepthBiasState::default(),
-            }),
-            multisample: wgpu::MultisampleState::default(),
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("mesh3d_fs_main"),
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            multiview_mask: None,
-            cache: None,
-        });
-        let clipped_surface_pipeline =
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("sim-engine clipped 3D surface pipeline"),
-                layout: Some(&pipeline_layout),
-                vertex: wgpu::VertexState {
-                    module: &shader,
-                    entry_point: Some("mesh3d_clipped_surface_vs_main"),
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                    buffers: &[
-                        Some(SurfaceClipVertex::LAYOUT),
-                        Some(MeshInstanceGpu::LAYOUT),
-                    ],
-                },
-                primitive: wgpu::PrimitiveState {
-                    topology: wgpu::PrimitiveTopology::TriangleList,
-                    ..Default::default()
-                },
-                depth_stencil: Some(wgpu::DepthStencilState {
-                    format: DEPTH_FORMAT,
-                    depth_write_enabled: Some(true),
-                    depth_compare: Some(wgpu::CompareFunction::Less),
-                    stencil: wgpu::StencilState::default(),
-                    bias: wgpu::DepthBiasState::default(),
-                }),
-                multisample: wgpu::MultisampleState::default(),
-                fragment: Some(wgpu::FragmentState {
-                    module: &shader,
-                    entry_point: Some("mesh3d_fs_main"),
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format,
-                        blend: None,
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                }),
-                multiview_mask: None,
-                cache: None,
-            });
+        );
         let edge_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("sim-engine 3D edge pipeline layout"),
             bind_group_layouts: &[Some(&camera_layout), Some(&edge_object_layout)],
@@ -405,19 +368,27 @@ impl Mesh3dRenderer {
             dynamic_scratch: dynamic::DynamicMesh3dScratch::default(),
             textures: MeshTextureRenderer::new(device, format, &camera_layout),
             pipeline,
-            colored_pipeline: colors::colored_pipeline(
+            colored_pipeline: create_surface_pipelines(
                 device,
                 format,
                 &pipeline_layout,
                 &shader,
-                false,
+                SurfaceLayout {
+                    clipped: false,
+                    textured: false,
+                    colored: true,
+                },
             ),
-            colored_clipped_pipeline: colors::colored_pipeline(
+            colored_clipped_pipeline: create_surface_pipelines(
                 device,
                 format,
                 &pipeline_layout,
                 &shader,
-                true,
+                SurfaceLayout {
+                    clipped: true,
+                    textured: false,
+                    colored: true,
+                },
             ),
             clipped_color_buffer: None,
             clipped_color_capacity: 0,
@@ -559,7 +530,7 @@ pub struct RetainedMesh3d {
 }
 
 impl RetainedMesh3d {
-    /// Returns the optional opaque shared texture material for this handle.
+    /// Returns the optional shared texture/filter/tint material for this handle.
     /// Mesh clones share buffers while retaining independent material selection.
     pub const fn material(&self) -> Option<&TextureMaterial3d> {
         self.material.as_ref()
@@ -753,6 +724,13 @@ impl Error for Mesh3dResourceError {}
 /// Failure while encoding a depth-tested 3D scene.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mesh3dRenderError {
+    /// Transient Blend ordering capacity exceeded its explicit byte ceiling.
+    SortingBudgetExceeded {
+        /// Configured sorting-array byte limit.
+        limit: usize,
+        /// Required or actually reserved bytes.
+        actual: usize,
+    },
     /// A mesh or target belongs to another renderer/device identity.
     RendererMismatch,
     /// Model/camera inputs or their arithmetic leave the portable GPU envelope.
@@ -874,6 +852,10 @@ impl Mesh3dRenderError {
 impl fmt::Display for Mesh3dRenderError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::SortingBudgetExceeded { limit, actual } => write!(
+                formatter,
+                "3D sorting storage {actual} exceeds {limit} bytes"
+            ),
             Self::RendererMismatch => {
                 write!(formatter, "3D scene resource belongs to another renderer")
             }
@@ -1126,7 +1108,8 @@ impl WgpuRenderer {
         self.create_render_target3d(source.width(), source.height(), source.logical_viewport())
     }
 
-    /// Draws opaque retained objects into a reusable color/depth target.
+    /// Draws retained opaque/masked surfaces, sorted blended surfaces, then edges
+    /// into a reusable premultiplied color/depth target.
     ///
     /// Object insertion order does not determine visibility. Every surface
     /// writes and tests hardware depth. Model transforms are uploaded through a
@@ -1236,13 +1219,17 @@ impl Mesh3dRenderer {
         {
             return Err(Mesh3dRenderError::InstanceCapacityTooLarge);
         }
-        let frame = surface::preflight(
+        let order = material::prepare_order(scene, camera, budget)?;
+        let mut frame = surface::preflight(
             renderer_identity,
             scene,
             camera_uniform,
             budget,
             device.limits().max_buffer_size,
         )?;
+        frame.report.sorting_capacity_bytes =
+            order.capacity() * std::mem::size_of::<material::SurfaceDraw>();
+        frame.order = order;
         Ok((camera_uniform, frame))
     }
     #[allow(clippy::too_many_arguments)]
@@ -1339,6 +1326,7 @@ impl Mesh3dRenderer {
                 model_row_0: model_rows[0],
                 model_row_1: model_rows[1],
                 model_row_2: model_rows[2],
+                surface: material::surface_parameters(instance.style.surface_style()),
                 color: {
                     let color = instance
                         .style
@@ -1415,13 +1403,14 @@ impl Mesh3dRenderer {
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("sim-engine retained 3D scene encoder"),
         });
-        encode_scene_pass(
+        encode_ordered_scene_pass(
             &mut encoder,
             self,
             &target.color.view,
             &target.depth_view,
             scene.background(),
             scene.instances(),
+            &surface_frame.order,
         );
         queue.submit([encoder.finish()]);
         let encode_submit = encode_started_at.elapsed();
@@ -1799,7 +1788,7 @@ fn restore_scene3d_resources(
     }
     for prepared in prepared_textures {
         let (width, height) = prepared.source.size();
-        let restored = texture::create_texture(
+        let restored = texture::create_texture_impl(
             device,
             queue,
             &renderer_identity,
@@ -1808,6 +1797,7 @@ fn restore_scene3d_resources(
             height,
             prepared.pixels,
             prepared.source.budget(),
+            prepared.source.preserves_alpha(),
         )
         .map_err(Mesh3dResourceError::Texture)?;
         restored_textures.push((prepared.key, restored));
@@ -3093,6 +3083,7 @@ fn shader_dot(row: [f32; 4], point: [f32; 4]) -> Result<f32, Mesh3dRenderError> 
     shader_dot_range(row, point.map(ShaderValueRange::exact)).map(|value| value.fixed)
 }
 
+#[cfg(test)]
 fn encode_scene_pass(
     encoder: &mut wgpu::CommandEncoder,
     renderer: &Mesh3dRenderer,
@@ -3100,6 +3091,26 @@ fn encode_scene_pass(
     depth_view: &wgpu::TextureView,
     background: Color,
     instances: &[Mesh3dInstance],
+) {
+    encode_ordered_scene_pass(
+        encoder,
+        renderer,
+        color_view,
+        depth_view,
+        background,
+        instances,
+        &[],
+    );
+}
+
+fn encode_ordered_scene_pass(
+    encoder: &mut wgpu::CommandEncoder,
+    renderer: &Mesh3dRenderer,
+    color_view: &wgpu::TextureView,
+    depth_view: &wgpu::TextureView,
+    background: Color,
+    instances: &[Mesh3dInstance],
+    order: &[material::SurfaceDraw],
 ) {
     let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
         label: Some("sim-engine retained 3D mesh pass"),
@@ -3126,11 +3137,22 @@ fn encode_scene_pass(
     });
     pass.set_pipeline(&renderer.pipeline);
     pass.set_bind_group(0, &renderer.camera_bind_group, &[]);
-    for (instance_index, instance) in instances
+    let mut insertion = instances
         .iter()
         .filter(|instance| instance.visible)
-        .enumerate()
-    {
+        .enumerate();
+    let mut sorted = order.iter();
+    loop {
+        let next = if order.is_empty() {
+            insertion.next()
+        } else {
+            sorted
+                .next()
+                .map(|entry| (entry.visible_index, &instances[entry.scene_index]))
+        };
+        let Some((instance_index, instance)) = next else {
+            break;
+        };
         if instance.style.surface_style().is_none() || instance.mesh.index_count == 0 {
             continue;
         }
@@ -3138,6 +3160,9 @@ fn encode_scene_pass(
             (instance_index * std::mem::size_of::<MeshInstanceGpu>()) as wgpu::BufferAddress;
         let instance_end =
             instance_start + std::mem::size_of::<MeshInstanceGpu>() as wgpu::BufferAddress;
+        let Some(surface_style) = instance.style.surface_style() else {
+            continue;
+        };
         let material = instance.mesh.material();
         let colored = instance.mesh.color_buffer.is_some();
         if let Some(material) = material {
@@ -3151,12 +3176,13 @@ fn encode_scene_pass(
             let Some(buffer) = &renderer.clipped_surface_buffer else {
                 continue;
             };
-            pass.set_pipeline(match (material.is_some(), colored) {
+            let pipelines = match (material.is_some(), colored) {
                 (false, false) => &renderer.clipped_surface_pipeline,
                 (false, true) => &renderer.colored_clipped_pipeline,
                 (true, false) => &renderer.textures.clipped_pipeline,
                 (true, true) => &renderer.textures.colored_clipped_pipeline,
-            });
+            };
+            pass.set_pipeline(pipelines.for_style(surface_style));
             let stride = std::mem::size_of::<SurfaceClipVertex>() as u64;
             pass.set_vertex_buffer(
                 0,
@@ -3182,12 +3208,13 @@ fn encode_scene_pass(
         let Some(index_buffer) = &instance.mesh.index_buffer else {
             continue;
         };
-        pass.set_pipeline(match (material.is_some(), colored) {
+        let pipelines = match (material.is_some(), colored) {
             (false, false) => &renderer.pipeline,
             (false, true) => &renderer.colored_pipeline,
             (true, false) => &renderer.textures.retained_pipeline,
             (true, true) => &renderer.textures.colored_retained_pipeline,
-        });
+        };
+        pass.set_pipeline(pipelines.for_style(surface_style));
         pass.set_vertex_buffer(0, instance.mesh.vertex_buffer.slice(..));
         let instance_slot = if material.is_some() {
             if let Some(coordinates) = &instance.mesh.texture_coordinate_buffer {
@@ -3284,6 +3311,8 @@ pub(super) fn assert_gpu_depth_contract(
 ) {
     dynamic::assert_gpu_dynamic_contract(device, queue, format);
     vertex_color_tests::assert_gpu_vertex_color_contract(device, queue, format);
+    material_tests::assert_gpu_material_contract(device, queue, format);
+    material_resource_tests::assert_gpu_sort_budget(device, queue, format);
     color_budget_tests::assert_gpu_color_budget(device, queue, format);
     surface::assert_gpu_surface_contract(device, queue, format);
     surface::assert_gpu_native_surface_policy(device, queue, format);
@@ -3494,6 +3523,7 @@ pub(super) fn assert_gpu_depth_contract(
                 model_row_0: rows[0],
                 model_row_1: rows[1],
                 model_row_2: rows[2],
+                surface: material::surface_parameters(instance.style.surface_style()),
                 color: instance
                     .style
                     .surface_style()
@@ -3722,6 +3752,12 @@ pub(super) fn assert_gpu_scene_recovery_contract(
     recovery_queue: &wgpu::Queue,
 ) {
     dynamic::assert_gpu_dynamic_recovery(
+        source_device,
+        source_queue,
+        recovery_device,
+        recovery_queue,
+    );
+    material_resource_tests::assert_gpu_alpha_recovery(
         source_device,
         source_queue,
         recovery_device,

@@ -4,30 +4,9 @@ use crate::{Color, LogicalPixels, Vec3};
 
 const MAX_LOGICAL_EDGE_METRIC: f32 = 1_048_576.0;
 
-/// Surface material for one retained 3D instance.
-///
-/// The representation is private so translucent and hatched section modes can
-/// be added without changing `Mesh3dInstance` construction. The first renderer
-/// slice supports only opaque color/depth-writing surfaces.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct SurfaceStyle3d {
-    color: Color,
-}
-
-impl SurfaceStyle3d {
-    /// Creates an opaque linear-RGBA surface.
-    pub fn opaque(color: Color) -> Result<Self, Mesh3dStyleError> {
-        if !color.is_normalized() || color.alpha() != 1.0 {
-            return Err(Mesh3dStyleError::InvalidSurfaceColor);
-        }
-        Ok(Self { color })
-    }
-
-    /// Returns the opaque linear-RGBA color used by the current surface pass.
-    pub const fn color(self) -> Color {
-        self.color
-    }
-}
+#[path = "mesh3d_material.rs"]
+mod material;
+pub use material::{SurfaceAlphaMode3d, SurfaceSidedness3d, SurfaceStyle3d};
 
 /// Extensible visual material bundle for a retained 3D object.
 ///
@@ -41,7 +20,7 @@ pub struct MeshStyle3d {
 }
 
 impl MeshStyle3d {
-    /// Creates an object with an opaque surface and no display edges.
+    /// Creates an object with the selected surface material and no display edges.
     pub const fn surface(surface: SurfaceStyle3d) -> Self {
         Self {
             surface: Some(surface),
@@ -185,7 +164,11 @@ impl WireframeStyle3d {
 /// Rejection reason for logical-screen 3D edge presentation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mesh3dStyleError {
-    /// Surface color must be normalized and opaque in the initial material mode.
+    /// A mask/blend tint must have finite straight-linear RGBA in 0..=1.
+    InvalidMaterialColor,
+    /// The alpha-mask cutoff must be zero or normal and finite in 0..=1.
+    InvalidMaskCutoff,
+    /// The legacy opaque constructor requires normalized color with alpha one.
     InvalidSurfaceColor,
     /// Edge color must be normalized and opaque, and width must be a normal
     /// positive value no greater than [`WireframeStyle3d::MAX_LOGICAL_PIXELS`].
@@ -198,6 +181,14 @@ pub enum Mesh3dStyleError {
 impl fmt::Display for Mesh3dStyleError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidMaterialColor => write!(
+                formatter,
+                "3D material color must be normalized straight-linear RGBA"
+            ),
+            Self::InvalidMaskCutoff => write!(
+                formatter,
+                "3D mask cutoff must be zero or normal and finite in 0..=1"
+            ),
             Self::InvalidSurfaceColor => write!(formatter, "3D surface color must be opaque"),
             Self::InvalidColorOrWidth => {
                 write!(
@@ -385,8 +376,8 @@ impl Mesh3d {
 
     /// Builds topology with optional UVs and normalized straight-linear colors.
     /// Supplied attributes must match every vertex, including unused vertices.
-    /// Missing colors multiply by white; the opaque renderer ignores their
-    /// alpha. All buffers are moved into immutable shared storage without copies.
+    /// Missing colors multiply by white. Opaque ignores alpha; Mask and Blend
+    /// use combined vertex/material/texture alpha. All buffers are moved into immutable shared storage without copies.
     pub fn with_attributes(
         vertices: Vec<Vec3>,
         triangle_indices: Vec<u32>,

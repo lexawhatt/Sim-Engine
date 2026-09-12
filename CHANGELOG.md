@@ -7,10 +7,13 @@ changes.
 
 ## Unreleased - 0.4.0 development
 
-Current development version: `0.4.0-dev.1`. This is an incomplete integration
+Current development version: `0.4.0-dev.2`. This is an incomplete integration
 preview, not the official 0.4.0 release. The first external handoff will use an
 exact tested git revision for Sim;Logic; registry publication follows integration
 feedback and separate release qualification.
+The 0.4.0 scope prioritizes requested capabilities and reproducible measurement
+baselines. Intensive optimization is planned for 0.4.1, not claimed here as
+implemented work.
 
 ### Added
 
@@ -45,9 +48,25 @@ feedback and separate release qualification.
 - `Mesh3dAttributes` and `Mesh3d::with_attributes` accept normalized linear RGBA
   vertex colors alongside optional UVs. Colors interpolate through both retained
   and CPU-clipped surfaces and multiply surface/texture tints. Missing colors
-  preserve the colorless path; the current opaque pass ignores stored alpha.
+  preserve the colorless path; Opaque ignores stored alpha, while Mask and Blend
+  use the combined vertex/texture/material/surface alpha.
   Color storage participates in upload/clipping budgets, dynamic capacity reuse,
   immutable-alias isolation and exact recovery.
+- `SurfaceStyle3d::mask` and `blend`, alongside the unchanged `opaque` constructor.
+  Mask discards fragments below its alpha cutoff and writes surviving depth;
+  Blend tests depth without writing it and sorts objects back-to-front using
+  camera-forward distance, with stable insertion ties. Intersecting transparent
+  surfaces and triangle sorting within a mesh are not solved.
+- `SurfaceSidedness3d` selects two-sided rendering (default) or projected-CCW
+  front faces only. Display-edge presentation remains independent; Blend
+  surfaces do not occlude mathematical edges.
+- Explicit alpha-capable texture/material creation and normalized transparent
+  scene backgrounds. Offscreen color remains premultiplied for composition;
+  legacy opaque constructors keep their validation. Recovery preserves alpha.
+- Bounded, allocation-fallible Blend draw-order staging, reported separately
+  from retained scene memory; it does not reorder scene objects or their IDs.
+- `materials_3d` gallery for manual inspection and bounded confirmed-present
+  acceptance, with material/sidedness controls and device recovery.
 
 ### Migration notes from 0.3.0
 
@@ -64,8 +83,8 @@ feedback and separate release qualification.
 - `Mesh3dError` adds source-indexed invalid vertex colors and color-count
   mismatch errors. Existing mesh constructors still construct colorless data.
 
-The remaining 0.4.0 material, lighting, texture-lifecycle and fog
-work is not delivered by this initial slice. No general performance or release
+The remaining 0.4.0 lighting, texture-lifecycle and fog
+work is not delivered by this slice. No general performance or release
 readiness claim follows from these additions.
 
 ## 0.3.0 - 2026-09-11

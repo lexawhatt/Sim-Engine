@@ -311,6 +311,24 @@ impl Scene3d {
         if !background.is_normalized() || background.alpha() != 1.0 {
             return Err(Scene3dError::InvalidBackground);
         }
+        Self::with_alpha_background_and_budget(background, budget)
+    }
+
+    /// Creates an empty scene with a normalized straight-linear RGBA clear color.
+    /// Offscreen clear RGB is premultiplied; transparent black preserves alpha
+    /// for later target composition. This explicit API accepts alpha below one.
+    pub fn with_alpha_background(background: Color) -> Result<Self, Scene3dError> {
+        Self::with_alpha_background_and_budget(background, Scene3dBudget::default())
+    }
+
+    /// Creates an alpha-capable offscreen scene with explicit resource limits.
+    pub fn with_alpha_background_and_budget(
+        background: Color,
+        budget: Scene3dBudget,
+    ) -> Result<Self, Scene3dError> {
+        if !background.is_normalized() {
+            return Err(Scene3dError::InvalidBackground);
+        }
         let scene_id = NEXT_SCENE3D_ID
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 current.checked_add(1)
@@ -383,7 +401,7 @@ impl Scene3d {
         Ok(id)
     }
 
-    /// Returns the normalized finite opaque target clear color.
+    /// Returns the normalized straight-linear RGBA target clear color.
     pub const fn background(&self) -> Color {
         self.background
     }
@@ -994,7 +1012,7 @@ pub enum Scene3dError {
         /// Required count or bytes.
         actual: usize,
     },
-    /// The target clear color must be normalized and opaque.
+    /// The clear color must be normalized; legacy constructors also require opaque alpha.
     InvalidBackground,
     /// Surface and wireframe were both disabled.
     EmptyStyle,
@@ -1033,7 +1051,10 @@ impl fmt::Display for Scene3dError {
                 formatter,
                 "3D scene {resource:?} budget exceeded: {actual} > {limit}"
             ),
-            Self::InvalidBackground => write!(formatter, "3D scene background must be opaque"),
+            Self::InvalidBackground => write!(
+                formatter,
+                "3D scene background must be normalized; alpha requires an explicit alpha constructor"
+            ),
             Self::EmptyStyle => write!(formatter, "3D object requires a surface or wireframe"),
             Self::StyleHasNoMatchingGeometry => write!(
                 formatter,

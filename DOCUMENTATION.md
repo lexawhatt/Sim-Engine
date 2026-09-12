@@ -2,7 +2,7 @@
 
 This document contains the published 0.3.0 integration guide plus the explicit
 [0.4 development preview](#04-development-preview) below. The checkout version
-is `0.4.0-dev.1`; it is not a final 0.4.0 release. For older integrations, use the
+is `0.4.0-dev.2`; it is not a final 0.4.0 release. For older integrations, use the
 [archived 0.2 guide](https://github.com/lexawhatt/Sim-Engine/blob/v0.2.0/DOCUMENTATION.md).
 The [0.3.0 changelog](CHANGELOG.md#030---2026-09-11) includes migration notes.
 This guide is divided into two parts:
@@ -26,13 +26,19 @@ Rust version.
 
 ## 0.4 development preview
 
-Only the additions below are implemented in this initial development slice.
-The remaining 0.4 material/texture roadmap is not a shipped capability.
+Only the additions below are implemented in this development slice.
+The remaining 0.4 lighting/fog/texture-lifecycle roadmap is not a shipped capability.
 Development handoff uses a tested git commit, pinned with Cargo's `rev` field
 and the host lockfile, not an assumed stable `master` branch. A moving `_DEV`
 label is a convenience, not reproducible release evidence. The maintainer will
 provide the qualified revision after integration checks; do not publish this
 preview to crates.io as the completed release.
+
+The 0.4.0 milestone prioritizes the requested integration capabilities, their
+correctness/resource contracts, and reproducible performance measurements.
+Intensive profiling-driven optimization is planned for 0.4.1. Existing reuse
+requirements and regression gates remain part of 0.4.0; the later optimization
+phase is not a prerequisite for the Sim;Logic DEV test drive.
 
 ### CPU shaping without GPU dependencies
 
@@ -155,16 +161,99 @@ Colors interpolate perspective-correctly. RGB multiplies the surface color,
 optional sampled texture and texture-material tint in linear space. Strict CPU
 clipping carries colors with the same intersection parameter as positions/UVs;
 Native leaves this interpolation to the GPU. Mathematical-edge colors remain
-independent. The current opaque material deliberately ignores vertex alpha and
-writes alpha one; the existing 3D texture API still requires opaque texels.
-Stored vertex alpha is not yet a transparency feature: Mask and Blend materials
-remain forthcoming.
+independent. Opaque deliberately ignores combined alpha and writes alpha one;
+Mask and Blend use the combined alpha as described below. Legacy texture
+creation still requires opaque texels; alpha-bearing textures use the explicit
+new creation path.
 
 Meshes without colors allocate no color buffer. Colored sources, uploads,
 generated clipping streams and dynamic-update scratch count the additional
 storage in their existing budgets. Restoration preserves the exact colors and
 reserved capacity; color attribute layout changes follow the same whole-bundle
 replacement contract as UV changes.
+
+### Alpha materials and surface sidedness
+
+`SurfaceStyle3d` now separates coverage from tint. Input colors are normalized
+straight-linear RGBA; texture bytes are sRGB RGBA8 with linear alpha. The shader
+multiplies surface color, vertex color, sampled texture and texture-material tint.
+Missing vertex colors or textures multiply by white.
+
+| Mode | Coverage | Depth |
+| --- | --- | --- |
+| `opaque(color)` | Ignores combined alpha; output alpha is one | Test and write |
+| `mask(color, cutoff)` | Discards combined alpha below cutoff; equality survives | Test and write for surviving fragments |
+| `blend(color)` | Uses combined alpha | Test, no write |
+
+```rust
+use sim_engine::{Color, SurfaceSidedness3d, SurfaceStyle3d};
+
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+let solid = SurfaceStyle3d::opaque(Color::rgb(0.4, 0.6, 0.8))?;
+let cutout = SurfaceStyle3d::mask(Color::WHITE, 0.5)?;
+let ghost = SurfaceStyle3d::blend(Color::rgba(0.2, 0.8, 1.0, 0.35))?
+    .with_sidedness(SurfaceSidedness3d::FrontOnly);
+# let _ = (solid, cutout, ghost);
+# Ok(())
+# }
+```
+
+Two-sided rendering remains the default. `FrontOnly` retains projected
+counter-clockwise faces and culls back faces; it does not infer globally outward
+normals or fix reversed source topology. Transform scales remain positive.
+Sidedness does not remove explicit display edges.
+
+Mask cutoff must be zero or a normal finite value in `0..=1`; positive subnormal
+cutoffs are rejected rather than relying on backend flush-to-zero behavior.
+The comparison uses the filtered/interpolated alpha, not source texel coverage;
+Mask does not imply alpha-to-coverage or coverage-preserving mip filtering.
+
+For alpha-bearing image data use
+`renderer.create_texture3d_rgba8_with_alpha(width, height, pixels, budget)` and
+`TextureMaterial3d::with_alpha(&texture, sampling, tint)`. The legacy
+`create_texture3d_rgba8` and `TextureMaterial3d::new` retain their opaque-input
+validation. Transparent texels only create holes under Mask or transparency
+under Blend; an Opaque surface ignores their alpha. These textures are still
+single-level, clamp-addressed images: mipmaps and isolated repeating tiles
+remain future development work.
+
+Opaque and masked surfaces render first. Blend objects follow back-to-front,
+using the camera-forward distance of each transformed model-bounds center and
+insertion order for equal keys. This works for either camera projection and
+does not mutate `Scene3d::instances()` or object IDs. It is object-level sorting:
+intersecting/cyclic transparent surfaces and triangle order within one mesh can
+still produce incorrect overlap. It is not order-independent transparency,
+physical glass, refraction or a general translucent-section solution.
+
+Mathematical edges render last. Blend surfaces do not write the depth that
+classifies those edges; Mask holes likewise do not occlude them. Surviving
+masked fragments and opaque surfaces retain normal depth occlusion.
+
+`Scene3d::with_alpha_background(color)` opts into a normalized straight-alpha
+clear color; `with_alpha_background_and_budget` also accepts explicit scene
+limits. The old `new`/`with_budget` constructors still require opaque clears.
+Renderer targets store premultiplied color, including the clear, for use with
+existing target/frame composition. Do not premultiply the input colors yourself.
+Device and scene restoration preserve alpha texture data and material styles.
+
+Blend sorting uses bounded fallible staging before uploads or target clearing.
+Set `Mesh3dRenderBudget::with_max_sorting_bytes` to bound it; the preflight
+report's `sorting_capacity_bytes()` describes this transient allocation, not
+additional retained mesh memory. Scenes without Blend need no sorting array.
+
+Manual inspection (development checkout, not registry 0.3.0):
+
+```bash
+cargo run --release --example materials_3d
+cargo run --release --example materials_3d -- --acceptance
+```
+
+Use A or 1/2/3 to rotate material assignments across the three panels, C for
+sidedness, arrows to orbit, P for camera projection, Space to pause, R to reset,
+F5 for device recovery and Esc to exit. The window title labels the current
+panels. The acceptance mode requires 120 confirmed presents and exercises
+material, sidedness, projection and recovery transitions; it is not an FPS gate
+or a substitute for the automated pixel tests.
 
 ### Dynamic mesh revisions and capacity reuse
 
@@ -228,7 +317,8 @@ upload/allocation counters exclude camera/composition resources; thread-local
 allocation counts include backend calls on that thread, not worker threads.
 Host source snapshot bytes overlap scene CPU bytes and must not be added to
 them. This baseline does not replace the release matrix or complete the planned
-GPU-timestamp and large-scene optimization work.
+0.4.0 GPU-timestamp and workload coverage. Intensive large-scene optimization
+using these measurements is planned for 0.4.1.
 
 ## Part I: Integration Handbook
 

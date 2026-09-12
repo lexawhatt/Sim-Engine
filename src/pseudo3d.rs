@@ -465,6 +465,11 @@ impl Camera3d {
         self.position
     }
 
+    #[cfg(feature = "wgpu")]
+    pub(crate) const fn forward(self) -> Vec3 {
+        self.forward
+    }
+
     /// Returns the current perspective or orthographic projection.
     pub const fn projection(self) -> Projection3d {
         self.projection
