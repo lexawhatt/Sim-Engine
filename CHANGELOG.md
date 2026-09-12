@@ -5,17 +5,18 @@ uses a Keep a Changelog-style structure and Semantic Versioning. While the
 public API is pre-1.0, minor releases may contain documented source-breaking
 changes.
 
-## Unreleased - 0.4.0 development
+## Unreleased
 
-Current development version: `0.4.0-dev.5`. This is a development integration
-preview, not the official 0.4.0 release. External handoffs use an
-exact tested git revision for Sim;Logic; registry publication follows integration
-feedback and separate release qualification.
-The 0.4.0 scope prioritizes requested capabilities and reproducible measurement
-baselines. Intensive optimization is planned for 0.4.1, not claimed here as
-implemented work.
+No changes yet.
 
-### Consumer corrections in dev.5
+## 0.4.0 - 2026-09-12
+
+Dynamic 3D visual state, explicit alpha materials, lighting, texture lifecycle
+and reusable text preparation. This is the complete delta from 0.3.0, including
+the consumer-reported standalone restoration correction. Intensive optimization
+is planned for 0.4.1; measurement tooling is not a universal performance promise.
+
+### Fixed
 
 - Fixed standalone `restore_mesh3d` reconstructing an opaque material instead
   of preserving the source material. Transparent texels and alpha tint now
@@ -23,6 +24,11 @@ implemented work.
   the original opaque/alpha-capable rebinding policy survive along with all
   committed mip bytes/options and reserved attribute-buffer capacity.
   Whole-scene deduplicated restoration retains its existing contract.
+- Added material restoration pixel regressions on a second logical device and
+  public gallery acceptance through actual standalone restoration/rebinding.
+
+### Added
+
 - Added transactional `Scene3d::set_background` for normalized straight RGBA,
   including alpha below one. It preserves object IDs, resource residency,
   capacities, materials and environment without a geometry update or upload.
@@ -32,11 +38,6 @@ implemented work.
   the existing scene rebind contract; rejected changes preserve visual state.
 - Added `RetainedMesh3d::without_material` for an upload-free immutable plain
   handle. Old aliases keep their material; UVs remain available for rebinding.
-- Added material restoration pixel regressions on a second logical device and
-  public gallery acceptance through actual standalone restoration/rebinding.
-
-### Added
-
 - `fonts` feature exposes CPU font loading, shaping and rasterization without
   wgpu dependencies. `text` continues to include fonts and GPU atlas integration.
 - `TextShapingSession` retains a parsed face, one property-matched shaping plan
@@ -149,10 +150,16 @@ implemented work.
   diagnostic enums. Existing meshes and material constructors remain Unlit
   with fog disabled; no normal allocation is required for the old path.
 
-The combined dev.4 candidate includes the texture lifecycle and complete
-measurement tooling. Exact-revision diagnostic baselines and integration
-acceptance qualify each git handoff; these additions do not imply a universal
-performance guarantee or approval of the final 0.4.0 registry release.
+### Known limitations
+
+- Blend sorts objects, not intersecting surfaces or triangles within a mesh.
+- Point lights, shadows, PBR, hatching, projected 3D anchors and picking are
+  not included. Lighting/fog remain opt-in; the old path remains Unlit.
+- Mipmap generation does not preserve alpha-test coverage or add anisotropy.
+  A region edit regenerates/uploads all lower mip levels within explicit budgets.
+- Intel UHD (CML GT2) / Mesa 26.1.6 Vulkan qualification did not complete the
+  material readback fixture; unchanged dev.4 reproduces the wait. It is not
+  qualified by NVIDIA or software-Vulkan evidence; no root cause is asserted.
 
 ## 0.3.0 - 2026-09-11
 

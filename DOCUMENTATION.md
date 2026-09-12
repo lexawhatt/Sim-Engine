@@ -1,10 +1,11 @@
 # Sim;Engine Documentation
 
-This document contains the published 0.3.0 integration guide plus the explicit
-[0.4 development preview](#04-development-preview) below. The checkout version
-is `0.4.0-dev.5`; it is not a final 0.4.0 release. For older integrations, use the
-[archived 0.2 guide](https://github.com/lexawhatt/Sim-Engine/blob/v0.2.0/DOCUMENTATION.md).
-The [0.3.0 changelog](CHANGELOG.md#030---2026-09-11) includes migration notes.
+This is the integration and engineering guide for **Sim;Engine 0.4.0**.
+Start with the [0.4 integration guide](#04-integration-guide) for new rendering,
+text and resource workflows, or the handbook below for the complete library.
+For older integrations, use the
+[archived 0.3 guide](https://github.com/lexawhatt/Sim-Engine/blob/v0.3.0/DOCUMENTATION.md).
+The [0.4.0 changelog](CHANGELOG.md#040---2026-09-12) includes migration notes.
 This guide is divided into two parts:
 
 - [Integration Handbook](#part-i-integration-handbook) - how to add the crate,
@@ -24,28 +25,23 @@ Sim;Engine remains pre-1.0. Linux with
 Vulkan is its supported release target, and Rust 1.90 is the minimum supported
 Rust version.
 
-## 0.4 development preview
+## 0.4 integration guide
 
-This combined development candidate includes the additions below. Its git
-handoff is separate from a final registry release and host integration approval.
-Development handoff uses a tested git commit, pinned with Cargo's `rev` field
-and the host lockfile, not an assumed stable `master` branch. A moving `_DEV`
-label is a convenience, not reproducible release evidence. The maintainer will
-provide the qualified revision after integration checks; do not publish this
-preview to crates.io as the completed release.
+Version 0.4.0 delivers dynamic visual-state updates, material/texture lifecycle,
+reusable text preparation and reproducible measurements. Intensive
+profiling-driven optimization is planned for 0.4.1; existing reuse, validation
+and budget guarantees already apply. No universal frame rate is promised.
 
-The 0.4.0 milestone prioritizes the requested integration capabilities, their
-correctness/resource contracts, and reproducible performance measurements.
-Intensive profiling-driven optimization is planned for 0.4.1. Existing reuse
-requirements and regression gates remain part of 0.4.0; the later optimization
-phase is not a prerequisite for the Sim;Logic DEV test drive.
+For a git integration, pin a tested commit with Cargo's `rev` field and retain
+the host lockfile. A moving branch or `_DEV` label is not reproducible evidence.
+Consumer acceptance and Engine gates are distinct checks; official artifacts
+follow the [release procedure](#30-official-release-procedure).
 
-### Consumer corrections and in-place presentation changes (dev.5)
+### In-place presentation changes and complete restoration
 
-Use the dev.5 pin or later for standalone `renderer.restore_mesh3d(&mesh)`.
-Dev.4 incorrectly recreated a legacy opaque material in that route: transparent
-pixels/tints could reject, and UV/addressing/alpha-rebinding policy could reset.
-Restoration now preserves complete mip pixels/options, sampling, tint, signed
+Standalone `renderer.restore_mesh3d(&mesh)` preserves complete material policy.
+The dev.4 prerelease had an omission here that is corrected in 0.4.0.
+Restoration preserves complete mip pixels/options, sampling, tint, signed
 UV transformation, addressing, opaque/alpha-capable rebinding policy and every
 reserved geometry/attribute capacity. Existing source aliases do not change.
 Separate standalone restore calls recreate separate GPU resources; use
@@ -101,7 +97,7 @@ existing `text` feature still enables both fonts and wgpu text integration.
 `FontFace::shape_line` remains available. A caller-owned session reduces repeated
 face parsing, plan construction and storage allocation for changing labels:
 
-```rust
+```rust,no_run
 use sim_engine::{FontBudget, FontFace, LogicalPixels, PhysicalPerLogical,
     TextLayoutBudget, TextShapingSession, TextStyle};
 
@@ -268,7 +264,7 @@ For alpha-bearing image data use
 `create_texture3d_rgba8` and `TextureMaterial3d::new` retain their opaque-input
 validation. Transparent texels only create holes under Mask or transparency
 under Blend; an Opaque surface ignores their alpha. Legacy creation keeps one
-clamp-addressed mip level. Dev.4 adds explicit mip generation, tile isolation
+clamp-addressed mip level. Options add explicit mip generation, tile isolation
 and addressing options described below.
 
 Opaque and masked surfaces render first. Blend objects follow back-to-front,
@@ -295,7 +291,7 @@ Set `Mesh3dRenderBudget::with_max_sorting_bytes` to bound it; the preflight
 report's `sorting_capacity_bytes()` describes this transient allocation, not
 additional retained mesh memory. Scenes without Blend need no sorting array.
 
-Manual inspection (development checkout, not registry 0.3.0):
+Manual inspection from a matching 0.4 checkout:
 
 ```bash
 cargo run --release --example materials_3d
@@ -309,7 +305,7 @@ panels. The acceptance mode requires 120 confirmed presents and exercises
 material, sidedness, projection and recovery transitions; it is not an FPS gate
 or a substitute for the automated pixel tests.
 
-### Normals, lighting and distance fog (dev.3)
+### Normals, lighting and distance fog
 
 Lighting is opt-in and does not change the default scientific/stylized color
 path. Supply one nonzero model-space normal per source vertex through
@@ -425,9 +421,9 @@ preserve the prior drawable; GPU device loss follows the existing asynchronous
 recovery contract. Both `restore_mesh3d` and `restore_scene3d` preserve reserved
 buffer capacities, not just the current live topology.
 
-Every accepted update uploads all live positions, indices, UVs, colors and display
-edges, even when the supplied source is unchanged. Partial mesh edits and an
-unchanged-source no-op are not promised by this path. The returned report
+Every accepted update uploads all live positions, indices, UVs, colors, normals
+and display edges, even when the supplied source is unchanged. Partial mesh
+edits and an unchanged-source no-op are not promised by this path. The returned report
 separates uploaded/live bytes, reserved bytes, buffer allocations, alias
 detachment and scratch reuse. `mesh3d_update_scratch_bytes` and
 `clear_mesh3d_update_scratch` expose renderer-owned conversion storage, separate
@@ -454,15 +450,15 @@ All measured frames must be `Drawn`, source revision order is deterministic,
 and output changes abort measurement. The target stays 1280x720; actual surface
 size/DPI and adapter/presentation metadata are logged. CPU work excludes
 surface acquire; completed-batch wall FPS includes the final GPU completion
-drain. Neither is GPU execution time; dev.4 separately enables bounded timestamp
-queries and matches them to measured report IDs where supported. Mesh
+drain. Neither is GPU execution time; the fixture requests separate bounded
+timestamp queries and matches them to measured report IDs where supported. Mesh
 upload/allocation counters exclude camera/composition resources; thread-local
 allocation counts include backend calls on that thread, not worker threads.
 Host source snapshot bytes overlap scene CPU bytes and must not be added to
 them. This baseline does not replace the release matrix. Intensive large-scene optimization
 using these measurements is planned for 0.4.1.
 
-### Texture lifecycle and repeating tiles (dev.4)
+### Texture lifecycle and repeating tiles
 
 The default texture constructors preserve the old single-level contract.
 For reduced shimmering at distance, request a complete chain explicitly:
@@ -520,7 +516,7 @@ levels. CPU recovery and nominal GPU byte counters include the entire chain,
 not just mip zero. Image limits and GPU dimensions are checked before chain
 creation. Restoring a texture/scene uploads the retained levels exactly.
 
-### Partial 3D texture updates (dev.4)
+### Partial 3D texture updates
 
 `ImageTexelRect` uses physical source texels, not logical pixels or world units.
 The supplied byte slice starts at the patch origin; its exact length is
@@ -570,14 +566,14 @@ texture next to its unchanged immutable alias. `U` edits; `T` toggles repeat;
 `F5` replaces/restores the logical device and Esc exits. The bounded acceptance
 mode exercises these states and requires confirmed Drawn frames; manual
 inspection remains separate from pixel-oracle qualification.
-Since dev.5, the same recovery also restores four standalone meshes through
+The same recovery also restores four standalone meshes through
 the public API: transparent texels, alpha tint, signed/repeating UVs and an
 alpha-capable material whose current texture is opaque. It checks retained
 attributes/reserves, every CPU mip, alpha-image rebinding, background mutation
 and material removal without topology replacement. The mandatory GPU oracle
 separately reads the restored mip textures and rendered pixels on a new device.
 
-### GPU diagnostics and the full changing-scene matrix (dev.4)
+### GPU diagnostics and the full changing-scene matrix
 
 GPU timestamps are opt-in and require only the adapter's `TIMESTAMP_QUERY`
 feature. Enabling them is not a device requirement on unsupported adapters:
@@ -669,21 +665,28 @@ The default feature set includes the `wgpu` backend:
 
 ```toml
 [dependencies]
-sim-engine = "0.3"
+sim-engine = "0.4"
 ```
 
 Use the CPU-side visual-state APIs without GPU dependencies:
 
 ```toml
 [dependencies]
-sim-engine = { version = "0.3", default-features = false }
+sim-engine = { version = "0.4", default-features = false }
 ```
 
 | Configuration | Provides |
 | --- | --- |
 | default / `wgpu` | `WgpuRenderer`, GPU resources, targets, composition, particles, heatmaps, and retained 3D drawing |
-| `text` (opt-in; includes `wgpu`) | TTF/OTF loading from bytes, single-line shaping, antialiased glyph rasterization, fixed-capacity font atlases and retained text runs |
+| `fonts` (opt-in; CPU-only with default features disabled) | TTF/OTF loading from bytes, single-line shaping, reusable shaping sessions and antialiased glyph rasterization |
+| `text` (opt-in; includes `fonts` and `wgpu`) | CPU font APIs plus fixed-capacity GPU atlases, retained text runs and preparation from shaped lines |
 | `--no-default-features` | scenes, cameras, colors, fields, particles, tweening, 3D math, mesh topology, and styles |
+
+For CPU fonts without GPU dependencies:
+
+```toml
+sim-engine = { version = "0.4", default-features = false, features = ["fonts"] }
+```
 
 Window creation is deliberately outside the crate. The host may use `winit`,
 as the examples do, or another framework that can provide a compatible
@@ -773,8 +776,10 @@ normal finite logical dimensions, half-viewport camera translations, and clip
 coefficients. Transform sources are restricted to normal finite values with
 magnitude at most `2^120`, keeping reciprocals inside WGSL's specified
 division-accuracy domain. Directed-rounding intervals include legal
-association/FMA error. Retained 3D validation rejects any conservative range
-that cannot prove stable frustum-plane and edge classification. Likewise,
+association/FMA error. Retained 3D `StrictPortable` validation rejects ranges
+that cannot prove stable surface topology; `Native` delegates surface clipping
+to hardware but retains arithmetic checks. Both policies keep strict
+mathematical-edge classification. Likewise,
 logical joins near reversal, straight/miter, or extrusion thresholds are
 rejected instead of allowing backend-dependent topology.
 
@@ -1177,7 +1182,7 @@ cargo run --release --example frame_cache_benchmark -- \
 The `uniform_uploads` line distinguishes queue writes, internal copies and
 retained transfer-buffer bytes; the existing upload count remains host bytes.
 
-The 0.3 CPU validation path avoids duplicate position proofs and memoizes eight
+The CPU validation path avoids duplicate position proofs and memoizes eight
 exact position keys within each call, including the shared world-anchor
 projection of circle/rounded-corner vertices. The interval helper uses a single
 term-counting pass and exact precomputed rounding coefficients, with the
@@ -1502,11 +1507,15 @@ No system font is implicitly selected, and no font is included in the library
 binary. The demonstration font and its license live under `examples/assets/fonts`.
 
 ```toml
-sim-engine = { version = "0.3", features = ["text"] }
+sim-engine = { version = "0.4", features = ["text"] }
 ```
 
 The default `wgpu` feature alone still accepts host-shaped glyph atlases and
 does not enable the font loader or shaping dependencies.
+For loading, shaping and rasterization without a GPU, select
+`default-features = false, features = ["fonts"]` instead. The earlier
+[CPU shaping section](#cpu-shaping-without-gpu-dependencies) explains reusable
+sessions and how `text` consumes prepared lines without shaping them again.
 
 Load a trusted, licensed TrueType or OpenType outline font from bytes:
 
@@ -1873,8 +1882,8 @@ let projected = camera.project_world(
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-Build immutable topology once, retain it on the GPU, and update only object
-transforms during animation:
+For rigid animation, build immutable topology once, retain it on the GPU,
+and update only object transforms:
 
 ```rust,ignore
 let topology = Mesh3d::with_display_edges(vertices, triangles, edges)?;
@@ -1936,6 +1945,13 @@ it does **not** modify clones or reuse same-capacity buffers. Scene rebinding is
 explicit. CPU source and nominal GPU overlap are bounded by old plus incoming
 revision limits, not by an immediate driver-deallocation promise.
 
+For deforming or rebuilding one scene object with reusable capacity, use
+`update_scene3d_mesh` and `DynamicMesh3dBudget`; see
+[dynamic geometry](#dynamic-mesh-revisions-and-capacity-reuse). That route
+reuses unique fitting buffers and detaches immutable aliases. Material-only edits use
+`scene.set_texture_material(id, Some(&material))` or `None`; sky-clear edits
+use `scene.set_background(color)`, with no geometry upload.
+
 Opaque surfaces write `Depth32Float`. Edge classification is conservative:
 fragments occluded beyond a two-implementation-depth-unit tolerance receive a
 logical-pixel dash pattern, while coplanar and sub-depth-resolution separations
@@ -1952,8 +1968,8 @@ visible edge is shortened; a fully clipped edge emits no fragments without
 rejecting the rest of the frame. Before submission, model and camera dot
 products are bounded independently of backend association/FMA choices, and the
 possible model-dot result interval becomes the input to camera validation. The
-surface validator proves a stable, normal projected signed-area direction.
-In 0.3, an object containing crossing triangles uses a bounded homogeneous
+`StrictPortable` surface validator proves a stable, normal projected signed-area
+direction. An object containing crossing triangles uses a bounded homogeneous
 polygon clipper across all six planes. It carries conservative transform and
 intersection intervals and emits canonical clip-space triangle lists only
 when topology is provable. Its display edges use the same canonical transform,
@@ -1962,13 +1978,22 @@ own surface. Fully inside objects keep the original retained indexed path.
 Entirely outside triangles remain deterministic no-ops; genuinely ambiguous,
 grazing, edge-on or unrepresentable geometry still fails closed.
 
+`SurfaceRasterization3d::Native` instead submits original indexed surface
+triangles for hardware clipping. It retains finite/portable arithmetic checks
+but does not promise strict CPU clipping classification. Mathematical edges
+remain strictly validated under either policy; Native is not a validation bypass.
+
 `validate_scene3d_for_target` and `render_scene3d_to_target_with_budget` use the
 same authoritative preflight. `Mesh3dRenderBudget` caps generated vertices,
-triangles and combined surface/edge upload bytes. `Mesh3dPreflightReport`
-distinguishes generated topology, clipped source triangles and discarded source
-triangles. Validation covers the complete visible set and additional work
+triangles and combined surface/edge upload bytes. `with_max_surface_triangles`
+also bounds the total submitted surface triangles, retained plus generated.
+`Mesh3dPreflightReport` exposes `submitted_triangle_count` and
+`generated_object_count`; clipped/discarded source counts are `Some` for
+StrictPortable and `None` for Native, not hardware visibility measurements.
+Validation covers the complete visible set and additional work
 before target mutation or submission. Object-local errors carry `object_id()`
-and their underlying category; camera, target, renderer ownership and aggregate
+and source triangle/vertex index plus the underlying reason where applicable;
+camera, target, renderer ownership and aggregate
 budget errors are scene-level. Hidden invalid objects are excluded. A successful
 preflight is valid for that exact scene/camera/target/budget, not a reusable
 permission to submit a subsequently changed scene.
@@ -1986,19 +2011,23 @@ Edge expansion then uses a deliberately conservative full-axis component bound
 for its normalized screen direction, so backend approximation cannot escape
 the proven envelope.
 
-Current 3D scope is deliberately focused: opaque surfaces, retained transforms,
-hardware depth, solid visible edges, and dashed hidden edges. Translucent or
-hatched sections, projected label anchors, text, and 3D picking are not in this
-release.
+Current 3D includes Opaque/Mask/Blend surfaces, retained transforms, optional
+Lambert lighting/fog, hardware depth, solid visible edges and dashed hidden
+edges. Blend sorting is per object; intersecting surfaces and triangle order
+within a mesh remain limitations. General section/hatching APIs, projected
+label anchors and 3D picking are not included. Screen-space text is available
+independently through the frame composer.
 
-#### Opaque textured surfaces
+#### Textured surfaces
 
 `Mesh3d::textured(vertices, uvs, triangles, display_edges)` accepts one
 `TextureCoordinate2d` per vertex. UVs are finite normalized coordinates in
 `[0, 1]`, with `(0, 0)` at the image's top-left and positive V downward. The
 core topology API works without `wgpu`; the renderer additionally checks the
 portable shader envelope. Duplicate vertices at texture seams so each face
-can have independent UVs. Existing constructors still create untextured
+can have independent UVs. Material UV scale/offset may map these source values
+to signed/repeated coordinates without changing their normalized storage.
+Existing constructors still create untextured
 meshes without a UV GPU buffer; display edges do not sample a texture.
 
 ```rust,ignore
@@ -2018,25 +2047,33 @@ let object = scene.try_push(
 )?;
 ```
 
-The source is row-major, top-to-bottom, straight sRGB RGBA8, with alpha **255
-in every texel**. Nonopaque pixels fail with their source texel index before
-texture creation. Sampling decodes RGB to linear light, then multiplies it by
-both the material tint and the instance's surface color. Both tints must be
-normalized and opaque. Surfaces keep the existing depth-writing, no-culling
-semantics: winding is not silently reinterpreted for game meshes.
+The source is row-major, top-to-bottom, straight sRGB RGBA8 with linear alpha.
+The legacy constructors shown above require alpha 255 in every texel and
+opaque tints. For transparency, explicitly preserve texture alpha and use
+`TextureMaterial3d::with_alpha`, then choose Mask or Blend on the surface.
+Sampling decodes RGB to linear light and multiplies texture, material tint,
+vertex color and surface color. Alpha mode controls coverage/depth independently
+of `SurfaceSidedness3d`; two-sided remains the default. See
+[alpha materials](#alpha-materials-and-surface-sidedness) for ordering limits.
 
-Textures have one mip level, clamp-to-edge addressing and nearest or linear
-filtering. `texture.region_coordinates(region)` returns corners in TL, TR,
-BR, BL order, inset to the atlas cell's outer texel centers. Use those UVs
-instead of the cell's outer boundaries; nearest sampling then stays inside
-the selected cell. Mipmap generation, repeat addressing and automatic atlas
-padding are not provided. High-quality minification or a different sampling
-policy requires host-owned asset preparation, not undocumented engine padding.
+Defaults retain one mip level, clamp addressing and the selected nearest/linear
+filter. `Texture3dOptions` enables complete mip chains; the material selects
+continuous UV scale/offset and Clamp/Repeat. For a non-mipmapped packed atlas,
+`texture.region_coordinates(region)` returns TL, TR, BR, BL corners inset to
+outer texel centers. Mipmapped packed regions are rejected: use
+`crop_texture3d_tile` to isolate a tile before mip generation or repetition.
+Do not repeat the entire atlas when only one tile is intended. Automatic atlas
+padding, coverage-preserving alpha-test mips and anisotropy are not provided.
+See [texture lifecycle](#texture-lifecycle-and-repeating-tiles) for exact costs.
 
-`Texture3d` clones share immutable CPU pixels, GPU texels and sampling
+`Texture3d` clones initially share immutable CPU pixels, GPU texels and sampling
 bindings. `with_mesh3d_material` creates a new mesh handle sharing the original
 topology buffers; it does not mutate existing clones. To change a single
-object's material, create that handle and call `scene.set_mesh(id, &handle)`.
+object's material, use `scene.set_texture_material(id, Some(&material))`;
+`None` detaches it without changing topology. `scene.set_mesh(id, &handle)`
+remains the general immutable mesh-revision route. Region edits use the
+bounded [copy-on-write update path](#partial-3d-texture-updates), preserving
+old aliases instead of mutating shared snapshots.
 Both the mesh and texture must belong to the current renderer generation.
 Texture dimensions, pixel bytes and CPU retention are bounded by `ImageBudget`;
 scene accounting counts shared textures separately from shared mesh buffers.
@@ -2048,11 +2085,13 @@ report exposes `peak_texture_cpu_bytes` and `peak_texture_gpu_bytes` for
 old/new overlap. These are library-retained capacity and nominal texel bytes,
 not driver allocation-page measurements.
 
-UVs travel through the same bounded homogeneous clipping path as positions,
-then use perspective-correct GPU interpolation. Generated clip-space vertices
-contain four position and two UV floats (24 bytes); generated-work limits use
-that actual stride, including for untextured crossing surfaces. This does not
-change the 12-byte retained untextured position buffer.
+Under StrictPortable, UVs travel through the same bounded homogeneous clipping
+path as positions; Native leaves clipping to hardware. Both paths use
+perspective-correct interpolation. The generated base stream contains four
+position and two UV floats (24 bytes), including untextured crossing surfaces;
+optional color and normal/depth streams add their own budgeted storage. This
+does not change the 12-byte retained position stream. Source UV/color/normal
+buffers are optional and counted separately.
 
 ### 15. Recovery
 
@@ -2073,9 +2112,9 @@ resources from the previous identity are rejected until restored.
 | `ScalarFieldTexture` | `restore_scalar_field_texture` | exact scalar grid |
 | `RenderTarget2d` | `restore_render_target` | empty target; redraw required |
 | `TrailBuffer2d` | `restore_trail_buffer` | empty history; redraw required |
-| `Texture3d` | `restore_texture3d` | exact opaque sRGB pixels and original limits; new device identity |
-| `RetainedMesh3d` | `restore_mesh3d` | exact topology, UVs, display edges and optional material |
-| `Scene3d` | `restore_scene3d` | stable IDs plus exact transform/style/visibility/material; shared meshes and textures restored once |
+| `Texture3d` | `restore_texture3d` | exact committed mip pixels/options, alpha policy and limits; new device identity |
+| `RetainedMesh3d` | `restore_mesh3d` | exact topology, all attributes, reserved capacity and complete material policy, including UV/addressing and alpha rebinding |
+| `Scene3d` | `restore_scene3d` | stable IDs, transform/style/visibility/material, background/lighting/fog; shared meshes and textures restored once |
 | `RenderTarget3d` | `restore_render_target3d` | empty color/depth; redraw required |
 
 For a retained 3D scene, restore the scene and target after device recovery:
@@ -2091,7 +2130,9 @@ scene.set_visible(selected_object, true)?;
 
 `restore_scene3d` is atomic at the scene boundary. It recreates every distinct
 stale mesh once and commits replacements only after all uploads succeed, while
-preserving object IDs, order, transforms, styles, visibility, and next-ID state.
+preserving object IDs, order, transforms, styles, visibility, next-ID state,
+background, lighting and fog. Reserved mesh capacities survive; scene CPU
+bookkeeping may be repacked and need not retain the same Vec capacity.
 Shared texture restoration is deduplicated independently of mesh geometry, so
 different mesh/material variants using one atlas keep one restored atlas.
 External old handles remain stale: obtain current mesh/material handles from
@@ -2123,8 +2164,11 @@ recovery returns `RecoveryLimitReached` before creating another device; inspect
 
 A display-limited frame rate is not renderer throughput. Surface acquisition
 can wait for FIFO or compositor pacing while renderer CPU work remains small.
-The published 0.3.0 metrics do not include GPU timestamp queries. The dev.4
-opt-in pass diagnostics are described in the development section above.
+Optional bounded GPU timestamps measure Scene3d and FrameComposer render passes,
+not queue waiting, scanout or total device utilisation. Unsupported adapters
+report Unavailable rather than a zero-duration substitute. See
+[GPU diagnostics](#gpu-diagnostics-and-the-full-changing-scene-matrix) for
+correlation IDs, bounded collection and loss accounting.
 
 From a clean Sim;Engine repository checkout, the named release-mode matrix is:
 
@@ -2383,6 +2427,8 @@ composed, drawn, measured, and recovered.
 | `particle.rs` | renderer-independent particle visual state |
 | `pseudo3d.rs` | checked 3D math, transforms, and CPU projection |
 | `mesh3d.rs` | retained topology and edge/style contracts |
+| `mesh3d_attributes.rs`, `mesh3d_uv.rs` | optional vertex attributes and bounded material UV mapping |
+| `text/font/session.rs` | CPU-only reusable shaping sessions |
 | `renderer/config.rs` | surface mode, DPI, renderer options, recovery setup |
 | `renderer/tessellation.rs` | 2D scene command to triangle conversion |
 | `renderer/visualization.rs` | fused scientific visualization path |
@@ -2390,7 +2436,10 @@ composed, drawn, measured, and recovered.
 | `renderer/mesh3d_objects.rs` | indexed object IDs, lifetime and shared-resource accounting |
 | `renderer/mesh3d_upload.rs` | bounded immutable mesh upload/replacement |
 | `renderer/mesh3d_surface.rs` | interval-proven bounded surface clipping and preflight |
-| `renderer/mesh3d_texture.rs` | opaque texture/material ownership and recovery |
+| `renderer/mesh3d_texture.rs` | texture/material ownership, alpha policy and recovery |
+| `renderer/mesh3d_dynamic.rs` | capacity-reusing whole-bundle mesh updates and alias isolation |
+| `renderer/mesh3d_restoration.rs` | standalone restoration preserving full material policy |
+| `renderer/gpu_timing.rs` | optional bounded render-pass timestamps and correlation |
 | `renderer/frame/cache.rs` | bounded frame scratch, uniform and binding reuse |
 | `renderer/frame/encoding.rs` | ordered mixed-source draw encoding and pass-local state reuse |
 | `renderer/frame/uniform_uploads.rs` | bounded packed transfers into independent retained uniforms |
@@ -2531,7 +2580,7 @@ and reported upload bytes all include this relative-world component.
 Preparation creates an immutable dedicated GPU buffer and retains a CPU vertex
 snapshot for recovery. Rendering reuses geometry and only updates camera state.
 
-#### Dynamic meshes
+#### Dynamic 2D meshes
 
 The resource retains a CPU copy and capacity-managed triangle buffer. Full
 updates grow amortized capacity; aligned range updates reuse it. Bounded meshes
@@ -2565,15 +2614,19 @@ finite value range through a cached lookup texture.
 
 #### Retained 3D
 
-Immutable vertex/index/edge topology is mirrored into GPU buffers and retained
-on the CPU for recovery. Scene objects store scene-provenance IDs and
-independent model transforms. Opaque surfaces populate color and depth. Display
+Immutable topology and optional UV/color/normal streams are mirrored into GPU
+buffers and retained on the CPU for recovery. Scene-owned dynamic updates reuse
+unique fitting bundles; shared aliases or growth use bounded whole-bundle
+replacement. Scene objects store scene-provenance IDs and independent transforms.
+Opaque and surviving Mask fragments populate color and depth. Blend objects
+follow in back-to-front order with depth testing but no depth writes. Unlit or
+Lambert shading and opt-in fog process surface RGB separately from alpha. Display
 edges are homogeneously clipped, conservatively classified against depth,
 rendered dashed when hidden beyond the coplanar tolerance, and rendered solid
 when visible. Edge expansion uses the target's logical-to-physical ratio rather
 than the window DPI.
 
-Mesh upload preflights vertex, index, and edge counts, checked byte sizes,
+Mesh upload preflights vertex, attribute, index and edge counts, checked byte sizes,
 draw-count representation, and the active device's `max_buffer_size` before
 allocating conversion staging memory. Staging vectors use fallible reservation
 and report `HostAllocationFailed`. GPU buffer creation still follows wgpu's
@@ -2649,6 +2702,11 @@ automation are repeatable.
   fixture passes on that concrete adapter/driver. CI records Mesa software
   evidence and the release evidence records the exact tested adapter; untested
   AMD/NVIDIA drivers are not silently certified by those results.
+- Intel UHD (CML GT2), PCI 0000:00:02.0, with Mesa 26.1.6 Vulkan did not
+  complete the material readback fixture during qualification. An independent
+  unchanged dev.4 baseline reproduced the wait; the root cause is not diagnosed.
+  This configuration remains unqualified. Earlier Intel evidence and successful
+  NVIDIA/software-Vulkan runs are not substitutes for a fresh pass on it.
 - Software-Vulkan CI uses packaged lavapipe from Ubuntu 26.04 and requires Mesa
   25.3 or newer. Mesa 25.2.8 llvmpipe was reproduced leaking half-covered MSAA
   samples outside integer scissor bounds. The upstream scissor-plane fix is
@@ -2657,16 +2715,16 @@ automation are repeatable.
   single-sample/production MSAA and scale 1/1.25. This software-driver CI floor
   neither changes host OS requirements nor certifies untested driver versions.
 - The crate is pre-1.0.
-- Optional `text` loads trusted TTF/OTF outlines and shapes horizontal single-run
-  text. Font fallback, paragraph bidi, line breaking, color emoji and automatic
-  atlas eviction are not implemented. The low-level API remains available for
+- Optional `fonts` loads trusted TTF/OTF outlines and shapes horizontal single-run
+  text; `text` adds GPU atlases. Font fallback, paragraph bidi, line breaking,
+  color emoji and automatic atlas eviction are not implemented. The low-level API remains available for
   host-shaped glyph runs and externally managed font policies.
-- Published 0.3.0 retained 3D supports opaque surfaces and depth-classified edges.
-  The development candidate adds the documented Mask/Blend, lighting and texture
-  lifecycle paths. General section materials, projected anchors and 3D picking
-  remain outside this release scope.
-- Published 0.3.0 renderer timing is CPU-side. Dev.4 offers opt-in, bounded GPU
-  pass timestamps; it does not measure scanout or total GPU utilisation.
+- Retained 3D supports Opaque/Mask/Blend, optional Lambert lighting/fog and
+  mipmapped texture lifecycle. Object-sorted Blend does not solve intersecting
+  transparency or triangle order inside a mesh. Point lights, shadows, PBR,
+  general section/hatching APIs, projected anchors and 3D picking are not included.
+- GPU timestamps are opt-in and bounded; they measure render-pass duration,
+  not scanout or total GPU utilisation. Unavailable and lost samples are explicit.
 - Independent multi-window recovery is not yet proven.
 - Render-target and trail pixels cannot be reconstructed after device loss.
 
@@ -2680,9 +2738,11 @@ gate is:
 ```
 
 It checks formatting, Rust 1.90 compatibility, all targets with and without
-default features, strict clippy, doctests, warning-free rustdoc, a mandatory
+default features and with CPU fonts, strict clippy, doctests, warning-free
+rustdoc, a mandatory
 Vulkan semantic GPU readback fixture with backend assertion, the Vulkan-pinned
-performance matrix, a real nested-KWin HiDPI transition, `git diff --check`,
+performance matrix, public text and standalone-mesh device recovery,
+a real nested-KWin HiDPI transition, `git diff --check`,
 and the offline package boundary. A successful local wrapper atomically
 publishes `target/linux-release-evidence/`, containing `completion.txt`,
 `linux-vulkan-surface.txt`, `linux-vulkan-adapter.txt`, and
@@ -2713,7 +2773,7 @@ and measurement method.
 
 ### 30. Official release procedure
 
-The commands below target the 0.3.0 release. For a later release, substitute its
+The commands below target the 0.4.0 release. For a later release, substitute its
 version and finish its dated changelog and migration notes first. Do not run
 publication or create a tag while review or the exact-commit release gate is
 pending.
@@ -2747,8 +2807,8 @@ cargo login
 git fetch origin
 test -z "$(git status --porcelain --untracked-files=all)"
 test "$(git rev-parse HEAD)" = "$(git rev-parse origin/master)"
-test -z "$(git tag -l v0.3.0)"
-test -z "$(git ls-remote --tags origin refs/tags/v0.3.0)"
+test -z "$(git tag -l v0.4.0)"
+test -z "$(git ls-remote --tags origin refs/tags/v0.4.0)"
 ./scripts/linux_release_gate.sh
 ```
 
@@ -2762,10 +2822,10 @@ grep -Fxq "vcs_sha=$release_sha" \
 grep -Fxq 'status=passed' target/linux-release-evidence/completion.txt
 cargo package --list
 cargo package --locked
-crate=target/package/sim-engine-0.3.0.crate
-tar -xOf "$crate" sim-engine-0.3.0/.cargo_vcs_info.json \
+crate=target/package/sim-engine-0.4.0.crate
+tar -xOf "$crate" sim-engine-0.4.0/.cargo_vcs_info.json \
   | grep -Fq "\"sha1\": \"$release_sha\""
-! tar -xOf "$crate" sim-engine-0.3.0/.cargo_vcs_info.json \
+! tar -xOf "$crate" sim-engine-0.4.0/.cargo_vcs_info.json \
   | grep -Fq '"dirty": true'
 cargo publish --dry-run --locked
 ```
@@ -2785,7 +2845,7 @@ cargo publish --locked
 
 Cargo may time out while waiting for the new version to appear in the registry
 index even after a successful upload. Before retrying, check the crates.io
-package page or run `cargo info sim-engine@0.3.0`; retrying an accepted version
+package page or run `cargo info sim-engine@0.4.0`; retrying an accepted version
 cannot overwrite it.
 
 #### 3. Tag the published commit
@@ -2796,39 +2856,39 @@ release tag for an upload that never succeeded, while the packaged
 
 ```bash
 test "$(git rev-parse HEAD)" = "$release_sha"
-git tag -a v0.3.0 -m "Sim;Engine v0.3.0"
-test "$(git rev-list -n 1 v0.3.0)" = "$release_sha"
-git push origin v0.3.0
+git tag -a v0.4.0 -m "Sim;Engine v0.4.0"
+test "$(git rev-list -n 1 v0.4.0)" = "$release_sha"
+git push origin v0.4.0
 ```
 
 Tags for published versions are immutable release history. Never move or
-force-push one. If `v0.3.0` already exists, stop and verify its target instead
+force-push one. If `v0.4.0` already exists, stop and verify its target instead
 of replacing it.
 
 #### 4. Create the GitHub Release and verify public artifacts
 
-Prepare release notes from the `0.3.0` changelog section, then either use the
+Prepare release notes from the `0.4.0` changelog section, then either use the
 GitHub web interface or the GitHub CLI:
 
 ```bash
-gh release create v0.3.0 \
+gh release create v0.4.0 \
   --verify-tag \
-  --title "Sim;Engine v0.3.0" \
-  --notes-file /tmp/sim-engine-v0.3.0-notes.md
+  --title "Sim;Engine v0.4.0" \
+  --notes-file /tmp/sim-engine-v0.4.0-notes.md
 ```
 
 Finally verify all four public identities:
 
-- `https://crates.io/crates/sim-engine/0.3.0` shows version 0.3.0;
-- `https://docs.rs/sim-engine/0.3.0` completes successfully;
-- Git tag `v0.3.0` points to `$release_sha`;
+- `https://crates.io/crates/sim-engine/0.4.0` shows version 0.4.0;
+- `https://docs.rs/sim-engine/0.4.0` completes successfully;
+- Git tag `v0.4.0` points to `$release_sha`;
 - the GitHub Release names the same tag and is not marked as a prerelease.
 
 If a serious defect is discovered after publishing, do not attempt to delete
-or overwrite 0.3.0. Yank it and prepare a corrected patch release:
+or overwrite 0.4.0. Yank it and prepare a corrected patch release:
 
 ```bash
-cargo yank --version 0.3.0 sim-engine
+cargo yank --version 0.4.0 sim-engine
 ```
 
 The authoritative external references are Cargo's

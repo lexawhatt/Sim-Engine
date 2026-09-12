@@ -1,22 +1,5 @@
 # Sim;Engine
 
-Development checkout: **0.4.0-dev.5**, not a published 0.4.0 release.
-Stable installation examples below remain on 0.3.0. See the
-[development integration notes](DOCUMENTATION.md#04-development-preview)
-and [unreleased changelog](CHANGELOG.md#unreleased---040-development)
-for the implemented subset and source migrations. Sim;Logic's 0.4 handoffs
-use exact tested git revisions before crates.io publication.
-The preview includes reusable CPU/prepared text, explicit 3D surface policies,
-capacity-reusing mesh updates, vertex colors, Opaque/Mask/Blend materials and
-explicit surface sidedness, optional model normals, ambient/directional Lambert
-lighting and camera-distance fog. The combined dev.4 candidate adds bounded
-mip chains, isolated repeating texture tiles, atomic region updates, optional
-GPU timestamp diagnostics and an expanded changing-scene measurement matrix.
-Dev.5 preserves complete standalone mesh materials during device restoration
-and adds in-place background changes and upload-free texture-material rebinding.
-The 0.4.0 priority is completing the integration requirements and measurement
-baselines; intensive performance optimization is planned for 0.4.1.
-
 Sim;Engine is a validated visualization library built for simulation products.
 It provides a high-performance 2D renderer, scientific visualization paths,
 and a focused retained 3D stereometry pipeline.
@@ -27,33 +10,33 @@ clipping, interpolation, GPU resources, composition, recovery, and rendering
 diagnostics. Physics, simulation stepping, domain entities, UI navigation, and
 plugins remain in the host application.
 
-This guide describes **Sim;Engine 0.3.0**. The crate remains pre-1.0, and its
+This guide describes **Sim;Engine 0.4.0**. The crate remains pre-1.0, and its
 supported release target is Linux with Vulkan. A concrete adapter/driver is
 supported when the mandatory semantic fixture passes on it;
 untested drivers are not inferred from Mesa evidence. The minimum supported
 Rust version is 1.90.
 
 The software-Vulkan CI fixture uses Mesa 25.3+ lavapipe. Mesa 25.2.8 llvmpipe
-has a reproduced MSAA scissor leak and does not pass the 0.3 rendering contract;
+has a reproduced MSAA scissor leak and does not pass the rendering contract;
 its upstream fix is included in [Mesa 25.3](https://docs.mesa3d.org/relnotes/25.3.0.html).
 This does not impose an Ubuntu-version requirement on host applications.
 
-Version 0.3.0 builds on the composed-frame and scientific-visualization foundation
-of 0.2.0. It adds capacity-aware glyph/sprite updates, independent per-draw
-placement and tint, bounded reusable composition storage, portable filled-3D
-clipping with object-attributed errors, indexed editable 3D scenes, shared
-opaque UV textures, exact-tip scientific arrows, and optional antialiased TTF/OTF
-text with cached glyphs and logical baseline metrics. CPU optimizations reuse
-exact text/geometry validation results without reordering draws or weakening
-precision checks. See the [0.3.0 changelog](CHANGELOG.md#030---2026-09-11)
-for the complete delta and migration notes from 0.2.0.
+Version 0.4.0 adds Opaque/Mask/Blend 3D materials, sidedness, vertex colors,
+optional Lambert lighting and distance fog, capacity-reusing mesh updates,
+mipmapped and repeating textures, atomic region edits, and complete material
+recovery. CPU-only fonts and reusable pre-shaped text reduce repeated text work;
+optional GPU timestamps and changing-scene fixtures make costs observable.
+See the [0.4 integration guide](DOCUMENTATION.md#04-integration-guide) and
+[0.4.0 changelog](CHANGELOG.md#040---2026-09-12) for contracts and migration
+notes from 0.3.0. Intensive profiling-driven optimization is planned for 0.4.1;
+this release does not promise a universal frame rate.
 
 ## Documentation
 
 - [Library documentation](DOCUMENTATION.md) - installation, concepts, every
   rendering path, recovery, performance, architecture, and examples.
 - [Changelog](CHANGELOG.md) - release history and migration notes.
-- [Archived 0.2 documentation](https://github.com/lexawhatt/Sim-Engine/blob/v0.2.0/DOCUMENTATION.md) - the guide for integrations that have not upgraded.
+- [Archived 0.3 documentation](https://github.com/lexawhatt/Sim-Engine/blob/v0.3.0/DOCUMENTATION.md) - the guide for integrations that have not upgraded.
 - Generated API reference:
 
   ```bash
@@ -73,8 +56,8 @@ for the complete delta and migration notes from 0.2.0.
 - streaming, prepared, and dynamic triangle geometry;
 - retained sRGB RGBA images, atlas sprite batches, and world-space image quads;
 - host-shaped, bounded glyph atlas runs with deterministic logical bounds;
-- optional `text` feature: load TTF/OTF outlines, shape single-direction lines,
-  and cache antialiased glyphs at the requested font size and DPI;
+- optional CPU-only `fonts` feature for TTF/OTF loading, shaping and rasterization;
+  `text` adds GPU atlases, retained runs and preparation from pre-shaped lines;
 - budgeted instanced particle rendering;
 - scalar-field textures, color maps, partial updates, and heatmaps;
 - offscreen targets, composition, and bounded trails;
@@ -82,8 +65,14 @@ for the complete delta and migration notes from 0.2.0.
 - typed logical-pixel, 2D/3D world-length, and target-scale boundaries;
 - retained 3D meshes, independent transforms, hardware depth, and visible or
   dashed hidden mathematical edges;
+- explicit StrictPortable/Native surface policies and source-triangle diagnostics;
+- capacity-reusing, alias-isolated mesh edits and material-only rebinding;
+- Opaque/Mask/Blend surfaces, sidedness, vertex colors, optional normals,
+  ambient/directional Lambert lighting and distance fog;
+- complete mip chains, isolated repeating tiles and bounded texture-region edits;
 - atomic retained-3D scene recovery that preserves stable object IDs and visual
   state across logical-device replacement;
+- optional bounded GPU pass timestamps with correlation IDs and loss counters;
 - primitive/source-grouped diagnostics and repeatable release-mode workloads
   for static UI, prepared/streaming UI, viewports, atlases, glyphs, mixed
   layers, budget rejection, DPI reconfiguration, real compositor scale
@@ -97,41 +86,49 @@ color targets under one frame budget and one surface presentation.
 `DynamicMeshBudget` limits caller-provided filled triangles and makes full
 updates allocation-fallible and atomic.
 
-GPU transform validation uses one conservative portability envelope for 2D
-scenes, dynamic triangles, particles, and retained 3D. Nonzero subnormal
+GPU transform validation enforces bounded arithmetic for 2D scenes, dynamic
+triangles, particles, and retained 3D. Nonzero subnormal
 coordinate/transform operands, coordinate magnitudes above `2^120`, ambiguous
 geometry-branch thresholds, and arithmetic ranges that cannot be proven
 portable are rejected with a structured transform error before submission.
 Normalized linear color channels are not geometric operands and may include
 subnormal values; their contribution is below the precision of current
 normalized render targets. This intentionally prefers a clear rejection over
-backend-dependent geometry disappearance or topology.
+backend-dependent geometry disappearance or topology. Retained 3D defaults to
+`StrictPortable`, which also proves clipping topology and rejects ambiguous
+surface classifications. Opt-in `Native` uses hardware surface clipping while
+retaining arithmetic checks; mathematical-edge validation stays strict.
 
-Translucent section materials, hatching, projected 3D anchors, and 3D picking
-remain outside 0.3.0's scope. Its texture path is unlit and opaque; the separate
-0.4 development preview above adds explicit alpha modes and simple lighting,
-not PBR or a voxel/domain model.
+Blend sorts objects, not triangles within a mesh; intersecting transparent
+surfaces can still overlap incorrectly. General section materials, hatching,
+projected 3D anchors, 3D picking, point lights, shadows and PBR remain outside
+0.4.0. Unlit remains available and is the default.
+
+An additional Intel UHD (CML GT2) / Mesa 26.1.6 Vulkan qualification run did
+not complete the material readback fixture; the same wait reproduced on the
+unchanged dev.4 baseline. This configuration is not qualified by the successful
+NVIDIA or software-Vulkan runs. See [known boundaries](DOCUMENTATION.md#28-known-boundaries).
 
 ## Installation
 
 The default feature set includes the `wgpu` renderer:
 
 ```bash
-cargo add sim-engine@0.3
+cargo add sim-engine@0.4
 ```
 
 or add it directly to `Cargo.toml`:
 
 ```toml
 [dependencies]
-sim-engine = "0.3"
+sim-engine = "0.4"
 ```
 
 Use core visual-state APIs without GPU dependencies:
 
 ```toml
 [dependencies]
-sim-engine = { version = "0.3", default-features = false }
+sim-engine = { version = "0.4", default-features = false }
 ```
 
 Run the examples from a repository checkout matching the library version:
@@ -171,7 +168,7 @@ GPU copy work are reported separately from host-upload bytes.
 Enable the optional `text` feature:
 
 ```toml
-sim-engine = { version = "0.3", features = ["text"] }
+sim-engine = { version = "0.4", features = ["text"] }
 ```
 
 ```rust,no_run
@@ -195,6 +192,10 @@ frame composer. The [font guide](DOCUMENTATION.md#loading-ttfotf-fonts-optional-
 covers the complete render/update/DPI/recovery workflow. Supply trusted,
 appropriately licensed font assets. Automatic font fallback, paragraph bidi,
 wrapping, color emoji, and font-file I/O are not built into the engine.
+
+For CPU-only font work, use `default-features = false, features = ["fonts"]`.
+`TextShapingSession` reuses shaping state; `TextAtlas2d::prepare_from_shaped`
+and `update_from_shaped` consume its results without shaping again.
 
 ## Quick Start
 
@@ -264,6 +265,9 @@ let report = frame.present()?;
 | Mixed UI, viewports, fields, and targets | `FrameComposer` |
 | Bounded gas plus particle overlay | `render_layered_visualization` |
 | Stereometry solids and hidden edges | `Mesh3d` plus `Scene3d` |
+| Changing 3D geometry with immutable aliases | `update_scene3d_mesh` with `DynamicMesh3dBudget` |
+| Material or background changes without geometry upload | `Scene3d::set_texture_material` / `set_background` |
+| Partial 3D texture edits | `update_scene3d_texture_region` |
 
 ## Examples
 
@@ -277,6 +281,11 @@ cargo run --release --example rendering_benchmark_suite -- --fixture ui_90_10
 cargo run --release --example stroke_gallery -- --uncapped
 cargo run --release --example stereometry_3d -- --uncapped
 cargo run --release --example cylinder_derivation_3d -- --uncapped --benchmark
+cargo run --release --example materials_3d
+cargo run --release --example lighting_3d
+cargo run --release --example texture_lifecycle_3d
+cargo run --release --example texture_lifecycle_3d -- --acceptance
+cargo run --release --all-features --example mesh3d_scene_benchmark -- --case repeated
 ```
 
 From a Sim;Engine repository checkout, run the complete named
@@ -361,11 +370,11 @@ and run creation without requiring the optional font loader or shaping path.
 ## Verification
 
 From a clean Sim;Engine repository checkout, the Linux release gate
-checks the declared Rust 1.90 MSRV, all targets
-with and without the renderer, strict clippy, rustdoc, Vulkan semantic GPU
+checks the declared Rust 1.90 MSRV, all targets with and without the renderer
+and CPU fonts, strict clippy, rustdoc, Vulkan semantic GPU
 readback with a backend assertion, the Vulkan performance matrix on a real
-surface, a transactional nested-compositor HiDPI transition, and the
-publishable package boundary:
+surface, real text/standalone-mesh recovery, a transactional nested-compositor
+HiDPI transition, and the publishable package boundary:
 
 ```bash
 ./scripts/linux_release_gate.sh
