@@ -91,6 +91,10 @@ name = "text_shaping_benchmark"
 required-features = ["fonts"]
 
 [[example]]
+name = "mesh3d_scene_benchmark"
+required-features = ["wgpu"]
+
+[[example]]
 name = "frame_cache_benchmark"
 required-features = ["wgpu"]
 

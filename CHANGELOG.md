@@ -32,6 +32,16 @@ feedback and separate release qualification.
   preserve their vertex index and reason.
 - CPU-only `text_shaping_benchmark` and prepared-line checks in the real-font
   example's acceptance mode; expanded CPU/GPU surface-policy and budget tests.
+- Scene-owned `update_scene3d_mesh` with explicit capacity and transient-overlap
+  budgets. Unique fitting GPU bundles are reused; shared snapshots, capacity
+  growth and UV-layout changes cause whole-bundle replacement. Other objects
+  retain their old geometry, and recovery preserves reserved capacities.
+- `DynamicMesh3dUpdateReport` exposes live/reserved bytes, actual uploads,
+  buffer allocations, alias detachment and reusable CPU scratch. Renderer
+  scratch can be queried and explicitly cleared independently of scene data.
+- `mesh3d_scene_benchmark` compares repeated/outside/host-hidden geometry and
+  immutable/dynamic single-object updates with confirmed presents and separated
+  CPU/acquire metrics. It is a diagnostic fixture, not a GPU timestamp/FPS gate.
 
 ### Migration notes from 0.3.0
 
@@ -46,7 +56,7 @@ feedback and separate release qualification.
   source-context and total-budget variants. Use diagnostic accessors when an
   exhaustive category match is unnecessary.
 
-The remaining 0.4.0 material, lighting, dynamic-mesh, texture-lifecycle and fog
+The remaining 0.4.0 material, lighting, texture-lifecycle and fog
 work is not delivered by this initial slice. No general performance or release
 readiness claim follows from these additions.
 

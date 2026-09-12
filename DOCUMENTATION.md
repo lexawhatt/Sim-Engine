@@ -117,6 +117,70 @@ with no surface reference retain vertex context. Camera/resource/aggregate
 capacity errors remain scene-level, and edge errors remain object-attributed.
 See the changelog for exhaustive-match and `Option` migrations from 0.3.0.
 
+### Dynamic mesh revisions and capacity reuse
+
+Use `renderer.update_scene3d_mesh(&mut scene, object_id, new_source, budget)`
+to change one object's geometry. `new_source` is an already validated, nonempty
+`Mesh3d`; its construction stays in the host. Hide or remove an empty chunk.
+Object ID, transform, visibility, style and texture material are preserved.
+A textured material still requires source UVs.
+
+`DynamicMesh3dBudget::new(Mesh3dUploadBudget::default())` accepts explicit
+`with_minimum_capacity(vertices, indices, display_edges)` reserves. Indices
+are capacity counts, not triangles; unused capacity need not form whole triples.
+Final source/GPU/scratch limits and `with_peak_limits(recovery, gpu, staging)`
+bound nominal old/new overlap before writes. Peak limits cover this operation's
+two revisions, not unrelated host snapshots or opaque driver allocations.
+
+If the scene object uniquely owns every GPU buffer and the capacity/layout fits,
+the buffers are reused. If another scene object or an exported mesh/instance
+clone shares them, the update creates a separate complete bundle. After that
+detachment, later unique updates reuse capacity. Creating a snapshot with
+`scene.instance(id)?.mesh().clone()` deliberately restores copy-on-write behavior
+for the next update. CPU source snapshots do not by themselves prevent GPU reuse.
+
+Growth or adding/removing UV layout also replaces the complete bundle, keeping
+unique allocation accounting correct. Synchronous validation/allocation errors
+preserve the prior drawable; GPU device loss follows the existing asynchronous
+recovery contract. Both `restore_mesh3d` and `restore_scene3d` preserve reserved
+buffer capacities, not just the current live topology.
+
+Every accepted update uploads all live positions, indices, UVs and display
+edges, even when the supplied source is unchanged. Partial mesh edits and an
+unchanged-source no-op are not promised by this path. The returned report
+separates uploaded/live bytes, reserved bytes, buffer allocations, alias
+detachment and scratch reuse. `mesh3d_update_scratch_bytes` and
+`clear_mesh3d_update_scratch` expose renderer-owned conversion storage, separate
+from `Scene3dStatistics` and `FrameCacheBudget`. Clear it before applying a
+smaller retained-scratch ceiling than an earlier update required.
+
+Compare identical prevalidated inputs through both update routes:
+
+```bash
+cargo run --release --example mesh3d_scene_benchmark -- \
+  --case immutable --objects 64 --side 32 --frames 120 --trials 3
+cargo run --release --example mesh3d_scene_benchmark -- \
+  --case dynamic --objects 64 --side 32 --frames 120 --trials 3
+```
+
+This changes one object per frame; the remaining objects share a static mesh.
+Initial detachment and scratch growth are reported during warmup, separately
+from steady-state allocation counts. Other cases are `repeated`, `outside`,
+and `host_hidden`, for example `--objects 1024 --side 1`. `outside` still submits
+the geometry; `host_hidden` explicitly hides the same distant objects. No
+automatic distance/frustum culling is inferred.
+
+All measured frames must be `Drawn`, source revision order is deterministic,
+and output changes abort measurement. The target stays 1280x720; actual surface
+size/DPI and adapter/presentation metadata are logged. CPU work excludes
+surface acquire; completed-batch wall FPS includes the final GPU completion
+drain. Neither is GPU execution time, which is explicitly unavailable. Mesh
+upload/allocation counters exclude camera/composition resources; thread-local
+allocation counts include backend calls on that thread, not worker threads.
+Host source snapshot bytes overlap scene CPU bytes and must not be added to
+them. This baseline does not replace the release matrix or complete the planned
+GPU-timestamp and large-scene optimization work.
+
 ## Part I: Integration Handbook
 
 ### 1. Scope

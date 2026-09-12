@@ -8086,12 +8086,13 @@ pub use image::{
 use image::{ImageRenderer, ImageUniform};
 use mesh3d::Mesh3dRenderer;
 pub use mesh3d::{
-    Mesh3dInstance, Mesh3dObjectError, Mesh3dPreflightReport, Mesh3dRenderBudget,
-    Mesh3dRenderError, Mesh3dRenderReport, Mesh3dResourceError, Mesh3dSurfaceError,
-    Mesh3dUploadBudget, Mesh3dUploadBudgetResource, Mesh3dUploadReport, Object3dId, RenderTarget3d,
-    RetainedMesh3d, Scene3d, Scene3dBudget, Scene3dBudgetResource, Scene3dError,
-    Scene3dMeshUpdateReport, Scene3dRestoreReport, Scene3dStatistics, SurfaceRasterization3d,
-    Texture3d, Texture3dError, TextureMaterial3d,
+    DynamicMesh3dBudget, DynamicMesh3dBudgetResource, DynamicMesh3dError,
+    DynamicMesh3dUpdateReport, Mesh3dInstance, Mesh3dObjectError, Mesh3dPreflightReport,
+    Mesh3dRenderBudget, Mesh3dRenderError, Mesh3dRenderReport, Mesh3dResourceError,
+    Mesh3dSurfaceError, Mesh3dUploadBudget, Mesh3dUploadBudgetResource, Mesh3dUploadReport,
+    Object3dId, RenderTarget3d, RetainedMesh3d, Scene3d, Scene3dBudget, Scene3dBudgetResource,
+    Scene3dError, Scene3dMeshUpdateReport, Scene3dRestoreReport, Scene3dStatistics,
+    SurfaceRasterization3d, Texture3d, Texture3dError, TextureMaterial3d,
 };
 use tessellation::{
     logical_viewport_scissor, offset_scissor, screen_clip_to_scissor, tessellate_scene,

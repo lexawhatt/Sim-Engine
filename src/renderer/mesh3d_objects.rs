@@ -96,11 +96,17 @@ struct ObjectSlot {
     next_free: Option<usize>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 struct ResourceUsage {
     key: (u8, usize),
     references: usize,
     bytes: usize,
+}
+
+pub(super) struct DynamicSceneMeshChange {
+    index: usize,
+    outgoing: [ResourceUsage; 4],
+    resources: Option<Vec<ResourceUsage>>,
 }
 
 /// Bounds scene-owned slots and distinct retained mesh allocations.
@@ -521,6 +527,95 @@ impl Scene3d {
             peak_texture_cpu_bytes,
             peak_texture_gpu_bytes,
         })
+    }
+
+    pub(super) fn prepare_dynamic_mesh_change(
+        &self,
+        object_id: Object3dId,
+        source: &Mesh3d,
+        gpu_bytes: usize,
+        replace_buffers: bool,
+    ) -> Result<DynamicSceneMeshChange, Scene3dError> {
+        let index = self.instance_index(object_id)?;
+        validate_mesh_source_style(source, self.instances[index].style)?;
+        let outgoing = mesh_resources(&self.instances[index].mesh);
+        let mut incoming = outgoing;
+        incoming[0].key.1 = source.vertices().as_ptr() as usize;
+        incoming[0].bytes = source.recovery_memory_bytes();
+        if replace_buffers {
+            // Real Arc allocation identities cannot be null. This temporary
+            // key proves new-bundle accounting before any GPU allocation.
+            incoming[1].key.1 = 0;
+        }
+        incoming[1].bytes = gpu_bytes;
+        self.validate_resource_change(&incoming, Some(&outgoing))?;
+        let retired = outgoing
+            .iter()
+            .filter(|resource| {
+                !incoming
+                    .iter()
+                    .any(|candidate| candidate.key == resource.key)
+                    && self
+                        .resources
+                        .binary_search_by_key(&resource.key, |entry| entry.key)
+                        .ok()
+                        .is_some_and(|index| self.resources[index].references == 1)
+            })
+            .count();
+        let additional = self.missing_resources(&incoming).saturating_sub(retired);
+        let mut capacity = planned_capacity(
+            &self.resources,
+            additional,
+            self.budget.max_objects.saturating_mul(4),
+        );
+        if storage_bytes(self.instances.capacity(), self.slots.capacity(), capacity)
+            > self.budget.max_storage_bytes
+        {
+            capacity = self
+                .resources
+                .capacity()
+                .max(self.resources.len().saturating_add(additional));
+        }
+        check_scene_limit(
+            Scene3dBudgetResource::StorageBytes,
+            self.budget.max_storage_bytes,
+            storage_bytes(self.instances.capacity(), self.slots.capacity(), capacity),
+        )?;
+        let resources = replacement_capacity(&self.resources, capacity)?;
+        check_scene_limit(
+            Scene3dBudgetResource::StorageBytes,
+            self.budget.max_storage_bytes,
+            storage_bytes(
+                self.instances.capacity(),
+                self.slots.capacity(),
+                resources
+                    .as_ref()
+                    .map_or(self.resources.capacity(), Vec::capacity),
+            ),
+        )?;
+        Ok(DynamicSceneMeshChange {
+            index,
+            outgoing,
+            resources,
+        })
+    }
+
+    pub(super) fn commit_dynamic_mesh_change(
+        &mut self,
+        change: DynamicSceneMeshChange,
+        mesh: RetainedMesh3d,
+    ) -> Scene3dStatistics {
+        if let Some(resources) = change.resources {
+            self.resources = resources;
+        }
+        for resource in change.outgoing {
+            self.remove_resource(resource.key);
+        }
+        for resource in mesh_resources(&mesh) {
+            self.add_resource(resource);
+        }
+        self.instances[change.index].mesh = mesh;
+        self.statistics()
     }
 
     /// Returns objects currently participating in rendering.

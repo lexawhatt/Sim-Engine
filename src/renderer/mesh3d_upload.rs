@@ -178,6 +178,43 @@ pub(super) fn prepare_with_budget(
     Ok(prepared)
 }
 
+pub(super) fn prepare_restoration(
+    device: &wgpu::Device,
+    source: &RetainedMesh3d,
+) -> Result<PreparedRetainedMeshUpload, Mesh3dResourceError> {
+    validate_allocation(device, source.allocation, source.budget)?;
+    let mut prepared = prepare_with_budget(device, source.source.clone(), source.budget)?;
+    prepared.allocation = source.allocation;
+    Ok(prepared)
+}
+
+pub(super) fn validate_allocation(
+    device: &wgpu::Device,
+    allocation: Mesh3dUploadLayout,
+    budget: Mesh3dUploadBudget,
+) -> Result<(), Mesh3dResourceError> {
+    if [
+        allocation.vertex_bytes,
+        allocation.index_bytes,
+        allocation.edge_bytes,
+        allocation.texture_coordinate_bytes,
+    ]
+    .into_iter()
+    .any(|bytes| bytes > device.limits().max_buffer_size)
+        || usize::try_from(allocation.total_bytes).is_err()
+    {
+        return Err(Mesh3dResourceError::CapacityTooLarge);
+    }
+    if allocation.total_bytes as usize > budget.max_gpu_bytes() {
+        return Err(Mesh3dResourceError::BudgetExceeded {
+            resource: Mesh3dUploadBudgetResource::GpuBytes,
+            limit: budget.max_gpu_bytes(),
+            actual: allocation.total_bytes as usize,
+        });
+    }
+    Ok(())
+}
+
 pub(super) fn replace_resources(
     device: &wgpu::Device,
     queue: &wgpu::Queue,

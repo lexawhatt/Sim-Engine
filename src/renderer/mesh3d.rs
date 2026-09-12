@@ -181,6 +181,7 @@ struct ClipProbeOutputGpu {
 }
 
 pub(super) struct Mesh3dRenderer {
+    dynamic_scratch: dynamic::DynamicMesh3dScratch,
     textures: MeshTextureRenderer,
     pipeline: wgpu::RenderPipeline,
     clipped_surface_pipeline: wgpu::RenderPipeline,
@@ -386,6 +387,7 @@ impl Mesh3dRenderer {
             true,
         );
         Self {
+            dynamic_scratch: dynamic::DynamicMesh3dScratch::default(),
             textures: MeshTextureRenderer::new(device, format, &camera_layout),
             pipeline,
             clipped_surface_pipeline,
@@ -521,6 +523,7 @@ pub struct RetainedMesh3d {
     edge_count: u32,
     gpu_allocation_bytes: usize,
     budget: Mesh3dUploadBudget,
+    allocation: Mesh3dUploadLayout,
 }
 
 impl RetainedMesh3d {
@@ -543,8 +546,9 @@ impl RetainedMesh3d {
         self.source.triangle_count()
     }
 
-    /// Returns exact vertex, optional UV, triangle-index and display-edge buffer
-    /// bytes. Shared material texels are reported separately by `Texture3d`.
+    /// Returns allocated vertex, optional UV, triangle-index and display-edge
+    /// buffer capacity bytes, including dynamic reserve beyond live geometry.
+    /// Shared material texels are reported separately by `Texture3d`.
     pub const fn gpu_allocation_bytes(&self) -> usize {
         self.gpu_allocation_bytes
     }
@@ -556,10 +560,15 @@ impl RetainedMesh3d {
     }
 }
 
+#[path = "mesh3d_dynamic.rs"]
+mod dynamic;
 #[path = "mesh3d_objects.rs"]
 mod objects;
 #[path = "mesh3d_upload.rs"]
 mod upload;
+pub use dynamic::{
+    DynamicMesh3dBudget, DynamicMesh3dBudgetResource, DynamicMesh3dError, DynamicMesh3dUpdateReport,
+};
 pub use objects::{
     Mesh3dInstance, Object3dId, Scene3d, Scene3dBudget, Scene3dBudgetResource, Scene3dError,
     Scene3dMeshUpdateReport, Scene3dStatistics,
@@ -614,9 +623,12 @@ impl RenderTarget3d {
 }
 
 fn validate_mesh_style(mesh: &RetainedMesh3d, style: MeshStyle3d) -> Result<(), Scene3dError> {
-    let has_surface = style.surface_style().is_some() && mesh.triangle_count() > 0;
-    let has_wireframe =
-        style.wireframe_style().is_some() && !mesh.source().display_edges().is_empty();
+    validate_mesh_source_style(mesh.source(), style)
+}
+
+fn validate_mesh_source_style(source: &Mesh3d, style: MeshStyle3d) -> Result<(), Scene3dError> {
+    let has_surface = style.surface_style().is_some() && source.triangle_count() > 0;
+    let has_wireframe = style.wireframe_style().is_some() && !source.display_edges().is_empty();
     (has_surface || has_wireframe)
         .then_some(())
         .ok_or(Scene3dError::StyleHasNoMatchingGeometry)
@@ -999,8 +1011,7 @@ impl WgpuRenderer {
         &self,
         source: &RetainedMesh3d,
     ) -> Result<RetainedMesh3d, Mesh3dResourceError> {
-        let prepared =
-            upload::prepare_with_budget(&self.device, source.source.clone(), source.budget)?;
+        let prepared = upload::prepare_restoration(&self.device, source)?;
         let restored_material = if let Some(material) = source.material() {
             Some(
                 TextureMaterial3d::new(
@@ -1295,9 +1306,7 @@ impl Mesh3dRenderer {
                 let generated = self.clipped_surface_objects[object_index]
                     .generated
                     .as_ref();
-                if generated.map_or(instance.mesh.index_buffer.is_some(), |range| {
-                    !range.is_empty()
-                }) {
+                if generated.map_or(instance.mesh.index_count > 0, |range| !range.is_empty()) {
                     draw_call_count = draw_call_count.saturating_add(1);
                 }
             }
@@ -1396,6 +1405,7 @@ fn create_retained_mesh(
 struct PreparedRetainedMeshUpload {
     source: Mesh3d,
     layout: Mesh3dUploadLayout,
+    allocation: Mesh3dUploadLayout,
     vertices: Vec<MeshVertexGpu>,
     edges: Vec<MeshEdgeGpu>,
     texture_coordinates: Vec<MeshUvGpu>,
@@ -1455,6 +1465,7 @@ fn prepare_retained_mesh_upload(
     Ok(PreparedRetainedMeshUpload {
         source,
         layout,
+        allocation: layout,
         vertices,
         edges,
         texture_coordinates,
@@ -1479,60 +1490,71 @@ fn upload_prepared_retained_mesh(
     let PreparedRetainedMeshUpload {
         source,
         layout,
+        allocation,
         vertices,
         edges,
         texture_coordinates,
         budget,
     } = prepared;
+    let mesh = allocate_retained_mesh(
+        device,
+        renderer_identity,
+        source,
+        layout,
+        allocation,
+        budget,
+    );
+    write_retained_mesh_uploads(queue, &mesh, &vertices, &edges, &texture_coordinates);
+    submit_pending_uploads(queue);
+    mesh
+}
+
+fn allocate_retained_mesh(
+    device: &wgpu::Device,
+    renderer_identity: Arc<()>,
+    source: Mesh3d,
+    live: Mesh3dUploadLayout,
+    allocation: Mesh3dUploadLayout,
+    budget: Mesh3dUploadBudget,
+) -> RetainedMesh3d {
     let vertex_buffer = Arc::new(device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("sim-engine retained 3D vertex buffer"),
-        size: layout.vertex_bytes,
+        size: allocation.vertex_bytes,
         usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     }));
-    let index_buffer = if layout.index_bytes == 0 {
+    let index_buffer = if allocation.index_bytes == 0 {
         None
     } else {
         Some(Arc::new(device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("sim-engine retained 3D index buffer"),
-            size: layout.index_bytes,
+            size: allocation.index_bytes,
             usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         })))
     };
-    queue.write_buffer(&vertex_buffer, 0, bytemuck::cast_slice(&vertices));
-    if let Some(index_buffer) = index_buffer.as_ref() {
-        queue.write_buffer(
-            index_buffer,
-            0,
-            bytemuck::cast_slice(source.triangle_indices()),
-        );
-    }
-    let edge_buffer = if layout.edge_bytes == 0 {
+    let edge_buffer = if allocation.edge_bytes == 0 {
         None
     } else {
         let buffer = Arc::new(device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("sim-engine retained 3D edge buffer"),
-            size: layout.edge_bytes,
+            size: allocation.edge_bytes,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         }));
-        queue.write_buffer(&buffer, 0, bytemuck::cast_slice(&edges));
         Some(buffer)
     };
-    let texture_coordinate_buffer = if layout.texture_coordinate_bytes == 0 {
+    let texture_coordinate_buffer = if allocation.texture_coordinate_bytes == 0 {
         None
     } else {
         let buffer = Arc::new(device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("sim-engine 3D UV buffer"),
-            size: layout.texture_coordinate_bytes,
+            size: allocation.texture_coordinate_bytes,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         }));
-        queue.write_buffer(&buffer, 0, bytemuck::cast_slice(&texture_coordinates));
         Some(buffer)
     };
-    submit_pending_uploads(queue);
     RetainedMesh3d {
         renderer_identity,
         vertex_buffer,
@@ -1541,11 +1563,42 @@ fn upload_prepared_retained_mesh(
         texture_coordinate_buffer,
         material: None,
         source,
-        index_count: layout.index_count,
-        edge_count: layout.edge_count,
-        gpu_allocation_bytes: layout.total_bytes as usize,
+        index_count: live.index_count,
+        edge_count: live.edge_count,
+        gpu_allocation_bytes: allocation.total_bytes as usize,
         budget,
+        allocation,
     }
+}
+
+fn write_retained_mesh_uploads(
+    queue: &wgpu::Queue,
+    mesh: &RetainedMesh3d,
+    vertices: &[MeshVertexGpu],
+    edges: &[MeshEdgeGpu],
+    coordinates: &[MeshUvGpu],
+) -> usize {
+    let mut calls = 0;
+    for (buffer, bytes) in [
+        (Some(&mesh.vertex_buffer), bytemuck::cast_slice(vertices)),
+        (
+            mesh.index_buffer.as_ref(),
+            bytemuck::cast_slice(mesh.source.triangle_indices()),
+        ),
+        (mesh.edge_buffer.as_ref(), bytemuck::cast_slice(edges)),
+        (
+            mesh.texture_coordinate_buffer.as_ref(),
+            bytemuck::cast_slice(coordinates),
+        ),
+    ] {
+        if let Some(buffer) = buffer
+            && !bytes.is_empty()
+        {
+            queue.write_buffer(buffer, 0, bytes);
+            calls += 1;
+        }
+    }
+    calls
 }
 
 fn restore_scene3d_resources(
@@ -1568,12 +1621,7 @@ fn restore_scene3d_resources(
     let pending_staging_bytes = scene
         .instances
         .len()
-        .checked_mul(std::mem::size_of::<(
-            usize,
-            Arc<wgpu::Buffer>,
-            Mesh3d,
-            Mesh3dUploadBudget,
-        )>())
+        .checked_mul(std::mem::size_of::<(usize, RetainedMesh3d)>())
         .and_then(|bytes| u64::try_from(bytes).ok())
         .ok_or(Mesh3dResourceError::CapacityTooLarge)?;
     let prepared_staging_bytes = scene
@@ -1598,7 +1646,7 @@ fn restore_scene3d_resources(
         .checked_mul(std::mem::size_of::<Mesh3dInstance>())
         .and_then(|bytes| u64::try_from(bytes).ok())
         .ok_or(Mesh3dResourceError::CapacityTooLarge)?;
-    let mut pending = Vec::<(usize, Arc<wgpu::Buffer>, Mesh3d, Mesh3dUploadBudget)>::new();
+    let mut pending = Vec::<(usize, RetainedMesh3d)>::new();
     pending
         .try_reserve_exact(scene.instances.len())
         .map_err(|_| Mesh3dResourceError::HostAllocationFailed {
@@ -1629,21 +1677,16 @@ fn restore_scene3d_resources(
             continue;
         }
         let key = Arc::as_ptr(&instance.mesh.vertex_buffer) as usize;
-        pending.push((
-            key,
-            Arc::clone(&instance.mesh.vertex_buffer),
-            instance.mesh.source.clone(),
-            instance.mesh.budget,
-        ));
+        pending.push((key, instance.mesh.clone()));
     }
     pending.sort_unstable_by_key(|entry| entry.0);
     pending.dedup_by_key(|entry| entry.0);
 
     // Complete every device-limit check and caller-scale host allocation
     // before the first replacement GPU resource is created or written.
-    for (key, old_vertex_buffer, source, budget) in pending {
-        let upload = upload::prepare_with_budget(device, source, budget)?;
-        prepared.push((key, old_vertex_buffer, upload));
+    for (key, mesh) in pending {
+        let upload = upload::prepare_restoration(device, &mesh)?;
+        prepared.push((key, Arc::clone(&mesh.vertex_buffer), upload));
     }
     for (key, _old_vertex_buffer, upload) in prepared {
         let replacement =
@@ -2974,7 +3017,7 @@ fn encode_scene_pass(
         .filter(|instance| instance.visible)
         .enumerate()
     {
-        if instance.style.surface_style().is_none() {
+        if instance.style.surface_style().is_none() || instance.mesh.index_count == 0 {
             continue;
         }
         let instance_start =
@@ -3049,7 +3092,7 @@ fn encode_scene_pass(
         let Some(edge_buffer) = instance.mesh.edge_buffer.as_ref() else {
             continue;
         };
-        if !style.hidden_enabled() {
+        if !style.hidden_enabled() || instance.mesh.edge_count == 0 {
             continue;
         }
         let dynamic_offset = (object_index * renderer.edge_object_stride) as u32;
@@ -3078,7 +3121,7 @@ fn encode_scene_pass(
         .filter(|instance| instance.visible)
         .enumerate()
     {
-        if instance.wireframe().is_none() {
+        if instance.wireframe().is_none() || instance.mesh.edge_count == 0 {
             continue;
         }
         let Some(edge_buffer) = instance.mesh.edge_buffer.as_ref() else {
@@ -3112,6 +3155,7 @@ pub(super) fn assert_gpu_depth_contract(
     queue: &wgpu::Queue,
     format: wgpu::TextureFormat,
 ) {
+    dynamic::assert_gpu_dynamic_contract(device, queue, format);
     surface::assert_gpu_surface_contract(device, queue, format);
     surface::assert_gpu_native_surface_policy(device, queue, format);
     surface::assert_gpu_native_edge_validation(device, queue, format);
@@ -3548,6 +3592,12 @@ pub(super) fn assert_gpu_scene_recovery_contract(
     recovery_device: &wgpu::Device,
     recovery_queue: &wgpu::Queue,
 ) {
+    dynamic::assert_gpu_dynamic_recovery(
+        source_device,
+        source_queue,
+        recovery_device,
+        recovery_queue,
+    );
     lifetime_tests::assert_lifetime_contract(
         source_device,
         source_queue,

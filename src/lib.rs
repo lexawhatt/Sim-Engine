@@ -62,7 +62,8 @@ pub use units::{LogicalPixels, PhysicalPerLogical, UnitError, WorldLength};
 
 #[cfg(feature = "wgpu")]
 pub use renderer::{
-    BlendMode, DynamicMesh2d, DynamicMeshBudget, DynamicMeshBudgetResource, DynamicMeshError,
+    BlendMode, DynamicMesh2d, DynamicMesh3dBudget, DynamicMesh3dBudgetResource, DynamicMesh3dError,
+    DynamicMesh3dUpdateReport, DynamicMeshBudget, DynamicMeshBudgetResource, DynamicMeshError,
     DynamicMeshRenderError, DynamicMeshUpdateReport, DynamicVertex2d, FrameBudget,
     FrameBudgetResource, FrameCacheBudget, FrameCacheStatistics, FrameComposer, FrameComposerError,
     FramePassOptions, FrameReport, FrameSourceKind, FrameSourceStatistics, FrameStatistics,
