@@ -2,6 +2,8 @@
 
 #[path = "support/texture_lifecycle_3d_scene.rs"]
 mod gallery;
+#[path = "support/mesh3d_dev5_acceptance.rs"]
+mod standalone_acceptance;
 
 use gallery::{BACKGROUND, Gallery};
 use sim_engine::{
@@ -9,6 +11,7 @@ use sim_engine::{
     Mesh3dRenderBudget, Projection3d, RenderStatus, RenderTarget3d, RendererPresentMode,
     SurfaceRasterization3d, Vec3, WgpuRenderer, WgpuRendererOptions, WorldLength,
 };
+use standalone_acceptance::StandaloneRecovery;
 use std::{
     error::Error,
     sync::Arc,
@@ -271,6 +274,11 @@ fn main() -> ExampleResult<()> {
         .as_ref()
         .ok_or("gallery did not initialize")?;
     if options.acceptance {
+        state
+            .standalone
+            .as_ref()
+            .ok_or("acceptance lost public standalone recovery controls")?
+            .validate()?;
         state.evidence.validate(
             state.gallery.edits,
             state.gallery.detached_edits,
@@ -318,6 +326,7 @@ struct State {
     renderer: WgpuRenderer,
     target: RenderTarget3d,
     gallery: Gallery,
+    standalone: Option<StandaloneRecovery>,
     evidence: Evidence,
     timing: Option<TimingEvidence>,
     attempts: usize,
@@ -352,6 +361,10 @@ impl State {
         renderer.set_pre_present_notify(move || notify.pre_present_notify());
         let target = make_target(&renderer, size.width.max(1), size.height.max(1))?;
         let gallery = Gallery::new(&renderer)?;
+        let standalone = options
+            .acceptance
+            .then(|| StandaloneRecovery::new(&mut renderer))
+            .transpose()?;
         println!(
             "texture_lifecycle_3d adapter={:?} backend={} pci={:?} format={:?} MSAA_surface={} target=1",
             renderer.adapter_name(),
@@ -375,6 +388,7 @@ impl State {
             renderer,
             target,
             gallery,
+            standalone,
             evidence: Evidence::default(),
             timing,
             attempts: 0,
@@ -429,6 +443,7 @@ impl State {
 
     fn recover(&mut self) -> ExampleResult<()> {
         let before = fingerprint(&self.gallery.scene)?;
+        let statistics = self.gallery.scene.statistics();
         let lighting = self.gallery.scene.lighting();
         let fog = self.gallery.scene.fog();
         let adapter_before = adapter_identity(&self.renderer);
@@ -447,13 +462,37 @@ impl State {
         }
         let report = self.renderer.restore_scene3d(&mut self.gallery.scene)?;
         self.target = self.renderer.restore_render_target3d(&self.target)?;
+        let restored_statistics = self.gallery.scene.statistics();
+        // Recovery can repack scene bookkeeping. Mesh/texture allocations and
+        // their deduplication, unlike instance Vec capacity, must be preserved.
         if before != fingerprint(&self.gallery.scene)?
             || lighting != self.gallery.scene.lighting()
             || fog != self.gallery.scene.fog()
+            || statistics.object_count() != restored_statistics.object_count()
+            || statistics.mesh_count() != restored_statistics.mesh_count()
+            || statistics.mesh_cpu_bytes() != restored_statistics.mesh_cpu_bytes()
+            || statistics.mesh_gpu_bytes() != restored_statistics.mesh_gpu_bytes()
+            || statistics.texture_count() != restored_statistics.texture_count()
+            || statistics.texture_cpu_bytes() != restored_statistics.texture_cpu_bytes()
+            || statistics.texture_gpu_bytes() != restored_statistics.texture_gpu_bytes()
+            || report.restored_mesh_count() != statistics.mesh_count()
+            || report.restored_texture_count() != statistics.texture_count()
         {
-            return Err("recovery changed IDs, style, UV settings or committed mip bytes".into());
+            return Err(
+                "recovery changed IDs, style, UV settings, mip bytes or deduplicated allocations"
+                    .into(),
+            );
         }
         self.gallery.validate_snapshot()?;
+        let camera = self.camera()?;
+        if let Some(standalone) = &mut self.standalone {
+            let ids = standalone.restore_and_submit(&mut self.renderer, &self.target, camera)?;
+            if let Some(timing) = &mut self.timing {
+                for id in ids {
+                    timing.submitted(Some(id))?;
+                }
+            }
+        }
         self.evidence.recoveries += 1;
         println!(
             "recovered textures={} meshes={}; exact CPU mip chains, material settings and object IDs preserved",
@@ -543,6 +582,10 @@ impl State {
                     self.reset_view();
                 }
                 PRESENTS => {
+                    self.standalone
+                        .as_ref()
+                        .ok_or("missing public standalone recovery acceptance")?
+                        .validate()?;
                     self.evidence.validate(
                         self.gallery.edits,
                         self.gallery.detached_edits,

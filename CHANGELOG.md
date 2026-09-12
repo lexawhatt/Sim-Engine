@@ -7,13 +7,33 @@ changes.
 
 ## Unreleased - 0.4.0 development
 
-Current development version: `0.4.0-dev.4`. This is a development integration
+Current development version: `0.4.0-dev.5`. This is a development integration
 preview, not the official 0.4.0 release. External handoffs use an
 exact tested git revision for Sim;Logic; registry publication follows integration
 feedback and separate release qualification.
 The 0.4.0 scope prioritizes requested capabilities and reproducible measurement
 baselines. Intensive optimization is planned for 0.4.1, not claimed here as
 implemented work.
+
+### Consumer corrections in dev.5
+
+- Fixed standalone `restore_mesh3d` reconstructing an opaque material instead
+  of preserving the source material. Transparent texels and alpha tint now
+  restore without rejection; signed UV scale/offset, Repeat, filtering and
+  the original opaque/alpha-capable rebinding policy survive along with all
+  committed mip bytes/options and reserved attribute-buffer capacity.
+  Whole-scene deduplicated restoration retains its existing contract.
+- Added transactional `Scene3d::set_background` for normalized straight RGBA,
+  including alpha below one. It preserves object IDs, resource residency,
+  capacities, materials and environment without a geometry update or upload.
+- Added `Scene3d::set_texture_material(id, Some(&material))` and `None` removal,
+  preserving shared topology/attribute buffers and all other object state.
+  Final resource/storage limits and unique old-plus-incoming peak reports use
+  the existing scene rebind contract; rejected changes preserve visual state.
+- Added `RetainedMesh3d::without_material` for an upload-free immutable plain
+  handle. Old aliases keep their material; UVs remain available for rebinding.
+- Added material restoration pixel regressions on a second logical device and
+  public gallery acceptance through actual standalone restoration/rebinding.
 
 ### Added
 
@@ -110,6 +130,9 @@ implemented work.
 
 ### Migration notes from 0.3.0
 
+- `Scene3dError::Texture` exposes material-rebinding failures; exhaustive enum
+  matches must account for it. `set_background` explicitly permits normalized
+  alpha, while the legacy scene constructors still require an opaque clear.
 - `ShapedLine` now retains its UTF-8 and shared font/style provenance. Its
   `allocation_bytes` includes the owned string, but not shared font storage.
   One-shot shaping therefore has one additional allocation; use a warmed

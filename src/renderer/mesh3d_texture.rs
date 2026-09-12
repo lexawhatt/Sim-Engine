@@ -37,6 +37,11 @@ mod lifecycle_tests;
 pub(super) use lifecycle_tests::{
     assert_gpu_texture_lifecycle, assert_gpu_texture_lifecycle_recovery,
 };
+#[cfg(test)]
+#[path = "mesh3d_dev5_tests.rs"]
+mod dev5_tests;
+#[cfg(test)]
+pub(super) use dev5_tests::assert_dev5_contract;
 
 /// Validation or allocation failure for a retained 3D texture/material.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -453,24 +458,13 @@ impl WgpuRenderer {
     /// Restores exact retained pixels on the current device. Existing handles
     /// remain unchanged; atomic `restore_scene3d` restores shared textures once.
     pub fn restore_texture3d(&self, source: &Texture3d) -> Result<Texture3d, Texture3dError> {
-        source
-            .storage
-            .chain
-            .validate_device_limit(self.device.limits().max_texture_dimension_2d)
-            .map_err(Texture3dError::Image)?;
-        let chain = source
-            .storage
-            .chain
-            .try_clone()
-            .map_err(Texture3dError::Image)?;
-        Ok(upload_chain(
+        restore_texture(
             &self.device,
             &self.queue,
             &self.renderer_identity,
             &self.mesh3d_renderer.textures.layout,
-            chain,
-            source.preserves_alpha(),
-        ))
+            source,
+        )
     }
 
     /// Associates a shared material with a new retained mesh handle without
@@ -483,6 +477,33 @@ impl WgpuRenderer {
     ) -> Result<RetainedMesh3d, Texture3dError> {
         attach_material(&self.renderer_identity, mesh, material)
     }
+}
+
+pub(super) fn restore_texture(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    identity: &Arc<()>,
+    layout: &wgpu::BindGroupLayout,
+    source: &Texture3d,
+) -> Result<Texture3d, Texture3dError> {
+    source
+        .storage
+        .chain
+        .validate_device_limit(device.limits().max_texture_dimension_2d)
+        .map_err(Texture3dError::Image)?;
+    let chain = source
+        .storage
+        .chain
+        .try_clone()
+        .map_err(Texture3dError::Image)?;
+    Ok(upload_chain(
+        device,
+        queue,
+        identity,
+        layout,
+        chain,
+        source.preserves_alpha(),
+    ))
 }
 
 pub(super) fn attach_material(

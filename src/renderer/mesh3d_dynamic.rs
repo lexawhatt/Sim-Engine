@@ -187,7 +187,7 @@ fn planned_allocation(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn update_scene_mesh(
+pub(super) fn update_scene_mesh(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     identity: &Arc<()>,

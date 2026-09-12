@@ -2,7 +2,7 @@
 
 This document contains the published 0.3.0 integration guide plus the explicit
 [0.4 development preview](#04-development-preview) below. The checkout version
-is `0.4.0-dev.4`; it is not a final 0.4.0 release. For older integrations, use the
+is `0.4.0-dev.5`; it is not a final 0.4.0 release. For older integrations, use the
 [archived 0.2 guide](https://github.com/lexawhatt/Sim-Engine/blob/v0.2.0/DOCUMENTATION.md).
 The [0.3.0 changelog](CHANGELOG.md#030---2026-09-11) includes migration notes.
 This guide is divided into two parts:
@@ -39,6 +39,60 @@ correctness/resource contracts, and reproducible performance measurements.
 Intensive profiling-driven optimization is planned for 0.4.1. Existing reuse
 requirements and regression gates remain part of 0.4.0; the later optimization
 phase is not a prerequisite for the Sim;Logic DEV test drive.
+
+### Consumer corrections and in-place presentation changes (dev.5)
+
+Use the dev.5 pin or later for standalone `renderer.restore_mesh3d(&mesh)`.
+Dev.4 incorrectly recreated a legacy opaque material in that route: transparent
+pixels/tints could reject, and UV/addressing/alpha-rebinding policy could reset.
+Restoration now preserves complete mip pixels/options, sampling, tint, signed
+UV transformation, addressing, opaque/alpha-capable rebinding policy and every
+reserved geometry/attribute capacity. Existing source aliases do not change.
+Separate standalone restore calls recreate separate GPU resources; use
+`renderer.restore_scene3d(&mut scene)` when shared-resource deduplication and
+stable object IDs across device replacement are required. Surface styles still
+belong to scene objects, not standalone mesh handles.
+
+For an animated clear color, mutate the existing scene:
+
+```rust
+use sim_engine::{Color, Scene3d};
+
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+let mut scene = Scene3d::new(Color::BLACK)?;
+scene.set_background(Color::rgba(0.1, 0.2, 0.3, 0.5))?;
+# Ok(())
+# }
+```
+
+The setter explicitly accepts normalized straight-linear RGBA, even on a scene
+created by the legacy opaque constructor. Non-finite or out-of-range channels
+return `Scene3dError::InvalidBackground` without modifying the previous color.
+This performs no allocation or GPU upload and changes no IDs, object/material
+state, resource capacity, lighting or fog. Offscreen rendering premultiplies
+the clear color; do not premultiply the setter input. It changes the target
+clear, not an environment sky mesh or simulation state.
+
+Use `scene.set_texture_material(id, Some(&material))` to attach/replace a
+texture material, and `scene.set_texture_material(id, None)` to remove it.
+The object's topology, UVs, normals, vertex colors, edge buffers and reserved
+capacities are shared unchanged. No GPU allocation, copy or upload occurs;
+fallible CPU scene-accounting reservation can still be needed for new texture
+references. Existing mesh handles and other scene objects retain their previous
+materials. Transform, surface/edge style, visibility and stable ID do not change.
+`mesh.without_material()` returns an independent material-free handle with the
+same buffers if a standalone snapshot is preferred. It does not restore a stale
+resource onto a new device.
+
+Material rebinding validates the object ID first, then texture/mesh generation,
+UV availability, styles and final scene resource/storage limits. Errors leave
+the old visual state intact; texture-specific failures are nested in
+`Scene3dError::Texture`. The `Scene3dMeshUpdateReport` includes unique scene-wide
+old-plus-incoming CPU/GPU peaks, just like `set_mesh`; these are reports, not new
+peak limits or a promise that previously submitted resources retire immediately.
+Already uploaded incoming textures and external aliases remain host-owned.
+Detaching the last scene reference removes its texture bytes from final scene
+statistics, not necessarily from the process or GPU driver.
 
 ### CPU shaping without GPU dependencies
 
@@ -516,6 +570,12 @@ texture next to its unchanged immutable alias. `U` edits; `T` toggles repeat;
 `F5` replaces/restores the logical device and Esc exits. The bounded acceptance
 mode exercises these states and requires confirmed Drawn frames; manual
 inspection remains separate from pixel-oracle qualification.
+Since dev.5, the same recovery also restores four standalone meshes through
+the public API: transparent texels, alpha tint, signed/repeating UVs and an
+alpha-capable material whose current texture is opaque. It checks retained
+attributes/reserves, every CPU mip, alpha-image rebinding, background mutation
+and material removal without topology replacement. The mandatory GPU oracle
+separately reads the restored mip textures and rendered pixels on a new device.
 
 ### GPU diagnostics and the full changing-scene matrix (dev.4)
 

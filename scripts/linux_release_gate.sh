@@ -99,6 +99,8 @@ assert_provenance
 WGPU_BACKEND=vulkan \
 cargo run --release --features text --example text_ui_updates -- --acceptance
 WGPU_BACKEND=vulkan \
+cargo run --release --example texture_lifecycle_3d -- --acceptance
+WGPU_BACKEND=vulkan \
 SIM_ENGINE_REQUIRE_VULKAN=1 \
 ./scripts/rendering_benchmark_matrix.sh
 

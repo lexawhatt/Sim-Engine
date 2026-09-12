@@ -18,6 +18,9 @@ use surface::{SurfaceClipEdge, SurfaceClipVertex, SurfaceFrame, SurfaceObject};
 #[path = "mesh3d_texture.rs"]
 mod texture;
 use texture::{MeshTextureRenderer, MeshUvGpu};
+#[path = "mesh3d_restoration.rs"]
+mod restoration;
+use restoration::restore_retained_mesh;
 #[path = "mesh3d_colors.rs"]
 mod colors;
 use crate::mesh3d::{SurfaceAlphaMode3d, SurfaceSidedness3d};
@@ -564,6 +567,18 @@ pub struct RetainedMesh3d {
 }
 
 impl RetainedMesh3d {
+    /// Returns a material-free handle sharing the same immutable topology and
+    /// attribute buffers. No CPU geometry is copied and no GPU resource is
+    /// allocated or uploaded. Existing handles and scene objects are unchanged.
+    /// UVs, normals, vertex colors, display edges and reserved capacity remain
+    /// available for later rebinding. Device provenance is unchanged; a stale
+    /// handle still needs restoration before rendering on a replacement device.
+    pub fn without_material(&self) -> Self {
+        let mut mesh = self.clone();
+        mesh.material = None;
+        mesh
+    }
+
     /// Returns the optional shared texture/filter/tint material for this handle.
     /// Mesh clones share buffers while retaining independent material selection.
     pub const fn material(&self) -> Option<&TextureMaterial3d> {
@@ -1139,34 +1154,23 @@ impl WgpuRenderer {
         )
     }
 
-    /// Restores retained topology onto this renderer after device replacement.
+    /// Restores retained topology and its complete optional texture material
+    /// onto this renderer after device replacement. Attribute/reserved buffer
+    /// capacities, committed mip bytes/options, filtering, tint, UV transform,
+    /// addressing and opaque/alpha-capable rebinding policy are preserved.
+    /// Source handles remain unchanged. Separate calls restore separate GPU
+    /// resources; use `restore_scene3d` to deduplicate shared scene resources.
     pub fn restore_mesh3d(
         &self,
         source: &RetainedMesh3d,
     ) -> Result<RetainedMesh3d, Mesh3dResourceError> {
-        let prepared = upload::prepare_restoration(&self.device, source)?;
-        let restored_material = if let Some(material) = source.material() {
-            Some(
-                TextureMaterial3d::new(
-                    &self
-                        .restore_texture3d(material.texture())
-                        .map_err(Mesh3dResourceError::Texture)?,
-                    material.sampling(),
-                    material.tint(),
-                )
-                .map_err(Mesh3dResourceError::Texture)?,
-            )
-        } else {
-            None
-        };
-        let mut restored = upload_prepared_retained_mesh(
+        restore_retained_mesh(
             &self.device,
             &self.queue,
             Arc::clone(&self.renderer_identity),
-            prepared,
-        );
-        restored.material = restored_material;
-        Ok(restored)
+            &self.mesh3d_renderer.textures.layout,
+            source,
+        )
     }
 
     /// Atomically restores every stale retained mesh referenced by a 3D scene.
@@ -4135,6 +4139,13 @@ pub(super) fn assert_gpu_scene_recovery_contract(
     recovery_queue: &wgpu::Queue,
     format: wgpu::TextureFormat,
 ) {
+    texture::assert_dev5_contract(
+        source_device,
+        source_queue,
+        recovery_device,
+        recovery_queue,
+        format,
+    );
     texture::assert_gpu_texture_lifecycle_recovery(
         source_device,
         source_queue,

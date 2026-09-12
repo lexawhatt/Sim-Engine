@@ -1,6 +1,6 @@
 # Sim;Engine
 
-Development checkout: **0.4.0-dev.4**, not a published 0.4.0 release.
+Development checkout: **0.4.0-dev.5**, not a published 0.4.0 release.
 Stable installation examples below remain on 0.3.0. See the
 [development integration notes](DOCUMENTATION.md#04-development-preview)
 and [unreleased changelog](CHANGELOG.md#unreleased---040-development)
@@ -12,6 +12,8 @@ explicit surface sidedness, optional model normals, ambient/directional Lambert
 lighting and camera-distance fog. The combined dev.4 candidate adds bounded
 mip chains, isolated repeating texture tiles, atomic region updates, optional
 GPU timestamp diagnostics and an expanded changing-scene measurement matrix.
+Dev.5 preserves complete standalone mesh materials during device restoration
+and adds in-place background changes and upload-free texture-material rebinding.
 The 0.4.0 priority is completing the integration requirements and measurement
 baselines; intensive performance optimization is planned for 0.4.1.
 

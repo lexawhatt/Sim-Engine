@@ -433,6 +433,21 @@ impl Scene3d {
         self.background
     }
 
+    /// Changes only the normalized straight-linear RGBA clear color, accepting
+    /// alpha in `0..=1` even on a scene created with the opaque constructor.
+    /// This explicit mutation performs no allocation, geometry update or upload;
+    /// IDs, resources, capacities, materials and the environment are untouched.
+    /// Non-finite or out-of-range channels return `InvalidBackground` without
+    /// changing the previous color. Rendering premultiplies clear RGB exactly
+    /// as it does for `with_alpha_background`.
+    pub fn set_background(&mut self, background: Color) -> Result<(), Scene3dError> {
+        if !background.is_normalized() {
+            return Err(Scene3dError::InvalidBackground);
+        }
+        self.background = background;
+        Ok(())
+    }
+
     /// Returns objects in host insertion order; depth determines visibility.
     pub fn instances(&self) -> &[Mesh3dInstance] {
         &self.instances
@@ -516,6 +531,32 @@ impl Scene3d {
             self.remove_resource(resource.key);
         }
         Ok(removed)
+    }
+
+    /// Attaches/replaces (`Some`) or removes (`None`) only this object's texture
+    /// material, sharing all existing topology and attribute buffers. There are
+    /// no geometry/texture uploads, GPU allocations or GPU copies. Existing mesh
+    /// aliases and other objects retain their materials; IDs, transform, style,
+    /// visibility and reserved mesh capacity are unchanged.
+    ///
+    /// Rebinding validates object provenance, texture device ownership, UVs and
+    /// final scene resource/storage limits before publication. Fallible scene
+    /// bookkeeping reservation may be needed. The returned report uses the same
+    /// unique old-plus-incoming overlap accounting as `set_mesh`; it does not
+    /// impose a new peak limit or promise immediate in-flight GPU retirement.
+    /// Detaching retains UVs for later rebinding and does not create geometry.
+    pub fn set_texture_material(
+        &mut self,
+        object_id: Object3dId,
+        material: Option<&TextureMaterial3d>,
+    ) -> Result<Scene3dMeshUpdateReport, Scene3dError> {
+        let mesh = self.instance(object_id)?.mesh();
+        let replacement = match material {
+            Some(material) => texture::attach_material(&mesh.renderer_identity, mesh, material)
+                .map_err(Scene3dError::Texture)?,
+            None => mesh.without_material(),
+        };
+        self.set_mesh(object_id, &replacement)
     }
 
     /// Rebinds only this object to an immutable mesh after complete validation.
@@ -1068,6 +1109,8 @@ fn planned_capacity<T>(current: &Vec<T>, additional: usize, maximum: usize) -> u
 /// Rejection reason for 3D scene visual state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scene3dError {
+    /// Texture material rebinding failed validation before scene mutation.
+    Texture(Texture3dError),
     /// Lambert surface requires one normalized model normal per source vertex.
     MissingNormals,
     /// Each explicit scene budget limit must be nonzero.
@@ -1110,6 +1153,7 @@ pub enum Scene3dError {
 impl fmt::Display for Scene3dError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Texture(error) => write!(formatter, "3D scene material: {error}"),
             Self::MissingNormals => write!(
                 formatter,
                 "Lambert surface requires application-supplied model normals"
@@ -1128,7 +1172,7 @@ impl fmt::Display for Scene3dError {
             ),
             Self::InvalidBackground => write!(
                 formatter,
-                "3D scene background must be normalized; alpha requires an explicit alpha constructor"
+                "3D scene background must be normalized; legacy constructors also require opaque alpha"
             ),
             Self::EmptyStyle => write!(formatter, "3D object requires a surface or wireframe"),
             Self::StyleHasNoMatchingGeometry => write!(
@@ -1156,4 +1200,75 @@ impl fmt::Display for Scene3dError {
     }
 }
 
-impl Error for Scene3dError {}
+impl Error for Scene3dError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Texture(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod presentation_tests {
+    use super::*;
+
+    #[test]
+    fn background_changes_are_normalized_atomic_and_allocation_free() {
+        let mut scene = Scene3d::new(Color::BLACK).unwrap();
+        let identity = scene.scene_id;
+        let statistics = scene.statistics();
+        let lighting = scene.lighting();
+        let fog = scene.fog();
+        let background = Color::rgba(0.125, 0.25, 0.5, 0.5);
+        let (_, allocations) = crate::test_allocations::count(|| {
+            scene.set_background(background).unwrap();
+            for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -0.1, 1.1] {
+                for channel in 0..4 {
+                    let mut channels = [0.5; 4];
+                    channels[channel] = bad;
+                    assert_eq!(
+                        scene.set_background(Color::rgba(
+                            channels[0],
+                            channels[1],
+                            channels[2],
+                            channels[3],
+                        )),
+                        Err(Scene3dError::InvalidBackground)
+                    );
+                    assert_eq!(scene.background(), background);
+                }
+            }
+        });
+        assert_eq!(allocations, 0);
+        assert_eq!(scene.scene_id, identity);
+        assert_eq!(scene.statistics(), statistics);
+        assert_eq!(scene.lighting(), lighting);
+        assert_eq!(scene.fog(), fog);
+        for alpha in [0.0, f32::from_bits(1), 1.0] {
+            scene
+                .set_background(Color::rgba(0.5, 0.0, 1.0, alpha))
+                .unwrap();
+            assert_eq!(scene.background().alpha(), alpha);
+        }
+    }
+
+    #[test]
+    fn background_setter_does_not_change_legacy_constructor_validation() {
+        let translucent = Color::rgba(0.5, 0.0, 1.0, 0.5);
+        assert!(matches!(
+            Scene3d::new(translucent),
+            Err(Scene3dError::InvalidBackground)
+        ));
+        assert_eq!(
+            Scene3d::with_alpha_background(translucent)
+                .unwrap()
+                .background(),
+            translucent
+        );
+        let cause = Texture3dError::MissingTextureCoordinates;
+        let error = Scene3dError::Texture(cause);
+        assert_eq!(error.source().unwrap().to_string(), cause.to_string());
+        assert!(Scene3dError::InvalidBackground.source().is_none());
+    }
+}
