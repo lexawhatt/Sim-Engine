@@ -111,6 +111,12 @@ pub(super) struct DynamicSceneMeshChange {
     resources: Option<Vec<ResourceUsage>>,
 }
 
+impl DynamicSceneMeshChange {
+    pub(super) fn object_index(&self) -> usize {
+        self.index
+    }
+}
+
 /// Bounds scene-owned slots and distinct retained mesh allocations.
 ///
 /// Object storage includes dense instances, reusable lookup slots and resource
@@ -587,6 +593,36 @@ impl Scene3d {
             incoming[1].key.1 = 0;
         }
         incoming[1].bytes = gpu_bytes;
+        self.prepare_resource_change(index, incoming, outgoing)
+    }
+
+    pub(super) fn prepare_dynamic_texture_change(
+        &self,
+        object_id: Object3dId,
+        cpu_bytes: usize,
+        gpu_bytes: usize,
+        detached: bool,
+    ) -> Result<DynamicSceneMeshChange, Scene3dError> {
+        let index = self.instance_index(object_id)?;
+        let outgoing = mesh_resources(&self.instances[index].mesh);
+        let mut incoming = outgoing;
+        // The candidate CPU chain has a distinct allocation even when its
+        // enclosing texture handle and GPU allocation are uniquely reused.
+        incoming[2].key.1 = 0;
+        incoming[2].bytes = cpu_bytes;
+        incoming[3].bytes = gpu_bytes;
+        if detached {
+            incoming[3].key.1 = 0;
+        }
+        self.prepare_resource_change(index, incoming, outgoing)
+    }
+
+    fn prepare_resource_change(
+        &self,
+        index: usize,
+        incoming: [ResourceUsage; 4],
+        outgoing: [ResourceUsage; 4],
+    ) -> Result<DynamicSceneMeshChange, Scene3dError> {
         self.validate_resource_change(&incoming, Some(&outgoing))?;
         let retired = outgoing
             .iter()
@@ -655,6 +691,18 @@ impl Scene3d {
         }
         self.instances[change.index].mesh = mesh;
         self.statistics()
+    }
+
+    pub(super) fn commit_dynamic_texture_change(&mut self, change: DynamicSceneMeshChange) {
+        if let Some(resources) = change.resources {
+            self.resources = resources;
+        }
+        for resource in change.outgoing {
+            self.remove_resource(resource.key);
+        }
+        for resource in mesh_resources(&self.instances[change.index].mesh) {
+            self.add_resource(resource);
+        }
     }
 
     /// Returns objects currently participating in rendering.

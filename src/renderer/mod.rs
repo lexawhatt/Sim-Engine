@@ -3548,6 +3548,8 @@ pub struct WgpuRenderer {
     target_composition_pipelines: CompositionPipelines,
     image_renderer: ImageRenderer,
     mesh3d_renderer: Mesh3dRenderer,
+    gpu_timing: gpu_timing::GpuTimingCollector,
+    gpu_timing_requested: bool,
     camera_uniform_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
     camera_bind_group_layout: wgpu::BindGroupLayout,
@@ -3622,7 +3624,10 @@ impl WgpuRenderer {
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("sim-engine device"),
-                required_features: wgpu::Features::empty(),
+                required_features: gpu_timing::requested_features(
+                    adapter.features(),
+                    options.gpu_timing(),
+                ),
                 required_limits: wgpu::Limits::default(),
                 experimental_features: wgpu::ExperimentalFeatures::disabled(),
                 memory_hints: wgpu::MemoryHints::Performance,
@@ -3674,6 +3679,7 @@ impl WgpuRenderer {
         let multisample_target = create_multisample_target(&device, &config, sample_count);
         let image_renderer = ImageRenderer::new(&device, config.format, sample_count);
         let mesh3d_renderer = Mesh3dRenderer::new(&device, config.format);
+        let gpu_timing = gpu_timing::GpuTimingCollector::new(&device, &queue, options.gpu_timing());
 
         Ok(Self {
             renderer_identity: Arc::new(()),
@@ -3699,6 +3705,8 @@ impl WgpuRenderer {
             target_composition_pipelines,
             image_renderer,
             mesh3d_renderer,
+            gpu_timing,
+            gpu_timing_requested: options.gpu_timing(),
             camera_uniform_buffer,
             camera_bind_group,
             camera_bind_group_layout,
@@ -3721,6 +3729,23 @@ impl WgpuRenderer {
     /// Returns the configured surface size in physical pixels.
     pub fn size(&self) -> (u32, u32) {
         (self.config.width, self.config.height)
+    }
+
+    /// Returns optional GPU-query availability, bounded resources and losses.
+    /// These diagnostics are independent of frame CPU timings and scene uploads.
+    pub fn gpu_timing_statistics(&self) -> GpuTimingStatistics {
+        self.gpu_timing.statistics()
+    }
+
+    /// Collects at most eight completed GPU pass intervals without waiting.
+    ///
+    /// Call regularly when timing is enabled; uncollected samples occupy the
+    /// fixed ring and eventually cause new samples to be dropped. Match sample
+    /// IDs to submitted reports when excluding warmup or unrelated work. A call
+    /// performs one nonblocking device poll and reports its CPU overhead. Device
+    /// recovery discards pending old-device samples and resets the counters.
+    pub fn collect_gpu_timings(&mut self) -> GpuTimingBatch {
+        self.gpu_timing.collect(&self.device)
     }
 
     /// Returns the render viewport size in logical screen pixels.
@@ -8054,6 +8079,7 @@ mod exact_markers;
 mod frame;
 mod geometry;
 mod glyph;
+mod gpu_timing;
 mod image;
 mod mesh3d;
 mod tessellation;
@@ -8079,6 +8105,10 @@ pub use glyph::{
     GlyphRunBounds, GlyphRunBudget, GlyphRunStatistics, GlyphRunUploadReport, GlyphUploadReport,
     PositionedGlyph2d,
 };
+pub use gpu_timing::{
+    GpuTimingBatch, GpuTimingId, GpuTimingSample, GpuTimingSource, GpuTimingStatistics,
+    GpuTimingStatus,
+};
 pub use image::{
     Image2d, ImageBatch2d, ImageBatchBudget, ImageBatchPlacement, ImageBatchUploadReport,
     ImageBudget, ImageError, ImageSampling, ImageSprite2d, ImageTexelRect, ImageUploadReport,
@@ -8092,7 +8122,9 @@ pub use mesh3d::{
     Mesh3dSurfaceError, Mesh3dUploadBudget, Mesh3dUploadBudgetResource, Mesh3dUploadReport,
     Object3dId, RenderTarget3d, RetainedMesh3d, Scene3d, Scene3dBudget, Scene3dBudgetResource,
     Scene3dError, Scene3dMeshUpdateReport, Scene3dRestoreReport, Scene3dStatistics,
-    SurfaceRasterization3d, Texture3d, Texture3dError, TextureMaterial3d,
+    SurfaceRasterization3d, Texture3d, Texture3dError, Texture3dOptions, Texture3dUpdateBudget,
+    Texture3dUpdateBudgetResource, Texture3dUpdateError, Texture3dUpdateReport, TextureMaterial3d,
+    TextureMipmaps3d,
 };
 use tessellation::{
     logical_viewport_scissor, offset_scissor, screen_clip_to_scissor, tessellate_scene,

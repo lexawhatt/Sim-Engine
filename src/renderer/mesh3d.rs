@@ -40,11 +40,18 @@ mod material;
 #[cfg(test)]
 #[path = "mesh3d_material_tests.rs"]
 mod material_tests;
+#[cfg(test)]
+#[path = "mesh3d_native_acceptance_tests.rs"]
+mod native_acceptance_tests;
 
 #[cfg(test)]
 #[path = "mesh3d_material_resource_tests.rs"]
 mod material_resource_tests;
-pub use texture::{Texture3d, Texture3dError, TextureMaterial3d};
+pub use texture::{
+    Texture3d, Texture3dError, Texture3dOptions, Texture3dUpdateBudget,
+    Texture3dUpdateBudgetResource, Texture3dUpdateError, Texture3dUpdateReport, TextureMaterial3d,
+    TextureMipmaps3d,
+};
 
 #[cfg(test)]
 use crate::{MeshEdge3d, Projection3d, Rotation3d, SurfaceStyle3d, WorldLength};
@@ -60,6 +67,12 @@ mod vertex_color_tests;
 #[cfg(test)]
 #[path = "mesh3d_color_budget_tests.rs"]
 mod color_budget_tests;
+
+#[cfg(test)]
+#[path = "mesh3d_timing_tests.rs"]
+mod timing_tests;
+#[cfg(test)]
+pub(super) use timing_tests::assert_gpu_scene_timing_and_upload_contract;
 
 #[cfg(test)]
 fn logical(value: f32) -> LogicalPixels {
@@ -112,10 +125,11 @@ struct MeshInstanceGpu {
     normal_row_0: [f32; 4],
     normal_row_1: [f32; 4],
     normal_row_2: [f32; 4],
+    uv_transform: [f32; 4],
 }
 
 impl MeshInstanceGpu {
-    const ATTRIBUTES: [wgpu::VertexAttribute; 8] = wgpu::vertex_attr_array![1 => Float32x4, 2 => Float32x4, 3 => Float32x4, 4 => Float32x4, 7 => Float32x4, 9 => Float32x4, 10 => Float32x4, 11 => Float32x4];
+    const ATTRIBUTES: [wgpu::VertexAttribute; 9] = wgpu::vertex_attr_array![1 => Float32x4, 2 => Float32x4, 3 => Float32x4, 4 => Float32x4, 7 => Float32x4, 9 => Float32x4, 10 => Float32x4, 11 => Float32x4, 12 => Float32x4];
     const LAYOUT: wgpu::VertexBufferLayout<'static> = wgpu::VertexBufferLayout {
         array_stride: std::mem::size_of::<Self>() as wgpu::BufferAddress,
         step_mode: wgpu::VertexStepMode::Instance,
@@ -937,8 +951,19 @@ pub struct Mesh3dRenderReport {
     render_pass_count: usize,
     draw_call_count: usize,
     upload: Duration,
+    preflight_duration: Duration,
+    staging_upload_duration: Duration,
     encode_submit: Duration,
     preflight: Mesh3dPreflightReport,
+    gpu_timing_id: Option<GpuTimingId>,
+    uploaded_bytes: usize,
+    upload_calls: usize,
+    buffer_allocation_count: usize,
+    retained_frame_cpu_bytes: usize,
+    retained_frame_gpu_bytes: usize,
+    staging_capacity_bytes: usize,
+    peak_frame_cpu_bytes: usize,
+    peak_frame_gpu_bytes: usize,
 }
 
 impl Mesh3dRenderReport {
@@ -983,6 +1008,72 @@ impl Mesh3dRenderReport {
     /// and enqueuing camera/instance uploads.
     pub const fn upload(self) -> Duration {
         self.upload
+    }
+
+    /// CPU time in authoritative source validation, clipping and draw ordering.
+    pub const fn preflight_duration(self) -> Duration {
+        self.preflight_duration
+    }
+
+    /// CPU time after preflight spent preparing/growing staging and GPU buffers
+    /// and enqueueing writes. Together with preflight this forms `upload()`;
+    /// none of these CPU measurements represents GPU execution time.
+    pub const fn staging_upload_duration(self) -> Duration {
+        self.staging_upload_duration
+    }
+
+    /// Correlation key for optional asynchronous GPU pass timing. `None` means
+    /// disabled/unavailable timing or a full ring, not a zero-duration pass.
+    pub const fn gpu_timing_id(self) -> Option<GpuTimingId> {
+        self.gpu_timing_id
+    }
+
+    /// Actual camera, instance, edge-uniform and generated-stream bytes written
+    /// for this draw. Retained topology/texture updates and diagnostic timestamp
+    /// resolution/readback are separate operations and are excluded.
+    pub const fn uploaded_bytes(self) -> usize {
+        self.uploaded_bytes
+    }
+
+    /// Number of nonempty queue buffer writes corresponding to `uploaded_bytes`.
+    pub const fn upload_calls(self) -> usize {
+        self.upload_calls
+    }
+
+    /// Reusable frame GPU buffers newly allocated by this draw. Excludes renderer
+    /// initialization, immutable scene resources, bind groups and driver internals.
+    pub const fn buffer_allocation_count(self) -> usize {
+        self.buffer_allocation_count
+    }
+
+    /// Retained CPU instance, edge-uniform and clipped-object array capacity after
+    /// the draw. Excludes scene sources, dynamic-update scratch and backend memory.
+    pub const fn retained_frame_cpu_bytes(self) -> usize {
+        self.retained_frame_cpu_bytes
+    }
+
+    /// Nominal reusable camera/instance/edge/generated GPU buffer bytes after this
+    /// draw. Render targets, scene resources and timestamp diagnostics are excluded.
+    pub const fn retained_frame_gpu_bytes(self) -> usize {
+        self.retained_frame_gpu_bytes
+    }
+
+    /// Live CPU frame-array capacities during encoding: retained frame arrays
+    /// plus this draw's temporary clipping/color/lighting/edge/sorting arrays.
+    pub const fn staging_capacity_bytes(self) -> usize {
+        self.staging_capacity_bytes
+    }
+
+    /// Maximum simultaneous old/new frame-array capacity during preparation.
+    /// Excludes caller data, backend allocations and allocator metadata.
+    pub const fn peak_frame_cpu_bytes(self) -> usize {
+        self.peak_frame_cpu_bytes
+    }
+
+    /// Old reusable GPU buffers plus newly allocated replacements for this draw;
+    /// driver retirement/in-flight allocations are not inferred from this count.
+    pub const fn peak_frame_gpu_bytes(self) -> usize {
+        self.peak_frame_gpu_bytes
     }
 
     /// Returns CPU time spent encoding and submitting the pass.
@@ -1203,7 +1294,7 @@ impl WgpuRenderer {
         camera: Camera3d,
         budget: Mesh3dRenderBudget,
     ) -> Result<Mesh3dRenderReport, Mesh3dRenderError> {
-        self.mesh3d_renderer.render_scene3d(
+        self.mesh3d_renderer.render_scene3d_with_timing(
             &self.device,
             &self.queue,
             &self.renderer_identity,
@@ -1211,11 +1302,41 @@ impl WgpuRenderer {
             scene,
             camera,
             budget,
+            Some(&mut self.gpu_timing),
         )
     }
 }
 
 impl Mesh3dRenderer {
+    fn retained_frame_cpu_bytes(&self) -> usize {
+        self.instances
+            .capacity()
+            .saturating_mul(std::mem::size_of::<MeshInstanceGpu>())
+            .saturating_add(self.edge_object_bytes.capacity())
+            .saturating_add(
+                self.clipped_surface_objects
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<SurfaceObject>()),
+            )
+    }
+
+    fn retained_frame_gpu_bytes(&self) -> usize {
+        [
+            Some(&self.camera_uniform_buffer),
+            Some(&self.instance_buffer),
+            Some(&self.edge_object_buffer),
+            self.clipped_surface_buffer.as_ref(),
+            self.clipped_color_buffer.as_ref(),
+            self.clipped_lighting_buffer.as_ref(),
+            self.clipped_edge_buffer.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .fold(0usize, |total, buffer| {
+            total.saturating_add(buffer.size() as usize)
+        })
+    }
+
     fn preflight_scene3d(
         &self,
         device: &wgpu::Device,
@@ -1261,6 +1382,7 @@ impl Mesh3dRenderer {
         frame.order = order;
         Ok((camera_uniform, frame))
     }
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     fn render_scene3d(
         &mut self,
@@ -1272,10 +1394,79 @@ impl Mesh3dRenderer {
         camera: Camera3d,
         budget: Mesh3dRenderBudget,
     ) -> Result<Mesh3dRenderReport, Mesh3dRenderError> {
+        self.render_scene3d_with_timing(
+            device,
+            queue,
+            renderer_identity,
+            target,
+            scene,
+            camera,
+            budget,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_scene3d_with_timing(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        renderer_identity: &Arc<()>,
+        target: &RenderTarget3d,
+        scene: &Scene3d,
+        camera: Camera3d,
+        budget: Mesh3dRenderBudget,
+        mut gpu_timing: Option<&mut gpu_timing::GpuTimingCollector>,
+    ) -> Result<Mesh3dRenderReport, Mesh3dRenderError> {
         let upload_started_at = Instant::now();
+        let previous_frame_cpu_bytes = self.retained_frame_cpu_bytes();
+        let previous_frame_gpu_bytes = self.retained_frame_gpu_bytes();
         let (camera_uniform, surface_frame) =
             self.preflight_scene3d(device, renderer_identity, target, scene, camera, budget)?;
+        let preflight_duration = upload_started_at.elapsed();
+        let transient_frame_cpu_bytes = surface_frame
+            .vertices
+            .capacity()
+            .saturating_mul(std::mem::size_of::<SurfaceClipVertex>())
+            .saturating_add(
+                surface_frame
+                    .colors
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<MeshColorGpu>()),
+            )
+            .saturating_add(
+                surface_frame
+                    .lighting
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<SurfaceLightingVertex>()),
+            )
+            .saturating_add(
+                surface_frame
+                    .edges
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<SurfaceClipEdge>()),
+            )
+            .saturating_add(
+                surface_frame
+                    .order
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<material::SurfaceDraw>()),
+            );
+        let incoming_object_bytes = surface_frame
+            .objects
+            .capacity()
+            .saturating_mul(std::mem::size_of::<SurfaceObject>());
         let visible_count = scene.visible_object_count();
+        let uploaded_bytes = std::mem::size_of::<Camera3dUniform>()
+            .saturating_add(visible_count.saturating_mul(std::mem::size_of::<MeshInstanceGpu>()))
+            .saturating_add(visible_count.saturating_mul(self.edge_object_stride))
+            .saturating_add(surface_frame.report.generated_upload_bytes());
+        let upload_calls = 1
+            + usize::from(visible_count > 0) * 2
+            + usize::from(!surface_frame.vertices.is_empty())
+            + usize::from(!surface_frame.colors.is_empty())
+            + usize::from(!surface_frame.lighting.is_empty())
+            + usize::from(!surface_frame.edges.is_empty());
         let replacement_surface_buffer =
             if surface_frame.vertices.len() > self.clipped_surface_capacity {
                 Some(device.create_buffer(&wgpu::BufferDescriptor {
@@ -1321,7 +1512,54 @@ impl Mesh3dRenderer {
         } else {
             None
         };
+        let replace_instance_buffer = visible_count > self.instance_capacity;
+        let replace_edge_buffer = visible_count > self.edge_object_capacity;
+        let replace_instance_staging = visible_count > self.instances.capacity();
+        let replace_edge_staging =
+            visible_count * self.edge_object_stride > self.edge_object_bytes.capacity();
+        let generated_replacements = [
+            replacement_surface_buffer.as_ref(),
+            replacement_lighting_buffer.as_ref(),
+            replacement_color_buffer.as_ref(),
+            replacement_edge_buffer.as_ref(),
+        ];
+        let buffer_allocation_count = generated_replacements.iter().flatten().count()
+            + usize::from(replace_instance_buffer)
+            + usize::from(replace_edge_buffer);
+        let replacement_generated_bytes = generated_replacements
+            .into_iter()
+            .flatten()
+            .fold(0usize, |total, buffer| {
+                total.saturating_add(buffer.size() as usize)
+            });
         self.ensure_frame_capacity(device, visible_count)?;
+        let peak_frame_cpu_bytes = previous_frame_cpu_bytes
+            .saturating_add(transient_frame_cpu_bytes)
+            .saturating_add(incoming_object_bytes)
+            .saturating_add(if replace_instance_staging {
+                self.instances
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<MeshInstanceGpu>())
+            } else {
+                0
+            })
+            .saturating_add(if replace_edge_staging {
+                self.edge_object_bytes.capacity()
+            } else {
+                0
+            });
+        let peak_frame_gpu_bytes = previous_frame_gpu_bytes
+            .saturating_add(replacement_generated_bytes)
+            .saturating_add(if replace_instance_buffer {
+                self.instance_buffer.size() as usize
+            } else {
+                0
+            })
+            .saturating_add(if replace_edge_buffer {
+                self.edge_object_buffer.size() as usize
+            } else {
+                0
+            });
         if let Some(buffer) = replacement_surface_buffer {
             self.clipped_surface_buffer = Some(buffer);
             self.clipped_surface_capacity = surface_frame.vertices.len();
@@ -1384,6 +1622,7 @@ impl Mesh3dRenderer {
                 model_row_1: model_rows[1],
                 model_row_2: model_rows[2],
                 surface: material::surface_parameters(instance.style.surface_style()),
+                uv_transform: texture::material_uv_parameters(instance.mesh.material()),
                 color: {
                     let color = instance
                         .style
@@ -1456,10 +1695,14 @@ impl Mesh3dRenderer {
             queue.write_buffer(&self.edge_object_buffer, 0, &self.edge_object_bytes);
         }
         let upload = upload_started_at.elapsed();
+        let staging_upload_duration = upload.saturating_sub(preflight_duration);
         let encode_started_at = Instant::now();
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("sim-engine retained 3D scene encoder"),
         });
+        let timing = gpu_timing
+            .as_deref_mut()
+            .and_then(|collector| collector.reserve(GpuTimingSource::Scene3d));
         encode_ordered_scene_pass(
             &mut encoder,
             self,
@@ -1468,8 +1711,16 @@ impl Mesh3dRenderer {
             scene.background(),
             scene.instances(),
             &surface_frame.order,
+            timing.as_ref().map(|timing| timing.timestamp_writes()),
         );
+        if let Some(timing) = &timing {
+            timing.resolve(&mut encoder);
+        }
         queue.submit([encoder.finish()]);
+        let gpu_timing_id = match (gpu_timing, timing) {
+            (Some(collector), Some(timing)) => Some(collector.submitted(timing)),
+            _ => None,
+        };
         let encode_submit = encode_started_at.elapsed();
         Ok(Mesh3dRenderReport {
             object_count: visible_count,
@@ -1478,8 +1729,21 @@ impl Mesh3dRenderer {
             render_pass_count: 1,
             draw_call_count,
             upload,
+            preflight_duration,
+            staging_upload_duration,
             encode_submit,
             preflight: surface_frame.report,
+            gpu_timing_id,
+            uploaded_bytes,
+            upload_calls,
+            buffer_allocation_count,
+            retained_frame_cpu_bytes: self.retained_frame_cpu_bytes(),
+            retained_frame_gpu_bytes: self.retained_frame_gpu_bytes(),
+            staging_capacity_bytes: self
+                .retained_frame_cpu_bytes()
+                .saturating_add(transient_frame_cpu_bytes),
+            peak_frame_cpu_bytes,
+            peak_frame_gpu_bytes,
         })
     }
 }
@@ -1872,20 +2136,17 @@ fn restore_scene3d_resources(
         restored.push((key, replacement));
     }
     for prepared in prepared_textures {
-        let (width, height) = prepared.source.size();
-        let restored = texture::create_texture_impl(
-            device,
-            queue,
-            &renderer_identity,
-            texture_layout,
-            width,
-            height,
-            prepared.pixels,
-            prepared.source.budget(),
-            prepared.source.preserves_alpha(),
-        )
-        .map_err(Mesh3dResourceError::Texture)?;
-        restored_textures.push((prepared.key, restored));
+        if let Some(chain) = prepared.chain {
+            let restored = texture::upload_chain(
+                device,
+                queue,
+                &renderer_identity,
+                texture_layout,
+                chain,
+                prepared.source.preserves_alpha(),
+            );
+            restored_textures.push((prepared.key, restored));
+        }
     }
 
     let mut migrated_object_count = 0;
@@ -3195,9 +3456,11 @@ fn encode_scene_pass(
         background,
         instances,
         &[],
+        None,
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn encode_ordered_scene_pass(
     encoder: &mut wgpu::CommandEncoder,
     renderer: &Mesh3dRenderer,
@@ -3206,6 +3469,7 @@ fn encode_ordered_scene_pass(
     background: Color,
     instances: &[Mesh3dInstance],
     order: &[material::SurfaceDraw],
+    timestamp_writes: Option<wgpu::RenderPassTimestampWrites<'_>>,
 ) {
     let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
         label: Some("sim-engine retained 3D mesh pass"),
@@ -3226,7 +3490,7 @@ fn encode_ordered_scene_pass(
             }),
             stencil_ops: None,
         }),
-        timestamp_writes: None,
+        timestamp_writes,
         occlusion_query_set: None,
         multiview_mask: None,
     });
@@ -3431,6 +3695,8 @@ pub(super) fn assert_gpu_depth_contract(
     surface::assert_gpu_native_surface_policy(device, queue, format);
     surface::assert_gpu_native_edge_validation(device, queue, format);
     texture::assert_gpu_texture_contract(device, queue, format);
+    texture::assert_gpu_texture_lifecycle(device, queue, format);
+    native_acceptance_tests::assert_gpu_native_acceptance(device, queue, format);
     assert_gpu_clip_equivalence(device, queue);
     let identity = Arc::new(());
     let mut renderer = Mesh3dRenderer::new(device, format);
@@ -3640,6 +3906,7 @@ pub(super) fn assert_gpu_depth_contract(
                 model_row_1: rows[1],
                 model_row_2: rows[2],
                 surface: material::surface_parameters(instance.style.surface_style()),
+                uv_transform: texture::material_uv_parameters(instance.mesh.material()),
                 color: instance
                     .style
                     .surface_style()
@@ -3866,7 +4133,15 @@ pub(super) fn assert_gpu_scene_recovery_contract(
     source_queue: &wgpu::Queue,
     recovery_device: &wgpu::Device,
     recovery_queue: &wgpu::Queue,
+    format: wgpu::TextureFormat,
 ) {
+    texture::assert_gpu_texture_lifecycle_recovery(
+        source_device,
+        source_queue,
+        recovery_device,
+        recovery_queue,
+        format,
+    );
     dynamic::assert_gpu_dynamic_recovery(
         source_device,
         source_queue,

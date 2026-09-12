@@ -90,6 +90,7 @@ pub struct WgpuRendererOptions {
     present_mode: RendererPresentMode,
     scale_factor: f64,
     max_quarantined_devices: usize,
+    gpu_timing: bool,
 }
 
 impl WgpuRendererOptions {
@@ -108,6 +109,7 @@ impl WgpuRendererOptions {
             present_mode,
             scale_factor,
             max_quarantined_devices: DEFAULT_MAX_QUARANTINED_DEVICES,
+            gpu_timing: false,
         })
     }
 
@@ -143,6 +145,23 @@ impl WgpuRendererOptions {
     pub fn max_quarantined_devices(self) -> usize {
         self.max_quarantined_devices
     }
+
+    /// Requests bounded, asynchronous GPU timestamp diagnostics when supported.
+    ///
+    /// Disabled by default, with no query/readback resource cost. Unsupported
+    /// adapters still initialize successfully and report `Unavailable` through
+    /// [`WgpuRenderer::gpu_timing_statistics`]. The measured paths are retained
+    /// 3D target rendering and [`FrameComposer`]; CPU submissions and presentation
+    /// waits are never reported as GPU time. Recovery preserves this preference.
+    pub const fn with_gpu_timing(mut self, enabled: bool) -> Self {
+        self.gpu_timing = enabled;
+        self
+    }
+
+    /// Returns whether optional GPU timestamp diagnostics were requested.
+    pub const fn gpu_timing(self) -> bool {
+        self.gpu_timing
+    }
 }
 
 impl Default for WgpuRendererOptions {
@@ -151,6 +170,7 @@ impl Default for WgpuRendererOptions {
             present_mode: RendererPresentMode::Vsync,
             scale_factor: 1.0,
             max_quarantined_devices: DEFAULT_MAX_QUARANTINED_DEVICES,
+            gpu_timing: false,
         }
     }
 }
@@ -283,7 +303,10 @@ impl WgpuRenderer {
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("sim-engine recovered device"),
-                required_features: wgpu::Features::empty(),
+                required_features: gpu_timing::requested_features(
+                    adapter.features(),
+                    self.gpu_timing_requested,
+                ),
                 required_limits: wgpu::Limits::default(),
                 experimental_features: wgpu::ExperimentalFeatures::disabled(),
                 memory_hints: wgpu::MemoryHints::Performance,
@@ -331,6 +354,8 @@ impl WgpuRenderer {
         let multisample_target = create_multisample_target(&device, &config, sample_count);
         let image_renderer = ImageRenderer::new(&device, config.format, sample_count);
         let mesh3d_renderer = Mesh3dRenderer::new(&device, config.format);
+        let gpu_timing =
+            gpu_timing::GpuTimingCollector::new(&device, &queue, self.gpu_timing_requested);
         self.surface.configure(&device, &config);
 
         self.renderer_identity = Arc::new(());
@@ -354,6 +379,7 @@ impl WgpuRenderer {
         self.target_composition_pipelines = target_composition_pipelines;
         self.image_renderer = image_renderer;
         self.mesh3d_renderer = mesh3d_renderer;
+        self.gpu_timing = gpu_timing;
         self.camera_uniform_buffer = camera_uniform_buffer;
         self.camera_bind_group = camera_bind_group;
         self.camera_bind_group_layout = camera_bind_group_layout;

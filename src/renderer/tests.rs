@@ -3039,6 +3039,36 @@ fn offscreen_gpu_readback_verifies_camera_depth_and_clip_contract() {
         let validation_scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
         let recovery_validation_scope =
             recovery_device.push_error_scope(wgpu::ErrorFilter::Validation);
+        gpu_timing::assert_gpu_timing_contract(&device, &queue);
+        if adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY) {
+            let (timing_device, timing_queue) = adapter
+                .request_device(&wgpu::DeviceDescriptor {
+                    label: Some("sim-engine optional GPU timestamp test device"),
+                    required_features: wgpu::Features::TIMESTAMP_QUERY,
+                    required_limits: wgpu::Limits::default(),
+                    experimental_features: wgpu::ExperimentalFeatures::disabled(),
+                    memory_hints: wgpu::MemoryHints::MemoryUsage,
+                    trace: wgpu::Trace::Off,
+                })
+                .await
+                .expect("timestamp-capable adapter should create a timing device");
+            let scope = timing_device.push_error_scope(wgpu::ErrorFilter::Validation);
+            gpu_timing::assert_gpu_timing_contract(&timing_device, &timing_queue);
+            mesh3d::assert_gpu_scene_timing_and_upload_contract(
+                &timing_device,
+                &timing_queue,
+                format,
+            );
+            let timing_validation_error = scope.pop().await;
+            assert!(
+                timing_validation_error.is_none(),
+                "GPU timestamp validation failed: {timing_validation_error:?}"
+            );
+        } else {
+            eprintln!(
+                "sim-engine GPU timestamps: adapter feature unavailable, no substitute measurement"
+            );
+        }
         assert_gpu_large_center_circle(&adapter, &device, &queue, format).await;
         assert_gpu_stroke_pixel_matrix(&adapter, &device, &queue, format).await;
         exact_markers::assert_gpu_pixels(&device, &queue, format, sample_count);
@@ -3060,6 +3090,7 @@ fn offscreen_gpu_readback_verifies_camera_depth_and_clip_contract() {
             &queue,
             &recovery_device,
             &recovery_queue,
+            format,
         );
         let vertex_limit = device.limits().max_buffer_size / std::mem::size_of::<Vertex>() as u64;
         if let Ok(first_invalid_capacity) = usize::try_from(vertex_limit.saturating_add(1)) {

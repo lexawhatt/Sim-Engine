@@ -2,7 +2,7 @@
 
 This document contains the published 0.3.0 integration guide plus the explicit
 [0.4 development preview](#04-development-preview) below. The checkout version
-is `0.4.0-dev.3`; it is not a final 0.4.0 release. For older integrations, use the
+is `0.4.0-dev.4`; it is not a final 0.4.0 release. For older integrations, use the
 [archived 0.2 guide](https://github.com/lexawhatt/Sim-Engine/blob/v0.2.0/DOCUMENTATION.md).
 The [0.3.0 changelog](CHANGELOG.md#030---2026-09-11) includes migration notes.
 This guide is divided into two parts:
@@ -26,9 +26,8 @@ Rust version.
 
 ## 0.4 development preview
 
-Only the additions below are implemented in this development slice.
-The remaining 0.4 texture-lifecycle roadmap and full measurement coverage are
-not shipped capabilities.
+This combined development candidate includes the additions below. Its git
+handoff is separate from a final registry release and host integration approval.
 Development handoff uses a tested git commit, pinned with Cargo's `rev` field
 and the host lockfile, not an assumed stable `master` branch. A moving `_DEV`
 label is a convenience, not reproducible release evidence. The maintainer will
@@ -214,9 +213,9 @@ For alpha-bearing image data use
 `TextureMaterial3d::with_alpha(&texture, sampling, tint)`. The legacy
 `create_texture3d_rgba8` and `TextureMaterial3d::new` retain their opaque-input
 validation. Transparent texels only create holes under Mask or transparency
-under Blend; an Opaque surface ignores their alpha. These textures are still
-single-level, clamp-addressed images: mipmaps and isolated repeating tiles
-remain future development work.
+under Blend; an Opaque surface ignores their alpha. Legacy creation keeps one
+clamp-addressed mip level. Dev.4 adds explicit mip generation, tile isolation
+and addressing options described below.
 
 Opaque and masked surfaces render first. Blend objects follow back-to-front,
 using the camera-forward distance of each transformed model-bounds center and
@@ -392,7 +391,7 @@ cargo run --release --example mesh3d_scene_benchmark -- \
 
 This changes one object per frame; the remaining objects share a static mesh.
 Initial detachment and scratch growth are reported during warmup, separately
-from steady-state allocation counts. Other cases are `repeated`, `outside`,
+from steady-state allocation counts. Other cases include `repeated`, `outside`,
 and `host_hidden`, for example `--objects 1024 --side 1`. `outside` still submits
 the geometry; `host_hidden` explicitly hides the same distant objects. No
 automatic distance/frustum culling is inferred.
@@ -401,13 +400,185 @@ All measured frames must be `Drawn`, source revision order is deterministic,
 and output changes abort measurement. The target stays 1280x720; actual surface
 size/DPI and adapter/presentation metadata are logged. CPU work excludes
 surface acquire; completed-batch wall FPS includes the final GPU completion
-drain. Neither is GPU execution time, which is explicitly unavailable. Mesh
+drain. Neither is GPU execution time; dev.4 separately enables bounded timestamp
+queries and matches them to measured report IDs where supported. Mesh
 upload/allocation counters exclude camera/composition resources; thread-local
 allocation counts include backend calls on that thread, not worker threads.
 Host source snapshot bytes overlap scene CPU bytes and must not be added to
-them. This baseline does not replace the release matrix or complete the planned
-0.4.0 GPU-timestamp and workload coverage. Intensive large-scene optimization
+them. This baseline does not replace the release matrix. Intensive large-scene optimization
 using these measurements is planned for 0.4.1.
+
+### Texture lifecycle and repeating tiles (dev.4)
+
+The default texture constructors preserve the old single-level contract.
+For reduced shimmering at distance, request a complete chain explicitly:
+
+```rust,ignore
+let options = Texture3dOptions::new()
+    .with_mipmaps(TextureMipmaps3d::Generate)
+    .with_alpha_preservation(true);
+let texture = renderer.create_texture3d_rgba8_with_options(
+    width, height, rgba8_pixels, ImageBudget::default(), options,
+)?;
+let material = TextureMaterial3d::with_alpha(
+    &texture, ImageSampling::Linear, Color::WHITE,
+)?
+.with_uv_transform(TextureUvTransform3d::new(
+    Vec2::new(8.0, 4.0), Vec2::new(-0.25, 0.125),
+)?)
+.with_address_mode(TextureAddressMode3d::Repeat);
+let textured_mesh = renderer.with_mesh3d_material(&mesh, &material)?;
+```
+
+UV transform order is `uv * scale + offset`. Zero scale selects a constant
+coordinate; negative scale mirrors the image, and negative coordinates repeat
+normally. The validated endpoint domain is bounded to +/-65536. Wrapping happens
+in the sampler, not through a discontinuous shader `fract`, so derivatives used
+for implicit LOD remain continuous. Linear sampling interpolates texels and mip
+levels; nearest sampling selects nearest texels/levels. No anisotropy is implied.
+
+Mip generation filters linear-light RGB with premultiplied-alpha weights, then
+stores straight sRGB RGBA8 again. NPOT levels include the entire preceding image;
+one-pixel axes remain one pixel. Fully transparent output has zero RGB. This
+avoids hidden RGB contaminating generated levels; it does not promise
+alpha-aware *base-level bilinear filtering*. Mask coverage is not preserved:
+thin cutouts can disappear under minification. These are explicit quality
+limitations, not a physically based material model.
+
+For an atlas, crop first, then generate the isolated tile's chain:
+
+```rust,ignore
+let tile = renderer.crop_texture3d_tile(
+    &atlas_texture, ImageTexelRect::new(tile_x, tile_y, tile_width, tile_height)?,
+    ImageBudget::default(), options,
+)?;
+// Use full 0..1 tile UVs and the same Repeat material settings above.
+```
+
+The cropped texture owns its pixels and does not follow later atlas edits.
+Each tile has independent mip storage/bindings, a deliberate memory/draw tradeoff.
+Generating a chain for a whole packed atlas is allowed as an ordinary image,
+but is **not** tile isolation. `region_coordinates` rejects a mipmapped image;
+an inset cannot repair neighbouring colours already mixed into lower levels.
+
+`mip_level_count`, `mip_level_size` and `mip_level_pixels` expose committed CPU
+levels. CPU recovery and nominal GPU byte counters include the entire chain,
+not just mip zero. Image limits and GPU dimensions are checked before chain
+creation. Restoring a texture/scene uploads the retained levels exactly.
+
+### Partial 3D texture updates (dev.4)
+
+`ImageTexelRect` uses physical source texels, not logical pixels or world units.
+The supplied byte slice starts at the patch origin; its exact length is
+`(height - 1) * bytes_per_row + width * 4`. Padding is allowed between rows.
+
+```rust,ignore
+let report = renderer.update_scene3d_texture_region(
+    &mut scene, object_id, ImageTexelRect::new(12, 8, 4, 4)?,
+    &patch_rgba8, 4 * 4, Texture3dUpdateBudget::default(),
+)?;
+println!("upload {} bytes, GPU copy {} bytes",
+    report.uploaded_bytes(), report.gpu_copy_bytes());
+```
+
+Use `update_texture3d_region(&mut texture, ...)` for a standalone handle; existing
+materials retain their previous immutable snapshot until explicitly rebound.
+The scene-owned variant updates one stable object ID and preserves all other
+objects/aliases. An unshared texture reuses its GPU allocation. A shared texture
+gets a new allocation, GPU copies of the old mip levels, then the patch uploads;
+it does not upload the unchanged base image from CPU memory. Material alpha
+policy, UV transform, addressing, sampling and tint survive rebinding/recovery.
+
+Every fallible validation and CPU preparation step precedes GPU writes. Failed
+rectangle/stride/alpha/budget checks leave CPU pixels, GPU pixels and scene
+accounting unchanged. Device loss remains an external GPU failure handled by
+the existing recovery contract, not a promise to roll back physical hardware.
+
+The no-mipmap path uploads only the patch. The initial mipmapped implementation
+regenerates and uploads **all lower levels**, not only affected lower rectangles.
+`Texture3dUpdateBudget` separately limits upload, staging, peak recovery, peak GPU
+and GPU-copy bytes. Reports separate base/mip uploads, calls, GPU copies,
+submissions, allocations, regenerated texels and CPU preparation/encoding costs.
+This is a bounded, documented cost; finer dirty-mip optimization is 0.4.1 work.
+
+Inspect the six-panel lifecycle gallery independently of benchmarks:
+
+```bash
+cargo run --release --example texture_lifecycle_3d
+cargo run --release --example texture_lifecycle_3d -- --acceptance
+```
+
+Top: identical mip-zero pixels with mipmaps disabled/enabled. Middle: an
+isolated atlas tile with positive/negative UV repetition. Bottom: a region-edited
+texture next to its unchanged immutable alias. `U` edits; `T` toggles repeat;
+`X` mirrors; `M` switches alpha mode; `L` lighting; `F` fog; `C` sidedness;
+`P` projection. Arrows orbit, wheel/`+`/`-` zoom, Space pauses, `R` resets the view,
+`F5` replaces/restores the logical device and Esc exits. The bounded acceptance
+mode exercises these states and requires confirmed Drawn frames; manual
+inspection remains separate from pixel-oracle qualification.
+
+### GPU diagnostics and the full changing-scene matrix (dev.4)
+
+GPU timestamps are opt-in and require only the adapter's `TIMESTAMP_QUERY`
+feature. Enabling them is not a device requirement on unsupported adapters:
+
+```rust,ignore
+let options = WgpuRendererOptions::new(present_mode, scale_factor)?
+    .with_gpu_timing(true);
+// Initialize with these options, then render normally.
+let submitted_id = report.gpu_timing_id();
+for sample in renderer.collect_gpu_timings().samples() {
+    // Match the ID to the exact submitted Scene3d/FrameComposer report.
+    println!("{:?} {:?}: {:?}", sample.id(), sample.source(), sample.elapsed());
+}
+```
+
+`GpuTimingStatus` distinguishes Disabled, Unavailable and Enabled. Samples cover
+the named GPU render pass, not CPU preflight, texture transfers, query resolution,
+queue waits, monitor scanout or total GPU utilisation. The fixed eight-slot ring
+uses 16 query indices and 256 nominal buffer bytes; backend/query bookkeeping
+is additional. Each submitted reading copies 16 bytes. Collection polls once
+without waiting, returns at most eight samples and allocates no result vector.
+Never match by arrival order. A full ring drops diagnostics, not drawing;
+`gpu_timing_statistics` exposes losses, mapping/interval failures, pending slots,
+readback bytes and CPU collection cost. Recovery discards old pending results.
+Zero duration can mean work below timer resolution; Unavailable is never zero.
+
+`Mesh3dRenderReport::preflight_duration` and `staging_upload_duration` split the
+legacy combined `upload()` CPU interval. `encode_submit` stays CPU time.
+The diagnostic example reports these separately from acquisition and GPU samples:
+
+```bash
+cargo run --release --all-features --example mesh3d_scene_benchmark -- \
+  --case texture_update --policy native --objects 256 --frames 60 --trials 3
+SIM_ENGINE_REQUIRED_ADAPTER_PCI_BUS_ID=0000:01:00.0 \
+  ./scripts/mesh3d_diagnostics_matrix.sh
+```
+
+Replace the PCI address with the adapter being qualified. The matrix takes a
+read-only exact-commit source snapshot and records its executable hash. It
+rejects source changes before publishing a uniquely named result directory;
+failed `.pending` logs remain available. Direct example runs without this
+wrapper are labelled unverified working-tree runs, not exact-SHA evidence.
+
+Fixtures include shared/distinct resources; mostly outside/host-hidden/crossing
+geometry under Native and StrictPortable; immutable/dynamic chunk updates;
+capacity growth; repeated mipmapped tiles; Mask/Blend; region updates; changing
+pre-shaped labels. Growth deliberately creates a fresh small mesh before a
+larger update each frame and counts **both** allocations/uploads. Native
+hardware-clipping totals are reported as unobserved rather than fabricated CPU
+culling. The prepared-label fixture performs no measured reshaping; the separate
+CPU shaping benchmark measures that cost.
+
+Every measured attempt must return Drawn. Slow trials are printed independently;
+skips/output transitions fail the attempt instead of inflating throughput.
+Warmup, diagnostics losses, end-of-trial drain and retained/shared accounting
+are explicit. On timestamp-capable devices, every measured frame must have both
+matched pass samples before a trial qualifies; incomplete readings remain in
+failed-attempt logs, not a successful GPU percentile baseline. Unsupported
+devices explicitly report Unavailable. Query instrumentation adds overhead and is off by default in
+applications. This matrix supplies platform-specific baselines for 0.4.1,
+not a universal 60/100 FPS promise or a replacement for existing release gates.
 
 ## Part I: Integration Handbook
 
@@ -1892,7 +2063,8 @@ recovery returns `RecoveryLimitReached` before creating another device; inspect
 
 A display-limited frame rate is not renderer throughput. Surface acquisition
 can wait for FIFO or compositor pacing while renderer CPU work remains small.
-The current public metrics do not include GPU timestamp queries.
+The published 0.3.0 metrics do not include GPU timestamp queries. The dev.4
+opt-in pass diagnostics are described in the development section above.
 
 From a clean Sim;Engine repository checkout, the named release-mode matrix is:
 
@@ -2429,9 +2601,12 @@ automation are repeatable.
   text. Font fallback, paragraph bidi, line breaking, color emoji and automatic
   atlas eviction are not implemented. The low-level API remains available for
   host-shaped glyph runs and externally managed font policies.
-- Retained 3D supports opaque surfaces and depth-classified edges, not section
-  materials, projected anchors, labels, or picking.
-- Renderer timing is CPU-side; public GPU timestamps are not available.
+- Published 0.3.0 retained 3D supports opaque surfaces and depth-classified edges.
+  The development candidate adds the documented Mask/Blend, lighting and texture
+  lifecycle paths. General section materials, projected anchors and 3D picking
+  remain outside this release scope.
+- Published 0.3.0 renderer timing is CPU-side. Dev.4 offers opt-in, bounded GPU
+  pass timestamps; it does not measure scanout or total GPU utilisation.
 - Independent multi-window recovery is not yet proven.
 - Render-target and trail pixels cannot be reconstructed after device loss.
 

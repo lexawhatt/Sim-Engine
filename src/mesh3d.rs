@@ -4,6 +4,10 @@ use crate::{Color, LogicalPixels, Vec3};
 
 const MAX_LOGICAL_EDGE_METRIC: f32 = 1_048_576.0;
 
+#[path = "mesh3d_uv.rs"]
+mod uv;
+pub use uv::{TextureAddressMode3d, TextureUvTransform3d, TextureUvTransformError};
+
 #[path = "mesh3d_material.rs"]
 mod material;
 pub use material::{SurfaceAlphaMode3d, SurfaceSidedness3d, SurfaceStyle3d};

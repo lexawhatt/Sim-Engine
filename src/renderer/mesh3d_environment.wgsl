@@ -13,6 +13,7 @@ struct SurfaceVertexIn {
     @location(1) row0: vec4<f32>, @location(2) row1: vec4<f32>, @location(3) row2: vec4<f32>,
     @location(4) color: vec4<f32>, @location(7) surface: vec4<f32>,
     @location(9) normal0: vec4<f32>, @location(10) normal1: vec4<f32>, @location(11) normal2: vec4<f32>,
+    @location(12) uv_transform: vec4<f32>,
 };
 struct SurfaceOut {
     @builtin(position) position: vec4<f32>, @location(0) color: vec4<f32>, @location(1) uv: vec2<f32>,
@@ -31,7 +32,7 @@ fn surface_retained(input: SurfaceVertexIn, uv: vec2<f32>, vertex_color: vec4<f3
     if input.surface.w == 1.0 && camera3d.environment.fog_density.x > 0.0 {
         auxiliary.w = dot(camera3d.environment.depth_row, world);
     }
-    return SurfaceOut(clip, input.color * vertex_color, uv, input.surface, auxiliary);
+    return SurfaceOut(clip, input.color * vertex_color, uv * input.uv_transform.xy + input.uv_transform.zw, input.surface, auxiliary);
 }
 fn surface_fragment(color: vec4<f32>, surface: vec4<f32>, auxiliary: vec4<f32>, front: bool) -> vec4<f32> {
     if surface.x == 1.0 && color.a < surface.y { discard; }

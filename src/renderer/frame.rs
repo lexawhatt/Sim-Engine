@@ -498,6 +498,7 @@ pub struct FrameReport {
     status: RenderStatus,
     statistics: FrameStatistics,
     metrics: RendererFrameMetrics,
+    gpu_timing_id: Option<GpuTimingId>,
 }
 
 impl FrameReport {
@@ -514,6 +515,13 @@ impl FrameReport {
     /// Returns CPU-side timing and tessellation diagnostics.
     pub const fn metrics(self) -> RendererFrameMetrics {
         self.metrics
+    }
+
+    /// Correlation key for this submitted pass's optional asynchronous GPU time.
+    /// Skipped frames never reserve a key. `None` also covers disabled/unavailable
+    /// timing or a full diagnostics ring; inspect renderer timing statistics.
+    pub const fn gpu_timing_id(self) -> Option<GpuTimingId> {
+        self.gpu_timing_id
     }
 
     /// Returns command encoders submitted by this composed frame.
@@ -2397,6 +2405,7 @@ fn present_frame_with_vertices<'frame>(
     cache.flush_uniform_uploads(&renderer.device, &renderer.queue, &mut encoder, bindings);
     let uniform_batch_upload = uniform_batch_started_at.elapsed();
     upload += uniform_batch_upload;
+    let timing = renderer.gpu_timing.reserve(GpuTimingSource::FrameComposer);
     {
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("sim-engine composed frame pass"),
@@ -2410,20 +2419,24 @@ fn present_frame_with_vertices<'frame>(
                 },
             })],
             depth_stencil_attachment: None,
-            timestamp_writes: None,
+            timestamp_writes: timing.as_ref().map(|timing| timing.timestamp_writes()),
             occlusion_query_set: None,
             multiview_mask: None,
         });
         encoding::encode_items(renderer, &mut pass, ready, bindings);
     }
+    if let Some(timing) = &timing {
+        timing.resolve(&mut encoder);
+    }
     renderer.queue.submit([encoder.finish()]);
+    let gpu_timing_id = timing.map(|timing| renderer.gpu_timing.submitted(timing));
     renderer.notify_before_present();
     renderer.queue.present(surface_texture);
     set_particle_rendered(ready, true);
     let encode_submit_present = encode_started_at
         .elapsed()
         .saturating_sub(uniform_batch_upload);
-    Ok(frame_report(
+    let mut report = frame_report(
         RenderStatus::Drawn,
         statistics,
         tessellation,
@@ -2435,7 +2448,9 @@ fn present_frame_with_vertices<'frame>(
         geometry_reused,
         geometry_streamed,
         tessellation_stats,
-    ))
+    );
+    report.gpu_timing_id = gpu_timing_id;
+    Ok(report)
 }
 
 fn preflight_frame_items(
@@ -3345,6 +3360,7 @@ fn frame_report(
         status: report.status,
         statistics,
         metrics: report.metrics,
+        gpu_timing_id: None,
     }
 }
 
@@ -3523,6 +3539,7 @@ mod tests {
             status: RenderStatus::Drawn,
             statistics: FrameStatistics::default(),
             metrics: RendererFrameMetrics::default(),
+            gpu_timing_id: None,
         };
         assert_eq!(drawn.command_encoder_count(), 1);
         assert_eq!(drawn.render_pass_count(), 1);
@@ -3537,6 +3554,7 @@ mod tests {
         assert_eq!(skipped.render_pass_count(), 0);
         assert_eq!(skipped.queue_submission_count(), 0);
         assert_eq!(skipped.surface_present_count(), 0);
+        assert_eq!(skipped.gpu_timing_id(), None);
 
         let planned = FrameStatistics {
             upload_bytes: 128,

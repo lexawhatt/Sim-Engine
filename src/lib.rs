@@ -44,7 +44,8 @@ pub use math::{Rect, Vec2};
 pub use mesh3d::{
     AmbientLight3d, DirectionalLight3d, Fog3d, Fog3dError, Lighting3d, Lighting3dError, Mesh3d,
     Mesh3dAttributes, Mesh3dError, Mesh3dStyleError, MeshEdge3d, MeshStyle3d, SurfaceAlphaMode3d,
-    SurfaceLighting3d, SurfaceSidedness3d, SurfaceStyle3d, TextureCoordinate2d, WireframeStyle3d,
+    SurfaceLighting3d, SurfaceSidedness3d, SurfaceStyle3d, TextureAddressMode3d,
+    TextureCoordinate2d, TextureUvTransform3d, TextureUvTransformError, WireframeStyle3d,
 };
 pub use particle::{ParticleInstance2d, ParticleInstanceError};
 pub use pseudo3d::{
@@ -70,13 +71,14 @@ pub use renderer::{
     FramePassOptions, FrameReport, FrameSourceKind, FrameSourceStatistics, FrameStatistics,
     GlyphAtlas2d, GlyphAtlasBudget, GlyphAtlasEntry, GlyphError, GlyphId, GlyphRun2d,
     GlyphRunBounds, GlyphRunBudget, GlyphRunStatistics, GlyphRunUploadReport, GlyphUploadReport,
-    Image2d, ImageBatch2d, ImageBatchBudget, ImageBatchPlacement, ImageBatchUploadReport,
-    ImageBudget, ImageError, ImageSampling, ImageSprite2d, ImageTexelRect, ImageUploadReport,
-    LayeredVisualizationError, LayeredVisualizationOptions, LayeredVisualizationReport,
-    Mesh3dInstance, Mesh3dObjectError, Mesh3dPreflightReport, Mesh3dRenderBudget,
-    Mesh3dRenderError, Mesh3dRenderReport, Mesh3dResourceError, Mesh3dSurfaceError,
-    Mesh3dUploadBudget, Mesh3dUploadBudgetResource, Mesh3dUploadReport, Object3dId,
-    ParticleBudgetError, ParticleField2d, ParticleFieldError, ParticleFieldRenderError,
+    GpuTimingBatch, GpuTimingId, GpuTimingSample, GpuTimingSource, GpuTimingStatistics,
+    GpuTimingStatus, Image2d, ImageBatch2d, ImageBatchBudget, ImageBatchPlacement,
+    ImageBatchUploadReport, ImageBudget, ImageError, ImageSampling, ImageSprite2d, ImageTexelRect,
+    ImageUploadReport, LayeredVisualizationError, LayeredVisualizationOptions,
+    LayeredVisualizationReport, Mesh3dInstance, Mesh3dObjectError, Mesh3dPreflightReport,
+    Mesh3dRenderBudget, Mesh3dRenderError, Mesh3dRenderReport, Mesh3dResourceError,
+    Mesh3dSurfaceError, Mesh3dUploadBudget, Mesh3dUploadBudgetResource, Mesh3dUploadReport,
+    Object3dId, ParticleBudgetError, ParticleField2d, ParticleFieldError, ParticleFieldRenderError,
     ParticleFieldUpdateReport, ParticleRenderBudget, ParticleStatistics, PositionedGlyph2d,
     PreparedScene, PreparedSceneError, PreparedSceneRenderError, PreparedScreenScene, RenderReport,
     RenderStatus, RenderTarget2d, RenderTarget3d, RenderTargetError, RenderTargetLoad,
@@ -86,5 +88,7 @@ pub use renderer::{
     ScalarFieldTextureError, ScalarFieldUploadReport, Scene3d, Scene3dBudget,
     Scene3dBudgetResource, Scene3dError, Scene3dMeshUpdateReport, Scene3dRestoreReport,
     Scene3dStatistics, SurfaceRasterization3d, TessellationStats, Texture3d, Texture3dError,
-    TextureMaterial3d, TrailBuffer2d, WgpuRenderer, WgpuRendererOptions,
+    Texture3dOptions, Texture3dUpdateBudget, Texture3dUpdateBudgetResource, Texture3dUpdateError,
+    Texture3dUpdateReport, TextureMaterial3d, TextureMipmaps3d, TrailBuffer2d, WgpuRenderer,
+    WgpuRendererOptions,
 };

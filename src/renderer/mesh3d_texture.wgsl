@@ -12,19 +12,19 @@
 @vertex fn colored_retained_enhanced_vs_main(input: SurfaceVertexIn, @location(5) uv: vec2<f32>, @location(6) vertex_color: vec4<f32>, @location(8) normal: vec3<f32>) -> SurfaceOut {
     return surface_retained(input, uv, vertex_color, normal);
 }
-@vertex fn clipped_vs_main(@location(0) clip: vec4<f32>, @location(4) color: vec4<f32>, @location(7) surface: vec4<f32>, @location(5) uv: vec2<f32>) -> SurfaceOut {
-    return SurfaceOut(clip, color * vec4<f32>(1.0), uv, surface, vec4<f32>(0.0));
+@vertex fn clipped_vs_main(@location(0) clip: vec4<f32>, @location(12) uv_transform: vec4<f32>, @location(4) color: vec4<f32>, @location(7) surface: vec4<f32>, @location(5) uv: vec2<f32>) -> SurfaceOut {
+    return SurfaceOut(clip, color * vec4<f32>(1.0), uv * uv_transform.xy + uv_transform.zw, surface, vec4<f32>(0.0));
 }
-@vertex fn clipped_enhanced_vs_main(@location(0) clip: vec4<f32>, @location(4) color: vec4<f32>, @location(7) surface: vec4<f32>, @location(5) uv: vec2<f32>, @location(8) auxiliary: vec4<f32>) -> SurfaceOut {
-    return SurfaceOut(clip, color * vec4<f32>(1.0), uv, surface, auxiliary);
+@vertex fn clipped_enhanced_vs_main(@location(0) clip: vec4<f32>, @location(12) uv_transform: vec4<f32>, @location(4) color: vec4<f32>, @location(7) surface: vec4<f32>, @location(5) uv: vec2<f32>, @location(8) auxiliary: vec4<f32>) -> SurfaceOut {
+    return SurfaceOut(clip, color * vec4<f32>(1.0), uv * uv_transform.xy + uv_transform.zw, surface, auxiliary);
 }
-@vertex fn colored_clipped_vs_main(@location(0) clip: vec4<f32>, @location(4) color: vec4<f32>, @location(7) surface: vec4<f32>, @location(5) uv: vec2<f32>, @location(6) vertex_color: vec4<f32>) -> SurfaceOut {
-    return SurfaceOut(clip, color * vertex_color, uv, surface, vec4<f32>(0.0));
+@vertex fn colored_clipped_vs_main(@location(0) clip: vec4<f32>, @location(12) uv_transform: vec4<f32>, @location(4) color: vec4<f32>, @location(7) surface: vec4<f32>, @location(5) uv: vec2<f32>, @location(6) vertex_color: vec4<f32>) -> SurfaceOut {
+    return SurfaceOut(clip, color * vertex_color, uv * uv_transform.xy + uv_transform.zw, surface, vec4<f32>(0.0));
 }
-@vertex fn colored_clipped_enhanced_vs_main(@location(0) clip: vec4<f32>, @location(4) color: vec4<f32>, @location(7) surface: vec4<f32>, @location(5) uv: vec2<f32>, @location(6) vertex_color: vec4<f32>, @location(8) auxiliary: vec4<f32>) -> SurfaceOut {
-    return SurfaceOut(clip, color * vertex_color, uv, surface, auxiliary);
+@vertex fn colored_clipped_enhanced_vs_main(@location(0) clip: vec4<f32>, @location(12) uv_transform: vec4<f32>, @location(4) color: vec4<f32>, @location(7) surface: vec4<f32>, @location(5) uv: vec2<f32>, @location(6) vertex_color: vec4<f32>, @location(8) auxiliary: vec4<f32>) -> SurfaceOut {
+    return SurfaceOut(clip, color * vertex_color, uv * uv_transform.xy + uv_transform.zw, surface, auxiliary);
 }
 @fragment fn fs_main(input: SurfaceOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {
-    let color = textureSampleLevel(material_texture, material_sampler, input.uv, 0.0) * input.color;
+    let color = textureSample(material_texture, material_sampler, input.uv) * input.color;
     return surface_fragment(color, input.surface, input.normal_depth, front);
 }

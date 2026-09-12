@@ -7,7 +7,7 @@ changes.
 
 ## Unreleased - 0.4.0 development
 
-Current development version: `0.4.0-dev.3`. This is an incomplete integration
+Current development version: `0.4.0-dev.4`. This is a development integration
 preview, not the official 0.4.0 release. External handoffs use an
 exact tested git revision for Sim;Logic; registry publication follows integration
 feedback and separate release qualification.
@@ -44,7 +44,7 @@ implemented work.
   scratch can be queried and explicitly cleared independently of scene data.
 - `mesh3d_scene_benchmark` compares repeated/outside/host-hidden geometry and
   immutable/dynamic single-object updates with confirmed presents and separated
-  CPU/acquire metrics. It is a diagnostic fixture, not a GPU timestamp/FPS gate.
+  CPU/acquire metrics. It is a diagnostic fixture, not a universal FPS gate.
 - `Mesh3dAttributes` and `Mesh3d::with_attributes` accept normalized linear RGBA
   vertex colors alongside optional UVs. Colors interpolate through both retained
   and CPU-clipped surfaces and multiply surface/texture tints. Missing colors
@@ -82,6 +82,31 @@ implemented work.
   normals produce structured errors rather than silently becoming Unlit.
 - `lighting_3d` inspection gallery with lighting/fog controls, nonuniform scale,
   alpha materials, projection switching and bounded recovery acceptance.
+- Opt-in `Texture3dOptions` complete mip chains, generated in linear light with
+  alpha-aware filtering, including non-power-of-two and one-pixel dimensions.
+  Full-chain storage participates in preflight, scene budgets and exact recovery.
+  Ordinary mip averaging does not preserve alpha-test coverage or add anisotropy.
+- `crop_texture3d_tile` creates an independent tile before generating its mip
+  chain. Neighbouring packed-atlas entries cannot enter that chain. Mipmapped
+  packed-atlas `region_coordinates` is rejected; use isolated tiles instead.
+- `TextureUvTransform3d` applies continuous scale then offset, with explicit
+  clamp/repeat sampling. Negative coordinates/scales are supported; bounded
+  validation rejects unsupported derived arithmetic. Hardware repeat preserves
+  implicit texture derivatives at seams in retained and CPU-clipped paths.
+- `update_texture3d_region` and scene-owned `update_scene3d_texture_region` stage
+  validated CPU recovery pixels before writes. Unique textures reuse allocation;
+  immutable aliases detach through GPU copies and retain their old contents.
+  Mip zero uploads only the dirty rectangle; lower levels are regenerated and
+  uploaded in full with explicit upload/copy/staging/peak-memory budgets.
+- Optional bounded GPU render-pass timestamps for retained 3D and
+  `FrameComposer`, with correlation IDs, explicit unavailable status, nonblocking
+  fixed-capacity collection, loss counters and measurement-overhead accounting.
+  Timing is disabled by default and does not replace CPU/acquire diagnostics.
+- Expanded 3D diagnostic fixtures: distinct/shared resources, both surface
+  policies, frustum crossings, explicit growth, mipmapped/repeating and updated
+  textures, Opaque/Mask/Blend materials and changing pre-shaped labels. A separate
+  exact-source snapshot matrix records every trial rather than declaring a
+  platform-independent frame-rate guarantee.
 
 ### Migration notes from 0.3.0
 
@@ -101,9 +126,10 @@ implemented work.
   diagnostic enums. Existing meshes and material constructors remain Unlit
   with fog disabled; no normal allocation is required for the old path.
 
-The remaining 0.4.0 texture-lifecycle work and full measurement coverage
-are not delivered by this slice. No general performance or release
-readiness claim follows from these additions.
+The combined dev.4 candidate includes the texture lifecycle and complete
+measurement tooling. Exact-revision diagnostic baselines and integration
+acceptance qualify each git handoff; these additions do not imply a universal
+performance guarantee or approval of the final 0.4.0 registry release.
 
 ## 0.3.0 - 2026-09-11
 

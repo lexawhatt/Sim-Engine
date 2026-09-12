@@ -1,6 +1,6 @@
 [package]
 name = "sim-engine"
-version = "0.4.0-dev.3"
+version = "0.4.0-dev.4"
 edition = "2024"
 rust-version = "1.90"
 license = "MIT OR Apache-2.0"
@@ -100,6 +100,10 @@ required-features = ["wgpu"]
 
 [[example]]
 name = "lighting_3d"
+required-features = ["wgpu"]
+
+[[example]]
+name = "texture_lifecycle_3d"
 required-features = ["wgpu"]
 
 [[example]]
