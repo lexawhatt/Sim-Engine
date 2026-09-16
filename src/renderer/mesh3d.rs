@@ -10,6 +10,15 @@ mod validation;
 use validation::validate_points_for_policy;
 pub use validation::{Mesh3dSurfaceError, SurfaceRasterization3d};
 
+#[path = "mesh3d_batch.rs"]
+mod batch;
+#[cfg(test)]
+#[path = "mesh3d_batch_tests.rs"]
+mod batch_tests;
+#[cfg(test)]
+#[path = "mesh3d_edge_upload_tests.rs"]
+mod edge_upload_tests;
+
 #[path = "mesh3d_surface.rs"]
 mod surface;
 pub use surface::{Mesh3dPreflightReport, Mesh3dRenderBudget};
@@ -456,6 +465,7 @@ impl Mesh3dRenderer {
         &mut self,
         device: &wgpu::Device,
         object_count: usize,
+        edge_object_count: usize,
     ) -> Result<(), Mesh3dRenderError> {
         let instance_capacity = if object_count > self.instance_capacity {
             Some(
@@ -467,9 +477,9 @@ impl Mesh3dRenderer {
         } else {
             None
         };
-        let edge_capacity = if object_count > self.edge_object_capacity {
+        let edge_capacity = if edge_object_count > self.edge_object_capacity {
             Some(
-                object_count
+                edge_object_count
                     .checked_next_power_of_two()
                     .filter(|capacity| {
                         capacity
@@ -484,7 +494,7 @@ impl Mesh3dRenderer {
         } else {
             None
         };
-        let required_edge_bytes = object_count
+        let required_edge_bytes = edge_object_count
             .checked_mul(self.edge_object_stride)
             .ok_or(Mesh3dRenderError::InstanceCapacityTooLarge)?;
         let replace_instance_staging = self.instances.capacity() < object_count;
@@ -1311,6 +1321,18 @@ impl WgpuRenderer {
     }
 }
 
+// Keep visible-index dynamic offsets unchanged when edges exist. Surface-only
+// frames need neither padded edge staging nor a proportional edge GPU buffer.
+fn edge_uniform_object_count(scene: &Scene3d) -> usize {
+    if scene.instances().iter().any(|instance| {
+        instance.visible && instance.wireframe().is_some() && instance.mesh.edge_count > 0
+    }) {
+        scene.visible_object_count()
+    } else {
+        0
+    }
+}
+
 impl Mesh3dRenderer {
     fn retained_frame_cpu_bytes(&self) -> usize {
         self.instances
@@ -1358,13 +1380,19 @@ impl Mesh3dRenderer {
             target.height(),
             target.pixels_per_logical(),
         )?;
+        if scene.visible_object_count() > u32::MAX as usize {
+            return Err(Mesh3dRenderError::InstanceCapacityTooLarge);
+        }
         let capacity = scene
             .visible_object_count()
             .max(1)
             .checked_next_power_of_two()
             .ok_or(Mesh3dRenderError::InstanceCapacityTooLarge)?;
+        let edge_capacity = edge_uniform_object_count(scene)
+            .checked_next_power_of_two()
+            .ok_or(Mesh3dRenderError::InstanceCapacityTooLarge)?;
         if !buffer_capacity_fits::<MeshInstanceGpu>(device, capacity)
-            || capacity
+            || edge_capacity
                 .checked_mul(self.edge_object_stride)
                 .is_none_or(|bytes| {
                     bytes as u64 > device.limits().max_buffer_size || bytes > u32::MAX as usize
@@ -1461,12 +1489,14 @@ impl Mesh3dRenderer {
             .capacity()
             .saturating_mul(std::mem::size_of::<SurfaceObject>());
         let visible_count = scene.visible_object_count();
+        let edge_object_count = edge_uniform_object_count(scene);
         let uploaded_bytes = std::mem::size_of::<Camera3dUniform>()
             .saturating_add(visible_count.saturating_mul(std::mem::size_of::<MeshInstanceGpu>()))
-            .saturating_add(visible_count.saturating_mul(self.edge_object_stride))
+            .saturating_add(edge_object_count.saturating_mul(self.edge_object_stride))
             .saturating_add(surface_frame.report.generated_upload_bytes());
         let upload_calls = 1
-            + usize::from(visible_count > 0) * 2
+            + usize::from(visible_count > 0)
+            + usize::from(edge_object_count > 0)
             + usize::from(!surface_frame.vertices.is_empty())
             + usize::from(!surface_frame.colors.is_empty())
             + usize::from(!surface_frame.lighting.is_empty())
@@ -1517,10 +1547,10 @@ impl Mesh3dRenderer {
             None
         };
         let replace_instance_buffer = visible_count > self.instance_capacity;
-        let replace_edge_buffer = visible_count > self.edge_object_capacity;
+        let replace_edge_buffer = edge_object_count > self.edge_object_capacity;
         let replace_instance_staging = visible_count > self.instances.capacity();
         let replace_edge_staging =
-            visible_count * self.edge_object_stride > self.edge_object_bytes.capacity();
+            edge_object_count * self.edge_object_stride > self.edge_object_bytes.capacity();
         let generated_replacements = [
             replacement_surface_buffer.as_ref(),
             replacement_lighting_buffer.as_ref(),
@@ -1536,7 +1566,7 @@ impl Mesh3dRenderer {
             .fold(0usize, |total, buffer| {
                 total.saturating_add(buffer.size() as usize)
             });
-        self.ensure_frame_capacity(device, visible_count)?;
+        self.ensure_frame_capacity(device, visible_count, edge_object_count)?;
         let peak_frame_cpu_bytes = previous_frame_cpu_bytes
             .saturating_add(transient_frame_cpu_bytes)
             .saturating_add(incoming_object_bytes)
@@ -1604,10 +1634,9 @@ impl Mesh3dRenderer {
         self.instances.clear();
         self.edge_object_bytes.clear();
         self.edge_object_bytes
-            .resize(visible_count.saturating_mul(self.edge_object_stride), 0);
+            .resize(edge_object_count.saturating_mul(self.edge_object_stride), 0);
         let triangle_count = surface_frame.report.submitted_triangle_count();
         let mut edge_count = 0usize;
-        let mut draw_call_count = 0usize;
         for (object_index, instance) in scene
             .instances()
             .iter()
@@ -1641,23 +1670,12 @@ impl Mesh3dRenderer {
                     std::array::from_fn(|index| color[index] * tint[index])
                 },
             });
-            if instance.style.surface_style().is_some() {
-                let generated = self.clipped_surface_objects[object_index]
-                    .generated
-                    .as_ref();
-                if generated.map_or(instance.mesh.index_count > 0, |range| !range.is_empty()) {
-                    draw_call_count = draw_call_count.saturating_add(1);
-                }
-            }
-            if let Some(style) = instance.wireframe() {
+            if let Some(style) = instance
+                .wireframe()
+                .filter(|_| instance.mesh.edge_count > 0)
+            {
                 let instance_edge_count = instance.mesh.source().display_edges().len();
                 edge_count = edge_count.saturating_add(instance_edge_count);
-                if instance_edge_count > 0 {
-                    draw_call_count = draw_call_count.saturating_add(1);
-                    if style.hidden_enabled() {
-                        draw_call_count = draw_call_count.saturating_add(1);
-                    }
-                }
                 let hidden_color = style.hidden_color().unwrap_or(style.visible_color());
                 let hidden_width = style.hidden_width().map_or(0.0, LogicalPixels::get);
                 let (dash_length, gap_length) = style
@@ -1707,7 +1725,7 @@ impl Mesh3dRenderer {
         let timing = gpu_timing
             .as_deref_mut()
             .and_then(|collector| collector.reserve(GpuTimingSource::Scene3d));
-        encode_ordered_scene_pass(
+        let draw_call_count = encode_ordered_scene_pass(
             &mut encoder,
             self,
             &target.color.view,
@@ -3474,7 +3492,8 @@ fn encode_ordered_scene_pass(
     instances: &[Mesh3dInstance],
     order: &[material::SurfaceDraw],
     timestamp_writes: Option<wgpu::RenderPassTimestampWrites<'_>>,
-) {
+) -> usize {
+    let mut draw_call_count = 0;
     let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
         label: Some("sim-engine retained 3D mesh pass"),
         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -3505,17 +3524,17 @@ fn encode_ordered_scene_pass(
         .filter(|instance| instance.visible)
         .enumerate();
     let mut sorted = order.iter();
-    loop {
-        let next = if order.is_empty() {
+    let mut draws = std::iter::from_fn(|| {
+        if order.is_empty() {
             insertion.next()
         } else {
             sorted
                 .next()
                 .map(|entry| (entry.visible_index, &instances[entry.scene_index]))
-        };
-        let Some((instance_index, instance)) = next else {
-            break;
-        };
+        }
+    })
+    .peekable();
+    while let Some((instance_index, instance)) = draws.next() {
         if instance.style.surface_style().is_none() || instance.mesh.index_count == 0 {
             continue;
         }
@@ -3578,11 +3597,28 @@ fn encode_ordered_scene_pass(
                 );
             }
             pass.draw(0..range.end - range.start, 0..1);
+            draw_call_count += 1;
             continue;
         }
         let Some(index_buffer) = &instance.mesh.index_buffer else {
             continue;
         };
+        let mut instance_count = 1;
+        while let Some(&(next_index, next)) = draws.peek() {
+            if next_index != instance_index + instance_count
+                || renderer
+                    .clipped_surface_objects
+                    .get(next_index)
+                    .is_some_and(|object| object.generated.is_some())
+                || !batch::compatible(instance, next)
+            {
+                break;
+            }
+            instance_count += 1;
+            draws.next();
+        }
+        let instance_end = instance_start
+            + (instance_count * std::mem::size_of::<MeshInstanceGpu>()) as wgpu::BufferAddress;
         let pipelines = match (material.is_some(), colored) {
             (false, false) => &renderer.pipeline,
             (false, true) => &renderer.colored_pipeline,
@@ -3612,7 +3648,8 @@ fn encode_ordered_scene_pass(
             pass.set_vertex_buffer(instance_slot + 1 + u32::from(colored), buffer.slice(..));
         }
         pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-        pass.draw_indexed(0..instance.mesh.index_count, 0, 0..1);
+        pass.draw_indexed(0..instance.mesh.index_count, 0, 0..instance_count as u32);
+        draw_call_count += 1;
     }
     pass.set_pipeline(&renderer.hidden_edge_pipeline);
     for (object_index, instance) in instances
@@ -3642,12 +3679,14 @@ fn encode_ordered_scene_pass(
                 pass.set_pipeline(&renderer.clipped_hidden_edge_pipeline);
                 pass.set_vertex_buffer(0, buffer.slice(..));
                 pass.draw(0..6, range.clone());
+                draw_call_count += 1;
             }
             continue;
         }
         pass.set_pipeline(&renderer.hidden_edge_pipeline);
         pass.set_vertex_buffer(0, edge_buffer.slice(..));
         pass.draw(0..6, 0..instance.mesh.edge_count);
+        draw_call_count += 1;
     }
     pass.set_pipeline(&renderer.visible_edge_pipeline);
     for (object_index, instance) in instances
@@ -3674,13 +3713,16 @@ fn encode_ordered_scene_pass(
                 pass.set_pipeline(&renderer.clipped_visible_edge_pipeline);
                 pass.set_vertex_buffer(0, buffer.slice(..));
                 pass.draw(0..6, range.clone());
+                draw_call_count += 1;
             }
             continue;
         }
         pass.set_pipeline(&renderer.visible_edge_pipeline);
         pass.set_vertex_buffer(0, edge_buffer.slice(..));
         pass.draw(0..6, 0..instance.mesh.edge_count);
+        draw_call_count += 1;
     }
+    draw_call_count
 }
 
 #[cfg(test)]
@@ -3689,6 +3731,8 @@ pub(super) fn assert_gpu_depth_contract(
     queue: &wgpu::Queue,
     format: wgpu::TextureFormat,
 ) {
+    batch_tests::assert_gpu_batch_contract(device, queue, format);
+    edge_upload_tests::assert_gpu_edge_upload_contract(device, queue, format);
     dynamic::assert_gpu_dynamic_contract(device, queue, format);
     vertex_color_tests::assert_gpu_vertex_color_contract(device, queue, format);
     material_tests::assert_gpu_material_contract(device, queue, format);
@@ -3895,7 +3939,7 @@ pub(super) fn assert_gpu_depth_contract(
     assert_eq!(scene.visible_object_count(), 5);
     scene.set_transform(near_id, near_transform).unwrap();
     renderer
-        .ensure_frame_capacity(device, scene.object_count())
+        .ensure_frame_capacity(device, scene.object_count(), scene.object_count())
         .unwrap();
     renderer.instances = scene
         .instances()

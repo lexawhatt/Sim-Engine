@@ -25,6 +25,42 @@ Sim;Engine remains pre-1.0. Linux with
 Vulkan is its supported release target, and Rust 1.90 is the minimum supported
 Rust version.
 
+## 0.4.1 development performance
+
+The current development package is `0.4.1-dev.1`; the stable installation
+examples below continue to target the released 0.4 API. No source migration is
+needed for this optimization slice. Pin a tested git revision when trying it.
+
+- `Native` surface validation first attempts a sufficient whole-mesh numerical
+  proof. Immutable source metadata includes nonzero component magnitudes, not
+  just an AABB: tiny interior or unused coordinates must not escape validation.
+  Model and camera arithmetic are bounded separately. Cancellation or uncertain
+  arithmetic falls back to the original source-ordered vertex checks, including
+  the same object/triangle/vertex error attribution. This is not culling.
+- Adjacent retained Opaque/Mask surfaces can share one instanced draw when their
+  actual geometry streams, texture/filter/address bindings and pipelines match.
+  Transforms, tint, UV transforms, cutoff and fog remain per instance. No object
+  is reordered. Blend, generated CPU-clipped geometry and incompatible bindings
+  break batches. `draw_call_count()` reports the commands actually encoded;
+  object and triangle counts retain their previous meaning.
+- Frames without drawable mathematical edges skip padded per-object edge
+  staging/uploads and do not grow its GPU buffer. Previously allocated capacity
+  remains available for future edge frames and remains included in memory
+  counters. Mixed scenes retain the existing visible-object offsets.
+
+StrictPortable topology, mathematical edges, normal/fog validation, device
+provenance, resource budgets and failure transactionality are unchanged. This
+slice particularly targets dense Native chunks and repeated meshes; lighting,
+fog and strict clipping can still dominate other workloads. No shader precision,
+MSAA quality, mip level or rendered geometry is reduced.
+
+Use `mesh3d_scene_benchmark` to compare unchanged workloads on the same physical
+adapter. Report preflight, staging/upload, encode/submit, GPU pass timings and
+surface acquisition separately. FPS also includes desktop scheduling and is not
+a standalone measure of CPU savings. Preserve all trials and check actual
+submitted counts, uploads and complete timestamp coverage before interpreting
+speedups. See the [Unreleased changelog](CHANGELOG.md#unreleased).
+
 ## 0.4 integration guide
 
 Version 0.4.0 delivers dynamic visual-state updates, material/texture lifecycle,

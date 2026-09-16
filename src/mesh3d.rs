@@ -331,6 +331,7 @@ pub struct Mesh3d {
     storage: Arc<Mesh3dStorage>,
     bounds_min: Vec3,
     bounds_max: Vec3,
+    minimum_nonzero_components: [f32; 3],
 }
 
 impl Mesh3d {
@@ -487,7 +488,7 @@ impl Mesh3d {
             });
         }
 
-        let (bounds_min, bounds_max) = mesh_bounds(&vertices);
+        let (bounds_min, bounds_max, minimum_nonzero_components) = mesh_bounds(&vertices);
         Ok(Self {
             // One fixed-size Arc control block makes Mesh3d cloning O(1)
             // without copying any caller-scale topology buffers.
@@ -501,6 +502,7 @@ impl Mesh3d {
             }),
             bounds_min,
             bounds_max,
+            minimum_nonzero_components,
         })
     }
 
@@ -549,6 +551,13 @@ impl Mesh3d {
     /// Returns the inclusive model-space upper bound.
     pub const fn bounds_max(&self) -> Vec3 {
         self.bounds_max
+    }
+
+    // Bounds alone cannot detect a subnormal source hidden between ordinary
+    // extrema. Immutable source metadata also covers unreferenced vertices.
+    #[cfg(feature = "wgpu")]
+    pub(crate) const fn minimum_nonzero_components(&self) -> [f32; 3] {
+        self.minimum_nonzero_components
     }
 
     /// Returns retained CPU capacity bytes for topology and optional attributes.
@@ -765,20 +774,25 @@ fn triangle_is_degenerate(first: Vec3, second: Vec3, third: Vec3) -> bool {
     cross.0 == 0.0 && cross.1 == 0.0 && cross.2 == 0.0
 }
 
-fn mesh_bounds(vertices: &[Vec3]) -> (Vec3, Vec3) {
+fn mesh_bounds(vertices: &[Vec3]) -> (Vec3, Vec3, [f32; 3]) {
     let first = vertices[0];
     let mut minimum = [first.x(), first.y(), first.z()];
     let mut maximum = minimum;
-    for vertex in &vertices[1..] {
+    let mut minimum_nonzero = [f32::INFINITY; 3];
+    for vertex in vertices {
         let components = [vertex.x(), vertex.y(), vertex.z()];
         for axis in 0..3 {
             minimum[axis] = minimum[axis].min(components[axis]);
             maximum[axis] = maximum[axis].max(components[axis]);
+            if components[axis] != 0.0 {
+                minimum_nonzero[axis] = minimum_nonzero[axis].min(components[axis].abs());
+            }
         }
     }
     (
         Vec3::new_unchecked(minimum[0], minimum[1], minimum[2]),
         Vec3::new_unchecked(maximum[0], maximum[1], maximum[2]),
+        minimum_nonzero,
     )
 }
 

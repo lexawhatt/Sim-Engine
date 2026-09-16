@@ -38,8 +38,8 @@ pub(in crate::renderer) fn assert_gpu_scene_timing_and_upload_contract(
             )
             .unwrap();
     }
-    let expected_bytes = std::mem::size_of::<Camera3dUniform>()
-        + 17 * (std::mem::size_of::<MeshInstanceGpu>() + renderer.edge_object_stride);
+    let expected_bytes =
+        std::mem::size_of::<Camera3dUniform>() + 17 * std::mem::size_of::<MeshInstanceGpu>();
     let native = Mesh3dRenderBudget::default().with_surface_policy(SurfaceRasterization3d::Native);
     let old_gpu = renderer.retained_frame_gpu_bytes();
     let first = renderer
@@ -55,8 +55,11 @@ pub(in crate::renderer) fn assert_gpu_scene_timing_and_upload_contract(
         )
         .unwrap();
     assert_eq!(first.uploaded_bytes(), expected_bytes);
-    assert_eq!(first.upload_calls(), 3);
-    assert_eq!(first.buffer_allocation_count(), 2);
+    assert_eq!(first.draw_call_count(), 1);
+    assert_eq!(first.upload_calls(), 2);
+    assert_eq!(first.buffer_allocation_count(), 1);
+    assert_eq!(renderer.edge_object_capacity, INITIAL_INSTANCE_CAPACITY);
+    assert_eq!(renderer.edge_object_bytes.capacity(), 0);
     assert_eq!(
         first.upload(),
         first.preflight_duration() + first.staging_upload_duration()
@@ -75,9 +78,7 @@ pub(in crate::renderer) fn assert_gpu_scene_timing_and_upload_contract(
     );
     assert_eq!(
         first.peak_frame_gpu_bytes(),
-        old_gpu
-            + renderer.instance_buffer.size() as usize
-            + renderer.edge_object_buffer.size() as usize
+        old_gpu + renderer.instance_buffer.size() as usize
     );
     let reused = renderer
         .render_scene3d_with_timing(
@@ -92,7 +93,8 @@ pub(in crate::renderer) fn assert_gpu_scene_timing_and_upload_contract(
         )
         .unwrap();
     assert_eq!(reused.uploaded_bytes(), expected_bytes);
-    assert_eq!(reused.upload_calls(), 3);
+    assert_eq!(reused.draw_call_count(), 1);
+    assert_eq!(reused.upload_calls(), 2);
     assert_eq!(reused.buffer_allocation_count(), 0);
     assert_eq!(
         reused.retained_frame_gpu_bytes(),
@@ -150,13 +152,12 @@ pub(in crate::renderer) fn assert_gpu_scene_timing_and_upload_contract(
         )
         .unwrap();
     assert!(generated.preflight().generated_vertex_count() > 0);
-    assert_eq!(generated.upload_calls(), 6);
+    assert_eq!(generated.upload_calls(), 5);
     assert_eq!(generated.buffer_allocation_count(), 3);
     assert_eq!(
         generated.uploaded_bytes(),
         std::mem::size_of::<Camera3dUniform>()
             + std::mem::size_of::<MeshInstanceGpu>()
-            + renderer.edge_object_stride
             + generated.preflight().generated_upload_bytes()
     );
     assert!(generated.staging_capacity_bytes() > generated.retained_frame_cpu_bytes());

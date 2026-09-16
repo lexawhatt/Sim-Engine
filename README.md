@@ -31,6 +31,13 @@ See the [0.4 integration guide](DOCUMENTATION.md#04-integration-guide) and
 notes from 0.3.0. Intensive profiling-driven optimization is planned for 0.4.1;
 this release does not promise a universal frame rate.
 
+The development branch is now **0.4.1-dev.1**. Its first performance slice
+accelerates Native 3D arithmetic validation, batches compatible repeated
+surfaces, and removes unused edge uploads. The public 0.4 API is unchanged;
+see [development performance notes](DOCUMENTATION.md#041-development-performance)
+and [Unreleased changes](CHANGELOG.md#unreleased). This is not a new registry
+release or a replacement for consumer testing.
+
 ## Documentation
 
 - [Library documentation](DOCUMENTATION.md) - installation, concepts, every

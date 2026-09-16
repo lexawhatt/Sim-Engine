@@ -2,6 +2,13 @@
 
 use super::*;
 
+#[path = "mesh3d_validation_bounds.rs"]
+mod bounds;
+
+#[cfg(test)]
+#[path = "mesh3d_validation_bounds_tests.rs"]
+mod bounds_tests;
+
 /// Selects the portability contract for filled 3D surfaces, not display edges.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
@@ -82,30 +89,44 @@ pub(super) fn validate_points_for_policy(
     policy: SurfaceRasterization3d,
     object_id: Object3dId,
 ) -> Result<(), Mesh3dRenderError> {
+    if policy == SurfaceRasterization3d::Native
+        && bounds::native_transform_is_proven(mesh, model_rows, camera_rows)
+    {
+        return Ok(());
+    }
     for (vertex_index, vertex) in mesh.vertices().iter().enumerate() {
         let result = validate_point_for_policy(*vertex, model_rows, camera_rows, policy);
         if let Err(reason) = result {
             // Only failures search for a source owner; the ordinary path does
             // not allocate an adjacency map or validate shared vertices twice.
-            return Err(
-                match mesh
-                    .triangle_indices()
-                    .iter()
-                    .position(|index| *index as usize == vertex_index)
-                {
-                    Some(index) => reason.for_triangle(object_id, index / 3),
-                    None => Mesh3dRenderError::ObjectFailure {
-                        object_id,
-                        reason: Mesh3dObjectError::Vertex {
-                            vertex_index,
-                            reason,
-                        },
-                    },
-                },
-            );
+            return Err(Mesh3dRenderError::ObjectFailure {
+                object_id,
+                reason: source_point_error(mesh, vertex_index, reason),
+            });
         }
     }
     Ok(())
+}
+
+fn source_point_error(
+    mesh: &Mesh3d,
+    vertex_index: usize,
+    reason: Mesh3dSurfaceError,
+) -> Mesh3dObjectError {
+    match mesh
+        .triangle_indices()
+        .iter()
+        .position(|index| *index as usize == vertex_index)
+    {
+        Some(index) => Mesh3dObjectError::SurfaceTriangle {
+            triangle_index: index / 3,
+            reason,
+        },
+        None => Mesh3dObjectError::Vertex {
+            vertex_index,
+            reason,
+        },
+    }
 }
 
 pub(super) fn validate_point_for_policy(

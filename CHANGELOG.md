@@ -7,7 +7,23 @@ changes.
 
 ## Unreleased
 
-No changes yet.
+Development target: 0.4.1. No new registry release is implied by this section.
+
+### Performance
+
+- Native 3D transform validation can prove finite arithmetic for an entire
+  immutable mesh using cached source bounds and nonzero-component magnitudes.
+  Inconclusive cases use the original per-vertex validation and error attribution.
+  StrictPortable topology, mathematical edges, lighting and fog keep their
+  independent checks. This is not frustum culling or a relaxed safety mode.
+- Adjacent retained Opaque/Mask objects sharing geometry streams, material
+  bindings and compatible pipelines use instanced draws without reordering.
+  Per-instance transforms, colors, UV mapping and cutoff remain independent.
+  Blended and CPU-clipped surfaces keep separate draws. Draw reports count actual
+  encoded commands, rather than one assumed draw per object.
+- Surface-only 3D frames no longer stage, upload or grow unused per-object
+  edge-uniform storage. Existing edge capacity is retained for reuse, and mixed
+  surface/edge scenes preserve their dynamic uniform offsets.
 
 ## 0.4.0 - 2026-09-12
 
