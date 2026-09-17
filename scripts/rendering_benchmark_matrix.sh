@@ -196,7 +196,7 @@ test "$(grep -c '^layered\[passes=3,draw_calls=3,scalar=256x144,target=640x360,.
 test "$(grep -c '^particle_scalar_contract=retained:16384,visibility_cap:8192,field:256x144,target:640x360$' "$performance_evidence")" -eq 1
 grep -q '^fixture=retained_3d ' "$performance_evidence"
 test "$(grep -c '^passes=2 commands=2 vertices=12294 .*draw_calls=2 sources\[streaming=0,prepared=0,dynamic=1,particles=0,scalars=0,images=0,glyphs=0,targets=1\]$' "$performance_evidence")" -eq 1
-test "$(grep -Ec '^retained_3d\[objects=48,triangles=576,edges=576,render_passes=2,draw_calls=146,retained_cpu_bytes=[1-9][0-9]*,retained_buffer_bytes=[1-9][0-9]*,texture_bytes=[1-9][0-9]*\]$' "$performance_evidence")" -eq 1
+test "$(grep -Ec '^retained_3d\[objects=48,triangles=576,edges=576,render_passes=2,draw_calls=99,retained_cpu_bytes=[1-9][0-9]*,retained_buffer_bytes=[1-9][0-9]*,texture_bytes=[1-9][0-9]*\]$' "$performance_evidence")" -eq 1
 test "$(grep -c '^retained_3d_contract=objects:48,triangles:576,edges:576,dynamic_triangles:4096$' "$performance_evidence")" -eq 1
 mv "$surface_evidence" "$output_dir/linux-vulkan-surface.txt"
 mv "$adapter_evidence" "$output_dir/linux-vulkan-adapter.txt"

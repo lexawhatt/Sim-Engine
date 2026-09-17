@@ -26,6 +26,7 @@ assert_provenance
 
 echo "[2/11] formatting"
 cargo fmt --all -- --check
+bash scripts/check_source_layout.sh
 
 echo "[3/11] Rust 1.90 minimum version"
 cargo +1.90.0 check --all-targets --no-default-features

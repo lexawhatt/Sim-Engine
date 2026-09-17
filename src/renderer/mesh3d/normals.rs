@@ -1,6 +1,6 @@
 //! Optional model-normal storage, independent of the legacy position stream.
 
-use super::*;
+use super::Vec3;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]

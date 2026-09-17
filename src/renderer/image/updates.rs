@@ -1,4 +1,10 @@
-use super::*;
+use std::sync::Arc;
+
+use super::{
+    Image2d, ImageBatch2d, ImageBatchBudget, ImageBatchUploadReport, ImageError, ImageInstance,
+    ImageSprite2d, logical_image_region_is_portable, preflight_image_batch_capacity, proof,
+};
+use crate::renderer::{WgpuRenderer, submit_pending_uploads};
 
 pub(in crate::renderer) fn batch_retained_bytes(count: usize) -> usize {
     count.saturating_mul(ImageBatchBudget::RETAINED_BYTES_PER_SPRITE)

@@ -1,4 +1,4 @@
-use super::*;
+use super::{Error, Mesh3dResourceError, Mesh3dUploadBudget, Scene3dError, Scene3dStatistics, fmt};
 
 /// Limits one scene-owned mesh update, including reserved buffers and overlap.
 ///

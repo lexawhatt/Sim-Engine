@@ -1,6 +1,9 @@
 //! Low-level instance, depth and mathematical-edge resources.
 
-use super::*;
+use super::{
+    DEPTH_FORMAT, EdgeObjectUniform, HIDDEN_EDGE_DEPTH_BIAS, MeshEdgeGpu, MeshInstanceGpu,
+    SurfaceClipEdge, VISIBLE_EDGE_DEPTH_BIAS,
+};
 
 pub(super) fn create_instance_buffer(device: &wgpu::Device, capacity: usize) -> wgpu::Buffer {
     device.create_buffer(&wgpu::BufferDescriptor {

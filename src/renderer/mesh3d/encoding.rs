@@ -1,6 +1,9 @@
 //! Ordered surface and mathematical-edge draw encoding.
 
-use super::*;
+use super::{
+    Color, Mesh3dInstance, Mesh3dRenderer, MeshColorGpu, MeshInstanceGpu, SurfaceClipVertex,
+    SurfaceLighting3d, SurfaceLightingVertex, batch, material, premultiplied_wgpu_color,
+};
 
 #[cfg(test)]
 pub(super) fn encode_scene_pass(

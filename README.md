@@ -47,6 +47,9 @@ all original validation and budget checks. It is disabled by default; small
 shared meshes can cost more draw calls when omissions split instanced batches.
 The 2D/3D renderer, scene styles and regression fixtures are now organized into
 focused modules, with unchanged public imports and rendering contracts.
+External tests follow their owning subsystem, use contract-based names, and
+share raw GPU readback transport without sharing expected-pixel calculations.
+CI checks the source-layout conventions.
 Existing 0.4 calls keep their default behavior;
 see [development performance notes](DOCUMENTATION.md#041-development-performance)
 and [Unreleased changes](CHANGELOG.md#unreleased). This is not a new registry

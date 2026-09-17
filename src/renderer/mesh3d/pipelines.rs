@@ -1,6 +1,11 @@
 //! 3D pipeline initialization and bounded frame resource growth.
 
-use super::*;
+use super::{
+    Camera3dUniform, EdgeObjectUniform, INITIAL_INSTANCE_CAPACITY, Mesh3dRenderError,
+    Mesh3dRenderer, MeshInstanceGpu, MeshTextureRenderer, SurfaceFrame, SurfaceLayout, align_to,
+    buffer_capacity_fits, create_edge_object_bind_group, create_edge_object_buffer,
+    create_edge_pipeline, create_instance_buffer, create_surface_pipelines, dynamic, lighting,
+};
 
 impl Mesh3dRenderer {
     pub(in crate::renderer) fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {

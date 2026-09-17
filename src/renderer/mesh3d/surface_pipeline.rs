@@ -1,6 +1,10 @@
 //! Shared depth, blending and projected winding policy for all surface layouts.
 
-use super::*;
+use super::{
+    DEPTH_FORMAT, MeshColorGpu, MeshInstanceGpu, MeshNormalGpu, MeshUvGpu, MeshVertexGpu,
+    SurfaceAlphaMode3d, SurfaceClipVertex, SurfaceLighting3d, SurfaceLightingVertex,
+    SurfaceSidedness3d,
+};
 
 pub(super) struct SurfacePipelines([wgpu::RenderPipeline; 8], bool);
 

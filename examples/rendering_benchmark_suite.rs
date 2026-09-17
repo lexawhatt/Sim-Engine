@@ -189,7 +189,7 @@ struct LayeredFixtureStatistics {
     texture_bytes: usize,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 struct Retained3dFixtureStatistics {
     objects: usize,
     triangles: usize,
@@ -1037,6 +1037,66 @@ fn validate_adapter_identity(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retained_fixture_requires_one_surface_batch_and_every_edge_and_composition_draw() {
+        let valid = Retained3dFixtureStatistics {
+            objects: 48,
+            triangles: 576,
+            edges: 576,
+            render_passes: 2,
+            // One shared surface batch, 48 hidden + 48 visible edge draws,
+            // one target composition and one dynamic-mesh draw.
+            draw_calls: 99,
+            retained_cpu_bytes: 1,
+            retained_buffer_bytes: 1,
+            texture_bytes: 1,
+        };
+        assert!(validate_retained_fixture_statistics(valid));
+        for draw_calls in [0, 1, 97, 98, 100, 146] {
+            assert!(!validate_retained_fixture_statistics(
+                Retained3dFixtureStatistics {
+                    draw_calls,
+                    ..valid
+                }
+            ));
+        }
+        for invalid in [
+            Retained3dFixtureStatistics {
+                objects: 47,
+                ..valid
+            },
+            Retained3dFixtureStatistics {
+                triangles: 575,
+                ..valid
+            },
+            Retained3dFixtureStatistics {
+                edges: 575,
+                ..valid
+            },
+            Retained3dFixtureStatistics {
+                render_passes: 1,
+                ..valid
+            },
+            Retained3dFixtureStatistics {
+                retained_cpu_bytes: 0,
+                ..valid
+            },
+            Retained3dFixtureStatistics {
+                retained_buffer_bytes: 0,
+                ..valid
+            },
+            Retained3dFixtureStatistics {
+                texture_bytes: 0,
+                ..valid
+            },
+        ] {
+            assert!(
+                !validate_retained_fixture_statistics(invalid),
+                "{invalid:?}"
+            );
+        }
+    }
 
     #[test]
     fn hidpi_evidence_requires_a_real_event_and_post_transition_present() {
@@ -2450,14 +2510,7 @@ fn validate_fixture_contract(name: &str, frame: &BenchmarkFrame) -> Result<(), B
         ("retained_3d", Some(statistics)) => {
             let sources = statistics.source_counts();
             frame.retained_3d_statistics.is_some_and(|retained| {
-                retained.objects == RETAINED_3D_OBJECTS
-                    && retained.triangles == RETAINED_3D_OBJECTS * 12
-                    && retained.edges == RETAINED_3D_OBJECTS * 12
-                    && retained.render_passes == 2
-                    && retained.draw_calls == RETAINED_3D_OBJECTS * 3 + 2
-                    && retained.retained_cpu_bytes > 0
-                    && retained.retained_buffer_bytes > 0
-                    && retained.texture_bytes > 0
+                validate_retained_fixture_statistics(retained)
                     && sources.dynamic_meshes() == 1
                     && sources.render_targets() == 1
                     && statistics.command_count() == 2
@@ -2472,8 +2525,25 @@ fn validate_fixture_contract(name: &str, frame: &BenchmarkFrame) -> Result<(), B
     if valid {
         Ok(())
     } else {
-        Err(format!("{name} no longer matches its deterministic source/count contract").into())
+        Err(format!(
+            "{name} no longer matches its deterministic source/count contract; retained_3d={:?}",
+            frame.retained_3d_statistics,
+        )
+        .into())
     }
+}
+
+fn validate_retained_fixture_statistics(retained: Retained3dFixtureStatistics) -> bool {
+    retained.objects == RETAINED_3D_OBJECTS
+        && retained.triangles == RETAINED_3D_OBJECTS * 12
+        && retained.edges == RETAINED_3D_OBJECTS * 12
+        && retained.render_passes == 2
+        // Adjacent shared opaque surfaces are one instanced draw. Mathematical
+        // edges still issue hidden + visible draws per object; composition adds two.
+        && retained.draw_calls == 1 + RETAINED_3D_OBJECTS * 2 + 2
+        && retained.retained_cpu_bytes > 0
+        && retained.retained_buffer_bytes > 0
+        && retained.texture_bytes > 0
 }
 
 fn validate_composed_fixture_contract(name: &str, statistics: FrameStatistics) -> bool {

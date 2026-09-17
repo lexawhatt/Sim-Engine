@@ -1,6 +1,9 @@
 //! Complete-chain creation and physically isolated atlas snapshots.
 
-use super::*;
+use super::{
+    Arc, CpuMipChain, ImageBudget, ImageError, ImageTexelRect, Texture3d, Texture3dError,
+    Texture3dOptions, WgpuRenderer, image, mips, upload_chain,
+};
 
 impl WgpuRenderer {
     /// Creates an independently filtered image with explicit alpha/mipmap policy.

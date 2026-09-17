@@ -1,6 +1,13 @@
 //! Scene-owned whole-bundle updates with immutable snapshot isolation.
 
-use super::*;
+use super::{
+    Arc, Error, Mesh3d, Mesh3dResourceError, Mesh3dUploadBudget, Mesh3dUploadBudgetResource,
+    Mesh3dUploadLayout, MeshColorGpu, MeshEdgeGpu, MeshNormalGpu, MeshUvGpu, MeshVertexGpu,
+    Object3dId, RetainedMesh3d, Scene3d, Scene3dError, Scene3dStatistics, Texture3dError,
+    WgpuRenderer, allocate_retained_mesh, fmt, is_portable_shader_source,
+    mesh3d_source_is_portable, preflight_mesh3d_source, preflight_mesh3d_upload,
+    submit_pending_uploads, upload, validate_mesh_source_style, write_retained_mesh_uploads,
+};
 
 mod types;
 pub use types::{

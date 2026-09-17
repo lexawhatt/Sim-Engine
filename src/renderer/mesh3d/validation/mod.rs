@@ -1,13 +1,15 @@
 //! Surface rasterization policy and source-attributed numerical validation.
 
-use super::*;
+use super::{
+    MAX_PORTABLE_SHADER_VALUE, Mesh3d, Mesh3dObjectError, Mesh3dRenderError, Object3dId, Vec3,
+    interval_products_f64, is_portable_shader_source, shader_clip_point_ranges,
+    validate_clip_classification,
+};
 
 mod bounds;
 
 #[cfg(test)]
-mod bounds_tests;
-#[cfg(test)]
-mod culling_tests;
+mod tests;
 
 pub(super) fn native_mesh_is_outside(
     mesh: &Mesh3d,

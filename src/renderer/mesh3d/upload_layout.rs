@@ -1,6 +1,8 @@
 //! GPU capacity preflight and stream byte layout.
 
-use super::*;
+use super::{
+    Mesh3d, Mesh3dResourceError, MeshColorGpu, MeshEdgeGpu, MeshNormalGpu, MeshUvGpu, MeshVertexGpu,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct Mesh3dUploadLayout {

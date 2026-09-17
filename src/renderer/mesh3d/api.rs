@@ -1,6 +1,11 @@
 //! Public renderer entry points for retained 3D resources and frames.
 
-use super::*;
+use super::{
+    Arc, Camera3d, LogicalViewport, Mesh3d, Mesh3dPreflightReport, Mesh3dRenderBudget,
+    Mesh3dRenderError, Mesh3dRenderReport, Mesh3dResourceError, RenderTarget3d, RetainedMesh3d,
+    Scene3d, Scene3dRestoreReport, WgpuRenderer, create_depth_texture, create_retained_mesh,
+    restore_retained_mesh, restore_scene3d_resources, target_pixels_per_logical,
+};
 
 impl WgpuRenderer {
     /// Uploads validated immutable topology into retained GPU buffers.
@@ -152,7 +157,7 @@ impl WgpuRenderer {
     /// before the first GPU write or target mutation. Numerical ambiguity is
     /// attributed to the exact visible object; aggregate capacity remains a
     /// scene-level error. Wholly inside objects retain their indexed GPU path.
-    /// With [`SurfaceRasterization3d::Native`], all filled surfaces keep their
+    /// With [`SurfaceRasterization3d::Native`](crate::SurfaceRasterization3d::Native), all filled surfaces keep their
     /// original indices and hardware clipping defines boundary coverage. Finite
     /// shader arithmetic and independent mathematical-edge proofs still apply.
     pub fn render_scene3d_to_target_with_budget(

@@ -1,4 +1,11 @@
-use super::*;
+use super::{
+    Arc, Color, Error, Image2d, ImageBatch2d, ImageBatchBudget, ImageBatchUploadReport,
+    ImageBudget, ImageError, ImageSprite2d, ImageTexelRect, LogicalScreenPosition, LogicalViewport,
+    LogicalViewportRegion, WgpuRenderer, fmt, image,
+};
+
+#[cfg(test)]
+use super::Vec2;
 
 /// Opaque host-provided glyph identity within one [`GlyphAtlas2d`].
 ///

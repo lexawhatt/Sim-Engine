@@ -1,6 +1,15 @@
 //! Renderer initialization, surface sizing and host-facing diagnostics.
 
-use super::*;
+use super::{
+    Arc, GpuTimingBatch, GpuTimingStatistics, INITIAL_VERTEX_CAPACITY, ImageRenderer,
+    LogicalScreenPosition, LogicalViewport, Mesh3dRenderer, PhysicalScreenPosition,
+    PipelineResources, RendererConfigurationError, RendererCoordinateError, RendererInitError,
+    RendererSurfacePresentMode, WgpuRenderer, WgpuRendererOptions, create_multisample_target,
+    create_pipeline, create_submitted_particle_unit_buffer, create_vertex_buffer, frame,
+    gpu_timing, invoke_pre_present_notify, logical_to_physical_screen, physical_to_logical_screen,
+    preferred_sample_count, select_surface_present_mode, validate_scale_factor,
+    validate_surface_dimensions,
+};
 
 impl WgpuRenderer {
     /// Creates a renderer for a window or canvas surface target.

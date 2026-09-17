@@ -1,6 +1,14 @@
 //! Mutable triangle-mesh creation, updates, recovery and drawing.
 
-use super::*;
+use super::{
+    Arc, Camera2d, Color, Duration, DynamicGpu, Error, GeometryExtents, GeometryValidationCache,
+    GeometryValidationSource, Instant, PreparedDrawBatch, RenderReport, RenderStatus,
+    RendererFrameError, TessellationStats, Vec2, WgpuRenderer, buffer_capacity_fits,
+    create_dynamic_vertex_buffer, dynamic_mesh_bytes, dynamic_vertex_capacity,
+    dynamic_vertices_to_gpu, fmt, prepared_scene_belongs_to, replace_dynamic_mesh_resources,
+    restore_dynamic_mesh_resources, submit_pending_uploads, validate_dynamic_mesh_budget,
+    validate_dynamic_retained_capacity,
+};
 
 /// One world-space vertex in a dynamic triangle-list mesh.
 ///

@@ -72,6 +72,14 @@ Development target: 0.4.1. No new registry release is implied by this section.
 
 ### Development tooling
 
+- Unified modules with children under `mod.rs` and external tests under their
+  owning module's `tests/`, named by contract. Removed path overrides and
+  historical dev/reviewer filenames. Added a CI/release layout check, explicit
+  production imports and shared test-only raw GPU readback transport; independent
+  pixel expectations and frozen mathematical references remain separate.
+- The retained-3D release fixture requires the exact instanced draw count (99,
+  previously 146), while preserving all object, triangle, edge and composition
+  counts. Negative regressions reject missing work and the old unbatched count.
 - Split the renderer facade into initialization, ordinary scenes, dynamic meshes,
   particles, scalar fields, targets, pipelines, outcomes and numerical-validation
   modules. Frame composition/presentation, scene styles and large test fixtures

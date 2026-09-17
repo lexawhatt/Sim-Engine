@@ -1,6 +1,12 @@
 //! Conservative homogeneous edge clipping and raster arithmetic.
 
-use super::*;
+use super::{
+    LogicalPixels, MAX_PORTABLE_SHADER_VALUE, Mesh3d, Mesh3dRenderError, PhysicalPerLogical,
+    ShaderValueRange, WireframeStyle3d, clip_plane_ranges, interval_lerp_range,
+    is_nonzero_subnormal, is_portable_shader_source, rounded_f32_add_range,
+    rounded_f32_product_range, shader_clip_point_ranges, shader_range_minimum_magnitude,
+    validate_clip_classification, wgsl_division_range, wgsl_signed_division_range,
+};
 
 pub(super) type ClipPlaneRanges = [(f64, f64); 6];
 pub(super) type EdgeClipPlaneRanges = [ClipPlaneRanges; 2];

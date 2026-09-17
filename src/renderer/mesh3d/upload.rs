@@ -1,6 +1,10 @@
 //! Explicit immutable mesh replacement budgets and peak accounting.
 
-use super::*;
+use super::{
+    Arc, Mesh3d, Mesh3dResourceError, Mesh3dUploadLayout, PreparedRetainedMeshUpload,
+    RetainedMesh3d, Texture3dError, WgpuRenderer, preflight_mesh3d_source,
+    prepare_retained_mesh_upload, upload_prepared_retained_mesh,
+};
 
 /// Byte category bounded before immutable mesh upload or replacement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,7 +121,7 @@ impl WgpuRenderer {
     /// Atomically replaces this retained handle with a newly uploaded revision.
     ///
     /// Clones and scene objects referencing the previous revision are unchanged;
-    /// use [`Scene3d::set_mesh`] to rebind selected live objects. This is immutable
+    /// use [`Scene3d::set_mesh`](crate::Scene3d::set_mesh) to rebind selected live objects. This is immutable
     /// replacement, not a stable-capacity in-place upload. Validation/allocation
     /// errors preserve the old handle; asynchronous device failure is separate.
     /// In-flight work keeps its old references. Nominal transient GPU/source

@@ -1,4 +1,10 @@
-use super::*;
+use super::{
+    Arc, INITIAL_VERTEX_CAPACITY, ImageRenderer, LogicalScreenPosition, Mesh3dRenderer,
+    PhysicalScreenPosition, PipelineResources, RendererConfigurationError, RendererCoordinateError,
+    RendererInitError, RetiredDevice, WgpuRenderer, create_pipeline,
+    create_submitted_particle_unit_buffer, create_vertex_buffer, gpu_timing,
+    preferred_sample_count,
+};
 use std::fmt;
 
 const DEFAULT_MAX_QUARANTINED_DEVICES: usize = 4;
@@ -151,7 +157,7 @@ impl WgpuRendererOptions {
     /// Disabled by default, with no query/readback resource cost. Unsupported
     /// adapters still initialize successfully and report `Unavailable` through
     /// [`WgpuRenderer::gpu_timing_statistics`]. The measured paths are retained
-    /// 3D target rendering and [`FrameComposer`]; CPU submissions and presentation
+    /// 3D target rendering and [`FrameComposer`](crate::FrameComposer); CPU submissions and presentation
     /// waits are never reported as GPU time. Recovery preserves this preference.
     pub const fn with_gpu_timing(mut self, enabled: bool) -> Self {
         self.gpu_timing = enabled;

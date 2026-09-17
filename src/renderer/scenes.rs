@@ -1,6 +1,17 @@
 //! Ordinary and prepared scene drawing through the shared geometry pipeline.
 
-use super::*;
+use super::{
+    Arc, Camera2d, CameraUniform, Color, Duration, GeometryExtents, GeometryValidationCache,
+    GeometryValidationSource, Instant, LogicalViewport, LogicalViewportRegion, PhysicalPerLogical,
+    PreparedDrawBatch, PreparedScene, PreparedSceneError, PreparedSceneRenderError,
+    PreparedScreenScene, RenderReport, RenderStatus, RenderTarget2d, RenderTargetError,
+    RenderTargetLoad, RendererFrameError, RendererSurfaceStatus, Scene, ScissorRect, ScreenScene,
+    TessellationStats, Vec2, Vertex, WgpuRenderer, buffer_capacity_fits, create_vertex_buffer,
+    dynamic_vertex_capacity, geometry_is_safe_for, geometry_is_safe_for_cached,
+    logical_viewport_scissor, offset_scissor, premultiplied_wgpu_color, prepare_scene_resources,
+    prepared_scene_belongs_to, render_report, restore_prepared_scene_resources,
+    scene_estimate_fits_streaming_device, screen_camera, screen_clip_to_scissor, tessellate_scene,
+};
 
 impl WgpuRenderer {
     /// Draws a scene using the supplied camera.

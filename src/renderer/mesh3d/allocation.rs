@@ -1,6 +1,10 @@
 //! Bounded retained topology validation, staging and GPU allocation.
 
-use super::*;
+use super::{
+    Arc, Mesh3d, Mesh3dResourceError, Mesh3dUploadBudget, Mesh3dUploadLayout, MeshColorGpu,
+    MeshEdgeGpu, MeshNormalGpu, MeshUvGpu, MeshVertexGpu, RetainedMesh3d,
+    is_portable_shader_source, preflight_mesh3d_source, submit_pending_uploads, upload,
+};
 
 pub(super) fn create_retained_mesh(
     device: &wgpu::Device,

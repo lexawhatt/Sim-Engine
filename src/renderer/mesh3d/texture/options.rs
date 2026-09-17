@@ -1,4 +1,4 @@
-use super::*;
+use super::TextureMipmaps3d;
 
 /// Explicit creation policy for independently filtered 3D RGBA8 images.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

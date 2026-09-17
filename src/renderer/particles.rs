@@ -1,6 +1,17 @@
 //! Retained particle-field updates, bounded visibility and draw submission.
 
-use super::*;
+use super::{
+    Arc, Camera2d, CameraUniform, Color, Duration, Error, Instant, LogicalViewport,
+    ParticleDrawPreparation, ParticleGpu, ParticleInstance2d, RenderReport, RenderStatus,
+    RenderTarget2d, RenderTargetLoad, RendererFrameError, RendererSurfaceStatus, TessellationStats,
+    WgpuRenderer, allocate_particle_staging, buffer_capacity_fits, compact_particle_instances,
+    create_particle_instance_buffer, fmt, particle_budgeted_capacity, particle_idle_statistics,
+    particle_instances_to_gpu, particle_statistics_with_budget, particle_update_range,
+    particle_visible_index_is_selected, premultiplied_wgpu_color, prepared_scene_belongs_to,
+    render_report, restore_particle_field_resources, uniformly_sampled_index,
+    validate_particle_retained_capacities, validate_particle_retained_count,
+    validate_particle_staging_capacity, visible_particle_count,
+};
 
 /// Counts associated with one particle-field update or draw.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

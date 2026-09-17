@@ -1,6 +1,6 @@
 //! Frame outcomes, timing reports and public rendering errors.
 
-use super::*;
+use super::{Duration, Error, SceneBudgetResource, TessellationError, TessellationStats, fmt};
 
 /// Result of attempting to draw a frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -283,7 +283,7 @@ impl fmt::Display for RendererInitError {
 
 impl Error for RendererInitError {}
 
-/// Invalid runtime or initialization configuration for [`WgpuRenderer`].
+/// Invalid runtime or initialization configuration for [`WgpuRenderer`](crate::WgpuRenderer).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum RendererConfigurationError {
     /// Logical-to-physical scale must keep all surface transforms normal and finite.
@@ -445,7 +445,7 @@ impl From<TessellationError> for PreparedSceneError {
 
 impl Error for PreparedSceneError {}
 
-/// Failure to draw geometry prepared by [`WgpuRenderer::prepare_scene`].
+/// Failure to draw geometry prepared by [`WgpuRenderer::prepare_scene`](crate::WgpuRenderer::prepare_scene).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PreparedSceneRenderError {
     /// The prepared geometry belongs to a different renderer and GPU device.

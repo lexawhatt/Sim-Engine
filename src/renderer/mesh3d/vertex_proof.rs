@@ -1,6 +1,12 @@
 //! Per-vertex clip classification and projected triangle orientation.
 
-use super::*;
+use super::{
+    Mesh3dRenderError, ShaderValueRange, Vec3, rounded_f32_add_range, rounded_f32_product_range,
+    shader_dot_range, wgsl_division_range,
+};
+
+#[cfg(test)]
+use super::{Mesh3d, surface};
 
 #[cfg(test)]
 pub(super) fn validate_shader_transform(

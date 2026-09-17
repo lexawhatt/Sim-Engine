@@ -1,5 +1,9 @@
-use super::*;
+use std::error::Error;
+use std::fmt;
+
+use super::{ShapedLine, TextAtlas2d, TextError, TextLayoutBudget, TextRun2d, TextUpdateReport};
 use crate::ShapedLineError;
+use crate::renderer::WgpuRenderer;
 
 /// Rejected prepared-text provenance/limits or an underlying atlas/run operation.
 /// Existing UTF-8 APIs retain their original [`TextError`] return type.
@@ -45,8 +49,8 @@ impl From<ShapedLineError> for PreparedTextError {
 impl TextAtlas2d {
     /// Prepares a validated CPU line without invoking the text shaper again.
     ///
-    /// The line must originate from this exact [`FontFace`] (clones share identity)
-    /// and [`TextStyle`], including DPI and requested direction. Separately loaded
+    /// The line must originate from this exact [`FontFace`](crate::FontFace) (clones share identity)
+    /// and [`TextStyle`](crate::TextStyle), including DPI and requested direction. Separately loaded
     /// identical font bytes are intentionally not treated as the same identity.
     /// Text/glyph limits are checked before placement allocation or cache mutation;
     /// raster limits apply to uncached glyphs. Run capacity includes whitespace as

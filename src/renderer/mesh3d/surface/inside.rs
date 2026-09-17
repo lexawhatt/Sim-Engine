@@ -1,6 +1,6 @@
 //! Success-only shortcut for an unchanged original triangle.
 
-use super::*;
+use super::{ClipVertex, MAX_POLYGON_VERTICES, validate_projected_triangle_orientation};
 
 pub(super) fn accepts(
     vertices: &[ClipVertex; MAX_POLYGON_VERTICES],

@@ -1,4 +1,17 @@
-use super::*;
+use super::{
+    FrameComposer, FrameComposerError, FrameItem, FramePassOptions, FrameReport, FrameSourceKind,
+    FrameSourceStatistics, FrameStatistics, RetainedResourceAccounting, RetainedResourceKey,
+    ScalarLutPlan, account_new_retained_resources, retained_arc_key, retained_key,
+    scalar_lut_counts_with_inserted, validate_frame_budget,
+};
+use crate::renderer::{
+    BlendMode, COLOR_MAP_LUT_SIZE, Camera2d, CameraUniform, Color, ColorMap, CompositeUniform,
+    DynamicGpu, DynamicMesh2d, GlyphAtlas2d, GlyphRun2d, HeatmapUniform, Image2d, ImageBatch2d,
+    ImageBatchPlacement, ImageSampling, ImageTexelRect, ImageUniform, ParticleField2d, ParticleGpu,
+    PreparedDrawBatch, PreparedScene, PreparedScreenScene, Rect, RenderTarget2d,
+    ScalarFieldSampling, ScalarFieldTexture, Scene, ScreenScene, Vertex, color_map_lut,
+    prepared_scene_belongs_to, scalar_normalization_is_portable, scalar_value_range_extent,
+};
 
 impl<'frame> FrameComposer<'frame> {
     /// Adds a streaming world-space scene through its own camera.

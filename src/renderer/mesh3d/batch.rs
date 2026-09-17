@@ -1,6 +1,6 @@
 //! Adjacent retained-instance batching without reordering or new frame storage.
 
-use super::*;
+use super::{Arc, Mesh3dInstance, SurfaceAlphaMode3d};
 
 pub(super) fn compatible(left: &Mesh3dInstance, right: &Mesh3dInstance) -> bool {
     let (Some(left_style), Some(right_style)) =

@@ -1,7 +1,14 @@
 //! Retained 3D frame validation, staging, upload and submission.
 
-use super::*;
-use upload_changes::UploadSpan;
+use super::upload_changes::UploadSpan;
+use super::{
+    Arc, Camera3d, Camera3dUniform, Color, EdgeObjectUniform, GpuTimingSource, Instant,
+    LogicalPixels, Mesh3dRenderBudget, Mesh3dRenderError, Mesh3dRenderReport, Mesh3dRenderer,
+    MeshColorGpu, MeshInstanceGpu, RenderTarget3d, Scene3d, SurfaceClipEdge, SurfaceClipVertex,
+    SurfaceEnvironmentGpu, SurfaceFrame, SurfaceLightingVertex, TextureMaterial3d,
+    buffer_capacity_fits, encode_ordered_scene_pass, gpu_timing, material, surface, texture,
+    validate_camera_target_aspect, validate_target_identity,
+};
 
 // Keep visible-index dynamic offsets unchanged when edges exist. Surface-only
 // frames need neither padded edge staging nor a proportional edge GPU buffer.

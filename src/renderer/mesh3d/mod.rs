@@ -1,16 +1,13 @@
 #[cfg(test)]
-mod gpu_contract;
-#[cfg(test)]
 mod tests;
 #[cfg(test)]
-pub(super) use gpu_contract::{assert_gpu_depth_contract, assert_gpu_scene_recovery_contract};
+pub(super) use tests::{assert_gpu_depth_contract, assert_gpu_scene_recovery_contract};
 mod encoding;
-use encoding::*;
+use encoding::encode_ordered_scene_pass;
+#[cfg(test)]
+use encoding::encode_scene_pass;
 mod api;
 mod frame;
-#[cfg(test)]
-#[path = "tests/frame_upload.rs"]
-mod frame_upload_tests;
 mod pipelines;
 mod report;
 mod upload_changes;
@@ -19,22 +16,49 @@ pub use report::{
     Scene3dRestoreReport,
 };
 mod allocation;
-use allocation::*;
+use allocation::{
+    PreparedRetainedMeshUpload, allocate_retained_mesh, create_retained_mesh,
+    mesh3d_source_is_portable, prepare_retained_mesh_upload, upload_prepared_retained_mesh,
+    write_retained_mesh_uploads,
+};
 mod scene_restore;
-use scene_restore::*;
+use scene_restore::restore_scene3d_resources;
 mod upload_layout;
-use upload_layout::*;
+use upload_layout::{Mesh3dUploadLayout, preflight_mesh3d_source, preflight_mesh3d_upload};
 mod resources;
-use resources::*;
+use resources::{
+    align_to, create_depth_texture, create_edge_object_bind_group, create_edge_object_buffer,
+    create_edge_pipeline, create_instance_buffer,
+};
 mod vertex_proof;
-use vertex_proof::*;
+use vertex_proof::{
+    clip_plane_ranges, shader_clip_point_ranges, validate_clip_classification,
+    validate_projected_triangle_orientation,
+};
+#[cfg(test)]
+use vertex_proof::{
+    validate_shader_points, validate_shader_transform, validate_surface_triangle_topology,
+};
 mod edge_proof;
-use edge_proof::*;
+use edge_proof::validate_edge_projection;
+#[cfg(test)]
+use edge_proof::{clip_edge_to_frustum, clip_edge_to_frustum_details, edge_raster_envelope};
 mod shader_math;
-use shader_math::*;
+#[cfg(test)]
+use shader_math::shader_dot;
+use shader_math::{
+    ShaderValueRange, interval_lerp_range, shader_dot_range, shader_range_minimum_magnitude,
+    wgsl_division_range, wgsl_signed_division_range,
+};
 use shader_math::{rounded_f32_add_range, rounded_f32_product_range};
 
-use super::*;
+use super::{
+    Arc, Color, Cow, Duration, Error, GpuTimingId, GpuTimingSource, ImageBudget, ImageError,
+    ImageSampling, ImageTexelRect, Instant, LogicalViewport, MAX_PORTABLE_SHADER_VALUE,
+    RenderTarget2d, RenderTargetError, WgpuRenderer, buffer_capacity_fits, fmt, gpu_timing, image,
+    interval_products_f64, is_nonzero_subnormal, is_portable_shader_source,
+    premultiplied_wgpu_color, shader_interval_sum_range, submit_pending_uploads,
+};
 use crate::{
     Camera3d, LogicalPixels, Mesh3d, MeshStyle3d, PhysicalPerLogical, Transform3d, Vec3,
     WireframeStyle3d,
@@ -46,12 +70,6 @@ use validation::validate_points_for_policy;
 pub use validation::{Mesh3dSurfaceError, SurfaceRasterization3d};
 
 mod batch;
-#[cfg(test)]
-#[path = "tests/batch.rs"]
-mod batch_tests;
-#[cfg(test)]
-#[path = "tests/edge_upload.rs"]
-mod edge_upload_tests;
 
 mod surface;
 pub use surface::{Mesh3dPreflightReport, Mesh3dRenderBudget};
@@ -71,20 +89,8 @@ use crate::mesh3d::{Fog3d, Lighting3d, SurfaceLighting3d};
 use lighting::{SurfaceEnvironmentGpu, SurfaceLightingVertex, SurfaceTransport};
 mod surface_pipeline;
 use surface_pipeline::{SurfaceLayout, SurfacePipelines, create_surface_pipelines};
-#[cfg(test)]
-#[path = "tests/lighting.rs"]
-mod lighting_tests;
 mod material;
-#[cfg(test)]
-#[path = "tests/material.rs"]
-mod material_tests;
-#[cfg(test)]
-#[path = "tests/native_acceptance.rs"]
-mod native_acceptance_tests;
 
-#[cfg(test)]
-#[path = "tests/material_resource.rs"]
-mod material_resource_tests;
 pub use texture::{
     Texture3d, Texture3dError, Texture3dOptions, Texture3dUpdateBudget,
     Texture3dUpdateBudgetResource, Texture3dUpdateError, Texture3dUpdateReport, TextureMaterial3d,
@@ -95,25 +101,7 @@ pub use texture::{
 use crate::{MeshEdge3d, Projection3d, Rotation3d, SurfaceStyle3d, WorldLength};
 
 #[cfg(test)]
-#[path = "tests/accounting_benchmark.rs"]
-mod accounting_benchmark;
-#[cfg(test)]
-#[path = "tests/lifetime.rs"]
-mod lifetime_tests;
-
-#[cfg(test)]
-#[path = "tests/vertex_color.rs"]
-mod vertex_color_tests;
-
-#[cfg(test)]
-#[path = "tests/color_budget.rs"]
-mod color_budget_tests;
-
-#[cfg(test)]
-#[path = "tests/timing.rs"]
-mod timing_tests;
-#[cfg(test)]
-pub(super) use timing_tests::assert_gpu_scene_timing_and_upload_contract;
+pub(super) use tests::assert_gpu_scene_timing_and_upload_contract;
 
 #[cfg(test)]
 fn logical(value: f32) -> LogicalPixels {

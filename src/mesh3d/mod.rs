@@ -71,10 +71,12 @@ struct Mesh3dStorage {
 
 /// Normalized texture coordinate with a top-left origin and downward V axis.
 ///
-/// Both components are finite in `0..=1`. The textured 3D path uses mip level
-/// zero and clamp-to-edge addressing. Atlas cells should map geometry to their
-/// edge texel centers for nearest sampling. Strict linear-filter isolation also
-/// requires host-owned extruded gutters to tolerate interpolation rounding.
+/// Both components are finite in `0..=1`. Material UV transforms and addressing
+/// control repetition independently of these source coordinates. Textures use
+/// mip level zero by default and can opt into complete mip chains. Atlas cells
+/// should map geometry to their edge texel centers for nearest sampling; linear
+/// filtering also needs extruded gutters. Independent cropped tiles isolate
+/// generated mip chains from neighboring atlas cells.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TextureCoordinate2d {
     u: f32,
@@ -106,9 +108,9 @@ impl TextureCoordinate2d {
 /// Immutable validated topology for retained stereometry rendering.
 ///
 /// Vertices use caller-defined model-space world units. Triangle indices are a
-/// flat triangle list. Winding is preserved but deliberately not interpreted:
-/// the current surface pass disables face culling, and a global
-/// "counter-clockwise" rule is meaningless without a declared outward side.
+/// flat triangle list. Construction preserves winding without inferring an
+/// outward side. Surfaces are two-sided by default; an explicitly one-sided
+/// [`SurfaceSidedness3d`] material keeps projected counter-clockwise front faces.
 /// Optional display edges identify the mathematical edges that a later
 /// visible/hidden-line pass should draw; they are not inferred from triangle
 /// adjacency because triangulation diagonals are not necessarily meaningful

@@ -1,6 +1,8 @@
 //! Standalone retained restoration preserves the full immutable material policy.
 
-use super::*;
+use super::{
+    Arc, Mesh3dResourceError, RetainedMesh3d, texture, upload, upload_prepared_retained_mesh,
+};
 
 pub(super) fn restore_retained_mesh(
     device: &wgpu::Device,

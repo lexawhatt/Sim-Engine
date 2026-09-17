@@ -1,4 +1,7 @@
-use super::*;
+use super::{
+    FontBudgetResource, FontError, FontFace, ShapedGlyph, ShapedLine, TextDirection,
+    TextLayoutBudget, TextStyle, check, represent, reserve,
+};
 
 /// A prepared line cannot be reused with the requested font, style or limits.
 /// Kept separate from [`FontError`] so existing exhaustive matches remain valid.

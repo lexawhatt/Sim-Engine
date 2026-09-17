@@ -1,6 +1,9 @@
 //! Transactional scene resource restoration with alias preservation.
 
-use super::*;
+use super::{
+    Arc, Mesh3dInstance, Mesh3dResourceError, PreparedRetainedMeshUpload, RetainedMesh3d, Scene3d,
+    Scene3dRestoreReport, Texture3d, texture, upload, upload_prepared_retained_mesh,
+};
 
 pub(super) fn restore_scene3d_resources(
     device: &wgpu::Device,

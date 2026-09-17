@@ -1,6 +1,6 @@
 //! Success-only Native surface omission; never a replacement for validation.
 
-use super::*;
+use super::{Camera3dUniform, Scene3d, SurfaceFrame, validation};
 
 pub(super) fn omit_offscreen_surfaces(
     scene: &Scene3d,

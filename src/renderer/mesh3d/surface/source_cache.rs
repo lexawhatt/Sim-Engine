@@ -1,6 +1,8 @@
 //! Invocation-local source-index memoization, without caller-sized allocation.
 
-use super::*;
+use super::{
+    Mesh3d, Mesh3dSurfaceError, ShaderValueRange, SurfaceTransport, shader_clip_point_ranges,
+};
 
 pub(super) const CAPACITY: usize = 64;
 

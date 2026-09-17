@@ -2358,7 +2358,8 @@ cube surfaces plus visible/hidden mathematical edges into a retained depth
 target, composes that target to the surface, and validates 4,096 budgeted
 dynamic triangles in the same frame. Its machine-checked compound report merges
 the offscreen retained-3D pass with the composed surface frame: two actual
-render passes, 146 actual draw calls, unique retained mesh/dynamic CPU and GPU
+render passes, 99 actual draw calls (one instanced surface batch, 96 edge draws
+and two composition draws; 0.4.0 used 146 before instancing), unique retained mesh/dynamic CPU and GPU
 buffer bytes, and both color-target and depth-target texel bytes.
 The same matrix covers mixed-layer construction through
 `scene_construction_benchmark`, atomic budget rejection through its exact core
@@ -2562,7 +2563,7 @@ composed, drawn, measured, and recovered.
 | `color.rs` | linear color, sRGB byte conversion, palette |
 | `easing.rs`, `tween.rs` | fallible visual interpolation |
 | `camera.rs` | 2D camera, pseudo-depth, typed screen spaces |
-| `scene.rs`, `scene/styles.rs` | validated ordered 2D command stream and visual styles |
+| `scene/mod.rs`, `scene/styles.rs` | validated ordered 2D command stream and visual styles |
 | `field.rs` | finite scalar grid and CPU color-map contracts |
 | `particle.rs` | renderer-independent particle visual state |
 | `pseudo3d.rs` | checked 3D math, transforms, and CPU projection |
@@ -2579,7 +2580,7 @@ composed, drawn, measured, and recovered.
 | `renderer/visualization.rs` | fused scientific visualization path |
 | `renderer/mesh3d/mod.rs`, `renderer/mesh3d/api.rs` | retained resource facade and public entry points |
 | `renderer/mesh3d/frame.rs`, `renderer/mesh3d/encoding.rs` | transactional frame staging and ordered depth/edge passes |
-| `renderer/mesh3d/objects.rs` | indexed object IDs, lifetime and shared-resource accounting |
+| `renderer/mesh3d/objects/mod.rs` | indexed object IDs, lifetime and shared-resource accounting |
 | `renderer/mesh3d/upload.rs`, `renderer/mesh3d/allocation.rs` | bounded immutable mesh upload/replacement |
 | `renderer/mesh3d/surface/mod.rs` | interval-proven bounded surface clipping and preflight |
 | `renderer/mesh3d/validation/`, `renderer/mesh3d/lighting/` | sufficient mesh-wide proofs and ordered vertex fallback |
@@ -2587,16 +2588,29 @@ composed, drawn, measured, and recovered.
 | `renderer/mesh3d/dynamic/` | capacity-reusing whole-bundle mesh updates and alias isolation |
 | `renderer/mesh3d/restoration.rs`, `renderer/mesh3d/scene_restore.rs` | standalone and shared-scene restoration preserving material policy |
 | `renderer/gpu_timing.rs` | optional bounded render-pass timestamps and correlation |
-| `renderer/frame/cache.rs` | bounded frame scratch, uniform and binding reuse |
+| `renderer/frame/cache/mod.rs` | bounded frame scratch, uniform and binding reuse |
 | `renderer/frame/compose.rs`, `renderer/frame/present.rs` | frame admission and surface presentation orchestration |
-| `renderer/frame/encoding.rs` | ordered mixed-source draw encoding and pass-local state reuse |
-| `renderer/frame/uniform_uploads.rs` | bounded packed transfers into independent retained uniforms |
+| `renderer/frame/encoding/mod.rs` | ordered mixed-source draw encoding and pass-local state reuse |
+| `renderer/frame/uniform_uploads/mod.rs` | bounded packed transfers into independent retained uniforms |
 | `renderer/primitive.wgsl` | 2D, particle, heatmap, and composition shaders |
 | `renderer/mesh3d/primitive.wgsl` | 3D projection and screen-space edge expansion |
-| `renderer/tests/`, `scene/tests.rs`, `renderer/frame/tests.rs` | responsibility-specific CPU/pixel regressions |
+| `renderer/tests/`, `scene/tests/`, `renderer/frame/tests/` | responsibility-specific CPU/pixel regressions |
+| `renderer/test_support.rs` | test-only raw GPU readback transport, without expected-pixel calculations |
 
 The entire renderer module is behind the `wgpu` feature. CPU-side contracts
 remain testable without it.
+
+CPU `mesh3d/` describes validated visual state; `renderer/mesh3d/` owns its GPU
+implementation. Their separate layers keep core geometry usable without wgpu.
+A module with child files uses `name/mod.rs`; a leaf uses `name.rs`. Small leaf
+tests can stay inline. External tests use the owning module's `tests/mod.rs`
+with contract-named children, without `#[path]` overrides or release/reviewer
+names. Production boundaries use explicit imports; private tests can import
+their parent. In a repository checkout, `bash scripts/check_source_layout.sh` checks file conventions in
+CI and the release gate. Shared GPU test support handles raw buffer mapping
+only: channel order, row layout, expected colors, tolerances, adapter selection
+and independent mathematical references remain fixture-owned. These structural
+changes improve maintenance; they do not claim a render-throughput improvement.
 
 ### 20. Coordinate and projection model
 

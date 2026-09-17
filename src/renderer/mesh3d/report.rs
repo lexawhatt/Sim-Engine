@@ -1,6 +1,9 @@
 //! Public retained 3D errors and submission/recovery diagnostics.
 
-use super::*;
+use super::{
+    Duration, Error, GpuTimingId, Mesh3dPreflightReport, Mesh3dSurfaceError,
+    Mesh3dUploadBudgetResource, Object3dId, RenderTargetError, Texture3dError, fmt,
+};
 
 /// Resource creation or ownership failure for retained 3D rendering.
 #[derive(Debug, Clone, Copy, PartialEq)]

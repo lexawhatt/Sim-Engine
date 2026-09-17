@@ -1,6 +1,11 @@
 //! Offscreen target ownership, presentation and temporal trail accumulation.
 
-use super::*;
+use super::{
+    Arc, BlendMode, Color, CompositeUniform, Duration, Error, Instant, RenderReport, RenderStatus,
+    RendererFrameError, RendererSurfaceStatus, TessellationStats, WgpuRenderer, fmt,
+    premultiplied_wgpu_color, prepared_scene_belongs_to, render_report,
+    render_target_allocation_bytes,
+};
 
 /// A renderer-owned offscreen color target in physical texture pixels.
 ///

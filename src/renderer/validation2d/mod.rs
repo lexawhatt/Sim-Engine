@@ -1,4 +1,7 @@
-use super::*;
+use super::{
+    Camera2d, CameraUniform, DynamicGpu, GeometryExtents, LogicalViewport, Mutex, Vec2, Vertex,
+    exact_markers, geometry, is_portable_shader_source,
+};
 
 mod interval;
 #[cfg(test)]

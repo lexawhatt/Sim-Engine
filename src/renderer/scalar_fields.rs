@@ -1,6 +1,17 @@
 //! Scalar-texture updates, recovery, color mapping and heatmap drawing.
 
-use super::*;
+use super::{
+    Arc, Color, ColorMap, Duration, Error, HeatmapUniform, Instant, MAX_PORTABLE_SHADER_VALUE,
+    RenderReport, RenderStatus, RenderTarget2d, RendererFrameError, RendererSurfaceStatus,
+    ScalarField, ScalarFieldSampling, TessellationStats, WgpuRenderer,
+    clone_scalar_field_for_restore, color_map_lut, compact_scalar_field_for_retention,
+    create_cached_color_map, create_scalar_field_texture, create_scalar_field_texture_resources,
+    fmt, is_portable_shader_source, premultiplied_wgpu_color, prepared_scene_belongs_to,
+    render_report, scalar_field_sources_are_portable, scalar_normalization_is_portable,
+    scalar_region_result_range, scalar_value_range_extent, upload_scalar_field_texture,
+    upload_scalar_field_texture_region, validate_scalar_field_device_extent,
+    validate_scalar_field_texture_region,
+};
 
 /// Renderer-owned scalar texture retaining its validated source field.
 pub struct ScalarFieldTexture {

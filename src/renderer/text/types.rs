@@ -1,4 +1,8 @@
-use super::*;
+use std::error::Error;
+use std::fmt;
+
+use super::FontError;
+use crate::renderer::{GlyphError, GlyphRunBudget, ImageBudget, ImageError};
 
 /// Fixed atlas texel/cache capacity and per-run limits for optional font rendering.
 ///

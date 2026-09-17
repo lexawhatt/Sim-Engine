@@ -1,6 +1,10 @@
 use std::sync::OnceLock;
 
-use super::*;
+use super::{
+    CIRCLE_SEGMENTS, CORNER_SEGMENTS, Circle, Color, DrawCommand, Fill, Line, LogicalViewport,
+    Polyline, PreparedDrawBatch, ROUND_CAP_SEGMENTS, Rect, Scene, SceneBudgetResource, ScissorRect,
+    ScreenClipRect, Shadow, ShapeStyle, Stroke, TessellationError, TessellationStats, Vec2, Vertex,
+};
 
 #[derive(Clone, Copy)]
 struct WorldPoint {

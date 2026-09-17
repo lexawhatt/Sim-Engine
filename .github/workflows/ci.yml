@@ -21,7 +21,7 @@ jobs:
       - run: cargo check --all-targets --all-features
 
   quality:
-    name: format and core/fonts/default/all-feature lint
+    name: format, layout and core/fonts/default/all-feature lint
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -30,6 +30,7 @@ jobs:
           toolchain: 1.96.0
           components: rustfmt, clippy
       - run: cargo fmt --all -- --check
+      - run: bash scripts/check_source_layout.sh
       - run: cargo test --all-targets --no-default-features
       - run: cargo test --all-targets --no-default-features --features fonts
       - run: cargo clippy --all-targets --no-default-features -- -D warnings

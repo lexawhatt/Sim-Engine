@@ -1,6 +1,11 @@
 //! Immutable straight-alpha texture materials for the retained 3D surface path.
 
-use super::*;
+use super::{
+    Arc, Color, Duration, Error, ImageBudget, ImageError, ImageSampling, ImageTexelRect, Instant,
+    Mesh3dResourceError, Object3dId, RetainedMesh3d, Scene3d, Scene3dError, SurfaceLayout,
+    SurfacePipelines, WgpuRenderer, create_surface_pipelines, fmt, image, lighting,
+    submit_pending_uploads,
+};
 use crate::mesh3d::{TextureAddressMode3d, TextureCoordinate2d, TextureUvTransform3d};
 mod mips;
 use mips::CpuMipChain;
@@ -19,33 +24,13 @@ pub use updates::{
 pub(super) use updates::{update_scene_texture_region, update_texture_region};
 
 #[cfg(test)]
-mod red_tests;
-#[cfg(test)]
 mod tests;
 #[cfg(test)]
-pub(super) use tests::{assert_gpu_texture_contract, assert_gpu_textured_recovery};
-#[cfg(test)]
-mod lifecycle_tests;
-#[cfg(test)]
-pub(super) use lifecycle_tests::{
-    assert_gpu_texture_lifecycle, assert_gpu_texture_lifecycle_recovery,
-};
-#[cfg(test)]
-mod dev5_tests;
-#[cfg(test)]
-mod full_mip_reference;
-#[cfg(test)]
-mod region_gpu_tests;
-#[cfg(test)]
-mod update_benchmark;
-#[cfg(test)]
-pub(super) use dev5_tests::assert_dev5_contract;
-#[cfg(test)]
-pub(super) use region_gpu_tests::{
+pub(super) use tests::{
     assert_gpu_partial_mip_recovery, assert_gpu_partial_mip_updates,
+    assert_gpu_restored_material_policy, assert_gpu_texture_contract, assert_gpu_texture_lifecycle,
+    assert_gpu_texture_lifecycle_recovery, assert_gpu_textured_recovery, benchmark_texture_updates,
 };
-#[cfg(test)]
-pub(super) use update_benchmark::run as benchmark_texture_updates;
 
 /// Validation or allocation failure for a retained 3D texture/material.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

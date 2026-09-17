@@ -3,7 +3,7 @@
 //! This never rejects geometry. An inconclusive proof delegates to the original
 //! source-ordered vertex validation, preserving errors and their attribution.
 
-use super::*;
+use super::{MAX_PORTABLE_SHADER_VALUE, Mesh3d, interval_products_f64, is_portable_shader_source};
 
 const MINIMUM_NORMAL: f64 = f32::MIN_POSITIVE as f64;
 const MAXIMUM: f64 = MAX_PORTABLE_SHADER_VALUE as f64;

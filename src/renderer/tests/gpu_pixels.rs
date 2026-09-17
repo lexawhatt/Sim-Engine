@@ -189,24 +189,8 @@ pub(super) async fn assert_gpu_stroke_pixel_matrix(
             timeout: Some(Duration::from_secs(5)),
         })
         .expect("stroke pixel-matrix submission should complete");
-    let slice = readback.slice(..);
-    let (sender, receiver) = mpsc::channel();
-    slice.map_async(wgpu::MapMode::Read, move |result| {
-        sender.send(result).unwrap()
-    });
-    device
-        .poll(wgpu::PollType::Wait {
-            submission_index: None,
-            timeout: Some(Duration::from_secs(5)),
-        })
-        .expect("stroke pixel-matrix readback should complete");
-    receiver
-        .recv_timeout(Duration::from_secs(5))
-        .expect("stroke pixel-matrix callback")
-        .expect("stroke pixel-matrix should map");
-    let bytes = slice
-        .get_mapped_range()
-        .expect("stroke pixel-matrix mapped bytes");
+    let bytes =
+        crate::renderer::test_support::read_buffer(device, &readback, Duration::from_secs(5));
     let pixel = |x: usize, y: usize| &bytes[y * ROW_BYTES as usize + x * 4..][..4];
     let mut covered = [[[0usize; 9]; 2]; 2];
     for (width_mode, turns) in covered.iter_mut().enumerate() {
@@ -284,8 +268,6 @@ pub(super) async fn assert_gpu_stroke_pixel_matrix(
     assert!(short_body.abs_diff(short_start_marker) <= 8);
     assert!(short_body.abs_diff(short_end_marker) <= 8);
     assert!(pixel(241, 235)[0] < 10 && pixel(271, 235)[0] < 10);
-    drop(bytes);
-    readback.unmap();
     eprintln!(
         "sim-engine stroke pixel matrix: 36 mirrored cap/join/width cells + short dual markers, sample_count={sample_count}"
     );
@@ -440,24 +422,8 @@ pub(super) async fn assert_gpu_large_center_circle(
             timeout: Some(Duration::from_secs(5)),
         })
         .expect("large-center circle submission should complete");
-    let slice = readback.slice(..);
-    let (sender, receiver) = mpsc::channel();
-    slice.map_async(wgpu::MapMode::Read, move |result| {
-        sender.send(result).unwrap()
-    });
-    device
-        .poll(wgpu::PollType::Wait {
-            submission_index: None,
-            timeout: Some(Duration::from_secs(5)),
-        })
-        .expect("large-center circle readback should complete");
-    receiver
-        .recv_timeout(Duration::from_secs(5))
-        .expect("large-center circle callback")
-        .expect("large-center circle should map");
-    let bytes = slice
-        .get_mapped_range()
-        .expect("large-center circle mapped bytes");
+    let bytes =
+        crate::renderer::test_support::read_buffer(device, &readback, Duration::from_secs(5));
     let channels = gpu_oracle_channel_indices(format);
     let pixel = |x: usize, y: usize| &bytes[y * ROW_BYTES as usize + x * 4..][..4];
     let center_pixel = pixel(32, 32);
@@ -486,8 +452,6 @@ pub(super) async fn assert_gpu_large_center_circle(
             && beside_world_width_line[channels[2]] < 10,
         "world-width line exceeded its camera-relative width: {beside_world_width_line:?}"
     );
-    drop(bytes);
-    readback.unmap();
 }
 
 pub(super) fn parse_gpu_oracle_surface_format(name: &str) -> Option<wgpu::TextureFormat> {
