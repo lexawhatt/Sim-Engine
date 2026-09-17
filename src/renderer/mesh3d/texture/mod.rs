@@ -33,7 +33,19 @@ pub(super) use lifecycle_tests::{
 #[cfg(test)]
 mod dev5_tests;
 #[cfg(test)]
+mod full_mip_reference;
+#[cfg(test)]
+mod region_gpu_tests;
+#[cfg(test)]
+mod update_benchmark;
+#[cfg(test)]
 pub(super) use dev5_tests::assert_dev5_contract;
+#[cfg(test)]
+pub(super) use region_gpu_tests::{
+    assert_gpu_partial_mip_recovery, assert_gpu_partial_mip_updates,
+};
+#[cfg(test)]
+pub(super) use update_benchmark::run as benchmark_texture_updates;
 
 /// Validation or allocation failure for a retained 3D texture/material.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -27,10 +27,16 @@ Rust version.
 
 ## 0.4.1 development performance
 
-The current development package is `0.4.1-dev.6`; the stable installation
+The current development package is `0.4.1-dev.7`; the stable installation
 examples below continue to target the released 0.4 API. No source migration is
 needed for this optimization slice. Pin a tested git revision when trying it.
 
+- Texture region edits regenerate and upload only affected lower-mip rectangles.
+  Their bytes match complete regeneration, including odd dimensions and alpha.
+  Reports and upload/staging budgets charge these rectangles. CPU preparation
+  still clones the complete recovery chain and scans base alpha; shared textures
+  still copy their entire GPU chain. This is not an O(patch-area) whole-update
+  promise. Full-image patches retain full-chain filtering and upload work.
 - `Native` surface validation first attempts a sufficient whole-mesh numerical
   proof. Immutable source metadata includes nonzero component magnitudes, not
   just an AABB: tiny interior or unused coordinates must not escape validation.
@@ -667,12 +673,18 @@ rectangle/stride/alpha/budget checks leave CPU pixels, GPU pixels and scene
 accounting unchanged. Device loss remains an external GPU failure handled by
 the existing recovery contract, not a promise to roll back physical hardware.
 
-The no-mipmap path uploads only the patch. The initial mipmapped implementation
-regenerates and uploads **all lower levels**, not only affected lower rectangles.
+The no-mipmap path uploads only the patch. Released 0.4.0 regenerates/uploads
+all lower levels. The 0.4.1 development path instead follows the filter footprint
+through every mip and regenerates/uploads only affected rectangles, byte-for-byte
+equivalent to full filtering. This includes odd and one-texel-wide dimensions.
 `Texture3dUpdateBudget` separately limits upload, staging, peak recovery, peak GPU
 and GPU-copy bytes. Reports separate base/mip uploads, calls, GPU copies,
 submissions, allocations, regenerated texels and CPU preparation/encoding costs.
-This is a bounded, documented cost; finer dirty-mip optimization is 0.4.1 work.
+Even in 0.4.1, CPU preparation clones the complete recovery chain and scans base
+alpha; an aliased update also copies all GPU levels. These costs and retained
+memory do not shrink to the patch size. Queue uploads borrow candidate mip rows
+without allocating separately packed mip rectangles. Staging bytes count packed
+base capacity plus nominal uploaded texels, not backend padding or driver RSS.
 
 Inspect the six-panel lifecycle gallery independently of benchmarks:
 

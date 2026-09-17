@@ -69,7 +69,7 @@ impl Default for Texture3dUpdateBudget {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Texture3dUpdateBudgetResource {
-    /// Host upload bytes: base patch plus regenerated lower mip levels.
+    /// Host upload bytes: base patch plus affected lower-mip rectangles.
     UploadBytes,
     /// Packed patch capacity plus nominal queued-upload bytes.
     StagingBytes,
@@ -142,7 +142,9 @@ impl Error for Texture3dUpdateError {}
 /// Exact edit work and nominal resource storage; no GPU timing is inferred.
 ///
 /// Every successful edit uploads its patch, including identical input. Generated
-/// chains regenerate/upload all lower levels; their work is not region-local.
+/// chains regenerate/upload only affected lower-mip rectangles, using the same
+/// filter as full regeneration. Preparation still clones the complete CPU chain
+/// and scans its base-level alpha; it is not proportional only to patch area.
 /// Aliased edits copy the old GPU chain before patch uploads. Queue submissions
 /// and CPU durations describe this edit, not physical GPU completion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -167,7 +169,7 @@ impl Texture3dUpdateReport {
     pub const fn base_upload_bytes(self) -> usize {
         self.base
     }
-    /// Bytes uploaded for complete regenerated lower mip levels.
+    /// Bytes uploaded for regenerated rectangles in lower mip levels.
     pub const fn mip_upload_bytes(self) -> usize {
         self.mips
     }
@@ -223,7 +225,7 @@ impl Texture3dUpdateReport {
     pub const fn peak_gpu_bytes(self) -> usize {
         self.peak_gpu
     }
-    /// Number of output texels regenerated in complete lower mip levels.
+    /// Number of output texels regenerated in affected lower-mip rectangles.
     pub const fn regenerated_texel_count(self) -> usize {
         self.mips / 4
     }

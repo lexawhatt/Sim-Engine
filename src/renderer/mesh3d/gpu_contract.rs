@@ -9,6 +9,7 @@ pub(in crate::renderer) fn assert_gpu_depth_contract(
     format: wgpu::TextureFormat,
 ) {
     accounting_benchmark::run(device, queue);
+    texture::benchmark_texture_updates(device, queue, format);
     batch_tests::assert_gpu_batch_contract(device, queue, format);
     edge_upload_tests::assert_gpu_edge_upload_contract(device, queue, format);
     frame_upload_tests::assert_gpu_dirty_frame_upload_contract(device, queue, format);
@@ -25,6 +26,7 @@ pub(in crate::renderer) fn assert_gpu_depth_contract(
     surface::assert_gpu_native_edge_validation(device, queue, format);
     surface::assert_gpu_offscreen_culling(device, queue, &Arc::new(()));
     texture::assert_gpu_texture_contract(device, queue, format);
+    texture::assert_gpu_partial_mip_updates(device, queue, format);
     texture::assert_gpu_texture_lifecycle(device, queue, format);
     native_acceptance_tests::assert_gpu_native_acceptance(device, queue, format);
     assert_gpu_clip_equivalence(device, queue);
@@ -485,6 +487,13 @@ pub(in crate::renderer) fn assert_gpu_scene_recovery_contract(
         format,
     );
     texture::assert_gpu_texture_lifecycle_recovery(
+        source_device,
+        source_queue,
+        recovery_device,
+        recovery_queue,
+        format,
+    );
+    texture::assert_gpu_partial_mip_recovery(
         source_device,
         source_queue,
         recovery_device,

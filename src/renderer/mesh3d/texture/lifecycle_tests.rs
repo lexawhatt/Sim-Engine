@@ -590,7 +590,9 @@ fn assert_region_updates(fixture: &mut Fixture<'_>) {
             let expected = reference_chain(8, 8, model.clone(), mipmaps);
             assert_chain(fixture, &texture, &expected);
             let base_bytes = region.width() as usize * region.height() as usize * 4;
-            let lower_bytes = expected.iter().skip(1).map(Vec::len).sum::<usize>();
+            // Independent 8->4->2->1 footprints: the first two patches affect
+            // one texel per level, the odd-origin patch affects 4 + 1 + 1.
+            let lower_bytes = if mipmaps { [12, 12, 24][index] } else { 0 };
             assert_eq!(report.base_upload_bytes(), base_bytes);
             assert_eq!(report.mip_upload_bytes(), lower_bytes);
             assert_eq!(report.uploaded_bytes(), base_bytes + lower_bytes);
@@ -769,7 +771,7 @@ fn assert_scene_updates(fixture: &mut Fixture<'_>) {
     .unwrap();
     assert!(report.reused_allocation());
     assert_eq!(report.base_upload_bytes(), 16);
-    assert_eq!(report.mip_upload_bytes(), 84);
+    assert_eq!(report.mip_upload_bytes(), 12);
     assert_eq!(
         scene.instances()[0]
             .mesh

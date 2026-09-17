@@ -4,6 +4,12 @@ use super::{ImageBudget, ImageError, image};
 
 const MAX_LEVELS: usize = u32::BITS as usize;
 
+mod regions;
+pub(super) use regions::{MipRegion, MipRegionPlan};
+#[cfg(test)]
+#[path = "partial_mip_tests.rs"]
+mod partial_tests;
+
 pub(super) fn validate_layout(
     width: u32,
     height: u32,
@@ -242,6 +248,46 @@ impl CpuMipChain {
         }
     }
 
+    pub(super) fn region_update_plan(
+        &self,
+        region: super::ImageTexelRect,
+    ) -> Result<MipRegionPlan, ImageError> {
+        MipRegionPlan::new(self.levels(), region)
+    }
+
+    /// Refilters only planned footprints in a clone of the plan's source layout.
+    pub(super) fn regenerate_regions(&mut self, plan: &MipRegionPlan) {
+        debug_assert_eq!(plan.size(), self.size());
+        debug_assert_eq!(plan.regions().len(), self.levels().len());
+        let base = plan.regions()[0];
+        if base.x == 0 && base.y == 0 && (base.width, base.height) == self.size() {
+            // Preserve the full-image loop specialization for whole-texture
+            // updates; dynamic dirty bounds would add work without excluding
+            // any texels. Both paths retain the exact same filtering kernel.
+            self.regenerate();
+            return;
+        }
+        if self.layout.count <= 1 {
+            return;
+        }
+        let linear_channels = linear_channels();
+        for level in 1..self.layout.count {
+            let source = self.layout.levels[level - 1];
+            let destination = self.layout.levels[level];
+            let (earlier, later) = self.pixels.split_at_mut(destination.offset);
+            downsample_region(
+                &earlier[source.offset..source.offset + source.byte_count],
+                source.width,
+                source.height,
+                &mut later[..destination.byte_count],
+                destination.width,
+                destination.height,
+                &linear_channels,
+                plan.regions()[level],
+            );
+        }
+    }
+
     pub(super) fn regenerate(&mut self) {
         if self.layout.count <= 1 {
             return;
@@ -358,6 +404,64 @@ fn downsample(
         let top = f64::from(y) * vertical_ratio;
         let bottom = (f64::from(y) + 1.0) * vertical_ratio;
         for x in 0..width {
+            let left = f64::from(x) * horizontal_ratio;
+            let right = (f64::from(x) + 1.0) * horizontal_ratio;
+            let mut channels = [0.0; 3];
+            let mut alpha_weight = 0.0;
+            let mut total_weight = 0.0;
+            for source_y in (top.floor() as u32)..(bottom.ceil() as u32).min(source_height) {
+                let vertical_weight =
+                    bottom.min(f64::from(source_y) + 1.0) - top.max(f64::from(source_y));
+                for source_x in (left.floor() as u32)..(right.ceil() as u32).min(source_width) {
+                    let horizontal_weight =
+                        right.min(f64::from(source_x) + 1.0) - left.max(f64::from(source_x));
+                    let weight = vertical_weight * horizontal_weight;
+                    let index = (source_y as usize * source_width as usize + source_x as usize) * 4;
+                    let alpha = f64::from(source[index + 3]) / 255.0;
+                    for channel in 0..3 {
+                        channels[channel] +=
+                            linear_channels[source[index + channel] as usize] * alpha * weight;
+                    }
+                    alpha_weight += alpha * weight;
+                    total_weight += weight;
+                }
+            }
+            let index = (y as usize * width as usize + x as usize) * 4;
+            let alpha = (alpha_weight / total_weight * 255.0).round() as u8;
+            if alpha == 0 {
+                destination[index..index + 4].fill(0);
+                continue;
+            }
+            for channel in 0..3 {
+                destination[index + channel] = linear_to_srgb8(channels[channel] / alpha_weight);
+            }
+            destination[index + 3] = alpha;
+        }
+    }
+}
+
+// Keep the full-image loop above specialized for zero-origin complete extents.
+// This regional twin has identical arithmetic/rounding but dynamic loop bounds;
+// frozen full-filter differential tests cover both paths, including odd sizes.
+#[allow(clippy::too_many_arguments)]
+fn downsample_region(
+    source: &[u8],
+    source_width: u32,
+    source_height: u32,
+    destination: &mut [u8],
+    width: u32,
+    height: u32,
+    linear_channels: &[f64; 256],
+    region: MipRegion,
+) {
+    // Integer-halving dimensions still need the entire source extent. Using a
+    // fractional footprint includes the last row/column of odd-sized images.
+    let horizontal_ratio = f64::from(source_width) / f64::from(width);
+    let vertical_ratio = f64::from(source_height) / f64::from(height);
+    for y in region.y..region.y + region.height {
+        let top = f64::from(y) * vertical_ratio;
+        let bottom = (f64::from(y) + 1.0) * vertical_ratio;
+        for x in region.x..region.x + region.width {
             let left = f64::from(x) * horizontal_ratio;
             let right = (f64::from(x) + 1.0) * horizontal_ratio;
             let mut channels = [0.0; 3];

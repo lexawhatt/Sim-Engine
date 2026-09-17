@@ -11,6 +11,12 @@ Development target: 0.4.1. No new registry release is implied by this section.
 
 ### Performance
 
+- 3D texture region edits regenerate and upload only affected lower-mip
+  rectangles. Filtering remains byte-identical to full regeneration, including
+  odd dimensions, linear-light RGB and premultiplied-alpha accumulation. Reports
+  and upload/staging limits charge the smaller work. Complete CPU recovery
+  copies, opacity scans and immutable-alias GPU copies remain; full-image edits
+  still process the complete chain.
 - Optional `Mesh3dRenderBudget::with_offscreen_surface_culling(true)` omits
   Native surface-only objects proven wholly outside one homogeneous frustum
   plane. All original validation and unculled admission budgets run first;

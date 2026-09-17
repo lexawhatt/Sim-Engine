@@ -11,6 +11,7 @@ pub use types::{
 
 struct PreparedUpdate {
     chain: CpuMipChain,
+    regions: mips::MipRegionPlan,
     packed: Vec<u8>,
     first_nonopaque: Option<usize>,
     report: Texture3dUpdateReport,
@@ -24,7 +25,10 @@ impl WgpuRenderer {
     /// Unique handles reuse GPU storage. Shared handles detach by GPU-copying the
     /// old chain before uploading the base patch and regenerated lower levels.
     /// Old materials remain unchanged until explicitly rebound with `with_texture`.
-    /// All lower mips are fully regenerated; only mip-zero upload is region-local.
+    /// Only affected lower-mip rectangles are regenerated and uploaded, with
+    /// byte-identical filtering to full regeneration, including odd dimensions.
+    /// CPU preparation still clones the complete recovery chain; shared handles
+    /// still copy the complete GPU chain before applying these smaller uploads.
     /// Synchronous errors preserve CPU/GPU drawable state; asynchronous device
     /// loss is separate and recovery restores the last committed complete chain.
     pub fn update_texture3d_region(
@@ -160,7 +164,20 @@ fn prepare_update(
         }
     }
     let gpu = source.gpu_allocation_bytes();
-    let mips = gpu - source.pixels().len();
+    let regions = source
+        .storage
+        .chain
+        .region_update_plan(region)
+        .map_err(Texture3dError::Image)?;
+    // Each derived upload borrows rows of the complete candidate level. Check
+    // the queue's u32 row-pitch representation before any allocation or writes.
+    for level in source.storage.chain.levels() {
+        level
+            .width
+            .checked_mul(4)
+            .ok_or(Texture3dUpdateError::CapacityTooLarge)?;
+    }
+    let mips = regions.lower_upload_bytes();
     let uploaded = sum(base, mips)?;
     let copy = if detached { gpu } else { 0 };
     let peak_gpu = sum(gpu, copy)?;
@@ -223,7 +240,7 @@ fn prepare_update(
         packed.extend_from_slice(&pixels[y * stride..y * stride + row_bytes]);
     }
     chain.patch_base(region, &packed);
-    chain.regenerate();
+    chain.regenerate_regions(&regions);
     let first_nonopaque = chain
         .pixels()
         .chunks_exact(4)
@@ -231,6 +248,7 @@ fn prepare_update(
     let level_count = chain.levels().len();
     Ok(PreparedUpdate {
         chain,
+        regions,
         packed,
         first_nonopaque,
         report: Texture3dUpdateReport {
@@ -357,7 +375,43 @@ fn upload_patch(
             depth_or_array_layers: 1,
         },
     );
-    prepared.chain.upload_levels(queue, texture, 1);
+    for (index, (level, patch)) in prepared
+        .chain
+        .levels()
+        .iter()
+        .zip(prepared.regions.regions())
+        .enumerate()
+        .skip(1)
+    {
+        // The immutable plan checked these full-level slice spans before CPU
+        // preparation. Strided source rows avoid allocating packed mip patches.
+        let row_bytes = level.width as usize * 4;
+        let start = patch.y as usize * row_bytes + patch.x as usize * 4;
+        let end = start + (patch.height as usize - 1) * row_bytes + patch.width as usize * 4;
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture,
+                mip_level: index as u32,
+                origin: wgpu::Origin3d {
+                    x: patch.x,
+                    y: patch.y,
+                    z: 0,
+                },
+                aspect: wgpu::TextureAspect::All,
+            },
+            &prepared.chain.level_pixels(*level)[start..end],
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(level.width * 4),
+                rows_per_image: Some(patch.height),
+            },
+            wgpu::Extent3d {
+                width: patch.width,
+                height: patch.height,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
     submit_pending_uploads(queue);
 }
 
