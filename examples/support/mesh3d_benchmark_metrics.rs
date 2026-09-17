@@ -104,6 +104,8 @@ pub struct Samples {
     pub generated_upload_bytes: usize,
     pub submitted_triangles: usize,
     pub generated_triangles: usize,
+    pub culled_objects: usize,
+    pub culled_triangles: usize,
     pub discarded_triangles: usize,
     pub clipped_triangles: usize,
     pub draw_calls: usize,

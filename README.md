@@ -31,7 +31,7 @@ See the [0.4 integration guide](DOCUMENTATION.md#04-integration-guide) and
 notes from 0.3.0. Intensive profiling-driven optimization is planned for 0.4.1;
 this release does not promise a universal frame rate.
 
-The development branch is now **0.4.1-dev.5**. Its performance work
+The development branch is now **0.4.1-dev.6**. Its performance work
 accelerates Native 3D arithmetic validation, batches compatible repeated
 surfaces, removes unused edge uploads, and reduces repeated lighting/fog
 validation. StrictPortable classification reuses bounded per-source calculations
@@ -40,8 +40,11 @@ Frame preparation reuses scratch capacity and uploads only changed camera,
 instance and edge-uniform ranges, without skipping validation or drawing.
 Scene resource and visibility totals update at accepted mutations, making
 statistics queries constant-time without changing ownership or resource budgets.
+An opt-in Native surface culling path can omit proven offscreen objects after
+all original validation and budget checks. It is disabled by default; small
+shared meshes can cost more draw calls when omissions split instanced batches.
 The retained 3D implementation is organized into focused modules.
-The public 0.4 API is unchanged;
+Existing 0.4 calls keep their default behavior;
 see [development performance notes](DOCUMENTATION.md#041-development-performance)
 and [Unreleased changes](CHANGELOG.md#unreleased). This is not a new registry
 release or a replacement for consumer testing.

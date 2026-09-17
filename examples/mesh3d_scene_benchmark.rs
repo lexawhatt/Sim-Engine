@@ -50,6 +50,7 @@ struct Configuration {
     frames: usize,
     trials: usize,
     policy: SurfaceRasterization3d,
+    culling: bool,
 }
 
 impl Configuration {
@@ -61,6 +62,7 @@ impl Configuration {
             frames: 120,
             trials: 3,
             policy: SurfaceRasterization3d::Native,
+            culling: false,
         };
         let mut arguments = arguments.into_iter();
         while let Some(argument) = arguments.next() {
@@ -71,6 +73,13 @@ impl Configuration {
                 "--side" => result.side = value.parse()?,
                 "--frames" => result.frames = value.parse()?,
                 "--trials" => result.trials = value.parse()?,
+                "--culling" => {
+                    result.culling = match value.as_str() {
+                        "on" => true,
+                        "off" => false,
+                        _ => return Err("culling must be on or off".into()),
+                    }
+                }
                 "--policy" => {
                     result.policy = match value.as_str() {
                         "native" => SurfaceRasterization3d::Native,
@@ -108,12 +117,20 @@ impl Configuration {
         if result.case == Case::PreparedText && !cfg!(feature = "text") {
             return Err("prepared_text requires --features text".into());
         }
+        if result.culling
+            && (!result.case.culling_control() || result.policy != SurfaceRasterization3d::Native)
+        {
+            return Err("culling diagnostics require Native and a static repeated/distinct/outside/host_hidden control".into());
+        }
         Ok(result)
     }
 }
 
 fn main() -> Result<()> {
     if std::env::args().any(|value| value == "--help" || value == "-h") {
+        println!(
+            "Culling controls: --case outside_all|outside_distinct|outside_alternating (also repeated/distinct/outside/host_hidden), --policy native --culling on|off. Disabled by default. Compares actual submissions against independent host fixture membership; omission may split shared draw runs."
+        );
         println!(
             "mesh3d_scene_benchmark --case repeated|distinct|outside|host_hidden|crossing|immutable|dynamic|growth|textured|mask|blend|texture_update|prepared_text|lit|fog|lit_fog|lit_smooth --policy native|strict --objects 1024 --side 1 --frames 120 --trials 3\nFor chunk updates: --case immutable (or dynamic/growth) --objects 64 --side 32. For active lighting/fog validation: --case lit (or fog/lit_fog) --objects 64 --side 32; geometry/camera match repeated. lit_smooth uses a static curved grid with varied normals and needs --side >= 2 (suggested: 32). prepared_text requires --features text. GPU queries are opt-in here, not a universal FPS gate."
         );
@@ -228,13 +245,32 @@ impl State {
             LogicalViewport::new(WIDTH as f32, HEIGHT as f32)?,
         )?;
         let started = Instant::now();
-        let workload = Workload::new(
+        let mut workload = Workload::new(
             &renderer,
             configuration.case,
             configuration.objects,
             configuration.side,
             configuration.policy,
         )?;
+        workload.budget = workload
+            .budget
+            .with_offscreen_surface_culling(configuration.culling);
+        let culled = if configuration.culling {
+            configuration
+                .case
+                .expected_culled_objects(configuration.objects)
+        } else {
+            0
+        };
+        if culled != 0 {
+            let triangles_per_object = workload.expected_triangles / workload.expected_objects;
+            workload.expected_objects -= culled;
+            workload.expected_triangles -= culled * triangles_per_object;
+        }
+        println!(
+            "offscreen_surface_culling={} fixture_expected_culled_objects={culled}",
+            configuration.culling
+        );
         #[cfg(feature = "text")]
         let labels = if configuration.case == Case::PreparedText {
             Some(text_labels::Labels::new(&renderer)?)
@@ -469,6 +505,8 @@ impl State {
         self.samples.generated_upload_bytes += report.preflight().generated_upload_bytes();
         self.samples.submitted_triangles += report.triangle_count();
         self.samples.generated_triangles += report.preflight().generated_triangle_count();
+        self.samples.culled_objects += report.preflight().culled_object_count();
+        self.samples.culled_triangles += report.preflight().culled_triangle_count();
         self.samples.discarded_triangles += report
             .preflight()
             .discarded_source_triangle_count()
@@ -548,6 +586,13 @@ impl State {
         }
         let stats = self.workload.scene.statistics();
         let frames = self.samples.work_ms.len();
+        println!(
+            "trial={} culled_objects_total={} culled_triangles_total={} offscreen_surface_culling={}",
+            self.trial + 1,
+            self.samples.culled_objects,
+            self.samples.culled_triangles,
+            self.configuration.culling
+        );
         println!(
             "case={} trial={} measured_drawn={} warmup_and_measurement_attempts={} startup_skipped={} completed_batch_wall_fps={:.3} renderer_work_ms[p50={:.3},p95={:.3},p99={:.3}] update_ms[p50={:.3},p95={:.3}] render3d_cpu_ms[p50={:.3},p95={:.3}] acquire_ms[p50={:.3},p95={:.3},p99={:.3}] objects={} submitted_objects={} triangles={} mesh_draw_calls={} unique_meshes={} scene_cpu_bytes={} scene_gpu_bytes={} scene_bookkeeping_bytes={} host_snapshot_bytes_including_shared={} target_bytes={} render_thread_alloc_realloc_calls={} render_thread_requested_allocation_bytes={} mesh_uploaded_bytes={} mesh_upload_calls={} mesh_gpu_allocation_count={} reused_updates={} detachments={} last_updated_capacity_bytes={} scratch_bytes={} scratch_reallocations={} composition_draw_calls_last={} composition_draw_calls_total={} end_of_trial_gpu_drain_ms={:.3}",
             self.configuration.case.name(),
@@ -793,6 +838,9 @@ mod tests {
             vec!["--case", "lit_smooth", "--side", "1"],
             vec!["--case", "growth", "--side", "128"],
             vec!["--policy", "guess"],
+            vec!["--culling", "maybe"],
+            vec!["--culling", "on", "--policy", "strict"],
+            vec!["--culling", "on", "--case", "blend"],
         ] {
             assert!(Configuration::parse(arguments.into_iter().map(String::from)).is_err());
         }
@@ -804,6 +852,9 @@ mod tests {
             "repeated",
             "distinct",
             "outside",
+            "outside_all",
+            "outside_distinct",
+            "outside_alternating",
             "host_hidden",
             "crossing",
             "immutable",
@@ -836,6 +887,40 @@ mod tests {
                     .is_ok()
                 );
             }
+        }
+    }
+
+    #[test]
+    fn culling_control_membership_is_independent_of_renderer_reports() {
+        for count in [1, 64, 512, 4096] {
+            let omitted = |case: Case| (0..count).filter(|&index| case.offscreen(index)).count();
+            assert_eq!(omitted(Case::OutsideAll), count);
+            assert_eq!(omitted(Case::OutsideAlternating), count / 2);
+            assert_eq!(omitted(Case::Outside), count - count.div_ceil(10));
+            assert_eq!(omitted(Case::OutsideDistinct), omitted(Case::Outside));
+            assert_eq!(omitted(Case::Repeated), 0);
+            assert_eq!(omitted(Case::Distinct), 0);
+        }
+        assert_eq!(Case::OutsideAll.expected_culled_objects(1), 0);
+        assert_eq!(Case::OutsideAll.expected_culled_objects(64), 64);
+        assert_eq!(Case::OutsideAll.expected_culled_objects(512), 512 - 23);
+        assert_eq!(Case::OutsideAll.expected_culled_objects(4096), 4096);
+        assert_eq!(Case::Outside.expected_culled_objects(64), 57);
+        assert_eq!(Case::HostHidden.expected_culled_objects(4096), 0);
+        for case in [
+            "repeated",
+            "distinct",
+            "outside",
+            "outside_all",
+            "outside_distinct",
+            "outside_alternating",
+            "host_hidden",
+        ] {
+            assert!(
+                Configuration::parse(["--case", case, "--culling", "on"].map(String::from))
+                    .unwrap()
+                    .culling
+            );
         }
     }
 

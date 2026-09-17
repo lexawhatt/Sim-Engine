@@ -41,7 +41,7 @@ pub(super) fn native_transform_is_proven(
     model_rows: [[f32; 4]; 3],
     camera_rows: [[f32; 4]; 4],
 ) -> bool {
-    final_rows_are_proven(mesh, model_rows, camera_rows)
+    final_row_bounds(mesh, model_rows, camera_rows).is_some()
 }
 
 pub(super) fn fog_transform_is_proven(
@@ -49,14 +49,31 @@ pub(super) fn fog_transform_is_proven(
     model_rows: [[f32; 4]; 3],
     depth_row: [f32; 4],
 ) -> bool {
-    final_rows_are_proven(mesh, model_rows, [depth_row])
+    final_row_bounds(mesh, model_rows, [depth_row]).is_some()
 }
 
-fn final_rows_are_proven<const N: usize>(
+pub(super) fn native_mesh_is_outside(
+    mesh: &Mesh3d,
+    model_rows: [[f32; 4]; 3],
+    camera_rows: [[f32; 4]; 4],
+) -> bool {
+    let Some([x, y, z, w]) = final_row_bounds(mesh, model_rows, camera_rows) else {
+        return false;
+    };
+    let plane_maxima = [w.1 + x.1, w.1 - x.0, w.1 + y.1, w.1 - y.0, z.1, w.1 - z.0];
+    // A single shared outside plane excludes every indexed triangle without
+    // dividing by W. Round the final f64 combination outward as well; a boundary
+    // or an inconclusive arithmetic envelope must keep its original draw.
+    plane_maxima
+        .into_iter()
+        .any(|maximum| maximum.is_finite() && maximum.next_up() <= -MINIMUM_NORMAL)
+}
+
+fn final_row_bounds<const N: usize>(
     mesh: &Mesh3d,
     model_rows: [[f32; 4]; 3],
     final_rows: [[f32; 4]; N],
-) -> bool {
+) -> Option<[(f64, f64); N]> {
     // The reference validates every source/row operand, even if multiplied by
     // zero. Do not let aggregate zero rows bypass this contractual rejection.
     if !model_rows
@@ -66,7 +83,7 @@ fn final_rows_are_proven<const N: usize>(
         .copied()
         .all(is_portable_shader_source)
     {
-        return false;
+        return None;
     }
     let minimum = mesh.bounds_min();
     let maximum = mesh.bounds_max();
@@ -79,7 +96,7 @@ fn final_rows_are_proven<const N: usize>(
             || !is_portable_shader_source(maximum[axis])
             || minimum_nonzero[axis] < f32::MIN_POSITIVE
         {
-            return false;
+            return None;
         }
         source[axis] = OperandBounds {
             minimum: f64::from(minimum[axis]),
@@ -89,17 +106,17 @@ fn final_rows_are_proven<const N: usize>(
     }
     let mut world = [OperandBounds::ONE; 4];
     for axis in 0..3 {
-        let Some(bounds) = model_component_bounds(model_rows[axis], source) else {
-            return false;
-        };
-        world[axis] = bounds;
+        world[axis] = model_component_bounds(model_rows[axis], source)?;
     }
     // Native clip coordinates and fog distances are not inputs to another dot,
-    // so a final interval may include zero. This proves the vertex evaluator's
-    // arithmetic contract, not frustum classification or generated attributes.
-    final_rows
-        .into_iter()
-        .all(|row| dot_bounds(row, world).is_some())
+    // so a final interval may include zero. These bounds preserve the vertex
+    // evaluator's arithmetic contract; generated attributes require their own
+    // validation even when a caller also proves common-plane exclusion.
+    let mut bounds = [(0.0, 0.0); N];
+    for (output, row) in bounds.iter_mut().zip(final_rows) {
+        *output = dot_bounds(row, world)?;
+    }
+    Some(bounds)
 }
 
 fn model_component_bounds(row: [f32; 4], source: [OperandBounds; 4]) -> Option<OperandBounds> {

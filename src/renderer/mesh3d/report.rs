@@ -287,9 +287,9 @@ impl Mesh3dRenderReport {
     }
     /// Returns independently transformed visible objects submitted for drawing.
     ///
-    /// Objects wholly outside a common frustum plane remain submitted objects
-    /// even when rasterization produces no fragments. See `preflight()` for
-    /// explicitly clipped and discarded source-triangle counts.
+    /// Outside objects count unless optional Native surface culling proves and
+    /// omits them. See `preflight()` for separate culled-object and CPU clipping
+    /// counts. This is not a visible-fragment or host-visibility count.
     pub const fn object_count(self) -> usize {
         self.object_count
     }

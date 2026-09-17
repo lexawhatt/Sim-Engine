@@ -6,6 +6,16 @@ mod bounds;
 
 #[cfg(test)]
 mod bounds_tests;
+#[cfg(test)]
+mod culling_tests;
+
+pub(super) fn native_mesh_is_outside(
+    mesh: &Mesh3d,
+    model_rows: [[f32; 4]; 3],
+    camera_rows: [[f32; 4]; 4],
+) -> bool {
+    bounds::native_mesh_is_outside(mesh, model_rows, camera_rows)
+}
 
 pub(super) fn fog_transform_is_proven(
     mesh: &Mesh3d,

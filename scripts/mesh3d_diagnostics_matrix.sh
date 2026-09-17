@@ -48,10 +48,12 @@ uname -a >"$staged/kernel.txt"
 if command -v lscpu >/dev/null 2>&1; then lscpu >"$staged/cpu.txt"; fi
 confirmed_cases=0
 run_case() {
-    local name=$1 policy=$2 objects=$3 side=$4
-    echo "3D diagnostics: $name / $policy / $objects objects / side $side"
+    local name=$1 policy=$2 objects=$3 side=$4 culling=${5:-off}
+    local suffix=""
+    if [[ "$culling" == on ]]; then suffix="-culling-on"; fi
+    echo "3D diagnostics: $name / $policy / $objects objects / side $side / culling $culling"
     timeout 600 "$binary" --case "$name" --policy "$policy" --objects "$objects" \
-        --side "$side" --frames 60 --trials 3 2>&1 | tee "$staged/$name-$policy-objects$objects-side$side.txt"
+        --side "$side" --culling "$culling" --frames 60 --trials 3 2>&1 | tee "$staged/$name-$policy-objects$objects-side$side$suffix.txt"
     if [[ "$(git rev-parse HEAD)" != "$start_sha" || -n "$(git status --porcelain --untracked-files=all)" ]]; then
         echo "source changed during diagnostics; incomplete bundle is not evidence" >&2
         exit 1
@@ -76,6 +78,12 @@ for policy in native strict; do
     done
     run_case lit_smooth "$policy" 64 32
 done
+for name in outside outside_all; do run_case "$name" native 64 128 on; done
+run_case outside_distinct native 64 32 on
+run_case outside_alternating native 4096 1 on
+run_case repeated native 4096 1 on
+run_case outside_all native 1 128 on
+run_case outside_all native 512 1 on
 if [[ "$(git rev-parse HEAD)" != "$start_sha" || -n "$(git status --porcelain --untracked-files=all)" ]]; then
     echo "source changed before diagnostics publication" >&2
     exit 1

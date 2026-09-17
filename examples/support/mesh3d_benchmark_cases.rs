@@ -15,6 +15,9 @@ pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 pub enum Case {
     Repeated,
     Outside,
+    OutsideAll,
+    OutsideDistinct,
+    OutsideAlternating,
     HostHidden,
     Immutable,
     Dynamic,
@@ -37,6 +40,9 @@ impl Case {
         match value {
             "repeated" => Ok(Self::Repeated),
             "outside" => Ok(Self::Outside),
+            "outside_all" => Ok(Self::OutsideAll),
+            "outside_distinct" => Ok(Self::OutsideDistinct),
+            "outside_alternating" => Ok(Self::OutsideAlternating),
             "host_hidden" => Ok(Self::HostHidden),
             "immutable" => Ok(Self::Immutable),
             "dynamic" => Ok(Self::Dynamic),
@@ -60,6 +66,9 @@ impl Case {
         match self {
             Self::Repeated => "repeated",
             Self::Outside => "outside",
+            Self::OutsideAll => "outside_all",
+            Self::OutsideDistinct => "outside_distinct",
+            Self::OutsideAlternating => "outside_alternating",
             Self::HostHidden => "host_hidden",
             Self::Immutable => "immutable",
             Self::Dynamic => "dynamic",
@@ -80,6 +89,46 @@ impl Case {
 
     pub fn changes_mesh(self) -> bool {
         matches!(self, Self::Immutable | Self::Dynamic | Self::Growth)
+    }
+
+    pub fn offscreen(self, index: usize) -> bool {
+        match self {
+            Self::OutsideAll => true,
+            Self::OutsideAlternating => !index.is_multiple_of(2),
+            Self::Outside | Self::OutsideDistinct | Self::HostHidden => !index.is_multiple_of(10),
+            _ => false,
+        }
+    }
+
+    pub fn culling_control(self) -> bool {
+        matches!(
+            self,
+            Self::Repeated
+                | Self::Distinct
+                | Self::Outside
+                | Self::OutsideAll
+                | Self::OutsideDistinct
+                | Self::OutsideAlternating
+                | Self::HostHidden
+        )
+    }
+
+    pub fn expected_culled_objects(self, objects: usize) -> usize {
+        if self == Self::HostHidden {
+            return 0;
+        }
+        let columns = (objects as f64).sqrt().ceil() as usize;
+        (0..objects)
+            .filter(|&index| {
+                // Odd grids have one row at y=-0.5 whose transformed [0, 0.9]
+                // source interval spans zero. The conservative model proof cannot
+                // infer a nonzero gap there, even when X is far outside. Keep this
+                // intentional fallback control; do not ask the renderer for expected
+                // membership or move geometry to make the proof succeed.
+                self.offscreen(index)
+                    && (columns.is_multiple_of(2) || index / columns != columns / 2)
+            })
+            .count()
     }
 
     pub fn textured(self) -> bool {
@@ -277,7 +326,7 @@ impl Workload {
         let mut first = None;
         let mut expected_objects = 0;
         for index in 0..objects {
-            let outside = matches!(case, Case::Outside | Case::HostHidden) && index % 10 != 0;
+            let outside = case.offscreen(index);
             let x = (index % columns) as f32 - columns as f32 * 0.5;
             let y = (index / columns) as f32 - columns as f32 * 0.5;
             let transform = Transform3d::new(
@@ -294,7 +343,7 @@ impl Workload {
                 Vec3::new(0.9, 0.9, 0.9)?,
             )?;
             // Distinct control owns distinct CPU snapshots as well as GPU buffers.
-            let unique = if case == Case::Distinct {
+            let unique = if matches!(case, Case::Distinct | Case::OutsideDistinct) {
                 Some(upload(grid(side, 0.0, false, false)?)?)
             } else {
                 None

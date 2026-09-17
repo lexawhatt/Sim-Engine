@@ -23,6 +23,7 @@ pub(in crate::renderer) fn assert_gpu_depth_contract(
     surface::assert_gpu_preflight_scratch(device, queue);
     surface::assert_gpu_native_surface_policy(device, queue, format);
     surface::assert_gpu_native_edge_validation(device, queue, format);
+    surface::assert_gpu_offscreen_culling(device, queue, &Arc::new(()));
     texture::assert_gpu_texture_contract(device, queue, format);
     texture::assert_gpu_texture_lifecycle(device, queue, format);
     native_acceptance_tests::assert_gpu_native_acceptance(device, queue, format);
@@ -465,6 +466,12 @@ pub(in crate::renderer) fn assert_gpu_scene_recovery_contract(
     format: wgpu::TextureFormat,
 ) {
     objects::accounting_gpu_tests::verify_scene_accounting(
+        source_device,
+        source_queue,
+        recovery_device,
+        recovery_queue,
+    );
+    surface::assert_gpu_offscreen_culling_recovery(
         source_device,
         source_queue,
         recovery_device,

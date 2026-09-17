@@ -2,7 +2,15 @@
 
 use super::*;
 
+mod culling;
+#[cfg(test)]
+mod culling_gpu_tests;
 mod inside;
+
+#[cfg(test)]
+pub(super) use culling_gpu_tests::{
+    assert_gpu_offscreen_culling, assert_gpu_offscreen_culling_recovery,
+};
 #[cfg(test)]
 mod inside_tests;
 
@@ -57,6 +65,7 @@ pub struct Mesh3dRenderBudget {
     max_surface_triangles: usize,
     surface_policy: SurfaceRasterization3d,
     max_sorting_bytes: usize,
+    offscreen_surface_culling: bool,
 }
 
 impl Mesh3dRenderBudget {
@@ -73,6 +82,7 @@ impl Mesh3dRenderBudget {
             max_surface_triangles: usize::MAX,
             surface_policy: SurfaceRasterization3d::StrictPortable,
             max_sorting_bytes: 16 * 1024 * 1024,
+            offscreen_surface_culling: false,
         }
     }
 
@@ -103,9 +113,31 @@ impl Mesh3dRenderBudget {
         self.surface_policy
     }
 
-    /// Limits the combined retained and generated surface triangles submitted
-    /// to the GPU. Zero permits edge-only or empty submissions. Retained indices
+    /// Optionally omits Native surface-only objects proven wholly outside one
+    /// frustum plane. Disabled by default; StrictPortable and objects with any
+    /// active wireframe keep their original submissions. Inconclusive bounds
+    /// keep drawing. This is not occlusion culling or host visibility mutation.
+    ///
+    /// All original validation and budgets run first, including the unculled
+    /// triangle limit. Actual submission and explicit culled counts are reported
+    /// separately. Instance staging, sorting and retained memory are unchanged.
+    /// Omission can split instanced draw runs; measure the tradeoff for the scene
+    /// before enabling this option, especially for many small repeated meshes.
+    pub const fn with_offscreen_surface_culling(mut self, enabled: bool) -> Self {
+        self.offscreen_surface_culling = enabled;
+        self
+    }
+
+    /// Whether conservative Native surface omission is requested for this draw.
+    pub const fn offscreen_surface_culling(self) -> bool {
+        self.offscreen_surface_culling
+    }
+
+    /// Limits combined retained and generated surface triangles before optional
+    /// culling. Zero permits edge-only or empty submissions. Retained indices
     /// still submitted for hardware clipping count even when outside the view.
+    /// Optional offscreen culling does not discount this admission limit; its
+    /// omission happens only after all unculled validation/budgets succeed.
     /// Failure occurs before generated staging allocations, uploads or target
     /// mutation and returns [`Mesh3dRenderError::SurfaceTriangleBudgetExceeded`].
     pub const fn with_max_surface_triangles(mut self, triangles: usize) -> Self {
@@ -113,7 +145,7 @@ impl Mesh3dRenderBudget {
         self
     }
 
-    /// Returns the maximum combined retained and generated surface submissions.
+    /// Returns the maximum combined retained/generated pre-culling submissions.
     pub const fn max_surface_triangles(self) -> usize {
         self.max_surface_triangles
     }
@@ -155,6 +187,8 @@ pub struct Mesh3dPreflightReport {
     pub(super) generated_lighting_vertices: usize,
     pub(super) clipped_source_triangles: usize,
     pub(super) discarded_source_triangles: usize,
+    pub(super) culled_objects: usize,
+    pub(super) culled_triangles: usize,
 }
 
 impl Mesh3dPreflightReport {
@@ -177,8 +211,22 @@ impl Mesh3dPreflightReport {
         self.submitted_triangles
     }
 
+    /// Native surface-only objects omitted by optional conservative frustum
+    /// culling after successful unculled validation. Not host-hidden objects,
+    /// generated clipping, or a measurement of fragments produced by the GPU.
+    pub const fn culled_object_count(self) -> usize {
+        self.culled_objects
+    }
+
+    /// Retained triangles omitted with wholly offscreen surface-only objects.
+    /// These still count against the unculled surface admission budget.
+    pub const fn culled_triangle_count(self) -> usize {
+        self.culled_triangles
+    }
+
     /// Returns objects whose retained surfaces are replaced with generated
     /// clip-space geometry for this draw, including empty generated ranges.
+    /// Optional Native culling is counted separately, not as CPU generation.
     pub const fn generated_object_count(self) -> usize {
         self.generated_objects
     }
@@ -310,6 +358,8 @@ impl SurfaceFrame {
 }
 
 pub(super) struct SurfaceObject {
+    // After complete preflight, an empty range can also suppress a conservatively
+    // culled retained object. It emits no generated attributes or edges.
     pub(super) generated: Option<std::ops::Range<u32>>,
     pub(super) generated_colors: Option<std::ops::Range<u32>>,
     pub(super) generated_lighting: Option<std::ops::Range<u32>>,
@@ -363,6 +413,10 @@ pub(super) fn preflight_into(
     );
     if result.is_err() {
         frame.reset();
+    } else if budget.offscreen_surface_culling()
+        && budget.surface_policy() == SurfaceRasterization3d::Native
+    {
+        culling::omit_offscreen_surfaces(scene, camera, frame);
     }
     result
 }

@@ -27,7 +27,7 @@ Rust version.
 
 ## 0.4.1 development performance
 
-The current development package is `0.4.1-dev.5`; the stable installation
+The current development package is `0.4.1-dev.6`; the stable installation
 examples below continue to target the released 0.4 API. No source migration is
 needed for this optimization slice. Pin a tested git revision when trying it.
 
@@ -89,12 +89,38 @@ needed for this optimization slice. Pin a tested git revision when trying it.
   Insert/remove/rebind and dynamic updates publish counters only when committed;
   recovery reconstructs them. Sorted resource lookup and stable object order are
   unchanged, so insertion/removal can still move table or object records.
+- `Mesh3dRenderBudget::with_offscreen_surface_culling(true)` is an optional,
+  default-disabled Native surface optimization. After every original validation
+  and budget check succeeds, conservative model/camera intervals may prove that
+  a complete surface lies outside one common frustum plane. Uncertain objects,
+  StrictPortable and any wireframe style keep their original submission. It does
+  not mutate host visibility, bypass invalid geometry, or perform occlusion tests.
+  `preflight().culled_object_count()` and `culled_triangle_count()` describe
+  omissions separately from generated/clipped geometry. Actual object/triangle
+  submission counts decrease; all admission budgets still charge the unculled
+  scene. Instance storage, sorting and uploads are not compacted. Omitting
+  individual shared instances can split one batch into more draws: enable it
+  only after measuring the application's geometry and camera distribution.
+
+For an off/on comparison using the same executable and static source membership:
+
+```bash
+cargo run --release --example mesh3d_scene_benchmark -- \
+  --case outside --policy native --objects 64 --side 128 --culling off
+cargo run --release --example mesh3d_scene_benchmark -- \
+  --case outside --policy native --objects 64 --side 128 --culling on
+```
+
+Also compare `repeated` (inside), `outside_all`, `outside_distinct`, and
+`outside_alternating`; use small `--side 1` objects to expose batch-fragmentation
+costs. Hardware, power state and desktop scheduling must be comparable. These
+are diagnostics, not a universal frame-rate guarantee.
 
 StrictPortable topology, mathematical edges, normal/fog safety contracts, device
 provenance, resource budgets and failure transactionality are unchanged. Dense
 Native chunks and repeated meshes benefit most; uncertain fog arithmetic,
-unique normals and strict clipping can still dominate other workloads. No shader precision,
-MSAA quality, mip level or rendered geometry is reduced.
+unique normals and strict clipping can still dominate other workloads. No shader
+precision, MSAA quality, mip level or potentially visible geometry is reduced.
 
 Use `mesh3d_scene_benchmark` to compare unchanged workloads on the same physical
 adapter. Report preflight, staging/upload, encode/submit, GPU pass timings and
@@ -538,9 +564,10 @@ cargo run --release --example mesh3d_scene_benchmark -- \
 This changes one object per frame; the remaining objects share a static mesh.
 Initial detachment and scratch growth are reported during warmup, separately
 from steady-state allocation counts. Other cases include `repeated`, `outside`,
-and `host_hidden`, for example `--objects 1024 --side 1`. `outside` still submits
-the geometry; `host_hidden` explicitly hides the same distant objects. No
-automatic distance/frustum culling is inferred.
+and `host_hidden`, for example `--objects 1024 --side 1`. By default `outside`
+still submits the geometry; `host_hidden` explicitly hides the same distant
+objects. Development 0.4.1 adds an explicit `--culling on` Native comparison;
+it never infers host visibility from distance alone.
 
 All measured frames must be `Drawn`, source revision order is deterministic,
 and output changes abort measurement. The target stays 1280x720; actual surface
@@ -2082,10 +2109,13 @@ remain strictly validated under either policy; Native is not a validation bypass
 `validate_scene3d_for_target` and `render_scene3d_to_target_with_budget` use the
 same authoritative preflight. `Mesh3dRenderBudget` caps generated vertices,
 triangles and combined surface/edge upload bytes. `with_max_surface_triangles`
-also bounds the total submitted surface triangles, retained plus generated.
+also bounds total retained plus generated triangles before optional culling.
 `Mesh3dPreflightReport` exposes `submitted_triangle_count` and
 `generated_object_count`; clipped/discarded source counts are `Some` for
 StrictPortable and `None` for Native, not hardware visibility measurements.
+Development 0.4.1 optionally omits proven offscreen Native surface-only objects
+after all these checks; separate culled counts explain reduced submissions,
+without reducing the admission budget or changing host visibility.
 Validation covers the complete visible set and additional work
 before target mutation or submission. Object-local errors carry `object_id()`
 and source triangle/vertex index plus the underlying reason where applicable;

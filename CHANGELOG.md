@@ -11,6 +11,15 @@ Development target: 0.4.1. No new registry release is implied by this section.
 
 ### Performance
 
+- Optional `Mesh3dRenderBudget::with_offscreen_surface_culling(true)` omits
+  Native surface-only objects proven wholly outside one homogeneous frustum
+  plane. All original validation and unculled admission budgets run first;
+  uncertain bounds, StrictPortable and wireframe styles retain their submissions.
+  Reports distinguish culled objects/triangles from CPU-generated clipping and
+  actual submissions. Default behavior is unchanged. Individual omissions can
+  split shared instanced runs: this is a measured scene-specific option, not a
+  universal speedup or spatial visibility system.
+
 - Native 3D transform validation can prove finite arithmetic for an entire
   immutable mesh using cached source bounds and nonzero-component magnitudes.
   Inconclusive cases use the original per-vertex validation and error attribution.

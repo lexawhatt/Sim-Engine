@@ -483,7 +483,7 @@ impl Mesh3dRenderer {
         };
         let encode_submit = encode_started_at.elapsed();
         Ok(Mesh3dRenderReport {
-            object_count: visible_count,
+            object_count: visible_count - surface_frame.report.culled_object_count(),
             triangle_count,
             edge_count,
             render_pass_count: 1,
