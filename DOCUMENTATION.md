@@ -27,7 +27,7 @@ Rust version.
 
 ## 0.4.1 development performance
 
-The current development package is `0.4.1-dev.4`; the stable installation
+The current development package is `0.4.1-dev.5`; the stable installation
 examples below continue to target the released 0.4 API. No source migration is
 needed for this optimization slice. Pin a tested git revision when trying it.
 
@@ -83,6 +83,12 @@ needed for this optimization slice. Pin a tested git revision when trying it.
   at encoding time. `peak_frame_cpu_bytes()` is a conservative capacity-overlap
   bound: reused arrays count once; replaced arrays count old plus new storage.
   It excludes fixed proof stacks and allocator/driver internals, and is not RSS.
+- `Scene3d::statistics()` and `visible_object_count()` use exact incremental
+  counters rather than scanning objects/resources. Shared allocations count once;
+  hiding an object changes visibility but does not release its resources.
+  Insert/remove/rebind and dynamic updates publish counters only when committed;
+  recovery reconstructs them. Sorted resource lookup and stable object order are
+  unchanged, so insertion/removal can still move table or object records.
 
 StrictPortable topology, mathematical edges, normal/fog safety contracts, device
 provenance, resource budgets and failure transactionality are unchanged. Dense

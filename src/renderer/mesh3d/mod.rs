@@ -95,6 +95,9 @@ pub use texture::{
 use crate::{MeshEdge3d, Projection3d, Rotation3d, SurfaceStyle3d, WorldLength};
 
 #[cfg(test)]
+#[path = "tests/accounting_benchmark.rs"]
+mod accounting_benchmark;
+#[cfg(test)]
 #[path = "tests/lifetime.rs"]
 mod lifetime_tests;
 

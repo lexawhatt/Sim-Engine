@@ -49,6 +49,11 @@ Development target: 0.4.1. No new registry release is implied by this section.
 - Frame CPU memory reports include retained generated/sorting capacity, even
   when idle. Preparation peak is an explicit conservative old/new allocation
   overlap bound, not process RSS or allocator-internal telemetry.
+- Retained 3D scenes maintain exact deduplicated resource byte/count totals and
+  visible-object counts at accepted mutation boundaries. Statistics and visible
+  counts are constant-time; insertion and rebind budget checks no longer rescan
+  the resource table. Shared aliases, final/overlap limits and failed-update
+  rollback are unchanged. Recovery reconstructs the counters from live objects.
 
 ### Development tooling
 

@@ -2,6 +2,11 @@
 
 use super::*;
 
+#[cfg(test)]
+pub(super) mod accounting_gpu_tests;
+#[cfg(test)]
+mod accounting_tests;
+
 /// Stable scene handle for a retained 3D object.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Object3dId {
@@ -89,6 +94,8 @@ pub struct Scene3d {
     slots: Vec<ObjectSlot>,
     free_slot: Option<usize>,
     resources: Vec<ResourceUsage>,
+    resource_totals: ResourceTotals,
+    visible_count: usize,
     budget: Scene3dBudget,
 }
 
@@ -103,6 +110,12 @@ struct ResourceUsage {
     key: (u8, usize),
     references: usize,
     bytes: usize,
+}
+
+#[derive(Default)]
+struct ResourceTotals {
+    bytes: [usize; 4],
+    counts: [usize; 4],
 }
 
 pub(super) struct DynamicSceneMeshChange {
@@ -353,6 +366,8 @@ impl Scene3d {
             slots: Vec::new(),
             free_slot: None,
             resources: Vec::new(),
+            resource_totals: ResourceTotals::default(),
+            visible_count: 0,
             budget,
         })
     }
@@ -424,6 +439,7 @@ impl Scene3d {
         self.renderer_identity = Some(Arc::clone(&mesh.renderer_identity));
         self.instances
             .push(Mesh3dInstance::new(id, mesh, transform, style));
+        self.visible_count += 1;
         self.next_object_id = next_object_id;
         Ok(id)
     }
@@ -463,22 +479,13 @@ impl Scene3d {
         self.budget
     }
 
-    /// Returns deduplicated allocation accounting without allocating scratch.
+    /// Returns deduplicated allocation accounting in constant time without
+    /// allocating scratch.
     pub fn statistics(&self) -> Scene3dStatistics {
         Scene3dStatistics {
-            texture_count: self.resources.iter().filter(|r| r.key.0 == 3).count(),
-            texture_cpu_bytes: self
-                .resources
-                .iter()
-                .filter(|r| r.key.0 == 2)
-                .map(|r| r.bytes)
-                .sum(),
-            texture_gpu_bytes: self
-                .resources
-                .iter()
-                .filter(|r| r.key.0 == 3)
-                .map(|r| r.bytes)
-                .sum(),
+            texture_count: self.resource_totals.counts[3],
+            texture_cpu_bytes: self.resource_totals.bytes[2],
+            texture_gpu_bytes: self.resource_totals.bytes[3],
             object_count: self.instances.len(),
             slot_capacity: self.slots.capacity(),
             storage_bytes: storage_bytes(
@@ -486,19 +493,9 @@ impl Scene3d {
                 self.slots.capacity(),
                 self.resources.capacity(),
             ),
-            mesh_count: self.resources.iter().filter(|r| r.key.0 == 1).count(),
-            mesh_cpu_bytes: self
-                .resources
-                .iter()
-                .filter(|r| r.key.0 == 0)
-                .map(|r| r.bytes)
-                .sum(),
-            mesh_gpu_bytes: self
-                .resources
-                .iter()
-                .filter(|r| r.key.0 == 1)
-                .map(|r| r.bytes)
-                .sum(),
+            mesh_count: self.resource_totals.counts[1],
+            mesh_cpu_bytes: self.resource_totals.bytes[0],
+            mesh_gpu_bytes: self.resource_totals.bytes[1],
         }
     }
 
@@ -529,6 +526,9 @@ impl Scene3d {
         self.free_slot = Some(object_id.slot);
         for resource in mesh_resources(&removed.mesh) {
             self.remove_resource(resource.key);
+        }
+        if removed.visible {
+            self.visible_count -= 1;
         }
         Ok(removed)
     }
@@ -746,12 +746,10 @@ impl Scene3d {
         }
     }
 
-    /// Returns objects currently participating in rendering.
+    /// Returns the number of objects currently participating in rendering in
+    /// constant time.
     pub fn visible_object_count(&self) -> usize {
-        self.instances
-            .iter()
-            .filter(|instance| instance.visible)
-            .count()
+        self.visible_count
     }
 
     /// Replaces one object's model transform without touching retained topology.
@@ -784,8 +782,16 @@ impl Scene3d {
         object_id: Object3dId,
         visible: bool,
     ) -> Result<(), Scene3dError> {
-        let instance = self.instance_mut(object_id)?;
-        instance.visible = visible;
+        let index = self.instance_index(object_id)?;
+        let instance = &mut self.instances[index];
+        if instance.visible != visible {
+            if visible {
+                self.visible_count += 1;
+            } else {
+                self.visible_count -= 1;
+            }
+            instance.visible = visible;
+        }
         Ok(())
     }
 
@@ -868,7 +874,12 @@ impl Scene3d {
             .binary_search_by_key(&resource.key, |r| r.key)
         {
             Ok(index) => self.resources[index].references += 1,
-            Err(index) => self.resources.insert(index, resource),
+            Err(index) => {
+                self.resources.insert(index, resource);
+                let category = resource.key.0 as usize;
+                self.resource_totals.bytes[category] += resource.bytes;
+                self.resource_totals.counts[category] += 1;
+            }
         }
     }
 
@@ -876,7 +887,12 @@ impl Scene3d {
         if let Ok(index) = self.resources.binary_search_by_key(&key, |r| r.key) {
             self.resources[index].references -= 1;
             if self.resources[index].references == 0 {
-                self.resources.remove(index);
+                // Unique texture updates can already have changed the live
+                // resource's capacity, so retire the bytes stored in the table.
+                let removed = self.resources.remove(index);
+                let category = removed.key.0 as usize;
+                self.resource_totals.bytes[category] -= removed.bytes;
+                self.resource_totals.counts[category] -= 1;
             }
         }
     }
@@ -886,13 +902,7 @@ impl Scene3d {
         incoming: &[ResourceUsage],
         outgoing: Option<&[ResourceUsage]>,
     ) -> Result<[usize; 4], Scene3dError> {
-        let stats = self.statistics();
-        let mut bytes = [
-            stats.mesh_cpu_bytes,
-            stats.mesh_gpu_bytes,
-            stats.texture_cpu_bytes,
-            stats.texture_gpu_bytes,
-        ];
+        let mut bytes = self.resource_totals.bytes;
         for resource in incoming {
             if self
                 .resources
@@ -1010,9 +1020,14 @@ impl Scene3d {
         // existing table capacity suffices. New GPU allocation identities replace
         // old keys only after the complete recovery candidate has been accepted.
         self.resources.clear();
+        self.resource_totals = ResourceTotals::default();
+        self.visible_count = 0;
         for index in 0..self.instances.len() {
             for resource in mesh_resources(&self.instances[index].mesh) {
                 self.add_resource(resource);
+            }
+            if self.instances[index].visible {
+                self.visible_count += 1;
             }
         }
     }

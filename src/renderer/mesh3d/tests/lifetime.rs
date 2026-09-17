@@ -340,13 +340,7 @@ fn linear_set_visible(
     id: Object3dId,
     visible: bool,
 ) -> Result<(), Scene3dError> {
-    let instance = scene
-        .instances
-        .iter_mut()
-        .find(|instance| instance.id == id)
-        .ok_or(Scene3dError::ObjectNotFound { object_id: id })?;
-    instance.visible = visible;
-    Ok(())
+    scene.set_visible_linear_reference(id, visible)
 }
 
 fn apply_setters<const INDEXED: bool>(scene: &mut Scene3d, ids: &[Object3dId], updates: &[usize]) {

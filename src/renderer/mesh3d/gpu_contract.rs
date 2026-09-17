@@ -8,6 +8,7 @@ pub(in crate::renderer) fn assert_gpu_depth_contract(
     queue: &wgpu::Queue,
     format: wgpu::TextureFormat,
 ) {
+    accounting_benchmark::run(device, queue);
     batch_tests::assert_gpu_batch_contract(device, queue, format);
     edge_upload_tests::assert_gpu_edge_upload_contract(device, queue, format);
     frame_upload_tests::assert_gpu_dirty_frame_upload_contract(device, queue, format);
@@ -463,6 +464,12 @@ pub(in crate::renderer) fn assert_gpu_scene_recovery_contract(
     recovery_queue: &wgpu::Queue,
     format: wgpu::TextureFormat,
 ) {
+    objects::accounting_gpu_tests::verify_scene_accounting(
+        source_device,
+        source_queue,
+        recovery_device,
+        recovery_queue,
+    );
     texture::assert_dev5_contract(
         source_device,
         source_queue,
