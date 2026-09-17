@@ -2,18 +2,14 @@
 
 use super::*;
 use crate::mesh3d::{TextureAddressMode3d, TextureCoordinate2d, TextureUvTransform3d};
-#[path = "mesh3d_texture_mips.rs"]
 mod mips;
 use mips::CpuMipChain;
 pub use mips::TextureMipmaps3d;
-#[path = "mesh3d_texture_options.rs"]
 mod options;
 pub use options::Texture3dOptions;
-#[path = "mesh3d_texture_creation.rs"]
 mod creation;
 #[cfg(test)]
 pub(super) use creation::{create_texture_with_options, crop_texture_tile};
-#[path = "mesh3d_texture_updates.rs"]
 mod updates;
 pub use updates::{
     Texture3dUpdateBudget, Texture3dUpdateBudgetResource, Texture3dUpdateError,
@@ -23,22 +19,18 @@ pub use updates::{
 pub(super) use updates::{update_scene_texture_region, update_texture_region};
 
 #[cfg(test)]
-#[path = "mesh3d_texture_red_tests.rs"]
 mod red_tests;
 #[cfg(test)]
-#[path = "mesh3d_texture_tests.rs"]
 mod tests;
 #[cfg(test)]
 pub(super) use tests::{assert_gpu_texture_contract, assert_gpu_textured_recovery};
 #[cfg(test)]
-#[path = "mesh3d_texture_lifecycle_tests.rs"]
 mod lifecycle_tests;
 #[cfg(test)]
 pub(super) use lifecycle_tests::{
     assert_gpu_texture_lifecycle, assert_gpu_texture_lifecycle_recovery,
 };
 #[cfg(test)]
-#[path = "mesh3d_dev5_tests.rs"]
 mod dev5_tests;
 #[cfg(test)]
 pub(super) use dev5_tests::assert_dev5_contract;
@@ -381,7 +373,7 @@ impl MeshTextureRenderer {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("sim-engine textured 3D surfaces"),
             source: wgpu::ShaderSource::Wgsl(lighting::shader_source(include_str!(
-                "mesh3d_texture.wgsl"
+                "primitive.wgsl"
             ))),
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {

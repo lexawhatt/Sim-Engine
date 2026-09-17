@@ -2,12 +2,18 @@
 
 use super::*;
 
-#[path = "mesh3d_validation_bounds.rs"]
 mod bounds;
 
 #[cfg(test)]
-#[path = "mesh3d_validation_bounds_tests.rs"]
 mod bounds_tests;
+
+pub(super) fn fog_transform_is_proven(
+    mesh: &Mesh3d,
+    model_rows: [[f32; 4]; 3],
+    depth_row: [f32; 4],
+) -> bool {
+    bounds::fog_transform_is_proven(mesh, model_rows, depth_row)
+}
 
 /// Selects the portability contract for filled 3D surfaces, not display edges.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

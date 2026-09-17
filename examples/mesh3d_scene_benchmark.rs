@@ -92,6 +92,11 @@ impl Configuration {
         if result.case.changes_mesh() && result.side < 2 {
             return Err("changing geometry requires --side >= 2 (suggested: 32)".into());
         }
+        if result.case == Case::LitSmooth && result.side < 2 {
+            return Err(
+                "lit_smooth requires --side >= 2 for curved geometry (suggested: 32)".into(),
+            );
+        }
         if result.case == Case::Growth
             && (result.side > 64
                 || (result.objects + 3) * result.side * result.side * 2 > 4_000_000)
@@ -110,7 +115,7 @@ impl Configuration {
 fn main() -> Result<()> {
     if std::env::args().any(|value| value == "--help" || value == "-h") {
         println!(
-            "mesh3d_scene_benchmark --case repeated|distinct|outside|host_hidden|crossing|immutable|dynamic|growth|textured|mask|blend|texture_update|prepared_text --policy native|strict --objects 1024 --side 1 --frames 120 --trials 3\nFor chunk updates: --case immutable (or dynamic/growth) --objects 64 --side 32. prepared_text requires --features text. GPU queries are opt-in here, not a universal FPS gate."
+            "mesh3d_scene_benchmark --case repeated|distinct|outside|host_hidden|crossing|immutable|dynamic|growth|textured|mask|blend|texture_update|prepared_text|lit|fog|lit_fog|lit_smooth --policy native|strict --objects 1024 --side 1 --frames 120 --trials 3\nFor chunk updates: --case immutable (or dynamic/growth) --objects 64 --side 32. For active lighting/fog validation: --case lit (or fog/lit_fog) --objects 64 --side 32; geometry/camera match repeated. lit_smooth uses a static curved grid with varied normals and needs --side >= 2 (suggested: 32). prepared_text requires --features text. GPU queries are opt-in here, not a universal FPS gate."
         );
         return Ok(());
     }
@@ -250,7 +255,7 @@ impl State {
             started.elapsed().as_secs_f64() * 1000.0
         );
         println!(
-            "policy={:?} gpu_timing={:?} query_period_ns={:?} diagnostic_ring_capacity={} diagnostic_query_count={} diagnostic_gpu_buffer_bytes={} source_sha={} executable_sha256={} growth_fixture=fresh_small_then_grown_update seed=0 camera_path=orthographic_sine_v1",
+            "policy={:?} gpu_timing={:?} query_period_ns={:?} diagnostic_ring_capacity={} diagnostic_query_count={} diagnostic_gpu_buffer_bytes={} source_sha={} fixture_source_sha={} executable_sha256={} growth_fixture=fresh_small_then_grown_update seed=0 camera_path={}",
             configuration.policy,
             renderer.gpu_timing_statistics().status(),
             renderer
@@ -261,8 +266,42 @@ impl State {
             renderer.gpu_timing_statistics().gpu_buffer_bytes(),
             std::env::var("SIM_ENGINE_RELEASE_SHA")
                 .unwrap_or_else(|_| "unverified-working-tree".into()),
+            std::env::var("SIM_ENGINE_BENCHMARK_FIXTURE_SHA")
+                .unwrap_or_else(|_| "unverified-working-tree".into()),
             std::env::var("SIM_ENGINE_BENCHMARK_BINARY_SHA256")
-                .unwrap_or_else(|_| "unverified".into())
+                .unwrap_or_else(|_| "unverified".into()),
+            if configuration.case == Case::Crossing {
+                "orthographic_sine_v1"
+            } else {
+                "orthographic_fixed_v1"
+            },
+        );
+        let first = workload.scene.instances().first().ok_or("empty workload")?;
+        println!(
+            "environment_fixture=directional_fog_v1 objects={} side={} source_vertices_per_mesh={} source_normals_per_mesh={} source_height_extent={} surface_lighting={:?} surface_fog_enabled={} ambient_intensity={} directional_intensity={:?} directional_direction={:?} fog_start={:?} fog_density={:?}",
+            configuration.objects,
+            configuration.side,
+            first.mesh().source().vertices().len(),
+            first.mesh().source().normals().len(),
+            first.mesh().source().bounds_max().z() - first.mesh().source().bounds_min().z(),
+            first.style().surface_style().map(|style| style.lighting()),
+            first
+                .style()
+                .surface_style()
+                .is_some_and(|style| style.fog_enabled()),
+            workload.scene.lighting().ambient().intensity(),
+            workload
+                .scene
+                .lighting()
+                .directional()
+                .map(|sun| sun.intensity()),
+            workload
+                .scene
+                .lighting()
+                .directional()
+                .map(|sun| sun.direction()),
+            workload.scene.fog().map(|fog| fog.start()),
+            workload.scene.fog().map(|fog| fog.density()),
         );
         let initial_timing_status = renderer.gpu_timing_statistics().status();
         Ok(Self {
@@ -751,6 +790,7 @@ mod tests {
             vec!["--objects", "8192", "--side", "128"],
             vec!["--case", "unknown"],
             vec!["--case", "dynamic", "--side", "1"],
+            vec!["--case", "lit_smooth", "--side", "1"],
             vec!["--case", "growth", "--side", "128"],
             vec!["--policy", "guess"],
         ] {
@@ -773,6 +813,10 @@ mod tests {
             "mask",
             "blend",
             "texture_update",
+            "lit",
+            "fog",
+            "lit_fog",
+            "lit_smooth",
         ] {
             for policy in ["native", "strict"] {
                 assert!(

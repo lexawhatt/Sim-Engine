@@ -3,19 +3,15 @@
 use super::*;
 
 #[cfg(test)]
-#[path = "mesh3d_surface_tests.rs"]
 mod gpu_tests;
 
 #[cfg(test)]
-#[path = "mesh3d_surface_red_tests.rs"]
 mod red_tests;
 
 #[cfg(test)]
-#[path = "mesh3d_policy_tests.rs"]
 mod policy_tests;
 
 #[cfg(test)]
-#[path = "mesh3d_native_edge_tests.rs"]
 mod native_edge_tests;
 
 #[cfg(test)]

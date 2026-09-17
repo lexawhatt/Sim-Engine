@@ -1,4 +1,4 @@
-//! Sufficient whole-mesh proof for Native finite transform arithmetic.
+//! Sufficient whole-mesh proofs for finite model and final-row arithmetic.
 //!
 //! This never rejects geometry. An inconclusive proof delegates to the original
 //! source-ordered vertex validation, preserving errors and their attribution.
@@ -41,11 +41,27 @@ pub(super) fn native_transform_is_proven(
     model_rows: [[f32; 4]; 3],
     camera_rows: [[f32; 4]; 4],
 ) -> bool {
+    final_rows_are_proven(mesh, model_rows, camera_rows)
+}
+
+pub(super) fn fog_transform_is_proven(
+    mesh: &Mesh3d,
+    model_rows: [[f32; 4]; 3],
+    depth_row: [f32; 4],
+) -> bool {
+    final_rows_are_proven(mesh, model_rows, [depth_row])
+}
+
+fn final_rows_are_proven<const N: usize>(
+    mesh: &Mesh3d,
+    model_rows: [[f32; 4]; 3],
+    final_rows: [[f32; 4]; N],
+) -> bool {
     // The reference validates every source/row operand, even if multiplied by
     // zero. Do not let aggregate zero rows bypass this contractual rejection.
     if !model_rows
         .iter()
-        .chain(camera_rows.iter())
+        .chain(final_rows.iter())
         .flatten()
         .copied()
         .all(is_portable_shader_source)
@@ -78,9 +94,10 @@ pub(super) fn native_transform_is_proven(
         };
         world[axis] = bounds;
     }
-    // Native consumes clip coordinates directly. Unlike model outputs, they
-    // are not inputs to another dot, so a final interval may include zero.
-    camera_rows
+    // Native clip coordinates and fog distances are not inputs to another dot,
+    // so a final interval may include zero. This proves the vertex evaluator's
+    // arithmetic contract, not frustum classification or generated attributes.
+    final_rows
         .into_iter()
         .all(|row| dot_bounds(row, world).is_some())
 }

@@ -415,5 +415,5 @@ fn linear_channels() -> [f64; 256] {
 }
 
 #[cfg(test)]
-#[path = "mesh3d_texture_mips_tests.rs"]
+#[path = "mips_tests.rs"]
 mod tests;

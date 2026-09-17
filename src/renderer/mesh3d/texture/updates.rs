@@ -2,7 +2,7 @@
 
 use super::*;
 
-#[path = "mesh3d_texture_update_types.rs"]
+#[path = "update_types.rs"]
 mod types;
 pub use types::{
     Texture3dUpdateBudget, Texture3dUpdateBudgetResource, Texture3dUpdateError,

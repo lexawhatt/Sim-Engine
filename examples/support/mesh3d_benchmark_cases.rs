@@ -1,9 +1,10 @@
 //! Host-owned fixtures; simulation and chunk models remain outside the library.
 
 use sim_engine::{
-    Camera3d, Color, DynamicMesh3dBudget, ImageBudget, ImageSampling, ImageTexelRect, Mesh3d,
-    Mesh3dAttributes, Mesh3dRenderBudget, Mesh3dUploadBudget, MeshStyle3d, Object3dId,
-    Projection3d, Rotation3d, Scene3d, SurfaceRasterization3d, SurfaceStyle3d, Texture3dOptions,
+    AmbientLight3d, Camera3d, Color, DirectionalLight3d, DynamicMesh3dBudget, Fog3d, ImageBudget,
+    ImageSampling, ImageTexelRect, Lighting3d, Mesh3d, Mesh3dAttributes, Mesh3dRenderBudget,
+    Mesh3dUploadBudget, MeshStyle3d, Object3dId, Projection3d, Rotation3d, Scene3d,
+    SurfaceLighting3d, SurfaceRasterization3d, SurfaceStyle3d, Texture3dOptions,
     Texture3dUpdateBudget, TextureAddressMode3d, TextureCoordinate2d, TextureMaterial3d,
     TextureMipmaps3d, TextureUvTransform3d, Transform3d, Vec2, Vec3, WgpuRenderer, WorldLength,
 };
@@ -25,6 +26,10 @@ pub enum Case {
     Blend,
     TextureUpdate,
     PreparedText,
+    Lit,
+    Fog,
+    LitFog,
+    LitSmooth,
 }
 
 impl Case {
@@ -43,6 +48,10 @@ impl Case {
             "blend" => Ok(Self::Blend),
             "texture_update" => Ok(Self::TextureUpdate),
             "prepared_text" => Ok(Self::PreparedText),
+            "lit" => Ok(Self::Lit),
+            "fog" => Ok(Self::Fog),
+            "lit_fog" => Ok(Self::LitFog),
+            "lit_smooth" => Ok(Self::LitSmooth),
             _ => Err(format!("unknown fixture: {value}").into()),
         }
     }
@@ -62,6 +71,10 @@ impl Case {
             Self::Blend => "blend",
             Self::TextureUpdate => "texture_update",
             Self::PreparedText => "prepared_text",
+            Self::Lit => "lit",
+            Self::Fog => "fog",
+            Self::LitFog => "lit_fog",
+            Self::LitSmooth => "lit_smooth",
         }
     }
 
@@ -84,6 +97,66 @@ impl Case {
         } else {
             0
         }
+    }
+
+    fn lit(self) -> bool {
+        matches!(self, Self::Lit | Self::LitFog | Self::LitSmooth)
+    }
+
+    fn fogged(self) -> bool {
+        matches!(self, Self::Fog | Self::LitFog)
+    }
+
+    fn initial_source(self, side: usize) -> Result<Mesh3d> {
+        grid(
+            side,
+            if self == Self::LitSmooth { 0.25 } else { 0.0 },
+            self.textured(),
+            self.lit(),
+        )
+    }
+
+    fn surface_style(self) -> Result<SurfaceStyle3d> {
+        let color = if self.textured() {
+            Color::WHITE
+        } else {
+            Color::rgb8(82, 176, 233)
+        };
+        Ok(match self {
+            Self::Mask => SurfaceStyle3d::mask(Color::WHITE, 0.5)?,
+            Self::Blend => SurfaceStyle3d::blend(Color::rgba(1.0, 1.0, 1.0, 0.5))?,
+            _ => SurfaceStyle3d::opaque(color)?,
+        }
+        .with_lighting(if self.lit() {
+            SurfaceLighting3d::Lambert
+        } else {
+            SurfaceLighting3d::Unlit
+        })
+        .with_fog(self.fogged()))
+    }
+
+    fn configure_environment(self, scene: &mut Scene3d, columns: usize) -> Result<()> {
+        if self.lit() {
+            scene.set_lighting(
+                Lighting3d::new(AmbientLight3d::new(Color::WHITE, 0.2)?).with_directional(Some(
+                    DirectionalLight3d::new(
+                        Vec3::new(0.35, 0.45, 1.0)?,
+                        Color::rgb(1.0, 0.95, 0.85),
+                        0.75,
+                    )?,
+                )),
+            );
+        }
+        if self.fogged() {
+            // Camera distance is 2 * columns. Scale the fog so both small and
+            // dense workloads exercise a visible, nonsaturated contribution.
+            scene.set_fog(Some(Fog3d::new(
+                Color::rgb(0.08, 0.12, 0.2),
+                columns as f32 * 0.5,
+                0.35 / columns as f32,
+            )?));
+        }
+        Ok(())
     }
 }
 
@@ -132,11 +205,12 @@ impl Workload {
         policy: SurfaceRasterization3d,
     ) -> Result<Self> {
         let sources = [
-            grid(side, 0.0, case.textured())?,
+            case.initial_source(side)?,
             grid(
                 if case == Case::Growth { side * 2 } else { side },
                 0.25,
                 case.textured(),
+                case.lit(),
             )?,
         ];
         let texture = if case.textured() {
@@ -196,14 +270,10 @@ impl Workload {
             })
         };
         let mesh = upload(sources[0].clone())?;
-        let color = Color::rgb8(82, 176, 233);
-        let style = MeshStyle3d::surface(match case {
-            Case::Mask => SurfaceStyle3d::mask(Color::WHITE, 0.5)?,
-            Case::Blend => SurfaceStyle3d::blend(Color::rgba(1.0, 1.0, 1.0, 0.5))?,
-            _ => SurfaceStyle3d::opaque(if case.textured() { Color::WHITE } else { color })?,
-        });
+        let style = MeshStyle3d::surface(case.surface_style()?);
         let mut scene = Scene3d::new(Color::rgb8(8, 12, 20))?;
         let columns = (objects as f64).sqrt().ceil() as usize;
+        case.configure_environment(&mut scene, columns)?;
         let mut first = None;
         let mut expected_objects = 0;
         for index in 0..objects {
@@ -225,7 +295,7 @@ impl Workload {
             )?;
             // Distinct control owns distinct CPU snapshots as well as GPU buffers.
             let unique = if case == Case::Distinct {
-                Some(upload(grid(side, 0.0, false)?)?)
+                Some(upload(grid(side, 0.0, false, false)?)?)
             } else {
                 None
             };
@@ -353,7 +423,7 @@ impl Workload {
     }
 }
 
-fn grid(side: usize, center_height: f32, textured: bool) -> Result<Mesh3d> {
+fn grid(side: usize, center_height: f32, textured: bool, lit: bool) -> Result<Mesh3d> {
     let mut vertices = Vec::with_capacity((side + 1) * (side + 1));
     for row in 0..=side {
         for column in 0..=side {
@@ -372,7 +442,7 @@ fn grid(side: usize, center_height: f32, textured: bool) -> Result<Mesh3d> {
             indices.extend([first, first + 1, next + 1, first, next + 1, next]);
         }
     }
-    let attributes = if textured {
+    let mut attributes = if textured {
         Mesh3dAttributes::new().with_texture_coordinates(
             vertices
                 .iter()
@@ -382,6 +452,28 @@ fn grid(side: usize, center_height: f32, textured: bool) -> Result<Mesh3d> {
     } else {
         Mesh3dAttributes::new()
     };
+    if lit {
+        let normals = vertices
+            .iter()
+            .map(|point| {
+                // Host-supplied analytic normals of this height field, not a
+                // renderer-generated lighting model. Flat grids use exact +Z.
+                if center_height == 0.0 {
+                    return Ok(Vec3::Z);
+                }
+                let x = point.x() * std::f32::consts::PI;
+                let y = point.y() * std::f32::consts::PI;
+                let gradient = center_height * std::f32::consts::PI;
+                Vec3::new(
+                    -gradient * x.cos() * y.sin(),
+                    -gradient * x.sin() * y.cos(),
+                    1.0,
+                )?
+                .normalized()
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        attributes = attributes.with_normals(normals)?;
+    }
     Ok(Mesh3d::with_attributes(
         vertices,
         indices,
@@ -397,8 +489,8 @@ mod tests {
     #[test]
     fn grid_revisions_have_equal_capacity_and_distinct_geometry() {
         for side in [1, 4, 32] {
-            let first = grid(side, 0.0, false).unwrap();
-            let second = grid(side, 0.25, false).unwrap();
+            let first = grid(side, 0.0, false, false).unwrap();
+            let second = grid(side, 0.25, false, false).unwrap();
             assert_eq!(first.triangle_count(), side * side * 2);
             assert_eq!(
                 first.recovery_memory_bytes(),
@@ -419,5 +511,114 @@ mod tests {
             assert_eq!(Case::Immutable.revision(frame), frame % 2);
             assert_eq!(Case::Repeated.revision(frame), 0);
         }
+    }
+
+    #[test]
+    fn environment_cases_keep_repeated_geometry_and_enable_real_validation_work() {
+        for (case, lit, fogged) in [
+            (Case::Repeated, false, false),
+            (Case::Lit, true, false),
+            (Case::Fog, false, true),
+            (Case::LitFog, true, true),
+        ] {
+            assert_eq!(Case::parse(case.name()).unwrap(), case);
+            assert!(!case.changes_mesh());
+            assert!(!case.textured());
+            for frame in [0, 1, 119] {
+                assert_eq!(case.revision(frame), 0);
+            }
+            let style = case.surface_style().unwrap();
+            assert_eq!(style.lighting() == SurfaceLighting3d::Lambert, lit);
+            assert_eq!(style.fog_enabled(), fogged);
+            for (side, columns) in [(1, 23), (32, 8)] {
+                let control = grid(side, 0.0, false, false).unwrap();
+                let source = case.initial_source(side).unwrap();
+                assert_eq!(source.vertices(), control.vertices());
+                assert_eq!(source.triangle_indices(), control.triangle_indices());
+                assert_eq!(
+                    source.normals().len(),
+                    if lit { (side + 1).pow(2) } else { 0 }
+                );
+                assert!(source.normals().iter().all(|normal| *normal == Vec3::Z));
+                let mut scene = Scene3d::new(Color::BLACK).unwrap();
+                case.configure_environment(&mut scene, columns).unwrap();
+                let lighting = scene.lighting();
+                assert_eq!(lighting.directional().is_some(), lit);
+                if let Some(sun) = lighting.directional() {
+                    assert_eq!(sun.intensity(), 0.75);
+                    assert_eq!(lighting.ambient().intensity(), 0.2);
+                    assert!(sun.direction().z() > 0.5);
+                    assert!(sun.direction().x() > 0.0 && sun.direction().y() > 0.0);
+                }
+                assert_eq!(scene.fog().is_some(), fogged);
+                if let Some(fog) = scene.fog() {
+                    let distance = columns as f32 * 2.0;
+                    assert!(fog.start() < distance);
+                    assert!(fog.density() > 0.0);
+                    let transmission = (-(distance - fog.start()) * fog.density()).exp();
+                    assert!((0.5..0.7).contains(&transmission));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn lit_grid_normals_follow_host_height_field_and_are_normalized() {
+        let source = grid(32, 0.25, false, true).unwrap();
+        assert_eq!(source.normals().len(), source.vertices().len());
+        assert!(source.normals().iter().any(|normal| *normal != Vec3::Z));
+        for (point, normal) in source.vertices().iter().zip(source.normals()) {
+            let length_squared =
+                normal.x() * normal.x() + normal.y() * normal.y() + normal.z() * normal.z();
+            assert!((length_squared - 1.0).abs() < 1e-6);
+            let x = point.x() * std::f32::consts::PI;
+            let y = point.y() * std::f32::consts::PI;
+            let gradient = 0.25 * std::f32::consts::PI;
+            assert!((normal.x() + normal.z() * gradient * x.cos() * y.sin()).abs() < 1e-6);
+            assert!((normal.y() + normal.z() * gradient * x.sin() * y.cos()).abs() < 1e-6);
+            assert!(normal.z() > 0.0);
+        }
+    }
+
+    #[test]
+    fn smooth_lit_fixture_renders_static_curvature_with_many_distinct_normals() {
+        let case = Case::parse("lit_smooth").unwrap();
+        assert_eq!(case, Case::LitSmooth);
+        assert_eq!(case.name(), "lit_smooth");
+        assert!(!case.changes_mesh());
+        assert!(!case.textured());
+        for frame in [0, 1, 59, 119] {
+            assert_eq!(case.revision(frame), 0);
+        }
+        let source = case.initial_source(32).unwrap();
+        let flat = Case::Lit.initial_source(32).unwrap();
+        assert_eq!(source.triangle_indices(), flat.triangle_indices());
+        assert_eq!(source.vertices().len(), 33 * 33);
+        assert_eq!(source.normals().len(), source.vertices().len());
+        assert_ne!(source.vertices(), flat.vertices());
+        assert_eq!(source.bounds_max().z(), 0.25);
+        assert_eq!(source, case.initial_source(32).unwrap());
+        // More than eight successive distinct normals force the bounded
+        // validation memo to saturate instead of measuring its flat-grid hit path.
+        let leading_normals: std::collections::HashSet<_> = source
+            .normals()
+            .iter()
+            .take(9)
+            .map(|normal| [normal.x(), normal.y(), normal.z()].map(f32::to_bits))
+            .collect();
+        assert_eq!(leading_normals.len(), 9);
+        let style = case.surface_style().unwrap();
+        assert_eq!(style.lighting(), SurfaceLighting3d::Lambert);
+        assert!(!style.fog_enabled());
+        let mut smooth_scene = Scene3d::new(Color::BLACK).unwrap();
+        let mut flat_scene = Scene3d::new(Color::BLACK).unwrap();
+        case.configure_environment(&mut smooth_scene, 8).unwrap();
+        Case::Lit.configure_environment(&mut flat_scene, 8).unwrap();
+        assert_eq!(smooth_scene.lighting(), flat_scene.lighting());
+        assert_eq!(
+            smooth_scene.lighting().directional().unwrap().intensity(),
+            0.75
+        );
+        assert_eq!(smooth_scene.fog(), None);
     }
 }

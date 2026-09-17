@@ -2,6 +2,9 @@
 
 use super::*;
 
+#[cfg(test)]
+mod proof_tests;
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
 pub(super) struct SurfaceEnvironmentGpu {
@@ -104,16 +107,73 @@ impl SurfaceTransport {
         instance: &Mesh3dInstance,
         model: [[f32; 4]; 3],
     ) -> Result<(), Mesh3dRenderError> {
+        self.validate_mesh(instance.mesh.source(), model)
+            .map_err(|(index, reason)| vertex_error(instance.id, index, reason))
+    }
+
+    fn validate_mesh(
+        self,
+        mesh: &Mesh3d,
+        model: [[f32; 4]; 3],
+    ) -> Result<(), (usize, Mesh3dSurfaceError)> {
         if !self.lit && self.depth_row.is_none() {
             return Ok(());
         }
-        for vertex_index in 0..instance.mesh.source().vertices().len() {
-            self.vertex(instance.mesh.source(), vertex_index, model)
-                .map_err(|reason| vertex_error(instance.id, vertex_index, reason))?;
+        if let Some(depth_row) = self.depth_row
+            && !validation::fog_transform_is_proven(mesh, model, depth_row)
+        {
+            // An earlier fog failure must win over a later normal failure.
+            // Inconclusive aggregate proofs keep the original combined order.
+            for index in 0..mesh.vertices().len() {
+                self.vertex(mesh, index, model)
+                    .map_err(|reason| (index, reason))?;
+            }
+            return Ok(());
+        }
+        if !self.lit {
+            return Ok(());
+        }
+        let normal_only = Self {
+            depth_row: None,
+            ..self
+        };
+        // This stack-only success cache belongs to one immutable mesh/model
+        // validation call. Disable it once diverse normals exceed capacity so
+        // smooth meshes do not pay a linear lookup for every remaining vertex.
+        let mut known_normals = [[0_u32; 3]; 8];
+        let mut known_count = 0;
+        for index in 0..mesh.vertices().len() {
+            let normal = mesh
+                .normals()
+                .get(index)
+                .ok_or((index, Mesh3dSurfaceError::NormalTransform))?;
+            let normal = [normal.x(), normal.y(), normal.z()].map(f32::to_bits);
+            if known_normals[..known_count].contains(&normal) {
+                continue;
+            }
+            normal_only
+                .vertex(mesh, index, model)
+                .map_err(|reason| (index, reason))?;
+            if let Some(slot) = known_normals.get_mut(known_count) {
+                *slot = normal;
+                known_count += 1;
+            } else {
+                // A separate tail loop avoids adding a cache-state branch to
+                // every remaining normal on a smooth, high-diversity mesh.
+                for remaining in index + 1..mesh.vertices().len() {
+                    normal_only
+                        .vertex(mesh, remaining, model)
+                        .map_err(|reason| (remaining, reason))?;
+                }
+                return Ok(());
+            }
         }
         Ok(())
     }
 
+    // Normal-only validation passes a statically absent fog row. Inlining lets
+    // it remove the unrelated model/depth path without duplicating arithmetic.
+    #[inline(always)]
     pub(super) fn vertex(
         self,
         mesh: &Mesh3d,
@@ -202,10 +262,7 @@ fn normal_rows(transform: Transform3d) -> Result<[[f32; 4]; 3], Mesh3dSurfaceErr
 }
 
 pub(super) fn shader_source(body: &'static str) -> Cow<'static, str> {
-    Cow::Owned(format!(
-        "{}\n{body}",
-        include_str!("mesh3d_environment.wgsl")
-    ))
+    Cow::Owned(format!("{}\n{body}", include_str!("../environment.wgsl")))
 }
 
 #[cfg(test)]

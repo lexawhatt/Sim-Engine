@@ -27,7 +27,7 @@ Rust version.
 
 ## 0.4.1 development performance
 
-The current development package is `0.4.1-dev.1`; the stable installation
+The current development package is `0.4.1-dev.2`; the stable installation
 examples below continue to target the released 0.4 API. No source migration is
 needed for this optimization slice. Pin a tested git revision when trying it.
 
@@ -47,11 +47,20 @@ needed for this optimization slice. Pin a tested git revision when trying it.
   staging/uploads and do not grow its GPU buffer. Previously allocated capacity
   remains available for future edge frames and remains included in memory
   counters. Mixed scenes retain the existing visible-object offsets.
+- Active fog attempts the same conservative model-transform proof followed by
+  the camera-forward depth row. Only a successful proof skips per-vertex fog
+  validation. Otherwise the original normal-then-fog checks run in source order,
+  preserving the first failing vertex and reason.
+- Repeated source normals can reuse a successful directional-lighting proof
+  within one object validation call, using bounded stack storage. There is no
+  cross-frame or cross-transform cache to invalidate. Distinct normals still
+  undergo the original numerical proof. CPU-clipped vertex attributes are
+  calculated exactly as before; neither lighting nor fog is approximated.
 
-StrictPortable topology, mathematical edges, normal/fog validation, device
-provenance, resource budgets and failure transactionality are unchanged. This
-slice particularly targets dense Native chunks and repeated meshes; lighting,
-fog and strict clipping can still dominate other workloads. No shader precision,
+StrictPortable topology, mathematical edges, normal/fog safety contracts, device
+provenance, resource budgets and failure transactionality are unchanged. Dense
+Native chunks and repeated meshes benefit most; uncertain fog arithmetic,
+unique normals and strict clipping can still dominate other workloads. No shader precision,
 MSAA quality, mip level or rendered geometry is reduced.
 
 Use `mesh3d_scene_benchmark` to compare unchanged workloads on the same physical
@@ -60,6 +69,22 @@ surface acquisition separately. FPS also includes desktop scheduling and is not
 a standalone measure of CPU savings. Preserve all trials and check actual
 submitted counts, uploads and complete timestamp coverage before interpreting
 speedups. See the [Unreleased changelog](CHANGELOG.md#unreleased).
+
+Measure genuinely active lighting and fog separately from unlit surfaces:
+
+```bash
+cargo run --release --all-features --example mesh3d_scene_benchmark -- \
+    --case lit_fog --policy native --objects 64 --side 32 --frames 120 --trials 3
+```
+
+Replace `lit_fog` with `lit` or `fog` to isolate the two costs, use `lit_smooth`
+for a curved surface with diverse normals, and use `strict` for the unchanged
+strict topology contract. The environment fixtures use the same fixed camera
+as `repeated`, supply actual normals where needed, and log nonzero directional
+light/fog settings. Benchmark source revision, physical GPU and
+binary identity belong with any comparison. The internal 3D modules are grouped
+by allocation, recovery, frame preparation, encoding and numerical proof; this
+reorganization does not change public imports.
 
 ## 0.4 integration guide
 
@@ -2462,25 +2487,27 @@ composed, drawn, measured, and recovered.
 | `field.rs` | finite scalar grid and CPU color-map contracts |
 | `particle.rs` | renderer-independent particle visual state |
 | `pseudo3d.rs` | checked 3D math, transforms, and CPU projection |
-| `mesh3d.rs` | retained topology and edge/style contracts |
-| `mesh3d_attributes.rs`, `mesh3d_uv.rs` | optional vertex attributes and bounded material UV mapping |
+| `mesh3d/mod.rs`, `mesh3d/style.rs` | retained topology and edge/style contracts |
+| `mesh3d/attributes.rs`, `mesh3d/uv.rs` | optional vertex attributes and bounded material UV mapping |
 | `text/font/session.rs` | CPU-only reusable shaping sessions |
 | `renderer/config.rs` | surface mode, DPI, renderer options, recovery setup |
 | `renderer/tessellation.rs` | 2D scene command to triangle conversion |
 | `renderer/visualization.rs` | fused scientific visualization path |
-| `renderer/mesh3d.rs` | retained mesh resources and depth/edge passes |
-| `renderer/mesh3d_objects.rs` | indexed object IDs, lifetime and shared-resource accounting |
-| `renderer/mesh3d_upload.rs` | bounded immutable mesh upload/replacement |
-| `renderer/mesh3d_surface.rs` | interval-proven bounded surface clipping and preflight |
-| `renderer/mesh3d_texture.rs` | texture/material ownership, alpha policy and recovery |
-| `renderer/mesh3d_dynamic.rs` | capacity-reusing whole-bundle mesh updates and alias isolation |
-| `renderer/mesh3d_restoration.rs` | standalone restoration preserving full material policy |
+| `renderer/mesh3d/mod.rs`, `renderer/mesh3d/api.rs` | retained resource facade and public entry points |
+| `renderer/mesh3d/frame.rs`, `renderer/mesh3d/encoding.rs` | transactional frame staging and ordered depth/edge passes |
+| `renderer/mesh3d/objects.rs` | indexed object IDs, lifetime and shared-resource accounting |
+| `renderer/mesh3d/upload.rs`, `renderer/mesh3d/allocation.rs` | bounded immutable mesh upload/replacement |
+| `renderer/mesh3d/surface/mod.rs` | interval-proven bounded surface clipping and preflight |
+| `renderer/mesh3d/validation/`, `renderer/mesh3d/lighting/` | sufficient mesh-wide proofs and ordered vertex fallback |
+| `renderer/mesh3d/texture/` | texture/material ownership, mipmaps, partial updates and recovery |
+| `renderer/mesh3d/dynamic/` | capacity-reusing whole-bundle mesh updates and alias isolation |
+| `renderer/mesh3d/restoration.rs`, `renderer/mesh3d/scene_restore.rs` | standalone and shared-scene restoration preserving material policy |
 | `renderer/gpu_timing.rs` | optional bounded render-pass timestamps and correlation |
 | `renderer/frame/cache.rs` | bounded frame scratch, uniform and binding reuse |
 | `renderer/frame/encoding.rs` | ordered mixed-source draw encoding and pass-local state reuse |
 | `renderer/frame/uniform_uploads.rs` | bounded packed transfers into independent retained uniforms |
 | `renderer/primitive.wgsl` | 2D, particle, heatmap, and composition shaders |
-| `renderer/mesh3d.wgsl` | 3D projection and screen-space edge expansion |
+| `renderer/mesh3d/primitive.wgsl` | 3D projection and screen-space edge expansion |
 
 The entire renderer module is behind the `wgpu` feature. CPU-side contracts
 remain testable without it.

@@ -1,5 +1,5 @@
 use super::*;
-#[path = "mesh3d_dynamic_normals_tests.rs"]
+#[path = "normal_tests.rs"]
 mod normal_tests;
 
 fn point(x: f32, y: f32) -> Vec3 {

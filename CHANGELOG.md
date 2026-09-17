@@ -24,6 +24,22 @@ Development target: 0.4.1. No new registry release is implied by this section.
 - Surface-only 3D frames no longer stage, upload or grow unused per-object
   edge-uniform storage. Existing edge capacity is retained for reuse, and mixed
   surface/edge scenes preserve their dynamic uniform offsets.
+- Active fog can use a sufficient whole-mesh arithmetic proof instead of
+  recomputing world/depth envelopes for every vertex. Inconclusive proofs retain
+  the original combined normal/fog loop and first-error attribution.
+- Active directional lighting reuses successful proofs for identical source
+  normals within one object validation call. The bounded cache does not retain
+  state across transforms, meshes, frames or device recovery; generated clipping
+  attributes still use the original per-vertex calculations.
+
+### Development tooling
+
+- Added active `lit`, `lit_smooth`, `fog` and `lit_fog` workloads to the 3D diagnostics matrix,
+  with dense and small-mesh cases under both surface policies. Fixture provenance
+  is distinct from library provenance for controlled before/after comparisons.
+- Split the retained 3D implementation by resource allocation, recovery, frame
+  preparation, encoding, numerical proofs and regression fixtures. Public import
+  paths and behavior are unchanged.
 
 ## 0.4.0 - 2026-09-12
 

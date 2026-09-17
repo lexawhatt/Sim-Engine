@@ -2,14 +2,12 @@
 
 use super::*;
 
-#[path = "mesh3d_dynamic_types.rs"]
 mod types;
 pub use types::{
     DynamicMesh3dBudget, DynamicMesh3dBudgetResource, DynamicMesh3dError, DynamicMesh3dUpdateReport,
 };
 
 #[cfg(test)]
-#[path = "mesh3d_dynamic_tests.rs"]
 mod tests;
 #[cfg(test)]
 pub(super) use tests::{assert_gpu_dynamic_contract, assert_gpu_dynamic_recovery};

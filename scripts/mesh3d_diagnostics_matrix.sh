@@ -26,6 +26,7 @@ mkdir -p "$CARGO_TARGET_DIR"
 exec 9>"$CARGO_TARGET_DIR/.matrix.lock"
 flock -n 9 || { echo "another 3D diagnostics matrix is running" >&2; exit 1; }
 export SIM_ENGINE_RELEASE_SHA="$start_sha"
+export SIM_ENGINE_BENCHMARK_FIXTURE_SHA="$start_sha"
 export WGPU_BACKEND=vulkan
 if [[ -z "${SIM_ENGINE_REQUIRED_ADAPTER_PCI_BUS_ID:-}" ]]; then
     echo "set SIM_ENGINE_REQUIRED_ADAPTER_PCI_BUS_ID to pin the physical GPU" >&2
@@ -40,20 +41,22 @@ SIM_ENGINE_BENCHMARK_BINARY_SHA256=$(sha256sum "$binary" | cut -d ' ' -f1)
 output_parent="$project_root/target/mesh3d-diagnostics"
 mkdir -p "$output_parent"
 staged=$(mktemp -d "$output_parent/.pending.XXXXXX")
-printf 'vcs_sha=%s\nbinary_sha256=%s\nrequested_backend=Vulkan\nrequested_pci=%s\nrelease_gate=false\n' \
-    "$start_sha" "$SIM_ENGINE_BENCHMARK_BINARY_SHA256" "$SIM_ENGINE_REQUIRED_ADAPTER_PCI_BUS_ID" >"$staged/manifest.txt"
+printf 'vcs_sha=%s\nfixture_vcs_sha=%s\nbinary_sha256=%s\nrequested_backend=Vulkan\nrequested_pci=%s\nrelease_gate=false\n' \
+    "$start_sha" "$SIM_ENGINE_BENCHMARK_FIXTURE_SHA" "$SIM_ENGINE_BENCHMARK_BINARY_SHA256" "$SIM_ENGINE_REQUIRED_ADAPTER_PCI_BUS_ID" >"$staged/manifest.txt"
 rustc -vV >"$staged/rustc.txt"
 uname -a >"$staged/kernel.txt"
 if command -v lscpu >/dev/null 2>&1; then lscpu >"$staged/cpu.txt"; fi
+confirmed_cases=0
 run_case() {
     local name=$1 policy=$2 objects=$3 side=$4
     echo "3D diagnostics: $name / $policy / $objects objects / side $side"
     timeout 600 "$binary" --case "$name" --policy "$policy" --objects "$objects" \
-        --side "$side" --frames 60 --trials 3 2>&1 | tee "$staged/$name-$policy.txt"
+        --side "$side" --frames 60 --trials 3 2>&1 | tee "$staged/$name-$policy-objects$objects-side$side.txt"
     if [[ "$(git rev-parse HEAD)" != "$start_sha" || -n "$(git status --porcelain --untracked-files=all)" ]]; then
         echo "source changed during diagnostics; incomplete bundle is not evidence" >&2
         exit 1
     fi
+    confirmed_cases=$((confirmed_cases + 1))
 }
 for policy in native strict; do
     run_case repeated "$policy" 512 1
@@ -66,11 +69,19 @@ for name in immutable dynamic growth; do run_case "$name" native 64 16; done
 for name in textured mask blend texture_update prepared_text; do
     run_case "$name" native 256 1
 done
+for policy in native strict; do
+    for name in lit fog lit_fog; do
+        run_case "$name" "$policy" 512 1
+        run_case "$name" "$policy" 64 32
+    done
+    run_case lit_smooth "$policy" 64 32
+done
 if [[ "$(git rev-parse HEAD)" != "$start_sha" || -n "$(git status --porcelain --untracked-files=all)" ]]; then
     echo "source changed before diagnostics publication" >&2
     exit 1
 fi
-printf 'status=complete\nconfirmed_trials=54\n' >>"$staged/manifest.txt"
+printf 'status=complete\nconfirmed_cases=%s\nconfirmed_trials=%s\n' \
+    "$confirmed_cases" "$((confirmed_cases * 3))" >>"$staged/manifest.txt"
 # Unique result directory preserves all older attempts and failed .pending logs.
 final="$output_parent/$start_sha-$(date -u +%Y%m%dT%H%M%SZ)"
 mv -T "$staged" "$final"
