@@ -2,8 +2,18 @@
 
 use super::*;
 
+mod inside;
+#[cfg(test)]
+mod inside_tests;
+
 #[cfg(test)]
 mod gpu_tests;
+
+#[cfg(test)]
+mod cache_gpu_tests;
+
+#[cfg(test)]
+pub(super) use cache_gpu_tests::assert_gpu_source_cache_contract;
 
 #[cfg(test)]
 mod red_tests;
@@ -758,9 +768,11 @@ fn clipped_triangle_with_attributes(
         count: 3,
         crossing: false,
     };
+    let mut all_planes_inside = true;
     for (provenance, (destination, ranges)) in result.vertices.iter_mut().zip(clips).enumerate() {
         let plane_ranges =
             clip_plane_ranges(ranges).map_err(|_| Mesh3dSurfaceError::TransformArithmetic)?;
+        all_planes_inside = all_planes_inside && plane_ranges.iter().all(|range| range.0 >= 0.0);
         let planes = plane_ranges
             .iter()
             .enumerate()
@@ -786,6 +798,9 @@ fn clipped_triangle_with_attributes(
             result.count = 0;
             return Ok(result);
         }
+    }
+    if all_planes_inside && inside::accepts(&result.vertices, all_planes_inside) {
+        return Ok(result);
     }
     for plane in 0..6 {
         if result.count == 0 {
@@ -909,7 +924,39 @@ fn classify_surface_for_object(
     )
 }
 
+mod source_cache;
+#[cfg(test)]
+mod source_cache_tests;
+
 fn classify_surface_impl(
+    mesh: &Mesh3d,
+    model_rows: [[f32; 4]; 3],
+    camera_rows: [[f32; 4]; 4],
+    transport: SurfaceTransport,
+    failure: impl Fn(usize, Mesh3dSurfaceError) -> Mesh3dRenderError,
+    visit: impl FnMut(
+        usize,
+        &[SurfaceClipVertex],
+        &[MeshColorGpu],
+        &[SurfaceLightingVertex],
+        bool,
+    ) -> Result<(), Mesh3dRenderError>,
+) -> Result<(), Mesh3dRenderError> {
+    if source_cache::worthwhile(mesh) {
+        classify_surface_with_cache::<{ source_cache::CAPACITY }>(
+            mesh,
+            model_rows,
+            camera_rows,
+            transport,
+            failure,
+            visit,
+        )
+    } else {
+        classify_surface_with_cache::<0>(mesh, model_rows, camera_rows, transport, failure, visit)
+    }
+}
+
+fn classify_surface_with_cache<const CACHE_SLOTS: usize>(
     mesh: &Mesh3d,
     model_rows: [[f32; 4]; 3],
     camera_rows: [[f32; 4]; 4],
@@ -923,15 +970,14 @@ fn classify_surface_impl(
         bool,
     ) -> Result<(), Mesh3dRenderError>,
 ) -> Result<(), Mesh3dRenderError> {
+    let mut cache =
+        source_cache::SourceCache::<CACHE_SLOTS>::new(mesh, model_rows, camera_rows, transport);
     for (index, triangle) in mesh.triangle_indices().chunks_exact(3).enumerate() {
         let mut clips = [[ShaderValueRange::exact(0.0); 4]; 3];
         for (destination, vertex) in clips.iter_mut().zip(triangle) {
-            *destination = shader_clip_point_ranges(
-                mesh.vertices()[*vertex as usize],
-                model_rows,
-                camera_rows,
-            )
-            .map_err(|_| failure(index, Mesh3dSurfaceError::TransformArithmetic))?;
+            *destination = cache
+                .clip(*vertex)
+                .map_err(|reason| failure(index, reason))?;
         }
         let uv = std::array::from_fn(|index| {
             mesh.texture_coordinates()
@@ -945,8 +991,8 @@ fn classify_surface_impl(
         });
         let mut auxiliary = [[0.0; 4]; 3];
         for (value, vertex) in auxiliary.iter_mut().zip(triangle) {
-            *value = transport
-                .vertex(mesh, *vertex as usize, model_rows)
+            *value = cache
+                .auxiliary(*vertex)
                 .map_err(|reason| failure(index, reason))?;
         }
         let polygon = clipped_triangle_with_attributes(clips, uv, colors, auxiliary)

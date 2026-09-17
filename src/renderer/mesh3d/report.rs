@@ -374,12 +374,14 @@ impl Mesh3dRenderReport {
 
     /// Live CPU frame-array capacities during encoding: retained frame arrays
     /// plus this draw's temporary clipping/color/lighting/edge/sorting arrays.
+    /// Fixed-size numerical proof stack storage is not included.
     pub const fn staging_capacity_bytes(self) -> usize {
         self.staging_capacity_bytes
     }
 
     /// Maximum simultaneous old/new frame-array capacity during preparation.
-    /// Excludes caller data, backend allocations and allocator metadata.
+    /// Excludes caller data, fixed-size numerical proof stack storage, backend
+    /// allocations and allocator metadata.
     pub const fn peak_frame_cpu_bytes(self) -> usize {
         self.peak_frame_cpu_bytes
     }

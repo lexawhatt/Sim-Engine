@@ -31,6 +31,12 @@ Development target: 0.4.1. No new registry release is implied by this section.
   normals within one object validation call. The bounded cache does not retain
   state across transforms, meshes, frames or device recovery; generated clipping
   attributes still use the original per-vertex calculations.
+- StrictPortable classification reuses successful source-index calculations
+  within one mesh/model/camera invocation using bounded stack storage. It keeps
+  original triangle-local provenance, failure order and generated-budget checks.
+  A proven all-inside triangle bypasses polygon clipping without reducing its
+  plane, positive-W or orientation requirements. Exact orthographic division
+  skips redundant arithmetic while retaining the same outward uncertainty.
 
 ### Development tooling
 

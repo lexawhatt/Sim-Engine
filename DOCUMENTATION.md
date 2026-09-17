@@ -27,7 +27,7 @@ Rust version.
 
 ## 0.4.1 development performance
 
-The current development package is `0.4.1-dev.2`; the stable installation
+The current development package is `0.4.1-dev.3`; the stable installation
 examples below continue to target the released 0.4 API. No source migration is
 needed for this optimization slice. Pin a tested git revision when trying it.
 
@@ -56,6 +56,15 @@ needed for this optimization slice. Pin a tested git revision when trying it.
   cross-frame or cross-transform cache to invalidate. Distinct normals still
   undergo the original numerical proof. CPU-clipped vertex attributes are
   calculated exactly as before; neither lighting nor fog is approximated.
+- `StrictPortable` classification can reuse successful clip ranges and auxiliary
+  attributes for repeated source indices within a single immutable validation
+  call. Bounded stack storage replaces repeated calculations, not validation:
+  original triangle attribution, source order and generated attributes remain
+  unchanged. Cache collisions always recompute using the complete source index.
+- Triangles proven wholly inside the frustum can bypass polygon clipping after
+  satisfying the same positive-W, plane, unique-vertex and projected-orientation
+  checks. Inconclusive cases enter the original clipper. Exact orthographic
+  division by one still retains the complete outward WGSL uncertainty envelope.
 
 StrictPortable topology, mathematical edges, normal/fog safety contracts, device
 provenance, resource budgets and failure transactionality are unchanged. Dense

@@ -2,6 +2,10 @@
 
 use super::*;
 
+#[cfg(test)]
+#[path = "shader_math_tests.rs"]
+mod tests;
+
 #[derive(Debug, Clone, Copy)]
 pub(super) struct ShaderValueRange {
     pub(super) fixed: f32,
@@ -152,16 +156,27 @@ pub(super) fn wgsl_division_range(
     if denominator.0 < minimum_normal || denominator.1 > maximum_divisor {
         return None;
     }
-    let quotients = [
-        numerator.0 / denominator.0,
-        numerator.0 / denominator.1,
-        numerator.1 / denominator.0,
-        numerator.1 / denominator.1,
-    ];
-    let mut range = rounded_f32_range(
-        quotients.into_iter().fold(f64::INFINITY, f64::min),
-        quotients.into_iter().fold(f64::NEG_INFINITY, f64::max),
-    )?;
+    let bounds = if denominator == (1.0, 1.0)
+        && numerator.0.is_finite()
+        && numerator.1.is_finite()
+        && numerator.0 <= numerator.1
+    {
+        // Orthographic W is often exactly one. Keep the full WGSL division
+        // envelope below, including all three outward ULPs, even in this case.
+        numerator
+    } else {
+        let quotients = [
+            numerator.0 / denominator.0,
+            numerator.0 / denominator.1,
+            numerator.1 / denominator.0,
+            numerator.1 / denominator.1,
+        ];
+        (
+            quotients.into_iter().fold(f64::INFINITY, f64::min),
+            quotients.into_iter().fold(f64::NEG_INFINITY, f64::max),
+        )
+    };
+    let mut range = rounded_f32_range(bounds.0, bounds.1)?;
     // Division permits 2.5 ULP. rounded_f32_range already contributed one
     // outward neighbor, so add two more on each side.
     for _ in 0..2 {

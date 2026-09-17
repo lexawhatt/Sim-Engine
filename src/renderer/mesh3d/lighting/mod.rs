@@ -75,6 +75,19 @@ impl SurfaceLightingVertex {
 }
 
 impl SurfaceTransport {
+    #[cfg(test)]
+    pub(in crate::renderer::mesh3d) fn test_transport(
+        normal_rows: [[f32; 4]; 3],
+        depth_row: Option<[f32; 4]>,
+    ) -> Self {
+        Self {
+            normal_rows,
+            depth_row,
+            lit: true,
+            generated_attributes: true,
+        }
+    }
+
     pub(super) fn new(
         instance: &Mesh3dInstance,
         environment: SurfaceEnvironmentGpu,

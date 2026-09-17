@@ -17,6 +17,7 @@ pub(in crate::renderer) fn assert_gpu_depth_contract(
     material_resource_tests::assert_gpu_sort_budget(device, queue, format);
     color_budget_tests::assert_gpu_color_budget(device, queue, format);
     surface::assert_gpu_surface_contract(device, queue, format);
+    surface::assert_gpu_source_cache_contract(device, queue, format);
     surface::assert_gpu_native_surface_policy(device, queue, format);
     surface::assert_gpu_native_edge_validation(device, queue, format);
     texture::assert_gpu_texture_contract(device, queue, format);

@@ -31,10 +31,12 @@ See the [0.4 integration guide](DOCUMENTATION.md#04-integration-guide) and
 notes from 0.3.0. Intensive profiling-driven optimization is planned for 0.4.1;
 this release does not promise a universal frame rate.
 
-The development branch is now **0.4.1-dev.2**. Its performance work
+The development branch is now **0.4.1-dev.3**. Its performance work
 accelerates Native 3D arithmetic validation, batches compatible repeated
 surfaces, removes unused edge uploads, and reduces repeated lighting/fog
-validation. The retained 3D implementation is organized into focused modules.
+validation. StrictPortable classification reuses bounded per-source calculations
+and skips polygon clipping when all original triangle proofs already succeed.
+The retained 3D implementation is organized into focused modules.
 The public 0.4 API is unchanged;
 see [development performance notes](DOCUMENTATION.md#041-development-performance)
 and [Unreleased changes](CHANGELOG.md#unreleased). This is not a new registry
