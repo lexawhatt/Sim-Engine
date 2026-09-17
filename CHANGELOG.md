@@ -72,6 +72,11 @@ Development target: 0.4.1. No new registry release is implied by this section.
 
 ### Development tooling
 
+- Split the renderer facade into initialization, ordinary scenes, dynamic meshes,
+  particles, scalar fields, targets, pipelines, outcomes and numerical-validation
+  modules. Frame composition/presentation, scene styles and large test fixtures
+  now have separate modules. Public imports, feature boundaries, shader formulas
+  and the mandatory GPU-test entry point are preserved.
 - Added active `lit`, `lit_smooth`, `fog` and `lit_fog` workloads to the 3D diagnostics matrix,
   with dense and small-mesh cases under both surface policies. Fixture provenance
   is distinct from library provenance for controlled before/after comparisons.

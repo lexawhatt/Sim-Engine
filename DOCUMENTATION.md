@@ -27,7 +27,7 @@ Rust version.
 
 ## 0.4.1 development performance
 
-The current development package is `0.4.1-dev.7`; the stable installation
+The current development package is `0.4.1-dev.8`; the stable installation
 examples below continue to target the released 0.4 API. No source migration is
 needed for this optimization slice. Pin a tested git revision when trying it.
 
@@ -147,9 +147,11 @@ for a curved surface with diverse normals, and use `strict` for the unchanged
 strict topology contract. The environment fixtures use the same fixed camera
 as `repeated`, supply actual normals where needed, and log nonzero directional
 light/fog settings. Benchmark source revision, physical GPU and
-binary identity belong with any comparison. The internal 3D modules are grouped
-by allocation, recovery, frame preparation, encoding and numerical proof; this
-reorganization does not change public imports.
+binary identity belong with any comparison. Internal modules separate resource
+ownership, initialization, scene/dynamic/particle/field/target entry points,
+frame composition/presentation, numerical validation, styles and test fixtures.
+This reorganization does not change public imports, feature boundaries, shader
+formulas or the exact mandatory GPU-test entry point.
 
 ## 0.4 integration guide
 
@@ -2560,7 +2562,7 @@ composed, drawn, measured, and recovered.
 | `color.rs` | linear color, sRGB byte conversion, palette |
 | `easing.rs`, `tween.rs` | fallible visual interpolation |
 | `camera.rs` | 2D camera, pseudo-depth, typed screen spaces |
-| `scene.rs` | validated ordered 2D command stream and styles |
+| `scene.rs`, `scene/styles.rs` | validated ordered 2D command stream and visual styles |
 | `field.rs` | finite scalar grid and CPU color-map contracts |
 | `particle.rs` | renderer-independent particle visual state |
 | `pseudo3d.rs` | checked 3D math, transforms, and CPU projection |
@@ -2568,6 +2570,11 @@ composed, drawn, measured, and recovered.
 | `mesh3d/attributes.rs`, `mesh3d/uv.rs` | optional vertex attributes and bounded material UV mapping |
 | `text/font/session.rs` | CPU-only reusable shaping sessions |
 | `renderer/config.rs` | surface mode, DPI, renderer options, recovery setup |
+| `renderer/mod.rs`, `renderer/outcomes.rs` | renderer facade, shared resources, reports and errors |
+| `renderer/initialization.rs`, `renderer/pipelines.rs` | device/surface setup and 2D pipeline construction |
+| `renderer/scenes.rs`, `renderer/dynamic_mesh.rs` | streaming/prepared scenes and bounded triangle updates |
+| `renderer/particles.rs`, `renderer/scalar_fields.rs`, `renderer/targets.rs` | particle/field resources, offscreen composition and trails |
+| `renderer/validation2d/` | camera-relative arithmetic, bounded validation cache and interval proofs |
 | `renderer/tessellation.rs` | 2D scene command to triangle conversion |
 | `renderer/visualization.rs` | fused scientific visualization path |
 | `renderer/mesh3d/mod.rs`, `renderer/mesh3d/api.rs` | retained resource facade and public entry points |
@@ -2581,10 +2588,12 @@ composed, drawn, measured, and recovered.
 | `renderer/mesh3d/restoration.rs`, `renderer/mesh3d/scene_restore.rs` | standalone and shared-scene restoration preserving material policy |
 | `renderer/gpu_timing.rs` | optional bounded render-pass timestamps and correlation |
 | `renderer/frame/cache.rs` | bounded frame scratch, uniform and binding reuse |
+| `renderer/frame/compose.rs`, `renderer/frame/present.rs` | frame admission and surface presentation orchestration |
 | `renderer/frame/encoding.rs` | ordered mixed-source draw encoding and pass-local state reuse |
 | `renderer/frame/uniform_uploads.rs` | bounded packed transfers into independent retained uniforms |
 | `renderer/primitive.wgsl` | 2D, particle, heatmap, and composition shaders |
 | `renderer/mesh3d/primitive.wgsl` | 3D projection and screen-space edge expansion |
+| `renderer/tests/`, `scene/tests.rs`, `renderer/frame/tests.rs` | responsibility-specific CPU/pixel regressions |
 
 The entire renderer module is behind the `wgpu` feature. CPU-side contracts
 remain testable without it.

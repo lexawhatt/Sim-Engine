@@ -31,7 +31,7 @@ See the [0.4 integration guide](DOCUMENTATION.md#04-integration-guide) and
 notes from 0.3.0. Intensive profiling-driven optimization is planned for 0.4.1;
 this release does not promise a universal frame rate.
 
-The development branch is now **0.4.1-dev.7**. Texture region edits now filter
+The development branch is now **0.4.1-dev.8**. Texture region edits now filter
 and upload only affected mip rectangles, preserving complete recovery snapshots
 and old aliases. Its other performance work
 accelerates Native 3D arithmetic validation, batches compatible repeated
@@ -45,7 +45,8 @@ statistics queries constant-time without changing ownership or resource budgets.
 An opt-in Native surface culling path can omit proven offscreen objects after
 all original validation and budget checks. It is disabled by default; small
 shared meshes can cost more draw calls when omissions split instanced batches.
-The retained 3D implementation is organized into focused modules.
+The 2D/3D renderer, scene styles and regression fixtures are now organized into
+focused modules, with unchanged public imports and rendering contracts.
 Existing 0.4 calls keep their default behavior;
 see [development performance notes](DOCUMENTATION.md#041-development-performance)
 and [Unreleased changes](CHANGELOG.md#unreleased). This is not a new registry

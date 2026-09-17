@@ -1,4 +1,5 @@
 use super::*;
+use crate::{LogicalPixels, WorldLength};
 use std::{hint::black_box, time::Instant};
 
 fn circle(index: usize) -> DrawCommand {
