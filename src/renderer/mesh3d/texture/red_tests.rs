@@ -335,7 +335,7 @@ fn assert_asymmetric_uv_clipping(
                 let actual = surface::test_read_pixels(device, queue, target);
                 // Bypass only generated CPU topology for the independent
                 // reference; run the retained WGSL path and hardware clipping.
-                renderer.clipped_surface_objects.clear();
+                renderer.surface_frame.objects.clear();
                 let mut encoder =
                     device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
                 encode_scene_pass(

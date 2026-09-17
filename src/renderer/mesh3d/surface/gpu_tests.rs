@@ -267,7 +267,7 @@ pub(in crate::renderer::mesh3d) fn assert_gpu_surface_contract(
                     }
                     // Compare against hardware clipping of the original retained
                     // topology, including visible and dashed hidden edge depth.
-                    renderer.clipped_surface_objects.clear();
+                    renderer.surface_frame.objects.clear();
                     let mut encoder =
                         device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
                     encode_scene_pass(

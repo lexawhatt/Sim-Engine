@@ -7,6 +7,12 @@ mod inside;
 mod inside_tests;
 
 #[cfg(test)]
+mod scratch_tests;
+
+#[cfg(test)]
+pub(super) use scratch_tests::assert_gpu_preflight_scratch;
+
+#[cfg(test)]
 mod gpu_tests;
 
 #[cfg(test)]
@@ -70,14 +76,16 @@ impl Mesh3dRenderBudget {
         }
     }
 
-    /// Limits transient order-record capacity in frames containing Blend objects.
-    /// Zero rejects such frames; opaque/masked-only frames allocate no order array.
-    /// Actual allocated Vec capacity is checked before GPU writes or clearing.
+    /// Limits active order-record capacity in frames containing Blend objects.
+    /// Zero rejects such frames. Opaque/masked-only frames use no order records,
+    /// but may retain idle storage from earlier frames outside this active limit.
+    /// Oversized retained storage is replaced before ordering under a smaller
+    /// budget; actual active Vec capacity is checked before GPU writes or clearing.
     pub const fn with_max_sorting_bytes(mut self, bytes: usize) -> Self {
         self.max_sorting_bytes = bytes;
         self
     }
-    /// Maximum transient sorting-array capacity, independent of generated geometry.
+    /// Maximum active sorting-array capacity, independent of generated geometry.
     pub const fn max_sorting_bytes(self) -> usize {
         self.max_sorting_bytes
     }
@@ -155,7 +163,9 @@ impl Mesh3dPreflightReport {
         self.surface_policy
     }
 
-    /// Actual transient draw-order capacity, zero for opaque/masked-only frames.
+    /// Actual active draw-order capacity, zero for opaque/masked-only frames.
+    /// A reused renderer may retain a larger compliant allocation than a fresh
+    /// immutable preflight. Idle storage is included in retained frame CPU bytes.
     pub const fn sorting_capacity_bytes(self) -> usize {
         self.sorting_capacity_bytes
     }
@@ -240,6 +250,7 @@ impl SurfaceClipVertex {
         };
 }
 
+#[derive(Default)]
 pub(super) struct SurfaceFrame {
     pub(super) report: Mesh3dPreflightReport,
     pub(super) vertices: Vec<SurfaceClipVertex>,
@@ -248,6 +259,54 @@ pub(super) struct SurfaceFrame {
     pub(super) edges: Vec<SurfaceClipEdge>,
     pub(super) objects: Vec<SurfaceObject>,
     pub(super) order: Vec<material::SurfaceDraw>,
+}
+
+impl SurfaceFrame {
+    /// Discards every active record while retaining reusable allocations.
+    pub(super) fn reset(&mut self) {
+        self.reset_geometry();
+        self.order.clear();
+    }
+
+    fn reset_geometry(&mut self) {
+        self.report = Mesh3dPreflightReport::default();
+        self.vertices.clear();
+        self.colors.clear();
+        self.lighting.clear();
+        self.edges.clear();
+        self.objects.clear();
+    }
+
+    /// Includes idle high-water allocations, not only this frame's active data.
+    pub(super) fn retained_cpu_bytes(&self) -> usize {
+        self.capacity_bytes()
+            .into_iter()
+            .fold(0usize, usize::saturating_add)
+    }
+
+    /// Vertex, color, lighting, edge, object and order allocations, respectively.
+    pub(super) fn capacity_bytes(&self) -> [usize; 6] {
+        [
+            self.vertices
+                .capacity()
+                .saturating_mul(std::mem::size_of::<SurfaceClipVertex>()),
+            self.colors
+                .capacity()
+                .saturating_mul(std::mem::size_of::<MeshColorGpu>()),
+            self.lighting
+                .capacity()
+                .saturating_mul(std::mem::size_of::<SurfaceLightingVertex>()),
+            self.edges
+                .capacity()
+                .saturating_mul(std::mem::size_of::<SurfaceClipEdge>()),
+            self.objects
+                .capacity()
+                .saturating_mul(std::mem::size_of::<SurfaceObject>()),
+            self.order
+                .capacity()
+                .saturating_mul(std::mem::size_of::<material::SurfaceDraw>()),
+        ]
+    }
 }
 
 pub(super) struct SurfaceObject {
@@ -276,13 +335,46 @@ impl SurfaceClipEdge {
     };
 }
 
-pub(super) fn preflight(
+/// Reuses generated staging after draw ordering has already succeeded. Source
+/// validation cannot disturb its error precedence by preparing ordering later.
+/// Failure clears every active array and report, including the prepared order.
+pub(super) fn preflight_into(
     renderer_identity: &Arc<()>,
     scene: &Scene3d,
     camera: Camera3dUniform,
     budget: Mesh3dRenderBudget,
     max_buffer_size: u64,
-) -> Result<SurfaceFrame, Mesh3dRenderError> {
+    frame: &mut SurfaceFrame,
+) -> Result<(), Mesh3dRenderError> {
+    frame.reset_geometry();
+    frame.report.surface_policy = budget.surface_policy();
+    frame.report.sorting_capacity_bytes = if frame.order.is_empty() {
+        0
+    } else {
+        frame.order.capacity() * std::mem::size_of::<material::SurfaceDraw>()
+    };
+    let result = generate_preflight(
+        renderer_identity,
+        scene,
+        camera,
+        budget,
+        max_buffer_size,
+        frame,
+    );
+    if result.is_err() {
+        frame.reset();
+    }
+    result
+}
+
+fn generate_preflight(
+    renderer_identity: &Arc<()>,
+    scene: &Scene3d,
+    camera: Camera3dUniform,
+    budget: Mesh3dRenderBudget,
+    max_buffer_size: u64,
+    frame: &mut SurfaceFrame,
+) -> Result<(), Mesh3dRenderError> {
     let capacity_error = Mesh3dRenderError::GeneratedGeometryCapacityTooLarge;
     let visible_count = scene.visible_object_count();
     let object_bytes = visible_count
@@ -291,18 +383,6 @@ pub(super) fn preflight(
     if u64::try_from(object_bytes).map_or(true, |bytes| bytes > max_buffer_size) {
         return Err(Mesh3dRenderError::InstanceCapacityTooLarge);
     }
-    let mut frame = SurfaceFrame {
-        report: Mesh3dPreflightReport {
-            surface_policy: budget.surface_policy(),
-            ..Mesh3dPreflightReport::default()
-        },
-        vertices: Vec::new(),
-        colors: Vec::new(),
-        lighting: Vec::new(),
-        edges: Vec::new(),
-        objects: Vec::new(),
-        order: Vec::new(),
-    };
     frame
         .objects
         .try_reserve_exact(visible_count)
@@ -457,8 +537,8 @@ pub(super) fn preflight(
         })();
         object_result.map_err(|error: Mesh3dRenderError| error.for_object(instance.id))?;
     }
-    // All source proofs and exact aggregate capacities succeeded. This private
-    // scratch is discarded on failure and never publishes a partial target.
+    // Reserve generated streams only after all source proofs and exact aggregate
+    // budgets succeed. Failure clears lengths without losing reusable capacity.
     frame
         .vertices
         .try_reserve_exact(frame.report.generated_vertices)
@@ -522,7 +602,7 @@ pub(super) fn preflight(
             }
         }
     }
-    Ok(frame)
+    Ok(())
 }
 
 fn record_surface_submission(

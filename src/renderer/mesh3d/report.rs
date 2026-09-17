@@ -345,6 +345,8 @@ impl Mesh3dRenderReport {
     /// Actual camera, instance, edge-uniform and generated-stream bytes written
     /// for this draw. Retained topology/texture updates and diagnostic timestamp
     /// resolution/readback are separate operations and are excluded.
+    /// Exact unchanged camera/instance/edge bytes are not rewritten. A zero
+    /// count still performs full preflight, target clearing and submission.
     pub const fn uploaded_bytes(self) -> usize {
         self.uploaded_bytes
     }
@@ -360,8 +362,9 @@ impl Mesh3dRenderReport {
         self.buffer_allocation_count
     }
 
-    /// Retained CPU instance, edge-uniform and clipped-object array capacity after
-    /// the draw. Excludes scene sources, dynamic-update scratch and backend memory.
+    /// Retained CPU instance, edge-uniform, object, generated-stream and sorting
+    /// array capacity after the draw, including idle high-water storage. Excludes
+    /// scene sources, dynamic-update scratch and backend memory.
     pub const fn retained_frame_cpu_bytes(self) -> usize {
         self.retained_frame_cpu_bytes
     }
@@ -372,14 +375,16 @@ impl Mesh3dRenderReport {
         self.retained_frame_gpu_bytes
     }
 
-    /// Live CPU frame-array capacities during encoding: retained frame arrays
-    /// plus this draw's temporary clipping/color/lighting/edge/sorting arrays.
+    /// Live CPU frame-array capacities during encoding. All arrays are reusable,
+    /// so this equals `retained_frame_cpu_bytes` after a successful draw.
     /// Fixed-size numerical proof stack storage is not included.
     pub const fn staging_capacity_bytes(self) -> usize {
         self.staging_capacity_bytes
     }
 
-    /// Maximum simultaneous old/new frame-array capacity during preparation.
+    /// Conservative upper bound on old/new frame-array capacity during preparation.
+    /// Reused arrays count once; capacity changes count both old and new storage,
+    /// even if the allocator could grow in place. This is not measured process RSS.
     /// Excludes caller data, fixed-size numerical proof stack storage, backend
     /// allocations and allocator metadata.
     pub const fn peak_frame_cpu_bytes(self) -> usize {

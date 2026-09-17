@@ -10,6 +10,7 @@ pub(in crate::renderer) fn assert_gpu_depth_contract(
 ) {
     batch_tests::assert_gpu_batch_contract(device, queue, format);
     edge_upload_tests::assert_gpu_edge_upload_contract(device, queue, format);
+    frame_upload_tests::assert_gpu_dirty_frame_upload_contract(device, queue, format);
     dynamic::assert_gpu_dynamic_contract(device, queue, format);
     vertex_color_tests::assert_gpu_vertex_color_contract(device, queue, format);
     material_tests::assert_gpu_material_contract(device, queue, format);
@@ -18,6 +19,7 @@ pub(in crate::renderer) fn assert_gpu_depth_contract(
     color_budget_tests::assert_gpu_color_budget(device, queue, format);
     surface::assert_gpu_surface_contract(device, queue, format);
     surface::assert_gpu_source_cache_contract(device, queue, format);
+    surface::assert_gpu_preflight_scratch(device, queue);
     surface::assert_gpu_native_surface_policy(device, queue, format);
     surface::assert_gpu_native_edge_validation(device, queue, format);
     texture::assert_gpu_texture_contract(device, queue, format);

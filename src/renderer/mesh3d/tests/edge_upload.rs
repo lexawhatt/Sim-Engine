@@ -131,10 +131,10 @@ pub(super) fn assert_gpu_edge_upload_contract(
         let edged = render(&mut renderer, &scene);
         assert_eq!(edged.object_count(), 18);
         assert_eq!(edged.edge_count(), 1);
-        assert_eq!(edged.upload_calls(), 3);
+        assert_eq!(edged.upload_calls(), 2);
         assert_eq!(
             edged.uploaded_bytes(),
-            camera_bytes + 18 * instance_bytes + 18 * renderer.edge_object_stride
+            18 * instance_bytes + 18 * renderer.edge_object_stride
         );
         assert_eq!(edged.buffer_allocation_count(), 1);
         assert_eq!(renderer.instance_capacity, 32);
@@ -153,11 +153,8 @@ pub(super) fn assert_gpu_edge_upload_contract(
 
         scene.set_visible(late_edge, false).unwrap();
         let restored = render(&mut renderer, &scene);
-        assert_eq!(restored.upload_calls(), 2);
-        assert_eq!(
-            restored.uploaded_bytes(),
-            camera_bytes + 17 * instance_bytes
-        );
+        assert_eq!(restored.upload_calls(), 0);
+        assert_eq!(restored.uploaded_bytes(), 0);
         assert_eq!(restored.buffer_allocation_count(), 0);
         assert_eq!(restored.edge_count(), 0);
         assert_eq!(renderer.edge_object_bytes.len(), 0);
@@ -176,8 +173,8 @@ pub(super) fn assert_gpu_edge_upload_contract(
         }
         let grown = render(&mut renderer, &scene);
         assert_eq!(grown.object_count(), 33);
-        assert_eq!(grown.upload_calls(), 2);
-        assert_eq!(grown.uploaded_bytes(), camera_bytes + 33 * instance_bytes);
+        assert_eq!(grown.upload_calls(), 1);
+        assert_eq!(grown.uploaded_bytes(), 33 * instance_bytes);
         assert_eq!(grown.buffer_allocation_count(), 1);
         assert_eq!(renderer.instance_capacity, 64);
         assert_eq!(renderer.edge_object_capacity, 32);
@@ -195,8 +192,8 @@ pub(super) fn assert_gpu_edge_upload_contract(
         assert_eq!(empty.edge_count(), 0);
         assert_eq!(empty.triangle_count(), 0);
         assert_eq!(empty.draw_call_count(), 0);
-        assert_eq!(empty.upload_calls(), 1);
-        assert_eq!(empty.uploaded_bytes(), camera_bytes);
+        assert_eq!(empty.upload_calls(), 0);
+        assert_eq!(empty.uploaded_bytes(), 0);
         assert_eq!(empty.buffer_allocation_count(), 0);
         assert_eq!(renderer.instance_capacity, 64);
         assert_eq!(renderer.instances.capacity(), instance_capacity);

@@ -37,6 +37,18 @@ Development target: 0.4.1. No new registry release is implied by this section.
   A proven all-inside triangle bypasses polygon clipping without reducing its
   plane, positive-W or orientation requirements. Exact orthographic division
   skips redundant arithmetic while retaining the same outward uncertainty.
+- 3D frame preparation retains clipping, attribute, object and sorting storage
+  across draws. Every draw still validates all sources and exact budgets; a
+  rejected draw clears derived records without changing the target or GPU history.
+  A smaller sorting budget replaces oversized idle capacity transactionally.
+- Camera, instance and edge uniforms use exact byte comparisons against the
+  previous GPU contents and upload at most one changed range per buffer. Growth,
+  lost staging history and renderer replacement force reinitialization. Unchanged
+  draws still clear, encode, submit and produce GPU timing samples; generated clip
+  streams remain uploaded each draw. Upload reports count actual queue writes.
+- Frame CPU memory reports include retained generated/sorting capacity, even
+  when idle. Preparation peak is an explicit conservative old/new allocation
+  overlap bound, not process RSS or allocator-internal telemetry.
 
 ### Development tooling
 

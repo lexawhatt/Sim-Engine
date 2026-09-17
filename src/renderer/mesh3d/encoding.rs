@@ -91,7 +91,7 @@ pub(super) fn encode_ordered_scene_pass(
         if let Some(material) = material {
             pass.set_bind_group(1, material.bind_group(), &[]);
         }
-        let object = renderer.clipped_surface_objects.get(instance_index);
+        let object = renderer.surface_frame.objects.get(instance_index);
         if let Some(range) = object.and_then(|object| object.generated.as_ref()) {
             if range.is_empty() {
                 continue;
@@ -148,7 +148,8 @@ pub(super) fn encode_ordered_scene_pass(
         while let Some(&(next_index, next)) = draws.peek() {
             if next_index != instance_index + instance_count
                 || renderer
-                    .clipped_surface_objects
+                    .surface_frame
+                    .objects
                     .get(next_index)
                     .is_some_and(|object| object.generated.is_some())
                 || !batch::compatible(instance, next)
@@ -210,7 +211,8 @@ pub(super) fn encode_ordered_scene_pass(
         let dynamic_offset = (object_index * renderer.edge_object_stride) as u32;
         pass.set_bind_group(1, &renderer.edge_object_bind_group, &[dynamic_offset]);
         if let Some(range) = renderer
-            .clipped_surface_objects
+            .surface_frame
+            .objects
             .get(object_index)
             .and_then(|object| object.generated_edges.as_ref())
         {
@@ -244,7 +246,8 @@ pub(super) fn encode_ordered_scene_pass(
         let dynamic_offset = (object_index * renderer.edge_object_stride) as u32;
         pass.set_bind_group(1, &renderer.edge_object_bind_group, &[dynamic_offset]);
         if let Some(range) = renderer
-            .clipped_surface_objects
+            .surface_frame
+            .objects
             .get(object_index)
             .and_then(|object| object.generated_edges.as_ref())
         {

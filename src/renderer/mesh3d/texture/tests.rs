@@ -141,7 +141,7 @@ pub(in crate::renderer::mesh3d) fn assert_gpu_texture_contract(
                 .unwrap();
             assert!(report.preflight.generated_triangles > 0);
             let actual = surface::test_read_pixels(device, queue, &target);
-            renderer.clipped_surface_objects.clear();
+            renderer.surface_frame.objects.clear();
             let mut encoder =
                 device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
             encode_scene_pass(

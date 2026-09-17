@@ -8,8 +8,12 @@ mod encoding;
 use encoding::*;
 mod api;
 mod frame;
+#[cfg(test)]
+#[path = "tests/frame_upload.rs"]
+mod frame_upload_tests;
 mod pipelines;
 mod report;
+mod upload_changes;
 pub use report::{
     Mesh3dObjectError, Mesh3dRenderError, Mesh3dRenderReport, Mesh3dResourceError,
     Scene3dRestoreReport,
@@ -51,7 +55,7 @@ mod edge_upload_tests;
 
 mod surface;
 pub use surface::{Mesh3dPreflightReport, Mesh3dRenderBudget};
-use surface::{SurfaceClipEdge, SurfaceClipVertex, SurfaceFrame, SurfaceObject};
+use surface::{SurfaceClipEdge, SurfaceClipVertex, SurfaceFrame};
 
 mod texture;
 use texture::{MeshTextureRenderer, MeshUvGpu};
@@ -280,7 +284,7 @@ pub(super) struct Mesh3dRenderer {
     clipped_surface_pipeline: SurfacePipelines,
     clipped_surface_buffer: Option<wgpu::Buffer>,
     clipped_surface_capacity: usize,
-    clipped_surface_objects: Vec<SurfaceObject>,
+    surface_frame: SurfaceFrame,
     clipped_visible_edge_pipeline: wgpu::RenderPipeline,
     clipped_hidden_edge_pipeline: wgpu::RenderPipeline,
     clipped_edge_buffer: Option<wgpu::Buffer>,
@@ -288,6 +292,7 @@ pub(super) struct Mesh3dRenderer {
     visible_edge_pipeline: wgpu::RenderPipeline,
     hidden_edge_pipeline: wgpu::RenderPipeline,
     camera_uniform_buffer: wgpu::Buffer,
+    previous_camera: Option<Camera3dUniform>,
     camera_bind_group: wgpu::BindGroup,
     instance_buffer: wgpu::Buffer,
     instance_capacity: usize,

@@ -27,7 +27,7 @@ Rust version.
 
 ## 0.4.1 development performance
 
-The current development package is `0.4.1-dev.3`; the stable installation
+The current development package is `0.4.1-dev.4`; the stable installation
 examples below continue to target the released 0.4 API. No source migration is
 needed for this optimization slice. Pin a tested git revision when trying it.
 
@@ -65,6 +65,24 @@ needed for this optimization slice. Pin a tested git revision when trying it.
   satisfying the same positive-W, plane, unique-vertex and projected-orientation
   checks. Inconclusive cases enter the original clipper. Exact orthographic
   division by one still retains the complete outward WGSL uncertainty envelope.
+- Frame preparation retains object, clipping, color, lighting, edge and sorting
+  arrays. It repeats all validation and clears active derived records on every
+  failure. Generated limits apply to active geometry/upload counts, not idle
+  high-water capacity. Active sorting capacity must still fit the current
+  sorting budget; an oversized previous allocation is replaced transactionally.
+  A fresh non-mutating preflight may therefore report less sorting capacity than
+  a draw reusing a larger compliant allocation; semantic counts are unchanged.
+- Camera/instance/edge uniform uploads compare exact POD bytes with the immediate
+  previous GPU contents, not scene IDs or revision numbers. A changed buffer gets
+  one aligned first-to-last changed span. New buffers or missing staging history
+  force full active-prefix initialization. Zero upload bytes do not skip validation,
+  target clearing, drawing, submission or GPU timing. Generated clip streams are
+  still uploaded on each draw.
+- `retained_frame_cpu_bytes()` includes all retained frame-array capacities,
+  including idle clipping/sorting storage. `staging_capacity_bytes()` equals it
+  at encoding time. `peak_frame_cpu_bytes()` is a conservative capacity-overlap
+  bound: reused arrays count once; replaced arrays count old plus new storage.
+  It excludes fixed proof stacks and allocator/driver internals, and is not RSS.
 
 StrictPortable topology, mathematical edges, normal/fog safety contracts, device
 provenance, resource budgets and failure transactionality are unchanged. Dense
@@ -358,8 +376,10 @@ Device and scene restoration preserve alpha texture data and material styles.
 
 Blend sorting uses bounded fallible staging before uploads or target clearing.
 Set `Mesh3dRenderBudget::with_max_sorting_bytes` to bound it; the preflight
-report's `sorting_capacity_bytes()` describes this transient allocation, not
-additional retained mesh memory. Scenes without Blend need no sorting array.
+report's `sorting_capacity_bytes()` describes the active allocation, not retained
+mesh memory. Reused capacity can exceed fresh validation capacity while fitting
+the same budget. Scenes without Blend report zero active sorting; idle storage
+remains reusable and is counted in retained frame CPU memory.
 
 Manual inspection from a matching 0.4 checkout:
 

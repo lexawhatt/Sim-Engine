@@ -1,4 +1,4 @@
-//! Bounded transient draw ordering and material uniform encoding.
+//! Reusable bounded draw ordering and material uniform encoding.
 
 use super::*;
 
@@ -29,11 +29,24 @@ pub(super) fn surface_parameters(style: Option<crate::SurfaceStyle3d>) -> [f32; 
     })
 }
 
+#[cfg(test)]
 pub(super) fn prepare_order(
     scene: &Scene3d,
     camera: Camera3d,
     budget: Mesh3dRenderBudget,
 ) -> Result<Vec<SurfaceDraw>, Mesh3dRenderError> {
+    let mut order = Vec::new();
+    prepare_order_into(scene, camera, budget, &mut order)?;
+    Ok(order)
+}
+
+pub(super) fn prepare_order_into(
+    scene: &Scene3d,
+    camera: Camera3d,
+    budget: Mesh3dRenderBudget,
+    order: &mut Vec<SurfaceDraw>,
+) -> Result<(), Mesh3dRenderError> {
+    order.clear();
     if !scene.instances().iter().any(|instance| {
         instance.visible
             && instance
@@ -41,9 +54,50 @@ pub(super) fn prepare_order(
                 .surface_style()
                 .is_some_and(|surface| surface.alpha_mode() == SurfaceAlphaMode3d::Blend)
     }) {
-        return Ok(Vec::new());
+        return Ok(());
     }
     let count = scene.visible_object_count();
+    prepare_order_storage(order, count, budget, |order| {
+        for (visible_index, (scene_index, instance)) in scene
+            .instances()
+            .iter()
+            .enumerate()
+            .filter(|(_, instance)| instance.visible)
+            .enumerate()
+        {
+            let blended = instance
+                .style
+                .surface_style()
+                .is_some_and(|surface| surface.alpha_mode() == SurfaceAlphaMode3d::Blend);
+            let depth = if blended {
+                let rows = instance.transform.model_rows().map_err(|_| {
+                    Mesh3dRenderError::InvalidGeometryTransform.for_object(instance.id)
+                })?;
+                bounds_depth(instance.mesh.source(), rows, camera)
+            } else {
+                0.0
+            };
+            order.push(SurfaceDraw {
+                scene_index,
+                visible_index,
+                depth,
+                blended,
+            });
+        }
+        // Explicit insertion tie-break makes an allocation-free unstable sort stable
+        // for the public contract, while retaining visible indices for GPU uniforms.
+        order.sort_unstable_by(compare_draws);
+        Ok(())
+    })
+}
+
+fn prepare_order_storage(
+    order: &mut Vec<SurfaceDraw>,
+    count: usize,
+    budget: Mesh3dRenderBudget,
+    populate: impl FnOnce(&mut Vec<SurfaceDraw>) -> Result<(), Mesh3dRenderError>,
+) -> Result<(), Mesh3dRenderError> {
+    order.clear();
     let check = |capacity: usize| {
         let actual = capacity
             .checked_mul(std::mem::size_of::<SurfaceDraw>())
@@ -57,42 +111,28 @@ pub(super) fn prepare_order(
         Ok(())
     };
     check(count)?;
-    let mut order = Vec::new();
+
+    // A smaller current budget constrains active sorting, not an old idle
+    // high-water allocation. Commit its bounded replacement only on success.
+    if check(order.capacity()).is_err() {
+        let mut replacement = Vec::new();
+        replacement
+            .try_reserve_exact(count)
+            .map_err(|_| Mesh3dRenderError::InstanceCapacityTooLarge)?;
+        check(replacement.capacity())?;
+        populate(&mut replacement)?;
+        *order = replacement;
+        return Ok(());
+    }
     order
         .try_reserve_exact(count)
         .map_err(|_| Mesh3dRenderError::InstanceCapacityTooLarge)?;
     check(order.capacity())?;
-    for (visible_index, (scene_index, instance)) in scene
-        .instances()
-        .iter()
-        .enumerate()
-        .filter(|(_, instance)| instance.visible)
-        .enumerate()
-    {
-        let blended = instance
-            .style
-            .surface_style()
-            .is_some_and(|surface| surface.alpha_mode() == SurfaceAlphaMode3d::Blend);
-        let depth = if blended {
-            let rows = instance
-                .transform
-                .model_rows()
-                .map_err(|_| Mesh3dRenderError::InvalidGeometryTransform.for_object(instance.id))?;
-            bounds_depth(instance.mesh.source(), rows, camera)
-        } else {
-            0.0
-        };
-        order.push(SurfaceDraw {
-            scene_index,
-            visible_index,
-            depth,
-            blended,
-        });
+    let result = populate(order);
+    if result.is_err() {
+        order.clear();
     }
-    // Explicit insertion tie-break makes an allocation-free unstable sort stable
-    // for the public contract, while retaining visible indices for GPU uniforms.
-    order.sort_unstable_by(compare_draws);
-    Ok(order)
+    result
 }
 
 fn compare_draws(left: &SurfaceDraw, right: &SurfaceDraw) -> std::cmp::Ordering {
@@ -136,6 +176,107 @@ fn bounds_depth(source: &Mesh3d, model: [[f32; 4]; 3], camera: Camera3d) -> f64 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn draw(index: usize) -> SurfaceDraw {
+        SurfaceDraw {
+            scene_index: index,
+            visible_index: index,
+            depth: index as f64,
+            blended: true,
+        }
+    }
+
+    #[test]
+    fn sorting_scratch_reuses_capacity_and_replaces_an_oversized_idle_allocation() {
+        let mut order = Vec::with_capacity(32);
+        let original = order.as_ptr();
+        let budget = Mesh3dRenderBudget::default();
+        prepare_order_storage(&mut order, 8, budget, |order| {
+            order.extend((0..8).map(draw));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(order.as_ptr(), original);
+        assert_eq!(order.len(), 8);
+        let single = std::mem::size_of::<SurfaceDraw>();
+        prepare_order_storage(
+            &mut order,
+            1,
+            budget.with_max_sorting_bytes(single),
+            |order| {
+                order.push(draw(7));
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(order.capacity(), 1);
+        assert_eq!(order[0].scene_index, 7);
+    }
+
+    #[test]
+    fn sorting_scratch_failure_clears_records_and_preserves_replaced_storage() {
+        let mut order = Vec::with_capacity(32);
+        order.push(draw(0));
+        let original = order.as_ptr();
+        let capacity = order.capacity();
+        for budget in [
+            Mesh3dRenderBudget::default(),
+            Mesh3dRenderBudget::default()
+                .with_max_sorting_bytes(std::mem::size_of::<SurfaceDraw>()),
+        ] {
+            assert_eq!(
+                prepare_order_storage(&mut order, 1, budget, |order| {
+                    order.push(draw(9));
+                    Err(Mesh3dRenderError::InvalidGeometryTransform)
+                }),
+                Err(Mesh3dRenderError::InvalidGeometryTransform)
+            );
+            assert!(order.is_empty());
+            assert_eq!(order.as_ptr(), original);
+            assert_eq!(order.capacity(), capacity);
+        }
+        assert_eq!(
+            prepare_order_storage(
+                &mut order,
+                1,
+                Mesh3dRenderBudget::default().with_max_sorting_bytes(0),
+                |_| panic!("count budget must fail before population"),
+            ),
+            Err(Mesh3dRenderError::SortingBudgetExceeded {
+                limit: 0,
+                actual: std::mem::size_of::<SurfaceDraw>(),
+            })
+        );
+        assert!(order.is_empty());
+        assert_eq!(order.as_ptr(), original);
+        assert_eq!(order.capacity(), capacity);
+    }
+
+    #[test]
+    fn sorting_scratch_no_blend_ignores_idle_capacity_under_zero_budget() {
+        let mut order = vec![draw(0); 32];
+        let original = order.as_ptr();
+        let capacity = order.capacity();
+        let scene = Scene3d::new(Color::BLACK).unwrap();
+        let camera = Camera3d::look_at(
+            Vec3::new(0.0, 0.0, 3.0).unwrap(),
+            Vec3::ZERO,
+            Vec3::Y,
+            Projection3d::orthographic(world(2.0), 1.0, world(0.5), world(8.0)).unwrap(),
+        )
+        .unwrap();
+        prepare_order_into(
+            &scene,
+            camera,
+            Mesh3dRenderBudget::default().with_max_sorting_bytes(0),
+            &mut order,
+        )
+        .unwrap();
+        assert!(order.is_empty());
+        assert_eq!(order.as_ptr(), original);
+        assert_eq!(order.capacity(), capacity);
+    }
+
     #[test]
     fn surface_depth_order_keeps_opaque_first_and_insertion_ties() {
         let make = |index, depth, blended| SurfaceDraw {
