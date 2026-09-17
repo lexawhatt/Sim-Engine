@@ -7,7 +7,16 @@ changes.
 
 ## Unreleased
 
-Development target: 0.4.1. No new registry release is implied by this section.
+No changes recorded.
+
+## 0.4.1 - 2026-09-17
+
+Profiling-driven CPU, upload and texture-update improvements, plus source and
+test organization. Existing 0.4 integrations require no source migration.
+Rendering quality, validation, resource budgets, immutable aliases and recovery
+contracts are preserved. Offscreen surface culling is explicitly opt-in;
+performance depends on the workload and qualified adapter, not a universal FPS
+guarantee.
 
 ### Performance
 

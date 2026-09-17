@@ -10,7 +10,7 @@ clipping, interpolation, GPU resources, composition, recovery, and rendering
 diagnostics. Physics, simulation stepping, domain entities, UI navigation, and
 plugins remain in the host application.
 
-This guide describes **Sim;Engine 0.4.0**. The crate remains pre-1.0, and its
+This guide describes **Sim;Engine 0.4.1**. The crate remains pre-1.0, and its
 supported release target is Linux with Vulkan. A concrete adapter/driver is
 supported when the mandatory semantic fixture passes on it;
 untested drivers are not inferred from Mesa evidence. The minimum supported
@@ -21,17 +21,16 @@ has a reproduced MSAA scissor leak and does not pass the rendering contract;
 its upstream fix is included in [Mesa 25.3](https://docs.mesa3d.org/relnotes/25.3.0.html).
 This does not impose an Ubuntu-version requirement on host applications.
 
-Version 0.4.0 adds Opaque/Mask/Blend 3D materials, sidedness, vertex colors,
+The 0.4 API includes Opaque/Mask/Blend 3D materials, sidedness, vertex colors,
 optional Lambert lighting and distance fog, capacity-reusing mesh updates,
 mipmapped and repeating textures, atomic region edits, and complete material
 recovery. CPU-only fonts and reusable pre-shaped text reduce repeated text work;
 optional GPU timestamps and changing-scene fixtures make costs observable.
 See the [0.4 integration guide](DOCUMENTATION.md#04-integration-guide) and
 [0.4.0 changelog](CHANGELOG.md#040---2026-09-12) for contracts and migration
-notes from 0.3.0. Intensive profiling-driven optimization is planned for 0.4.1;
-this release does not promise a universal frame rate.
+notes from 0.3.0.
 
-The development branch is now **0.4.1-dev.8**. Texture region edits now filter
+Version **0.4.1** focuses on profiling-driven optimization. Texture region edits filter
 and upload only affected mip rectangles, preserving complete recovery snapshots
 and old aliases. Its other performance work
 accelerates Native 3D arithmetic validation, batches compatible repeated
@@ -50,10 +49,11 @@ focused modules, with unchanged public imports and rendering contracts.
 External tests follow their owning subsystem, use contract-based names, and
 share raw GPU readback transport without sharing expected-pixel calculations.
 CI checks the source-layout conventions.
-Existing 0.4 calls keep their default behavior;
-see [development performance notes](DOCUMENTATION.md#041-development-performance)
-and [Unreleased changes](CHANGELOG.md#unreleased). This is not a new registry
-release or a replacement for consumer testing.
+Existing 0.4 integrations need no source migration. See the
+[performance guide](DOCUMENTATION.md#041-performance-guide) and
+[0.4.1 changelog](CHANGELOG.md#041---2026-09-17) for the complete delta and
+remaining costs. No universal frame rate or replacement for consumer testing
+is promised.
 
 ## Documentation
 
@@ -126,7 +126,7 @@ retaining arithmetic checks; mathematical-edge validation stays strict.
 Blend sorts objects, not triangles within a mesh; intersecting transparent
 surfaces can still overlap incorrectly. General section materials, hatching,
 projected 3D anchors, 3D picking, point lights, shadows and PBR remain outside
-0.4.0. Unlit remains available and is the default.
+0.4.1. Unlit remains available and is the default.
 
 An additional Intel UHD (CML GT2) / Mesa 26.1.6 Vulkan qualification run did
 not complete the material readback fixture; the same wait reproduced on the
@@ -138,21 +138,21 @@ NVIDIA or software-Vulkan runs. See [known boundaries](DOCUMENTATION.md#28-known
 The default feature set includes the `wgpu` renderer:
 
 ```bash
-cargo add sim-engine@0.4
+cargo add sim-engine@0.4.1
 ```
 
 or add it directly to `Cargo.toml`:
 
 ```toml
 [dependencies]
-sim-engine = "0.4"
+sim-engine = "0.4.1"
 ```
 
 Use core visual-state APIs without GPU dependencies:
 
 ```toml
 [dependencies]
-sim-engine = { version = "0.4", default-features = false }
+sim-engine = { version = "0.4.1", default-features = false }
 ```
 
 Run the examples from a repository checkout matching the library version:
@@ -192,7 +192,7 @@ GPU copy work are reported separately from host-upload bytes.
 Enable the optional `text` feature:
 
 ```toml
-sim-engine = { version = "0.4", features = ["text"] }
+sim-engine = { version = "0.4.1", features = ["text"] }
 ```
 
 ```rust,no_run

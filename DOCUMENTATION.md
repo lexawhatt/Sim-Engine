@@ -1,11 +1,13 @@
 # Sim;Engine Documentation
 
-This is the integration and engineering guide for **Sim;Engine 0.4.0**.
+This is the integration and engineering guide for **Sim;Engine 0.4.1**.
 Start with the [0.4 integration guide](#04-integration-guide) for new rendering,
 text and resource workflows, or the handbook below for the complete library.
 For older integrations, use the
 [archived 0.3 guide](https://github.com/lexawhatt/Sim-Engine/blob/v0.3.0/DOCUMENTATION.md).
-The [0.4.0 changelog](CHANGELOG.md#040---2026-09-12) includes migration notes.
+The [0.4.1 changelog](CHANGELOG.md#041---2026-09-17) describes the optimization
+release; the [0.4.0 changelog](CHANGELOG.md#040---2026-09-12) retains migration
+notes from 0.3.
 This guide is divided into two parts:
 
 - [Integration Handbook](#part-i-integration-handbook) - how to add the crate,
@@ -25,11 +27,12 @@ Sim;Engine remains pre-1.0. Linux with
 Vulkan is its supported release target, and Rust 1.90 is the minimum supported
 Rust version.
 
-## 0.4.1 development performance
+## 0.4.1 performance guide
 
-The current development package is `0.4.1-dev.8`; the stable installation
-examples below continue to target the released 0.4 API. No source migration is
-needed for this optimization slice. Pin a tested git revision when trying it.
+Version 0.4.1 reduces CPU validation, staging and upload work while retaining
+the 0.4 API and rendering contracts. Existing integrations require no source
+migration. The optional offscreen surface optimization stays disabled until
+the host explicitly enables it; measure its cost on representative scenes.
 
 - Texture region edits regenerate and upload only affected lower-mip rectangles.
   Their bytes match complete regeneration, including odd dimensions and alpha.
@@ -133,7 +136,7 @@ adapter. Report preflight, staging/upload, encode/submit, GPU pass timings and
 surface acquisition separately. FPS also includes desktop scheduling and is not
 a standalone measure of CPU savings. Preserve all trials and check actual
 submitted counts, uploads and complete timestamp coverage before interpreting
-speedups. See the [Unreleased changelog](CHANGELOG.md#unreleased).
+speedups. See the [0.4.1 changelog](CHANGELOG.md#041---2026-09-17).
 
 Measure genuinely active lighting and fog separately from unlit surfaces:
 
@@ -155,10 +158,10 @@ formulas or the exact mandatory GPU-test entry point.
 
 ## 0.4 integration guide
 
-Version 0.4.0 delivers dynamic visual-state updates, material/texture lifecycle,
-reusable text preparation and reproducible measurements. Intensive
-profiling-driven optimization is planned for 0.4.1; existing reuse, validation
-and budget guarantees already apply. No universal frame rate is promised.
+The 0.4 API provides dynamic visual-state updates, material/texture lifecycle,
+reusable text preparation and reproducible measurements. Version 0.4.1 adds
+profiling-driven optimizations while preserving reuse, validation and budget
+guarantees. No universal frame rate is promised.
 
 For a git integration, pin a tested commit with Cargo's `rev` field and retain
 the host lockfile. A moving branch or `_DEV` label is not reproducible evidence.
@@ -574,7 +577,7 @@ Initial detachment and scratch growth are reported during warmup, separately
 from steady-state allocation counts. Other cases include `repeated`, `outside`,
 and `host_hidden`, for example `--objects 1024 --side 1`. By default `outside`
 still submits the geometry; `host_hidden` explicitly hides the same distant
-objects. Development 0.4.1 adds an explicit `--culling on` Native comparison;
+objects. Version 0.4.1 adds an explicit `--culling on` Native comparison;
 it never infers host visibility from distance alone.
 
 All measured frames must be `Drawn`, source revision order is deterministic,
@@ -586,8 +589,8 @@ timestamp queries and matches them to measured report IDs where supported. Mesh
 upload/allocation counters exclude camera/composition resources; thread-local
 allocation counts include backend calls on that thread, not worker threads.
 Host source snapshot bytes overlap scene CPU bytes and must not be added to
-them. This baseline does not replace the release matrix. Intensive large-scene optimization
-using these measurements is planned for 0.4.1.
+them. These diagnostics guide the 0.4.1 optimizations and future workload-specific
+work; they do not replace the release matrix.
 
 ### Texture lifecycle and repeating tiles
 
@@ -675,8 +678,8 @@ rectangle/stride/alpha/budget checks leave CPU pixels, GPU pixels and scene
 accounting unchanged. Device loss remains an external GPU failure handled by
 the existing recovery contract, not a promise to roll back physical hardware.
 
-The no-mipmap path uploads only the patch. Released 0.4.0 regenerates/uploads
-all lower levels. The 0.4.1 development path instead follows the filter footprint
+The no-mipmap path uploads only the patch. Version 0.4.0 regenerated/uploaded
+all lower levels. Version 0.4.1 instead follows the filter footprint
 through every mip and regenerates/uploads only affected rectangles, byte-for-byte
 equivalent to full filtering. This includes odd and one-texel-wide dimensions.
 `Texture3dUpdateBudget` separately limits upload, staging, peak recovery, peak GPU
@@ -802,14 +805,14 @@ The default feature set includes the `wgpu` backend:
 
 ```toml
 [dependencies]
-sim-engine = "0.4"
+sim-engine = "0.4.1"
 ```
 
 Use the CPU-side visual-state APIs without GPU dependencies:
 
 ```toml
 [dependencies]
-sim-engine = { version = "0.4", default-features = false }
+sim-engine = { version = "0.4.1", default-features = false }
 ```
 
 | Configuration | Provides |
@@ -822,7 +825,7 @@ sim-engine = { version = "0.4", default-features = false }
 For CPU fonts without GPU dependencies:
 
 ```toml
-sim-engine = { version = "0.4", default-features = false, features = ["fonts"] }
+sim-engine = { version = "0.4.1", default-features = false, features = ["fonts"] }
 ```
 
 Window creation is deliberately outside the crate. The host may use `winit`,
@@ -1644,7 +1647,7 @@ No system font is implicitly selected, and no font is included in the library
 binary. The demonstration font and its license live under `examples/assets/fonts`.
 
 ```toml
-sim-engine = { version = "0.4", features = ["text"] }
+sim-engine = { version = "0.4.1", features = ["text"] }
 ```
 
 The default `wgpu` feature alone still accepts host-shaped glyph atlases and
@@ -2127,7 +2130,7 @@ also bounds total retained plus generated triangles before optional culling.
 `Mesh3dPreflightReport` exposes `submitted_triangle_count` and
 `generated_object_count`; clipped/discarded source counts are `Some` for
 StrictPortable and `None` for Native, not hardware visibility measurements.
-Development 0.4.1 optionally omits proven offscreen Native surface-only objects
+Version 0.4.1 optionally omits proven offscreen Native surface-only objects
 after all these checks; separate culled counts explain reduced submissions,
 without reducing the admission budget or changing host visibility.
 Validation covers the complete visible set and additional work
@@ -2936,10 +2939,13 @@ and measurement method.
 
 ### 30. Official release procedure
 
-The commands below target the 0.4.0 release. For a later release, substitute its
+The commands below target the 0.4.1 release. For a later release, substitute its
 version and finish its dated changelog and migration notes first. Do not run
 publication or create a tag while review or the exact-commit release gate is
-pending.
+pending. Run from the Sim-Engine repository, not a consumer checkout, and stop
+on any failed command. A version/docs-only change still needs its own clean
+release commit and matching completion evidence; a prerelease SHA is not proof
+of the final release archive.
 
 Publishing a crates.io version is permanent: the same version cannot be
 overwritten or deleted. A broken version can be yanked, but its archive remains
@@ -2968,10 +2974,11 @@ cargo login
 
 ```bash
 git fetch origin
+cargo pkgid -p sim-engine@0.4.1
 test -z "$(git status --porcelain --untracked-files=all)"
 test "$(git rev-parse HEAD)" = "$(git rev-parse origin/master)"
-test -z "$(git tag -l v0.4.0)"
-test -z "$(git ls-remote --tags origin refs/tags/v0.4.0)"
+test -z "$(git tag -l v0.4.1)"
+test -z "$(git ls-remote --tags origin refs/tags/v0.4.1)"
 ./scripts/linux_release_gate.sh
 ```
 
@@ -2985,12 +2992,12 @@ grep -Fxq "vcs_sha=$release_sha" \
 grep -Fxq 'status=passed' target/linux-release-evidence/completion.txt
 cargo package --list
 cargo package --locked
-crate=target/package/sim-engine-0.4.0.crate
-tar -xOf "$crate" sim-engine-0.4.0/.cargo_vcs_info.json \
+crate=target/package/sim-engine-0.4.1.crate
+tar -xOf "$crate" sim-engine-0.4.1/.cargo_vcs_info.json \
   | grep -Fq "\"sha1\": \"$release_sha\""
-! tar -xOf "$crate" sim-engine-0.4.0/.cargo_vcs_info.json \
+! tar -xOf "$crate" sim-engine-0.4.1/.cargo_vcs_info.json \
   | grep -Fq '"dirty": true'
-cargo publish --dry-run --locked
+cargo publish -p sim-engine@0.4.1 --registry crates-io --dry-run --locked
 ```
 
 `cargo package` explicitly refreshes the local archive; do not assume a publish
@@ -3003,12 +3010,12 @@ archive and file list if anything changed since the gate. Do not continue if
 #### 2. Publish the immutable crate
 
 ```bash
-cargo publish --locked
+cargo publish -p sim-engine@0.4.1 --registry crates-io --locked
 ```
 
 Cargo may time out while waiting for the new version to appear in the registry
 index even after a successful upload. Before retrying, check the crates.io
-package page or run `cargo info sim-engine@0.4.0`; retrying an accepted version
+package page or run `cargo info sim-engine@0.4.1`; retrying an accepted version
 cannot overwrite it.
 
 #### 3. Tag the published commit
@@ -3019,39 +3026,40 @@ release tag for an upload that never succeeded, while the packaged
 
 ```bash
 test "$(git rev-parse HEAD)" = "$release_sha"
-git tag -a v0.4.0 -m "Sim;Engine v0.4.0"
-test "$(git rev-list -n 1 v0.4.0)" = "$release_sha"
-git push origin v0.4.0
+git tag -a v0.4.1 "$release_sha" -m "Sim;Engine v0.4.1"
+test "$(git rev-list -n 1 v0.4.1)" = "$release_sha"
+git push origin v0.4.1
 ```
 
 Tags for published versions are immutable release history. Never move or
-force-push one. If `v0.4.0` already exists, stop and verify its target instead
+force-push one. If `v0.4.1` already exists, stop and verify its target instead
 of replacing it.
 
 #### 4. Create the GitHub Release and verify public artifacts
 
-Prepare release notes from the `0.4.0` changelog section, then either use the
+Prepare release notes from the `0.4.1` changelog section, then either use the
 GitHub web interface or the GitHub CLI:
 
 ```bash
-gh release create v0.4.0 \
+gh release create v0.4.1 \
+  --repo lexawhatt/Sim-Engine \
   --verify-tag \
-  --title "Sim;Engine v0.4.0" \
-  --notes-file /tmp/sim-engine-v0.4.0-notes.md
+  --title "Sim;Engine v0.4.1" \
+  --notes-file /tmp/sim-engine-v0.4.1-notes.md
 ```
 
 Finally verify all four public identities:
 
-- `https://crates.io/crates/sim-engine/0.4.0` shows version 0.4.0;
-- `https://docs.rs/sim-engine/0.4.0` completes successfully;
-- Git tag `v0.4.0` points to `$release_sha`;
+- `https://crates.io/crates/sim-engine/0.4.1` shows version 0.4.1;
+- `https://docs.rs/sim-engine/0.4.1` completes successfully;
+- Git tag `v0.4.1` points to `$release_sha`;
 - the GitHub Release names the same tag and is not marked as a prerelease.
 
 If a serious defect is discovered after publishing, do not attempt to delete
-or overwrite 0.4.0. Yank it and prepare a corrected patch release:
+or overwrite 0.4.1. Yank it and prepare a corrected patch release:
 
 ```bash
-cargo yank --version 0.4.0 sim-engine
+cargo yank --version 0.4.1 sim-engine
 ```
 
 The authoritative external references are Cargo's
