@@ -235,8 +235,9 @@ failure, reuse adequate capacity, and perform no instance upload for unchanged
 sprite data. Clip-only changes update spans rather than glyph pixels. Budget
 limits charge total glyphs, placements, and retained CPU capacity; inspect
 `recovery_memory_bytes()` and `gpu_allocation_bytes()` instead of summing the
-same shared atlas repeatedly. Uploads from creation/update happen outside the
-frame report and must be recorded from the corresponding update report.
+same shared atlas repeatedly. Creation and update work happens outside the
+frame report. Record update uploads through `GlyphBatchUploadReport::instances()`;
+measure initial creation separately because it has no dedicated upload report.
 
 After device replacement, restore the original atlas, then call
 `restore_glyph_batch(&restored_atlas, &labels)`. Restoration uses the snapshot;
