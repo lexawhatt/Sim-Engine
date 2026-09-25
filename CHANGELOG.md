@@ -70,6 +70,9 @@ scene or individually submitted labels.
 - Preserve failed release evidence separately from successful bundles, and
   cover exact-SHA, dirty-tree and read-only archive rerun boundaries with
   hermetic shell regressions.
+- Qualify every observed dense-workload surface format/MSAA pair with the
+  mandatory pixel oracle on the same revision and physical Vulkan adapter,
+  including formats observed after device recovery.
 
 ## 0.4.1 - 2026-09-17
 

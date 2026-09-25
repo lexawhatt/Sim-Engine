@@ -126,6 +126,7 @@ install -m 555 "$CARGO_TARGET_DIR/release/examples/dense_scene_benchmark" "$bina
 assert_provenance
 failures=0
 completed=0
+workload_logs=()
 for constructions in 100 500 2000; do
     for mode in "${modes[@]}"; do
         if [[ "$mode" == streaming ]]; then label_mode=runs; else label_mode=batch; fi
@@ -134,6 +135,7 @@ for constructions in 100 500 2000; do
         for labels in "${label_modes[@]}"; do
             assert_provenance
             case_name="$mode-$labels-$constructions"
+            workload_logs+=("$staged/$case_name.log")
             echo "Dense scene: $case_name"
             set +e
             timeout 1800 "$binary" --constructions "$constructions" --mode "$mode" \
@@ -165,6 +167,12 @@ if [[ "$failures" -ne 0 ]]; then
     echo "Dense diagnostics contain failed workloads; preserved at $staged" >&2
     exit 1
 fi
+bash "$staged/source/scripts/dense_scene_semantics.sh" "$staged/source" \
+    "$staged/semantic-formats" "$start_sha" "$SIM_ENGINE_REQUIRED_ADAPTER_PCI_BUS_ID" \
+    "${workload_logs[@]}"
+assert_provenance
+verified_pairs=$(sed -n 's/^verified_format_pairs=//p' "$staged/semantic-formats/manifest.txt")
+printf 'semantic_format_pairs_verified=%s\n' "$verified_pairs" >>"$staged/manifest.txt"
 printf 'status=complete\ncompleted_cases=%s\nfailed_cases=0\n' "$completed" >>"$staged/manifest.txt"
 (cd "$staged" && sha256sum ./*.log) >"$staged/logs-sha256.txt"
 final="$output_parent/$start_sha-$(date -u +%Y%m%dT%H%M%SZ)-${staged##*.}"

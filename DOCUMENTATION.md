@@ -3132,7 +3132,13 @@ publishes `target/linux-release-evidence/`, containing `completion.txt`,
 `linux-vulkan-performance.txt`, `linux-hidpi-transition.txt`, and
 `linux-dense-scene-performance.txt`. The dense-scene subdirectory retains the
 archived source, executable and hashes, cold/warm raw records, exact GPU IDs,
-recovery evidence and all 36 per-trial thresholds. The
+recovery evidence and all 36 per-trial thresholds. After the timed trials, it
+also runs the mandatory pixel oracle for every format/MSAA pair observed in
+the actual dense workload, including restored contexts. Those checks use the
+same archived revision and physical Vulkan adapter; their logs and manifests
+must prove a real passing test before the dense gate publishes success. A
+separate probe window's format is not a substitute for the measured surfaces.
+The
 performance manifest records the exact SHA plus every fixture's adapter,
 surface, present mode, trial FPS, CPU/acquire percentiles, deterministic work
 counters, threshold, and passed verdict. CI's narrower semantic job writes and

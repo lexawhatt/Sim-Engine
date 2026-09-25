@@ -29,6 +29,7 @@ cargo fmt --all -- --check
 bash scripts/check_source_layout.sh
 bash scripts/tests/release_snapshot_gate.sh
 bash scripts/tests/dense_scene_handshake.sh
+bash scripts/tests/dense_scene_semantics.sh
 
 echo "[3/11] Rust 1.90 minimum version"
 cargo +1.90.0 check --all-targets --no-default-features
