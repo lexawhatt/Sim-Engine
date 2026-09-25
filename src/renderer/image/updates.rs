@@ -93,26 +93,40 @@ where
         return Err(ImageError::RendererMismatch);
     }
     preflight_image_batch_capacity(device, count, budget)?;
-    if sprites.clone().count() != count {
-        return Err(ImageError::InvalidSprite);
-    }
     let mut destinations_unchanged = count == batch.sprites.len();
+    let mut sprites_unchanged = destinations_unchanged;
+    let mut actual_count = 0;
     for (index, sprite) in sprites.clone().enumerate() {
+        // Fuse count, source/tint, destination proof and equality checks. Glyph
+        // placements are a lazy transformed iterator; replaying it for each
+        // check would repeat the same construction and interval arithmetic.
+        if index >= count {
+            return Err(ImageError::InvalidSprite);
+        }
+        let previous = batch.sprites.get(index);
+        let same_destination = previous.is_some_and(|previous| {
+            proof::destination_bits(*previous) == proof::destination_bits(sprite)
+        });
         if !sprite.source.fits(image.width, image.height)
             || !sprite.tint.is_normalized()
-            || !logical_image_region_is_portable(sprite.destination)
+            || (!same_destination && !logical_image_region_is_portable(sprite.destination))
         {
             return Err(ImageError::InvalidSprite);
         }
-        destinations_unchanged = destinations_unchanged
-            && batch.sprites.get(index).is_some_and(|previous| {
-                proof::destination_bits(*previous) == proof::destination_bits(sprite)
-            });
+        // Every stored sprite already passed this exact immutable destination
+        // proof. Reuse it only for all four bit-identical components, while
+        // validating source and tint even on geometry-preserving updates.
+        destinations_unchanged &= same_destination;
+        sprites_unchanged &= previous == Some(&sprite);
+        actual_count += 1;
+    }
+    if actual_count != count {
+        return Err(ImageError::InvalidSprite);
     }
 
     let old_cpu = batch.recovery_memory_bytes();
     let old_gpu = batch.gpu_allocation_bytes();
-    if batch.sprites.iter().copied().eq(sprites.clone()) && old_cpu <= budget.max_retained_bytes {
+    if sprites_unchanged && old_cpu <= budget.max_retained_bytes {
         batch.budget = budget;
         return Ok(report(batch, 0, false, old_cpu, old_gpu));
     }

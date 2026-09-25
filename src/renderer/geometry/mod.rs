@@ -1,10 +1,11 @@
 //! Exact, bounded reuse of CPU position proofs within one validation call.
 
+use super::validation2d::StrokeProofs;
 use super::{
     CameraUniform, Vec2, Vertex, clip_triangle_has_stable_signed_area,
-    clip_triangle_is_wholly_outside, logical_stroke_vertex_screen_ranges, rounded_f32_add_range,
-    screen_ranges_to_clip, shader_direction_dot_range, shader_interval_sum_range,
-    shader_relative_component_bounds, shader_world_dot_range, triangle_position_sources_equal,
+    clip_triangle_is_wholly_outside, rounded_f32_add_range, screen_ranges_to_clip,
+    shader_direction_dot_range, shader_interval_sum_range, shader_relative_component_bounds,
+    shader_world_dot_range, triangle_position_sources_equal,
 };
 
 #[cfg(test)]
@@ -36,7 +37,7 @@ impl PositionKey {
     }
 }
 
-struct PositionProofs {
+pub(super) struct PositionProofs {
     uniform: CameraUniform,
     entries: [Option<(PositionKey, ClipRanges)>; 8],
     next: usize,
@@ -44,7 +45,7 @@ struct PositionProofs {
 }
 
 impl PositionProofs {
-    fn new(uniform: CameraUniform) -> Self {
+    pub(super) fn new(uniform: CameraUniform) -> Self {
         Self {
             uniform,
             entries: [None; 8],
@@ -53,7 +54,7 @@ impl PositionProofs {
         }
     }
 
-    fn clip(&mut self, vertex: Vertex) -> Option<ClipRanges> {
+    pub(super) fn clip(&mut self, vertex: Vertex) -> Option<ClipRanges> {
         let key = PositionKey::new(vertex);
         if let Some((_, ranges)) = self
             .entries
@@ -147,6 +148,7 @@ pub(super) fn tessellated_topology_is_portable(
     }
     let minimum_normal = f64::from(f32::MIN_POSITIVE);
     let mut positions = PositionProofs::new(uniform);
+    let mut strokes = StrokeProofs::new(uniform);
     for triangle in vertices.chunks_exact(3) {
         let has_shader_extrusion = !triangle.iter().all(|vertex| {
             vertex.normal_distance == 0.0
@@ -163,13 +165,19 @@ pub(super) fn tessellated_topology_is_portable(
             {
                 return false;
             }
-            let Some(first) = logical_stroke_vertex_screen_ranges(triangle[0], uniform) else {
+            if triangle
+                .iter()
+                .any(|vertex| !strokes.branches_are_stable(*vertex))
+            {
+                return false;
+            }
+            let Some(first) = strokes.screen(triangle[0]) else {
                 return false;
             };
-            let Some(second) = logical_stroke_vertex_screen_ranges(triangle[1], uniform) else {
+            let Some(second) = strokes.screen(triangle[1]) else {
                 return false;
             };
-            let Some(third) = logical_stroke_vertex_screen_ranges(triangle[2], uniform) else {
+            let Some(third) = strokes.screen(triangle[2]) else {
                 return false;
             };
             if [first, second, third].iter().all(|output| output.1)

@@ -103,6 +103,7 @@ fn late_transform_failure_accounts_grown_batches_before_idle_eviction() {
                 &mut statistics,
                 &mut aggregate,
                 batches,
+                &mut crate::RendererPreparationMetrics::default(),
             )
         });
         assert_eq!(

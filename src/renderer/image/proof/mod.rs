@@ -6,6 +6,9 @@ use crate::renderer::{
 };
 use std::sync::Mutex;
 
+const CERTIFICATE_MAXIMUM: f32 = 1_048_576.0; // 2^20
+const CERTIFICATE_MINIMUM_SCALE: f32 = 1.0 / CERTIFICATE_MAXIMUM;
+
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
@@ -65,7 +68,7 @@ impl BatchProofCache {
                 return proof.accepted;
             }
         }
-        // Evaluate the original proof outside the lock. Concurrent immutable
+        // Evaluate the source proof outside the lock. Concurrent immutable
         // readers may race to replace the one entry; each result is still keyed
         // by its exact transform. A destination/count mutation requires &mut
         // ImageBatch2d and clears this entry before publication, so no numeric
@@ -80,9 +83,10 @@ impl BatchProofCache {
     }
 }
 
-// Keep the original interval/FTZ checks unchanged. In particular, widening all
-// sprites into a single extrema interval is not used: endpoint-sensitive
-// subnormal rejection is not generally monotone under such widening.
+// A narrow sufficient certificate avoids interval work for ordinary positive
+// screen destinations. Every uncertain sprite keeps the original interval/FTZ
+// checks below. Widening sprites into a shared extrema interval is not used:
+// endpoint-sensitive subnormal rejection is not monotone under such widening.
 pub(in crate::renderer) fn sprites_are_safe_for_target(
     sprites: &[ImageSprite2d],
     viewport_origin: Vec2,
@@ -95,6 +99,7 @@ pub(in crate::renderer) fn sprites_are_safe_for_target(
     {
         return false;
     }
+    let positive_target = positive_target_certificate(viewport_origin, clip_transform);
     sprites.iter().all(|sprite| {
         let destination = sprite.destination();
         let origin = destination.origin().to_vec2();
@@ -104,6 +109,9 @@ pub(in crate::renderer) fn sprites_are_safe_for_target(
             .all(is_portable_shader_source)
         {
             return false;
+        }
+        if positive_target && positive_sprite_certificate(origin, size) {
+            return true;
         }
         let horizontal = shader_interval_sum_range([
             (f64::from(viewport_origin.x), f64::from(viewport_origin.x)),
@@ -131,4 +139,28 @@ pub(in crate::renderer) fn sprites_are_safe_for_target(
             )
         })
     })
+}
+
+fn positive_target_certificate(viewport_origin: Vec2, clip: [f32; 4]) -> bool {
+    [viewport_origin.x, viewport_origin.y]
+        .into_iter()
+        .all(|value| (0.0..=CERTIFICATE_MAXIMUM).contains(&value))
+        && clip[..2]
+            .iter()
+            .all(|value| (CERTIFICATE_MINIMUM_SCALE..=1.0).contains(&value.abs()))
+        && clip[2..].iter().all(|value| value.abs() <= 4.0)
+}
+
+fn positive_sprite_certificate(origin: Vec2, size: Vec2) -> bool {
+    // Sources passed their original finite/normal checks above. In each axis
+    // let s=viewport_origin+origin>=1 and 0<size<=2^20. The three-term interval
+    // uses at most gamma(3): lower >= s*(1-gamma3)-gamma3*2^20-3*MIN > 0.624,
+    // while upper < 2^22. At scales [2^-20,1], both clip products stay normal
+    // with magnitude [2^-21,2^22]. The remaining bounded offset and rounding
+    // cannot approach 2^120. Thus every original interval check returns Some.
+    [origin.x, origin.y]
+        .into_iter()
+        .all(|value| (1.0..=CERTIFICATE_MAXIMUM).contains(&value))
+        && size.x <= CERTIFICATE_MAXIMUM
+        && size.y <= CERTIFICATE_MAXIMUM
 }

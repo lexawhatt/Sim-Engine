@@ -6,11 +6,12 @@ use super::{
 };
 use crate::renderer::{
     BlendMode, COLOR_MAP_LUT_SIZE, Camera2d, CameraUniform, Color, ColorMap, CompositeUniform,
-    DynamicGpu, DynamicMesh2d, GlyphAtlas2d, GlyphRun2d, HeatmapUniform, Image2d, ImageBatch2d,
-    ImageBatchPlacement, ImageSampling, ImageTexelRect, ImageUniform, ParticleField2d, ParticleGpu,
-    PreparedDrawBatch, PreparedScene, PreparedScreenScene, Rect, RenderTarget2d,
-    ScalarFieldSampling, ScalarFieldTexture, Scene, ScreenScene, Vertex, color_map_lut,
-    prepared_scene_belongs_to, scalar_normalization_is_portable, scalar_value_range_extent,
+    DynamicGpu, DynamicMesh2d, GlyphAtlas2d, GlyphBatch2d, GlyphRun2d, HeatmapUniform, Image2d,
+    ImageBatch2d, ImageBatchPlacement, ImageSampling, ImageTexelRect, ImageUniform,
+    ParticleField2d, ParticleGpu, PreparedDrawBatch, PreparedScene, PreparedScreenScene, Rect,
+    RenderTarget2d, ScalarFieldSampling, ScalarFieldTexture, Scene, ScreenScene, Vertex,
+    color_map_lut, prepared_scene_belongs_to, scalar_normalization_is_portable,
+    scalar_value_range_extent,
 };
 
 impl<'frame> FrameComposer<'frame> {
@@ -681,7 +682,83 @@ impl<'frame> FrameComposer<'frame> {
             FrameItem::ImageBatch {
                 image,
                 batch,
+                spans: None,
                 placement,
+                sampling,
+                options,
+                insertion: self.next_insertion,
+            },
+        )
+    }
+
+    /// Draws an ordered many-placement glyph snapshot as one frame item.
+    ///
+    /// Adjacent placements with an identical local clip share one instanced draw.
+    /// Different clips produce ordered scissor draws without sorting glyphs. Each
+    /// local clip intersects the frame viewport and item clip. Other frame items
+    /// cannot interleave inside the snapshot; use separate batches for that case.
+    /// Empty snapshots are valid and emit no draw. No text shaping, per-glyph
+    /// upload or source-run lookup occurs during drawing.
+    pub fn draw_glyph_batch(
+        &mut self,
+        atlas: &'frame GlyphAtlas2d,
+        batch: &'frame GlyphBatch2d,
+        sampling: ImageSampling,
+        options: FramePassOptions,
+    ) -> Result<(), FrameComposerError> {
+        if self
+            .renderer
+            .validate_image_batch(&atlas.image, &batch.batch)
+            .is_err()
+        {
+            return Err(FrameComposerError::RendererMismatch {
+                source: FrameSourceKind::Glyph,
+            });
+        }
+        let image = &atlas.image;
+        let vertex_count = batch.glyph_count().saturating_mul(6);
+        self.push_accounted_item(
+            &[
+                RetainedResourceAccounting::new(
+                    retained_arc_key(&image.resource_identity, 7),
+                    image.recovery_memory_bytes(),
+                    0,
+                    image.gpu_allocation_bytes(),
+                ),
+                RetainedResourceAccounting::new(
+                    retained_key(atlas, 9),
+                    atlas
+                        .recovery_memory_bytes()
+                        .saturating_sub(image.recovery_memory_bytes()),
+                    0,
+                    0,
+                ),
+                RetainedResourceAccounting::new(
+                    retained_key(batch, 18),
+                    batch.recovery_memory_bytes(),
+                    batch.gpu_allocation_bytes(),
+                    0,
+                ),
+            ],
+            FrameStatistics {
+                pass_count: 1,
+                command_count: usize::from(batch.glyph_count() > 0),
+                vertex_count,
+                streaming_vertex_count: 0,
+                reused_vertex_count: vertex_count,
+                upload_bytes: std::mem::size_of::<ImageUniform>(),
+                streaming_upload_bytes: 0,
+                texture_bytes: 0,
+                retained_cpu_bytes: 0,
+                retained_buffer_bytes: 0,
+                draw_calls: batch.draw_count(),
+                source_counts: FrameSourceStatistics::single(FrameSourceKind::Glyph),
+            },
+            FrameItem::ImageBatch {
+                image,
+                batch: &batch.batch,
+                spans: Some(&batch.spans),
+                placement: ImageBatchPlacement::default(),
                 sampling,
                 options,
                 insertion: self.next_insertion,
@@ -731,6 +808,7 @@ impl<'frame> FrameComposer<'frame> {
             FrameItem::ImageBatch {
                 image,
                 batch,
+                spans: None,
                 placement,
                 sampling,
                 options,
@@ -814,7 +892,7 @@ impl<'frame> FrameComposer<'frame> {
         Ok(())
     }
 
-    fn push_accounted_item(
+    pub(super) fn push_accounted_item(
         &mut self,
         resources: &[RetainedResourceAccounting],
         mut work: FrameStatistics,

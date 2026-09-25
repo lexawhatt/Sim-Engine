@@ -31,6 +31,8 @@ jobs:
           components: rustfmt, clippy
       - run: cargo fmt --all -- --check
       - run: bash scripts/check_source_layout.sh
+      - run: bash scripts/tests/release_snapshot_gate.sh
+      - run: bash scripts/tests/dense_scene_handshake.sh
       - run: cargo test --all-targets --no-default-features
       - run: cargo test --all-targets --no-default-features --features fonts
       - run: cargo clippy --all-targets --no-default-features -- -D warnings

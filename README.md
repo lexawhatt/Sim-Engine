@@ -10,7 +10,9 @@ clipping, interpolation, GPU resources, composition, recovery, and rendering
 diagnostics. Physics, simulation stepping, domain entities, UI navigation, and
 plugins remain in the host application.
 
-This guide describes **Sim;Engine 0.4.1**. The crate remains pre-1.0, and its
+This is **Sim;Engine 0.4.2**, focused on dense 2D mathematical visualization.
+See the [0.4.2 changelog](CHANGELOG.md#042---2026-09-25).
+The crate remains pre-1.0, and its
 supported release target is Linux with Vulkan. A concrete adapter/driver is
 supported when the mandatory semantic fixture passes on it;
 untested drivers are not inferred from Mesa evidence. The minimum supported
@@ -30,30 +32,19 @@ See the [0.4 integration guide](DOCUMENTATION.md#04-integration-guide) and
 [0.4.0 changelog](CHANGELOG.md#040---2026-09-12) for contracts and migration
 notes from 0.3.0.
 
-Version **0.4.1** focuses on profiling-driven optimization. Texture region edits filter
-and upload only affected mip rectangles, preserving complete recovery snapshots
-and old aliases. Its other performance work
-accelerates Native 3D arithmetic validation, batches compatible repeated
-surfaces, removes unused edge uploads, and reduces repeated lighting/fog
-validation. StrictPortable classification reuses bounded per-source calculations
-and skips polygon clipping when all original triangle proofs already succeed.
-Frame preparation reuses scratch capacity and uploads only changed camera,
-instance and edge-uniform ranges, without skipping validation or drawing.
-Scene resource and visibility totals update at accepted mutations, making
-statistics queries constant-time without changing ownership or resource budgets.
-An opt-in Native surface culling path can omit proven offscreen objects after
-all original validation and budget checks. It is disabled by default; small
-shared meshes can cost more draw calls when omissions split instanced batches.
-The 2D/3D renderer, scene styles and regression fixtures are now organized into
-focused modules, with unchanged public imports and rendering contracts.
-External tests follow their owning subsystem, use contract-based names, and
-share raw GPU readback transport without sharing expected-pixel calculations.
-CI checks the source-layout conventions.
-Existing 0.4 integrations need no source migration. See the
-[performance guide](DOCUMENTATION.md#041-performance-guide) and
-[0.4.1 changelog](CHANGELOG.md#041---2026-09-17) for the complete delta and
-remaining costs. No universal frame rate or replacement for consumer testing
-is promised.
+Version **0.4.2** adds compact retained circles, independent round lines and
+axis-aligned rectangles, plus ordered same-atlas batches of prepared labels.
+They reuse capacity, support explicit clipping/DPI and device recovery, and
+keep numeric checks and resource budgets. Preparation substages and selected
+adapter metadata make remaining CPU/GPU costs visible. These paths are opt-in:
+an application must retain and submit batches; upgrading alone does not convert
+its existing streaming geometry. See the
+[dense 2D guide](DOCUMENTATION.md#042-dense-2d-rendering).
+
+The [0.4.1 performance guide](DOCUMENTATION.md#041-performance-guide) covers
+earlier partial mip uploads, retained-3D validation, instancing, changed-uniform
+uploads and optional culling. Existing 0.4 integrations need no source migration.
+No universal frame rate or replacement for consumer testing is promised.
 
 ## Documentation
 
@@ -78,8 +69,10 @@ is promised.
 - 2D camera pan, rotation, zoom, fit, and picking;
 - fallible tweening and easing;
 - streaming, prepared, and dynamic triangle geometry;
+- compact retained screen circles, independent round lines and rectangles;
 - retained sRGB RGBA images, atlas sprite batches, and world-space image quads;
 - host-shaped, bounded glyph atlas runs with deterministic logical bounds;
+- many-placement glyph batches with independent translations, tints and clips;
 - optional CPU-only `fonts` feature for TTF/OTF loading, shaping and rasterization;
   `text` adds GPU atlases, retained runs and preparation from pre-shaped lines;
 - budgeted instanced particle rendering;
@@ -105,7 +98,8 @@ is promised.
 Ordinary scenes support explicit construction, tessellation, and upload
 budgets, fixed logical-screen geometry, and independent positioned viewport or
 offscreen-target rendering. `FrameComposer` orders streaming and prepared
-scenes, dynamic meshes, particles, scalar fields, images, glyph runs, and 2D/3D
+scenes, compact primitives, dynamic meshes, particles, scalar fields, images,
+glyph runs/batches, and 2D/3D
 color targets under one frame budget and one surface presentation.
 `DynamicMeshBudget` limits caller-provided filled triangles and makes full
 updates allocation-fallible and atomic.
@@ -126,7 +120,7 @@ retaining arithmetic checks; mathematical-edge validation stays strict.
 Blend sorts objects, not triangles within a mesh; intersecting transparent
 surfaces can still overlap incorrectly. General section materials, hatching,
 projected 3D anchors, 3D picking, point lights, shadows and PBR remain outside
-0.4.1. Unlit remains available and is the default.
+0.4.2. Unlit remains available and is the default.
 
 An additional Intel UHD (CML GT2) / Mesa 26.1.6 Vulkan qualification run did
 not complete the material readback fixture; the same wait reproduced on the
@@ -138,21 +132,21 @@ NVIDIA or software-Vulkan runs. See [known boundaries](DOCUMENTATION.md#28-known
 The default feature set includes the `wgpu` renderer:
 
 ```bash
-cargo add sim-engine@0.4.1
+cargo add sim-engine@0.4.2
 ```
 
 or add it directly to `Cargo.toml`:
 
 ```toml
 [dependencies]
-sim-engine = "0.4.1"
+sim-engine = "0.4.2"
 ```
 
 Use core visual-state APIs without GPU dependencies:
 
 ```toml
 [dependencies]
-sim-engine = { version = "0.4.1", default-features = false }
+sim-engine = { version = "0.4.2", default-features = false }
 ```
 
 Run the examples from a repository checkout matching the library version:
@@ -167,6 +161,7 @@ cargo run --release --example frame_cache_benchmark -- --case mixed --labels 100
 cargo run --release --example stroke_gallery -- --page 5
 cargo run --release --example editable_textured_3d
 cargo run --release --example editable_textured_3d -- --acceptance
+cargo run --release --example dense_scene_benchmark -- --constructions 500 --mode analytic --labels batch
 ```
 
 The text lab has three pages: `1` compares DejaVu Sans/Serif/Mono, Inter and
@@ -192,7 +187,7 @@ GPU copy work are reported separately from host-upload bytes.
 Enable the optional `text` feature:
 
 ```toml
-sim-engine = { version = "0.4.1", features = ["text"] }
+sim-engine = { version = "0.4.2", features = ["text"] }
 ```
 
 ```rust,no_run

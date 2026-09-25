@@ -1,7 +1,10 @@
+use super::RendererPreparationMetrics;
+use super::glyph_batch::GlyphBatchSpan;
 use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
+use std::time::Instant;
 
 #[cfg(test)]
 use super::ImageSprite2d;
@@ -26,7 +29,13 @@ mod compose;
 mod encoding;
 #[cfg(test)]
 pub(super) use encoding::assert_gpu_encoding_contract;
+#[cfg(test)]
+pub(super) use encoding::encode_glyph_batch_for_test;
+pub(super) use encoding::encode_screen_primitives;
+#[cfg(test)]
+pub(super) use encoding::encode_screen_primitives_for_test;
 mod present;
+mod primitives;
 mod streaming;
 #[cfg(test)]
 mod tests;
@@ -734,6 +743,11 @@ enum FrameItem<'frame> {
         options: FramePassOptions,
         insertion: usize,
     },
+    ScreenPrimitives {
+        batch: &'frame super::ScreenPrimitiveBatch2d,
+        options: FramePassOptions,
+        insertion: usize,
+    },
     Dynamic {
         mesh: &'frame DynamicMesh2d,
         camera: Camera2d,
@@ -778,6 +792,7 @@ enum FrameItem<'frame> {
     ImageBatch {
         image: &'frame Image2d,
         batch: &'frame ImageBatch2d,
+        spans: Option<&'frame [GlyphBatchSpan]>,
         placement: ImageBatchPlacement,
         sampling: ImageSampling,
         options: FramePassOptions,
@@ -805,6 +820,9 @@ impl FrameItem<'_> {
                 options, insertion, ..
             }
             | Self::PreparedScreen {
+                options, insertion, ..
+            }
+            | Self::ScreenPrimitives {
                 options, insertion, ..
             }
             | Self::Dynamic {
@@ -876,6 +894,7 @@ enum ReadySource<'frame> {
     Streaming,
     Prepared(&'frame wgpu::Buffer),
     Dynamic(&'frame wgpu::Buffer),
+    ScreenPrimitives(&'frame wgpu::Buffer),
 }
 
 struct ReadyGeometry<'frame> {
@@ -911,6 +930,7 @@ enum ReadyItem<'frame> {
     ImageBatch {
         image: &'frame Image2d,
         batch: &'frame ImageBatch2d,
+        spans: Option<&'frame [GlyphBatchSpan]>,
         sampling: ImageSampling,
         uniform: ImageUniform,
         viewport: ResolvedViewport,
@@ -933,8 +953,14 @@ fn preflight_frame_items(
     renderer: &WgpuRenderer,
     target_viewport: LogicalViewport,
     items: &[FrameItem<'_>],
+    preparation: &mut RendererPreparationMetrics,
 ) -> Result<(), FrameComposerError> {
     for item in items {
+        let retained_image = matches!(
+            item,
+            FrameItem::Image { .. } | FrameItem::WorldImage { .. } | FrameItem::ImageBatch { .. }
+        );
+        let retained_started = Instant::now();
         match item {
             FrameItem::Scene {
                 camera, options, ..
@@ -960,6 +986,16 @@ fn preflight_frame_items(
                 )
                 .ok_or(RendererFrameError::InvalidGeometryTransform)?;
             }
+            FrameItem::ScreenPrimitives { batch, options, .. } => {
+                let viewport = resolve_viewport(renderer, target_viewport, *options)?;
+                primitives::validate(
+                    batch,
+                    viewport,
+                    target_viewport,
+                    renderer.scale_factor as f32,
+                    preparation,
+                )?;
+            }
             FrameItem::Prepared {
                 scene,
                 camera,
@@ -974,12 +1010,15 @@ fn preflight_frame_items(
                     target_viewport,
                 )
                 .ok_or(RendererFrameError::InvalidGeometryTransform)?;
-                if !geometry_is_safe_for_cached(
+                let validation_started = Instant::now();
+                let safe = geometry_is_safe_for_cached(
                     Some(&scene.geometry_validation_cache),
                     scene.geometry_extents,
                     GeometryValidationSource::Tessellated(&scene.vertices),
                     uniform,
-                ) {
+                );
+                preparation.geometry_validation += validation_started.elapsed();
+                if !safe {
                     return Err(RendererFrameError::InvalidGeometryTransform.into());
                 }
             }
@@ -994,12 +1033,15 @@ fn preflight_frame_items(
                     target_viewport,
                 )
                 .ok_or(RendererFrameError::InvalidGeometryTransform)?;
-                if !geometry_is_safe_for_cached(
+                let validation_started = Instant::now();
+                let safe = geometry_is_safe_for_cached(
                     Some(&scene.scene.geometry_validation_cache),
                     scene.scene.geometry_extents,
                     GeometryValidationSource::Tessellated(&scene.scene.vertices),
                     uniform,
-                ) {
+                );
+                preparation.geometry_validation += validation_started.elapsed();
+                if !safe {
                     return Err(RendererFrameError::InvalidGeometryTransform.into());
                 }
             }
@@ -1017,12 +1059,15 @@ fn preflight_frame_items(
                     target_viewport,
                 )
                 .ok_or(RendererFrameError::InvalidGeometryTransform)?;
-                if !geometry_is_safe_for_cached(
+                let validation_started = Instant::now();
+                let safe = geometry_is_safe_for_cached(
                     Some(&mesh.geometry_validation_cache),
                     mesh.geometry_extents,
                     GeometryValidationSource::Dynamic(&mesh.vertices),
                     uniform,
-                ) {
+                );
+                preparation.geometry_validation += validation_started.elapsed();
+                if !safe {
                     return Err(RendererFrameError::InvalidGeometryTransform.into());
                 }
             }
@@ -1147,6 +1192,9 @@ fn preflight_frame_items(
                     return Err(RendererFrameError::InvalidGeometryTransform.into());
                 }
             }
+        }
+        if retained_image {
+            preparation.retained_draws += retained_started.elapsed();
         }
     }
     Ok(())
@@ -1387,10 +1435,14 @@ fn prepare_streaming_scene_resolved<'frame>(
     statistics: &mut FrameStatistics,
     aggregate: &mut TessellationStats,
     batches: &mut Vec<PreparedDrawBatch>,
+    preparation: &mut RendererPreparationMetrics,
 ) -> Result<(), FrameComposerError> {
     let vertex_start = streaming_vertices.len();
+    let tessellation_started = Instant::now();
     let stats =
         tessellate_scene(scene, streaming_vertices, batches).map_err(RendererFrameError::from)?;
+    preparation.tessellation += tessellation_started.elapsed();
+    let validation_started = Instant::now();
     let vertices = &streaming_vertices[vertex_start..];
     let extents = GeometryExtents::from_vertices(vertices);
     if !geometry_is_safe_for(
@@ -1401,6 +1453,7 @@ fn prepare_streaming_scene_resolved<'frame>(
         streaming_vertices.truncate(vertex_start);
         return Err(RendererFrameError::InvalidGeometryTransform.into());
     }
+    preparation.geometry_validation += validation_started.elapsed();
     *statistics = statistics.adding(FrameStatistics {
         pass_count: 1,
         command_count: scene.command_count(),
@@ -1445,16 +1498,20 @@ fn prepare_retained_geometry<'frame>(
     statistics: &mut FrameStatistics,
     aggregate: &mut TessellationStats,
     mut owned_batches: Vec<PreparedDrawBatch>,
+    preparation: &mut RendererPreparationMetrics,
 ) -> Result<(), FrameComposerError> {
     let camera_uniform =
         CameraUniform::new_in_region(camera, viewport.viewport, viewport.origin, target_viewport)
             .ok_or(RendererFrameError::InvalidGeometryTransform)?;
-    if !geometry_is_safe_for_cached(
+    let validation_started = Instant::now();
+    let geometry_is_safe = geometry_is_safe_for_cached(
         geometry_validation_cache,
         extents,
         geometry_validation,
         camera_uniform,
-    ) {
+    );
+    preparation.geometry_validation += validation_started.elapsed();
+    if !geometry_is_safe {
         return Err(RendererFrameError::InvalidGeometryTransform.into());
     }
     owned_batches

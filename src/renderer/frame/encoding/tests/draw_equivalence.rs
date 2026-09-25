@@ -337,6 +337,7 @@ pub(in crate::renderer) fn assert_gpu_encoding_contract(
         })
     };
     let batch_item = |batch, viewport| ReadyItem::ImageBatch {
+        spans: None,
         image: &image,
         batch,
         sampling: ImageSampling::Nearest,
@@ -411,8 +412,15 @@ pub(in crate::renderer) fn assert_gpu_encoding_contract(
             _ => unreachable!(),
         })
         .collect();
+    let primitive_pipeline = crate::renderer::screen_primitives::create_pipeline(
+        device,
+        &pipelines.camera_bind_group_layout,
+        format,
+        sample_count,
+    );
     let resources = EncodingResources {
         pipeline: &pipelines.pipeline,
+        screen_primitive_pipeline: &primitive_pipeline,
         dynamic_pipeline: &pipelines.dynamic_pipeline,
         particle_pipeline: &pipelines.particle_pipeline,
         heatmap_pipeline: &pipelines.heatmap_pipeline,

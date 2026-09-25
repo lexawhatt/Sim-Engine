@@ -27,6 +27,8 @@ assert_provenance
 echo "[2/11] formatting"
 cargo fmt --all -- --check
 bash scripts/check_source_layout.sh
+bash scripts/tests/release_snapshot_gate.sh
+bash scripts/tests/dense_scene_handshake.sh
 
 echo "[3/11] Rust 1.90 minimum version"
 cargo +1.90.0 check --all-targets --no-default-features
@@ -104,6 +106,12 @@ cargo run --release --example texture_lifecycle_3d -- --acceptance
 WGPU_BACKEND=vulkan \
 SIM_ENGINE_REQUIRE_VULKAN=1 \
 ./scripts/rendering_benchmark_matrix.sh
+WGPU_BACKEND=vulkan \
+SIM_ENGINE_REQUIRED_ADAPTER_PCI_BUS_ID="$required_adapter_pci_bus_id" \
+./scripts/dense_scene_benchmark_matrix.sh --acceptance
+grep -Fxq "vcs_sha=$start_sha" "$output_dir/linux-dense-scene-performance.txt"
+grep -Fxq 'status=complete' "$output_dir/linux-dense-scene-performance.txt"
+grep -Fxq 'release_gate=true' "$output_dir/linux-dense-scene-performance.txt"
 
 echo "[10/11] package boundary"
 assert_provenance

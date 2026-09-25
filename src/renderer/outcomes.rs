@@ -28,9 +28,65 @@ pub struct RendererFrameMetrics {
     pub(super) geometry_reused: bool,
     pub(super) geometry_streamed: bool,
     pub(super) tessellation_stats: TessellationStats,
+    pub(super) preparation: Option<RendererPreparationMetrics>,
+}
+
+/// Non-overlapping CPU preparation stages for a heterogeneous composed frame.
+///
+/// All intervals are on the calling thread before uploads. They do not measure
+/// GPU work or presentation. `None` from [`RendererFrameMetrics::preparation`]
+/// identifies a rendering path which does not expose this detailed breakdown;
+/// it must not be interpreted as zero preparation cost.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RendererPreparationMetrics {
+    pub(super) tessellation: Duration,
+    pub(super) geometry_validation: Duration,
+    pub(super) retained_draws: Duration,
+    pub(super) other: Duration,
+}
+
+impl RendererPreparationMetrics {
+    /// CPU generation of streaming ordinary-scene vertices and clip batches.
+    pub const fn tessellation(self) -> Duration {
+        self.tessellation
+    }
+
+    /// CPU numeric/topology validation of streaming and retained 2D geometry.
+    /// Includes bounded exact-proof cache lookups when they replace validation.
+    /// Image/glyph placement validation is included in [`Self::retained_draws`].
+    pub const fn geometry_validation(self) -> Duration {
+        self.geometry_validation
+    }
+
+    /// Retained scene/image/glyph draw preparation excluding ordinary-scene
+    /// numeric validation. Includes placement validation and batch assembly.
+    pub const fn retained_draws(self) -> Duration {
+        self.retained_draws
+    }
+
+    /// Remaining preparation: item preflight, viewport resolution, particles,
+    /// scalar data, bookkeeping, and timing overhead. Excludes uploads/acquire.
+    pub const fn other(self) -> Duration {
+        self.other
+    }
+
+    /// Sum of this breakdown, equal to the report's coarse preparation interval.
+    pub fn total(self) -> Duration {
+        self.tessellation
+            .saturating_add(self.geometry_validation)
+            .saturating_add(self.retained_draws)
+            .saturating_add(self.other)
+    }
 }
 
 impl RendererFrameMetrics {
+    /// Detailed, non-overlapping CPU preparation stages when this path records
+    /// them. The coarse [`Self::tessellation`] interval remains available for
+    /// compatibility and includes all of these stages, not just triangulation.
+    pub const fn preparation(self) -> Option<RendererPreparationMetrics> {
+        self.preparation
+    }
+
     /// Returns CPU time spent preparing visual work before GPU uploads.
     ///
     /// For an ordinary streaming scene this is validation and tessellation.
@@ -155,6 +211,8 @@ pub enum RendererFrameError {
     /// stroke branch decisions that are ambiguous after projection, every
     /// dynamic triangle requiring partial frustum clipping, and projected
     /// triangle orientation that may change with legal shader association.
+    /// Compact screen primitives also reject transforms whose boundary-error
+    /// bound exceeds 0.25 physical pixels at the actual destination scale.
     InvalidGeometryTransform,
     /// A logical viewport is outside the active surface or render target.
     InvalidViewport,

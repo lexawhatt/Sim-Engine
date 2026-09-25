@@ -40,6 +40,9 @@ snapshot_root=""
 snapshot_added=0
 gate_complete=0
 cleanup() {
+    local exit_status=$?
+    # Cleanup must not erase diagnostics or mask the original gate failure.
+    set +e
     if [[ "$snapshot_added" -eq 1 ]]; then
         chmod -R u+w "$snapshot_root" 2>/dev/null || true
         git -C "$project_root" worktree remove --force "$snapshot_root" >/dev/null 2>&1 || true
@@ -48,10 +51,16 @@ cleanup() {
         rm -rf -- "$snapshot_parent"
     fi
     if [[ "$gate_complete" -ne 1 ]]; then
-        rm -rf -- "$staging_dir"
-    fi
-    if [[ "$gate_complete" -ne 1 ]]; then
-        rm -rf -- "$final_bundle"
+        if [[ -d "$staging_dir" ]]; then
+            printf 'format_version=1\nvcs_sha=%s\ngate_script=%s\nstatus=failed\nexit_status=%s\n' \
+                "${start_sha:-unknown}" "$gate_script" "$exit_status" >"$staging_dir/completion.txt"
+            failed_bundle="$output_dir/linux-release-failed-${staging_dir##*.}"
+            if mv -T -- "$staging_dir" "$failed_bundle"; then
+                echo "Failed release evidence preserved: $failed_bundle" >&2
+            else
+                echo "Failed release evidence remains at: $staging_dir" >&2
+            fi
+        fi
     fi
 }
 trap cleanup EXIT
@@ -62,6 +71,12 @@ trap 'exit 143' TERM
 # Never let a failed new invocation leave an older successful bundle looking
 # current, including failures before tool discovery or compilation. Individual
 # legacy manifests are also invalidated during the transition to the bundle.
+if [[ -d "$final_bundle" && ! -L "$final_bundle" ]]; then
+    # Dense diagnostics retain a read-only exact-source archive. The previous
+    # successful bundle is invalidated under the lock, not recursively removed
+    # through an unresolved path or while its children remain non-writable.
+    chmod -R u+w "$final_bundle"
+fi
 rm -rf -- "$final_bundle"
 rm -f -- "$output_dir/linux-vulkan-surface.txt" \
     "$output_dir/linux-vulkan-adapter.txt" \
@@ -133,6 +148,9 @@ case "$gate_script" in
         required_evidence=(linux-hidpi-transition.txt)
         ;;
 esac
+if [[ "$gate_script" == scripts/linux_release_gate.sh ]]; then
+    required_evidence+=(linux-dense-scene-performance.txt)
+fi
 for evidence in "${required_evidence[@]}"; do
     if [[ ! -s "$staging_dir/$evidence" ]]; then
         echo "release gate completed without required staged evidence: $evidence" >&2
@@ -144,5 +162,5 @@ printf 'format_version=1\nvcs_sha=%s\ngate_script=%s\nstatus=passed\n' \
 # This directory rename is the only publication boundary. SIGKILL before it
 # can leave a hidden staging directory, never a bundle that claims success.
 mv -T -- "$staging_dir" "$final_bundle"
-echo "Release evidence bundle: $final_bundle"
 gate_complete=1
+echo "Release evidence bundle: $final_bundle"

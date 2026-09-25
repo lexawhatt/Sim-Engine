@@ -1,12 +1,14 @@
 # Sim;Engine Documentation
 
-This is the integration and engineering guide for **Sim;Engine 0.4.1**.
+This is the integration and engineering guide for **Sim;Engine 0.4.2**.
+For dense mathematical scenes, start with the [dense 2D guide](#042-dense-2d-rendering).
 Start with the [0.4 integration guide](#04-integration-guide) for new rendering,
 text and resource workflows, or the handbook below for the complete library.
 For older integrations, use the
 [archived 0.3 guide](https://github.com/lexawhatt/Sim-Engine/blob/v0.3.0/DOCUMENTATION.md).
-The [0.4.1 changelog](CHANGELOG.md#041---2026-09-17) describes the optimization
-release; the [0.4.0 changelog](CHANGELOG.md#040---2026-09-12) retains migration
+The [0.4.2 changelog](CHANGELOG.md#042---2026-09-25) describes the current additions;
+the [0.4.1 changelog](CHANGELOG.md#041---2026-09-17) covers earlier optimizations,
+and the [0.4.0 changelog](CHANGELOG.md#040---2026-09-12) retains migration
 notes from 0.3.
 This guide is divided into two parts:
 
@@ -26,6 +28,220 @@ cargo doc --all-features --no-deps --open
 Sim;Engine remains pre-1.0. Linux with
 Vulkan is its supported release target, and Rust 1.90 is the minimum supported
 Rust version.
+
+## 0.4.2 dense 2D rendering
+
+The additions below are opt-in and additive. Existing `Scene`, `ScreenScene`,
+`PreparedScene` and text APIs keep their contracts. An ordinary scene still
+supports gradients, shadows, joined/dashed/marked strokes and arbitrary cameras;
+the compact path is deliberately narrower, not a replacement for these styles.
+Updating a dependency does not automatically convert streaming commands or
+individual glyph submissions. Adopt the new paths at the host's rendering bridge:
+
+1. Keep reusable ordinary geometry in `PreparedScene`. Use
+   `ScreenPrimitiveBatch2d` for compatible dense points/independent segments.
+2. Group adjacent same-atlas labels into `GlyphBatch2d` without moving them
+   across other painter-order content. Keep independent panel clips.
+3. Retain both resources across idle frames. Update only dirty batches on point
+   drag; update projected screen geometry and labels after camera pan/zoom.
+4. Record update reports separately from composed-frame metrics. Requalify the
+   consumer's complete input-to-present workload, not only this Engine fixture.
+
+### Compact screen primitives
+
+`ScreenPrimitiveBatch2d` retains solid circles, independent round-capped lines
+and square-cornered rectangles. Every primitive uses a 64-byte instance and a
+six-vertex quad. The shader evaluates the circular boundary analytically, so a
+small point and a large circle do not require different polygon segment counts.
+MSAA evaluates coverage at each sample; single-sample offscreen targets use
+binary edge coverage. This removes polygon approximation, not raster sampling.
+
+Positions, widths and captured clips are viewport-local logical pixels with
+positive Y downward. Project world positions through `Camera2d::world_to_screen`
+in the host when constructing screen-space visual state. With a flat 2D
+projection, scale world radii by camera zoom but keep a logical stroke width
+unchanged. A tilted projection turns a world circle into an ellipse, which this
+circle API does not represent. Likewise, use the compact rectangle only when
+its projected sides are screen-axis-aligned. Keep tilted circles, rotated
+rectangles and other unsupported projected shapes in `Scene`/`PreparedScene`;
+do not approximate them by a compact circle or axis-aligned bounding box. This
+explicit conversion does not move simulation or mathematical construction logic
+into the renderer.
+
+```rust,no_run
+use sim_engine::{Color, FrameBudget, FramePassOptions, LogicalPixels,
+    LogicalScreenPosition, ScreenPrimitive2d, ScreenPrimitiveBudget, WgpuRenderer};
+
+fn draw(renderer: &mut WgpuRenderer) -> Result<(), Box<dyn std::error::Error>> {
+    let primitives = [
+        ScreenPrimitive2d::circle(LogicalScreenPosition::new(40.25, 30.5),
+            LogicalPixels::new(3.0)?, Color::WHITE)?,
+        ScreenPrimitive2d::round_line(LogicalScreenPosition::new(20.5, 60.0),
+            LogicalScreenPosition::new(120.25, 80.5), LogicalPixels::new(2.0)?,
+            Color::rgb8(80, 200, 255).with_alpha(0.5))?,
+    ];
+    let batch = renderer.create_screen_primitive_batch(
+        &primitives, ScreenPrimitiveBudget::default())?;
+    let mut frame = renderer.begin_frame(Color::BLACK, FrameBudget::default())?;
+    frame.draw_screen_primitive_batch(&batch, FramePassOptions::new(0))?;
+    let _report = frame.present()?;
+    Ok(())
+}
+```
+
+Retain the batch between frames. `update_screen_primitive_batch` reuses adequate
+CPU/GPU capacity and skips instance writes when data is unchanged. The update
+report owns these upload bytes: they are not uploads performed by the later
+frame. Its CPU work also happens outside the frame's preparation interval.
+Use smaller batches for independently changing regions, but do not reorder
+translucent objects. Only adjacent equal clips merge; a batch remains one ordered
+frame item. Use multiple items to interleave primitives and text.
+
+`ScreenPrimitive2d::from_screen_scene` converts compatible scenes atomically.
+Unsupported styles report a command index instead of silently losing a shape.
+Adjacent capsules are independent lines, not a polyline-join implementation.
+Colors must be normalized linear RGBA. Degenerate or non-portable inputs are
+rejected, and viewport-dependent arithmetic is checked before drawing. Geometry
+proofs are bounded, tied to the owned snapshot, exact camera-uniform bytes and
+destination scale; changed geometry or source precision invalidates them, while
+clips cannot change shader positions. Constructors return
+`ScreenPrimitiveError::PrecisionLimit` when source conversion and fragment
+arithmetic cannot meet the precision envelope. Drawing additionally requires
+the combined source/transform bound to fit within **0.25 physical pixels** at
+the actual destination density; otherwise it returns
+`RendererFrameError::InvalidGeometryTransform` before submission. This bound
+concerns the mathematical boundary, not antialiasing: pixels intersecting the
+boundary still depend on the target's sample count. Extreme finite coordinates
+are not a promise of subpixel accuracy, and accepted construction alone is not
+a promise that every later target scale is representable.
+
+`ScreenPrimitiveBudget` limits primitive count, retained CPU capacity, GPU
+capacity and per-update payload. Growth may overlap old and new allocations,
+bounded by twice the respective resident limits; caller input storage and driver
+internals are excluded. `retained_cpu_bytes()` and `gpu_buffer_bytes()` expose
+actual owned capacities. Frame budgets additionally charge referenced work and
+deduplicate repeated references to a resource. No work is dropped to fit a limit.
+
+After device replacement call `restore_screen_primitive_batch`; no source
+scene is needed. The restored batch starts with fresh device identity and proof
+state. `render_screen_primitive_batch_to_target` uses explicit
+`PhysicalPerLogical` density and an optional positioned logical viewport,
+independent of the window DPI. Like other offscreen submissions, its `Drawn`
+does not mean a surface was presented. This direct target method does not expose
+GPU timestamp samples; composed surface frames do.
+
+### Preparation and adapter diagnostics
+
+The preparation interval historically named `metrics.tessellation()` includes
+numeric/topology validation and retained draw preparation, not only triangle
+generation. Composed frames now expose `metrics.preparation()` with four
+non-overlapping calling-thread durations: `tessellation()`,
+`geometry_validation()`, `retained_draws()`, and `other()`. Their `total()` equals
+the existing preparation interval. Other rendering paths return `None` rather
+than reporting unsupported substages as zero. Uploads and acquisition remain
+separate; neither a CPU duration nor a surface wait is hardware GPU execution.
+
+`WgpuRenderer::diagnostics()` returns an allocation-free borrowed snapshot of
+the selected adapter/backend/driver, vendor/device IDs, physical PCI address
+when available, DPI, physical surface size, format, sample count, and actual
+present mode. Record this context with host-level measurements. Obtain a new
+snapshot after resizing, changing scale, or replacing the logical device; do
+not infer the adapter from the list of GPUs installed in the machine.
+
+The existing opt-in GPU timestamps remain asynchronous. Correlate sample IDs
+with submitted `FrameReport`s, report missing samples, and keep acquisition and
+host scene construction separate from GPU pass time. The new diagnostics do
+not add a synchronous GPU readback to normal rendering.
+
+### Reproduce the dense workload
+
+The benchmark uses 19 geometry commands and three already-shaped four-glyph
+labels per construction, distributed across 24 clipped regions. It runs idle,
+camera pan, zoom and single-construction drag phases. Domain construction and
+font shaping are outside this fixture; projection, resource updates, frame
+composition and renderer work are measured. Individual raw samples distinguish
+host updates, numeric proofs, uploads, surface acquisition and asynchronous GPU
+execution. An unavailable timestamp or skipped frame is not a successful sample.
+
+```bash
+cargo run --release --all-features --example dense_scene_benchmark -- \
+    --constructions 500 --mode analytic --labels batch \
+    --frames 120 --trials 3 --warmup 20 --require-gpu --recovery
+```
+
+Compare `--mode streaming --labels runs` with the retained paths; use
+`--mode prepared` for ordinary retained geometry and `--labels off` to isolate
+geometry. Keep visual inputs, physical adapter and measurement conditions fixed.
+A baseline capacity failure is reported as a failure, not as a smaller workload
+or a dropped-geometry success. The normal diagnostic run reports distributions
+without claiming the target was met. `--maximum-ms 16.67` additionally requires
+each warm phase/trial's end-to-end p95 to meet that threshold.
+
+On a clean committed checkout, `scripts/dense_scene_benchmark_matrix.sh
+--acceptance` runs the fixed 100/500/2000 analytic-plus-batched-label reference
+workload in an isolated 1280x800, scale-1 KWin compositor. Set
+`SIM_ENGINE_REQUIRED_ADAPTER_PCI_BUS_ID` to the physical Vulkan adapter being
+qualified. The Linux release wrapper obtains this identity from its surface
+probe and runs this gate in addition to semantic, HiDPI and existing performance
+checks. Successful evidence includes the exact source, binary hash, raw trials,
+GPU correlation, recovery and resource counters. It is not a promise that an
+arbitrary application or different GPU achieves 60 FPS.
+
+The reference gate requests `NoVsync` and records the actual selected mode
+(Immediate on the measured NVIDIA reference). Use `--vsync` for a separate
+presentation-cadence diagnostic. FIFO/compositor scheduling and format selection
+can differ: the development FIFO/BGRA 2000-construction probe showed roughly
+29-30 ms pan/zoom p95, despite the separate Immediate/RGBA reference meeting
+16.67 ms in every trial. Both ran on the same physical GPU in separate isolated
+KWin instances. This is not a controlled present-mode-only comparison, nor a
+claim of locked 60 FPS for the consumer's original Vsync application. Preserve
+those contexts and acquisition costs instead of relabeling one as the other.
+
+### Many prepared labels on one atlas
+
+`GlyphBatch2d` snapshots several already-prepared `GlyphRun2d` placements.
+Each placement retains its own logical translation, normalized multiplicative
+tint, and optional viewport-local clip. It does not shape or rasterize again.
+For the `.ttf`/`.otf` text path, use `TextRun2d::glyph_run()` for each placement
+and `TextAtlas2d::atlas()` for batch creation and drawing. This uses the normal
+font atlas; batching does not require a synthetic or bitmap-only font.
+Only adjacent equal-clip spans share a draw; input order is painter order,
+including half-alpha overlaps. A batch is one frame item. Split it at any
+boundary where other geometry must draw between labels.
+
+```rust,ignore
+let placements = [
+    GlyphRunPlacement2d::new(&first_run, ImageBatchPlacement::new(
+        LogicalScreenVector::new(10.25, 20.5), Color::WHITE,
+    )?),
+    GlyphRunPlacement2d::new(&second_run, ImageBatchPlacement::new(
+        LogicalScreenVector::new(120.0, 20.5), Color::rgb8(80, 200, 255),
+    )?).with_clip(panel_clip),
+];
+let mut labels = renderer.create_glyph_batch(
+    &atlas, &placements, GlyphBatchBudget::default(),
+)?;
+
+// Reuse labels on unchanged frames. After changing layout, tint, or text:
+let update = renderer.update_glyph_batch(&atlas, &mut labels, &placements)?;
+let mut frame = renderer.begin_frame(background, FrameBudget::default())?;
+frame.draw_glyph_batch(&atlas, &labels, ImageSampling::Linear, FramePassOptions::new(10))?;
+let report = frame.present()?;
+```
+
+Later mutation of an input run does not implicitly mutate the snapshot. Explicit
+updates preserve the previous valid batch on synchronous validation/allocation
+failure, reuse adequate capacity, and perform no instance upload for unchanged
+sprite data. Clip-only changes update spans rather than glyph pixels. Budget
+limits charge total glyphs, placements, and retained CPU capacity; inspect
+`recovery_memory_bytes()` and `gpu_allocation_bytes()` instead of summing the
+same shared atlas repeatedly. Uploads from creation/update happen outside the
+frame report and must be recorded from the corresponding update report.
+
+After device replacement, restore the original atlas, then call
+`restore_glyph_batch(&restored_atlas, &labels)`. Restoration uses the snapshot;
+the source runs need not still exist. An unrelated atlas with identical pixels
+is not a valid substitute for the original atlas's recovery identity.
 
 ## 0.4.1 performance guide
 
@@ -805,14 +1021,14 @@ The default feature set includes the `wgpu` backend:
 
 ```toml
 [dependencies]
-sim-engine = "0.4.1"
+sim-engine = "0.4.2"
 ```
 
 Use the CPU-side visual-state APIs without GPU dependencies:
 
 ```toml
 [dependencies]
-sim-engine = { version = "0.4.1", default-features = false }
+sim-engine = { version = "0.4.2", default-features = false }
 ```
 
 | Configuration | Provides |
@@ -825,7 +1041,7 @@ sim-engine = { version = "0.4.1", default-features = false }
 For CPU fonts without GPU dependencies:
 
 ```toml
-sim-engine = { version = "0.4.1", default-features = false, features = ["fonts"] }
+sim-engine = { version = "0.4.2", default-features = false, features = ["fonts"] }
 ```
 
 Window creation is deliberately outside the crate. The host may use `winit`,
@@ -1647,7 +1863,7 @@ No system font is implicitly selected, and no font is included in the library
 binary. The demonstration font and its license live under `examples/assets/fonts`.
 
 ```toml
-sim-engine = { version = "0.4.1", features = ["text"] }
+sim-engine = { version = "0.4.2", features = ["text"] }
 ```
 
 The default `wgpu` feature alone still accepts host-shaped glyph atlases and
@@ -2908,11 +3124,15 @@ default features and with CPU fonts, strict clippy, doctests, warning-free
 rustdoc, a mandatory
 Vulkan semantic GPU readback fixture with backend assertion, the Vulkan-pinned
 performance matrix, public text and standalone-mesh device recovery,
-a real nested-KWin HiDPI transition, `git diff --check`,
+a real nested-KWin HiDPI transition, the fixed dense-scene 16.67 ms reference
+acceptance, shell provenance regressions, `git diff --check`,
 and the offline package boundary. A successful local wrapper atomically
 publishes `target/linux-release-evidence/`, containing `completion.txt`,
 `linux-vulkan-surface.txt`, `linux-vulkan-adapter.txt`, and
-`linux-vulkan-performance.txt`, and `linux-hidpi-transition.txt`. The
+`linux-vulkan-performance.txt`, `linux-hidpi-transition.txt`, and
+`linux-dense-scene-performance.txt`. The dense-scene subdirectory retains the
+archived source, executable and hashes, cold/warm raw records, exact GPU IDs,
+recovery evidence and all 36 per-trial thresholds. The
 performance manifest records the exact SHA plus every fixture's adapter,
 surface, present mode, trial FPS, CPU/acquire percentiles, deterministic work
 counters, threshold, and passed verdict. CI's narrower semantic job writes and
@@ -2931,6 +3151,9 @@ run from a clean worktree and finish on the exact revision captured at start.
 Their shared nonblocking `flock` prevents concurrent gates from deleting,
 nesting, or relabeling one another's evidence, and Linux `mv -T` is the sole
 publication boundary.
+Failed invocations invalidate the previous success bundle and preserve available
+diagnostics separately in `target/linux-release-failed-*`, explicitly marked
+`status=failed`; these must never be treated as successful release evidence.
 Hardware performance or recovery
 claims must additionally name the Linux adapter, PCI vendor/device and bus
 address, backend, driver, surface format/sample count, workload, present mode,
@@ -2939,7 +3162,7 @@ and measurement method.
 
 ### 30. Official release procedure
 
-The commands below target the 0.4.1 release. For a later release, substitute its
+The commands below target the 0.4.2 release. For a later release, substitute its
 version and finish its dated changelog and migration notes first. Do not run
 publication or create a tag while review or the exact-commit release gate is
 pending. Run from the Sim-Engine repository, not a consumer checkout, and stop
@@ -2974,11 +3197,18 @@ cargo login
 
 ```bash
 git fetch origin
-cargo pkgid -p sim-engine@0.4.1
+case "$(git remote get-url origin)" in
+  https://github.com/lexawhatt/Sim-Engine.git|git@github.com:lexawhatt/Sim-Engine.git) ;;
+  *) echo 'Wrong Git repository'; false ;;
+esac
+case "$(cargo pkgid --locked)" in
+  *'#sim-engine@0.4.2') ;;
+  *) echo 'Wrong repository or package version'; false ;;
+esac
 test -z "$(git status --porcelain --untracked-files=all)"
 test "$(git rev-parse HEAD)" = "$(git rev-parse origin/master)"
-test -z "$(git tag -l v0.4.1)"
-test -z "$(git ls-remote --tags origin refs/tags/v0.4.1)"
+test -z "$(git tag -l v0.4.2)"
+test -z "$(git ls-remote --tags origin refs/tags/v0.4.2)"
 ./scripts/linux_release_gate.sh
 ```
 
@@ -2992,12 +3222,12 @@ grep -Fxq "vcs_sha=$release_sha" \
 grep -Fxq 'status=passed' target/linux-release-evidence/completion.txt
 cargo package --list
 cargo package --locked
-crate=target/package/sim-engine-0.4.1.crate
-tar -xOf "$crate" sim-engine-0.4.1/.cargo_vcs_info.json \
+crate=target/package/sim-engine-0.4.2.crate
+tar -xOf "$crate" sim-engine-0.4.2/.cargo_vcs_info.json \
   | grep -Fq "\"sha1\": \"$release_sha\""
-! tar -xOf "$crate" sim-engine-0.4.1/.cargo_vcs_info.json \
+! tar -xOf "$crate" sim-engine-0.4.2/.cargo_vcs_info.json \
   | grep -Fq '"dirty": true'
-cargo publish -p sim-engine@0.4.1 --registry crates-io --dry-run --locked
+cargo publish -p sim-engine@0.4.2 --registry crates-io --dry-run --locked
 ```
 
 `cargo package` explicitly refreshes the local archive; do not assume a publish
@@ -3010,12 +3240,17 @@ archive and file list if anything changed since the gate. Do not continue if
 #### 2. Publish the immutable crate
 
 ```bash
-cargo publish -p sim-engine@0.4.1 --registry crates-io --locked
+test -n "${release_sha:?Bind release_sha to the qualified commit first}" &&
+test "$(git rev-parse HEAD)" = "$release_sha" &&
+test -z "$(git status --porcelain --untracked-files=all)" &&
+grep -Fxq "vcs_sha=$release_sha" target/linux-release-evidence/completion.txt &&
+grep -Fxq 'status=passed' target/linux-release-evidence/completion.txt &&
+cargo publish -p sim-engine@0.4.2 --registry crates-io --locked
 ```
 
 Cargo may time out while waiting for the new version to appear in the registry
 index even after a successful upload. Before retrying, check the crates.io
-package page or run `cargo info sim-engine@0.4.1`; retrying an accepted version
+package page or run `cargo info sim-engine@0.4.2`; retrying an accepted version
 cannot overwrite it.
 
 #### 3. Tag the published commit
@@ -3025,41 +3260,42 @@ release tag for an upload that never succeeded, while the packaged
 `.cargo_vcs_info.json` still binds the uploaded source to the clean commit:
 
 ```bash
-test "$(git rev-parse HEAD)" = "$release_sha"
-git tag -a v0.4.1 "$release_sha" -m "Sim;Engine v0.4.1"
-test "$(git rev-list -n 1 v0.4.1)" = "$release_sha"
-git push origin v0.4.1
+test -n "${release_sha:?Use the SHA recorded in the published crate}" &&
+test "$(git rev-parse HEAD)" = "$release_sha" &&
+git tag -a v0.4.2 "$release_sha" -m "Sim;Engine v0.4.2" &&
+test "$(git rev-list -n 1 v0.4.2)" = "$release_sha" &&
+git push origin v0.4.2
 ```
 
 Tags for published versions are immutable release history. Never move or
-force-push one. If `v0.4.1` already exists, stop and verify its target instead
+force-push one. If `v0.4.2` already exists, stop and verify its target instead
 of replacing it.
 
 #### 4. Create the GitHub Release and verify public artifacts
 
-Prepare release notes from the `0.4.1` changelog section, then either use the
+Prepare release notes from the `0.4.2` changelog section, then either use the
 GitHub web interface or the GitHub CLI:
 
 ```bash
-gh release create v0.4.1 \
+gh release create v0.4.2 \
   --repo lexawhatt/Sim-Engine \
   --verify-tag \
-  --title "Sim;Engine v0.4.1" \
-  --notes-file /tmp/sim-engine-v0.4.1-notes.md
+  --title "Sim;Engine v0.4.2" \
+  --notes-file /tmp/sim-engine-v0.4.2-notes.md
 ```
 
 Finally verify all four public identities:
 
-- `https://crates.io/crates/sim-engine/0.4.1` shows version 0.4.1;
-- `https://docs.rs/sim-engine/0.4.1` completes successfully;
-- Git tag `v0.4.1` points to `$release_sha`;
+- `https://crates.io/crates/sim-engine/0.4.2` shows version 0.4.2;
+- `https://docs.rs/sim-engine/0.4.2` completes successfully;
+- Git tag `v0.4.2` points to `$release_sha`;
 - the GitHub Release names the same tag and is not marked as a prerelease.
 
 If a serious defect is discovered after publishing, do not attempt to delete
-or overwrite 0.4.1. Yank it and prepare a corrected patch release:
+or overwrite 0.4.2. Yank it and prepare a corrected patch release:
 
 ```bash
-cargo yank --version 0.4.1 sim-engine
+cargo yank --version 0.4.2 sim-engine
 ```
 
 The authoritative external references are Cargo's

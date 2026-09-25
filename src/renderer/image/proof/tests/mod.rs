@@ -3,6 +3,8 @@ use crate::renderer::image::*;
 use crate::renderer::*;
 use std::{hint::black_box, time::Instant};
 
+mod target_certificate;
+
 fn sprite(x: f32, y: f32, width: f32, height: f32) -> ImageSprite2d {
     ImageSprite2d::new(
         ImageTexelRect::new(0, 0, 1, 1).unwrap(),

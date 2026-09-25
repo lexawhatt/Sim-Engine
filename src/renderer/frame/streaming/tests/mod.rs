@@ -80,6 +80,7 @@ impl<'a> Frame<'a> {
                 &mut self.statistics,
                 &mut self.aggregate,
                 &mut batches,
+                &mut crate::RendererPreparationMetrics::default(),
             )
             .unwrap();
         }
@@ -139,6 +140,34 @@ impl<'a> Frame<'a> {
             }
         }
     }
+}
+
+#[test]
+fn cached_streaming_does_not_charge_generation_or_validation_twice() {
+    let scene = panel(3.0);
+    let mut frame = Frame::default();
+    let mut proofs = StreamingSceneProofs::default();
+    let region = viewport();
+    let uniform = CameraUniform::new(Camera2d::default(), region.viewport).unwrap();
+    let started = std::time::Instant::now();
+    frame.push(&scene, uniform, region, Some(&mut proofs));
+    let first = proofs.preparation;
+    assert!(first.total() <= started.elapsed());
+    assert!(first.tessellation() > std::time::Duration::ZERO);
+    assert!(first.geometry_validation() > std::time::Duration::ZERO);
+    assert_eq!(first.retained_draws(), std::time::Duration::ZERO);
+    assert_eq!(first.other(), std::time::Duration::ZERO);
+
+    for _ in 0..4 {
+        frame.push(&scene, uniform, region, Some(&mut proofs));
+        assert_eq!(proofs.preparation, first);
+    }
+    let mut changed = uniform;
+    changed.camera_center[0] += 1.0;
+    frame.push(&scene, changed, region, Some(&mut proofs));
+    assert!(proofs.preparation.tessellation() > first.tessellation());
+    assert!(proofs.preparation.geometry_validation() > first.geometry_validation());
+    assert!(proofs.preparation.total() <= started.elapsed());
 }
 
 #[test]

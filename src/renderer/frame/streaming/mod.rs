@@ -5,7 +5,8 @@ use super::{
     add_tessellation_stats, prepare_streaming_scene_resolved,
 };
 use crate::renderer::{
-    CameraUniform, PreparedDrawBatch, RendererFrameError, Scene, TessellationStats, Vertex,
+    CameraUniform, PreparedDrawBatch, RendererFrameError, RendererPreparationMetrics, Scene,
+    TessellationStats, Vertex,
 };
 
 #[derive(Clone, Copy)]
@@ -26,6 +27,7 @@ mod tests;
 pub(super) struct StreamingSceneProofs<'frame> {
     entries: [Option<SceneProof<'frame>>; 8],
     next: usize,
+    pub(super) preparation: RendererPreparationMetrics,
 }
 
 impl<'frame> StreamingSceneProofs<'frame> {
@@ -96,6 +98,7 @@ impl<'frame> StreamingSceneProofs<'frame> {
             statistics,
             &mut source_statistics,
             batches,
+            &mut self.preparation,
         )?;
         add_tessellation_stats(aggregate, source_statistics);
         self.entries[self.next] = Some(SceneProof {

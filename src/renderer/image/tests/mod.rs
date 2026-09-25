@@ -1,6 +1,7 @@
 use super::*;
 use crate::renderer::*;
 
+mod region_admission;
 mod retained_updates;
 pub(in crate::renderer) use retained_updates::verify_retained_ui_updates;
 

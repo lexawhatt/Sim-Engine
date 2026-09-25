@@ -916,21 +916,14 @@ impl WgpuRenderer {
         source: &ImageBatch2d,
     ) -> Result<ImageBatch2d, ImageError> {
         self.validate_image(image)?;
-        if !Arc::ptr_eq(&image.recovery_identity, &source.image_recovery_identity) {
-            return Err(ImageError::RecoverySourceMismatch);
-        }
-        preflight_image_batch_capacity(&self.device, source.sprites.len(), source.budget)?;
-        let mut sprites = Vec::new();
-        let requested_bytes = source
-            .sprites
-            .len()
-            .checked_mul(std::mem::size_of::<ImageSprite2d>())
-            .ok_or(ImageError::DimensionsTooLarge)?;
-        sprites
-            .try_reserve_exact(source.sprites.len())
-            .map_err(|_| ImageError::AllocationFailed { requested_bytes })?;
-        sprites.extend_from_slice(&source.sprites);
-        self.create_image_batch(image, sprites, source.budget)
+        restore_image_batch_resources(
+            &self.device,
+            &self.queue,
+            Arc::clone(&self.renderer_identity),
+            image,
+            source,
+            source.budget,
+        )
     }
 
     pub(super) fn validate_image(&self, image: &Image2d) -> Result<(), ImageError> {
@@ -945,13 +938,48 @@ impl WgpuRenderer {
         batch: &ImageBatch2d,
     ) -> Result<(), ImageError> {
         self.validate_image(image)?;
-        if !prepared_scene_belongs_to(&self.renderer_identity, &batch.renderer_identity)
-            || !prepared_scene_belongs_to(&image.resource_identity, &batch.image_identity)
-        {
-            return Err(ImageError::RendererMismatch);
-        }
-        Ok(())
+        validate_batch_image(image, batch)
     }
+}
+
+pub(super) fn restore_image_batch_resources(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    renderer_identity: Arc<()>,
+    image: &Image2d,
+    source: &ImageBatch2d,
+    budget: ImageBatchBudget,
+) -> Result<ImageBatch2d, ImageError> {
+    if !Arc::ptr_eq(&renderer_identity, &image.renderer_identity) {
+        return Err(ImageError::RendererMismatch);
+    }
+    if !Arc::ptr_eq(&image.recovery_identity, &source.image_recovery_identity) {
+        return Err(ImageError::RecoverySourceMismatch);
+    }
+    preflight_image_batch_capacity(device, source.sprites.len(), budget)?;
+    let mut sprites = Vec::new();
+    let requested_bytes = source
+        .sprites
+        .len()
+        .checked_mul(std::mem::size_of::<ImageSprite2d>())
+        .ok_or(ImageError::DimensionsTooLarge)?;
+    sprites
+        .try_reserve_exact(source.sprites.len())
+        .map_err(|_| ImageError::AllocationFailed { requested_bytes })?;
+    sprites.extend_from_slice(&source.sprites);
+    create_image_batch_resources(device, queue, renderer_identity, image, sprites, budget)
+}
+
+pub(super) fn validate_batch_image(
+    image: &Image2d,
+    batch: &ImageBatch2d,
+) -> Result<(), ImageError> {
+    if !prepared_scene_belongs_to(&image.renderer_identity, &batch.renderer_identity)
+        || !prepared_scene_belongs_to(&image.resource_identity, &batch.image_identity)
+    {
+        return Err(ImageError::RendererMismatch);
+    }
+    Ok(())
 }
 
 pub(super) fn validate_image_region_upload(
@@ -1077,14 +1105,26 @@ pub(super) fn create_image_batch_resources(
 pub(super) fn logical_image_region_is_portable(region: LogicalViewportRegion) -> bool {
     let origin = region.origin().to_vec2();
     let size = region.viewport().size();
-    [origin.x, origin.y, size.x, size.y]
+    let components = [origin.x, origin.y, size.x, size.y];
+    if !components.into_iter().all(is_portable_shader_source) {
+        return false;
+    }
+    // A sufficient certificate for the exact two-term interval proof below.
+    // Each signed partial sum and magnitude sum is <= MAX/2. There are at most
+    // two rounding operations, so gamma(2) * MAX/2 + 2*MIN_POSITIVE cannot reach
+    // the remaining MAX/2 headroom. Source subnormals were rejected above.
+    // This skips no downstream target/clip proof and expands no accepted input.
+    if components
         .into_iter()
-        .all(is_portable_shader_source)
-        && shader_interval_sum_range([
-            (f64::from(origin.x), f64::from(origin.x)),
-            (0.0, f64::from(size.x)),
-        ])
-        .is_some()
+        .all(|value| value.abs() <= super::MAX_PORTABLE_SHADER_VALUE * 0.25)
+    {
+        return true;
+    }
+    shader_interval_sum_range([
+        (f64::from(origin.x), f64::from(origin.x)),
+        (0.0, f64::from(size.x)),
+    ])
+    .is_some()
         && shader_interval_sum_range([
             (f64::from(origin.y), f64::from(origin.y)),
             (0.0, f64::from(size.y)),

@@ -11,9 +11,10 @@ use super::{
 use crate::renderer::{
     COLOR_MAP_LUT_SIZE, CameraUniform, Color, CompositeUniform, GeometryValidationSource,
     GpuTimingSource, HeatmapUniform, ImageUniform, LogicalScreenPosition, LogicalViewportRegion,
-    PreparedDrawBatch, RenderStatus, RendererFrameError, RendererSurfaceStatus, TessellationStats,
-    Vec2, Vertex, WgpuRenderer, color_map_lut, image, is_portable_shader_source,
-    scalar_normalization_is_portable, scene_estimate_fits_streaming_device, screen_camera,
+    PreparedDrawBatch, RenderStatus, RendererFrameError, RendererPreparationMetrics,
+    RendererSurfaceStatus, TessellationStats, Vec2, Vertex, WgpuRenderer, color_map_lut, image,
+    is_portable_shader_source, scalar_normalization_is_portable,
+    scene_estimate_fits_streaming_device, screen_camera,
 };
 
 pub(super) fn present_frame(
@@ -26,6 +27,7 @@ pub(super) fn present_frame(
     streaming_vertices.clear();
     let mut ready = std::mem::take(&mut composer.cache.ready);
     let mut bindings = std::mem::take(&mut composer.cache.bindings);
+    let mut preparation = RendererPreparationMetrics::default();
     let result = present_frame_with_vertices(
         renderer,
         composer.background,
@@ -36,7 +38,12 @@ pub(super) fn present_frame(
         &mut ready,
         &mut bindings,
         &mut composer.cache,
-    );
+        &mut preparation,
+    )
+    .map(|mut report| {
+        report.metrics.preparation = Some(preparation);
+        report
+    });
     renderer.vertices = streaming_vertices;
     composer.cache.ready = cache::recycle_ready_with_batches(ready, &mut composer.cache.batches);
     bindings.clear();
@@ -55,6 +62,7 @@ fn present_frame_with_vertices<'frame>(
     ready: &mut Vec<ReadyItem<'frame>>,
     bindings: &mut Vec<FrameBinding>,
     cache: &mut FrameCache,
+    preparation: &mut RendererPreparationMetrics,
 ) -> Result<FrameReport, FrameComposerError> {
     let frame_started_at = Instant::now();
     items.sort_unstable_by_key(FrameItem::sort_key);
@@ -63,7 +71,7 @@ fn present_frame_with_vertices<'frame>(
         .logical_viewport()
         .map_err(|_| RendererFrameError::InvalidViewport)?;
     let tessellation_started_at = Instant::now();
-    preflight_frame_items(renderer, target_viewport, items)?;
+    preflight_frame_items(renderer, target_viewport, items, preparation)?;
     ready
         .try_reserve(items.len())
         .map_err(|_| FrameComposerError::AllocationFailed {
@@ -87,7 +95,34 @@ fn present_frame_with_vertices<'frame>(
     let mut simulated_color_map_lut = renderer.color_map_cache.as_ref().map(|cache| cache.lut);
 
     for item in items.drain(..) {
+        let retained = matches!(
+            &item,
+            FrameItem::Prepared { .. }
+                | FrameItem::PreparedScreen { .. }
+                | FrameItem::ScreenPrimitives { .. }
+                | FrameItem::Dynamic { .. }
+                | FrameItem::Image { .. }
+                | FrameItem::WorldImage { .. }
+                | FrameItem::ImageBatch { .. }
+        );
+        let retained_started = Instant::now();
+        let validation_before = preparation.geometry_validation;
         match item {
+            FrameItem::ScreenPrimitives { batch, options, .. } => {
+                let viewport = resolve_viewport(renderer, target_viewport, options)?;
+                super::primitives::prepare(
+                    batch,
+                    viewport,
+                    target_viewport,
+                    renderer.scale_factor as f32,
+                    preparation,
+                    ready,
+                    &mut statistics,
+                    &mut tessellation_stats,
+                    cache.batches.pop().unwrap_or_default(),
+                )?;
+                geometry_reused = true;
+            }
             FrameItem::Scene {
                 scene,
                 camera,
@@ -167,6 +202,7 @@ fn present_frame_with_vertices<'frame>(
                     &mut statistics,
                     &mut tessellation_stats,
                     cache.batches.pop().unwrap_or_default(),
+                    preparation,
                 )?;
                 geometry_reused = true;
             }
@@ -190,6 +226,7 @@ fn present_frame_with_vertices<'frame>(
                     &mut statistics,
                     &mut tessellation_stats,
                     cache.batches.pop().unwrap_or_default(),
+                    preparation,
                 )?;
                 geometry_reused = true;
             }
@@ -220,6 +257,7 @@ fn present_frame_with_vertices<'frame>(
                     &mut statistics,
                     &mut tessellation_stats,
                     cache.batches.pop().unwrap_or_default(),
+                    preparation,
                 )?;
                 geometry_streamed = true;
             }
@@ -444,6 +482,7 @@ fn present_frame_with_vertices<'frame>(
             FrameItem::ImageBatch {
                 image,
                 batch,
+                spans,
                 placement,
                 sampling,
                 options,
@@ -468,12 +507,13 @@ fn present_frame_with_vertices<'frame>(
                     texture_bytes: image.gpu_allocation_bytes(),
                     retained_cpu_bytes: 0,
                     retained_buffer_bytes: 0,
-                    draw_calls: usize::from(batch.sprite_count() > 0),
+                    draw_calls: spans.map_or(usize::from(batch.sprite_count() > 0), <[_]>::len),
                     source_counts: FrameSourceStatistics::default(),
                 });
                 ready.push(ReadyItem::ImageBatch {
                     image,
                     batch,
+                    spans,
                     sampling,
                     uniform,
                     viewport,
@@ -517,7 +557,14 @@ fn present_frame_with_vertices<'frame>(
                 });
             }
         }
+        if retained {
+            preparation.retained_draws += retained_started
+                .elapsed()
+                .saturating_sub(preparation.geometry_validation - validation_before);
+        }
     }
+    preparation.tessellation += streaming_proofs.preparation.tessellation;
+    preparation.geometry_validation += streaming_proofs.preparation.geometry_validation;
     statistics.texture_bytes = planned.texture_bytes;
     let (particle_cpu_before, particle_cpu_after) =
         ready
@@ -552,6 +599,7 @@ fn present_frame_with_vertices<'frame>(
     cache.reserve_slots(ready.len())?;
     cache.prepare_uniform_uploads(ready, renderer.device.limits().max_buffer_size);
     let tessellation = tessellation_started_at.elapsed();
+    preparation.other = tessellation.saturating_sub(preparation.total());
 
     // Surface availability is resolved after all fallible CPU preparation but
     // before bind-group creation or queue writes. Repeated skipped frames must

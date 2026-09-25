@@ -7,7 +7,69 @@ changes.
 
 ## Unreleased
 
-No changes recorded.
+## 0.4.2 - 2026-09-25
+
+Dense 2D mathematical visualization: compact retained primitives, many-label
+batches, and measurable preparation costs. These are additive opt-in APIs;
+existing 0.4 integrations need no source migration. Applications must select
+the new paths and retain their resources to benefit from their smaller geometry
+and fewer draw calls. Updating the dependency alone does not convert a streamed
+scene or individually submitted labels.
+
+### Added
+
+- Separate composed-frame CPU preparation into geometry generation, numeric
+  validation, retained draw preparation, and remaining preflight/bookkeeping.
+  The existing total preparation, upload, acquire, and asynchronous hardware
+  GPU diagnostics retain their meanings.
+- Add an allocation-free `WgpuRenderer::diagnostics` view of the selected
+  adapter, physical PCI identity when available, backend, driver, DPI, surface
+  format, MSAA, and actual present mode.
+- Add retained same-atlas `GlyphBatch2d` snapshots of prepared run placements,
+  with individual translations, tints, and clips. Only adjacent equal-clip
+  spans merge; transparent painter order is preserved without reshaping text.
+- Add an opt-in compact retained screen-primitive path for solid circles,
+  independent round-capped lines and axis-aligned rectangles. Analytic boundaries
+  replace polygon fans, with per-sample MSAA coverage, explicit CPU/GPU/upload
+  budgets, capacity-reusing atomic updates and device recovery. Ordinary scene
+  styles and their existing numeric validation remain supported unchanged.
+- Add composed and independently scaled offscreen-target draws for these
+  batches, plus an explicit compatible `ScreenScene` converter that rejects
+  unsupported commands without silently dropping them.
+- Bound compact-source and transformed boundary error to 0.25 physical pixels
+  at the actual destination scale. Unrepresentable precision is a structured
+  error, not a silently deformed shape. Fractional coordinates, HiDPI, clips,
+  transparent overlap and independently scaled targets have pixel regressions.
+
+### Performance
+
+- Reuse exact stroke direction, vertex-position, and branch interval proofs
+  within a validation call. Caches are bounded and compare complete bitwise
+  source keys; shader arithmetic, rejection guarantees, and geometry are
+  unchanged. Independent frozen 0.4.1 CPU references check equivalence.
+- Use sufficient bounded analytic-primitive and image-target certificates for
+  common coordinates. Inconclusive cases retain the original per-instance
+  interval checks. Full camera/scale keys, source-precision invalidation and
+  fresh proof state after recovery prevent stale success reuse.
+- Fuse glyph-placement validation and reuse valid unchanged destinations;
+  source UV/tint validation and transactional failure are preserved. Repeated
+  identical updates perform no instance upload; clip-only changes update spans.
+- Share compact instance generation, command accounting and source-bound scans.
+  Capacity-reusing updates retain complete recovery snapshots and report their
+  own upload bytes, separately from subsequent frame composition.
+
+### Verification and tooling
+
+- Add `dense_scene_benchmark`: identical 100/500/2000-construction visual inputs,
+  24 clips and three labels per construction under streaming, prepared and
+  compact paths. Idle, pan, zoom and drag have cold/warm p50/p95/p99, independent
+  CPU/GPU scopes, memory/vertices/uploads/draws, exact GPU correlation and recovery.
+- Add a reference-adapter acceptance gate: three 120-frame trials per phase,
+  each requiring end-to-end p95 <= 16.67 ms, all expected geometry and confirmed
+  draws. This is not an application-wide or arbitrary-hardware FPS guarantee.
+- Preserve failed release evidence separately from successful bundles, and
+  cover exact-SHA, dirty-tree and read-only archive rerun boundaries with
+  hermetic shell regressions.
 
 ## 0.4.1 - 2026-09-17
 

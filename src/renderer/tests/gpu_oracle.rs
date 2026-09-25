@@ -202,6 +202,22 @@ pub(super) fn run() {
         frame::assert_gpu_binding_sharing_contract(&device, &queue);
         frame::assert_gpu_uniform_upload_contract(&device, &queue);
         frame::assert_gpu_encoding_contract(&device, &queue, format, sample_count);
+        glyph_batch::verify_glyph_batches(
+            &device,
+            &queue,
+            &recovery_device,
+            &recovery_queue,
+            format,
+            sample_count,
+        );
+        screen_primitives::verify_analytic_primitives(
+            &device,
+            &queue,
+            &recovery_device,
+            &recovery_queue,
+            format,
+            sample_count,
+        );
         mesh3d::assert_gpu_depth_contract(&device, &queue, format);
         mesh3d::assert_gpu_scene_recovery_contract(
             &device,

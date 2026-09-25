@@ -557,25 +557,32 @@ mod validation2d;
 use validation2d::{
     GEOMETRY_VALIDATION_CACHE_CAPACITY, dynamic_triangle_topology_is_portable,
     geometry_vertex_centers_are_portable, logical_stroke_branches_are_stable,
-    shader_interval_sum_is_safe, shader_stroke_screen_bounds,
+    logical_stroke_vertex_screen_ranges, shader_interval_sum_is_safe, shader_stroke_screen_bounds,
     tessellated_triangle_topology_is_portable, tessellated_vertex_clip_ranges,
 };
 use validation2d::{
     GeometryValidationCache, GeometryValidationSource, center_axis,
     clip_triangle_has_stable_signed_area, clip_triangle_is_wholly_outside, geometry_is_safe_for,
     geometry_is_safe_for_cached, geometry_sources_are_portable, interval_products_f64,
-    is_nonzero_subnormal, logical_stroke_vertex_screen_ranges, range_abs, range_dot, range_negate,
-    range_vector_add, range_vector_scale, rounded_f32_add_range, rounded_f32_product_range,
-    screen_ranges_to_clip, shader_clip_interval_is_safe, shader_direction_dot_range,
-    shader_interval_sum_range, shader_relative_component_bounds, shader_world_dot_range,
-    stroke_safe_unit_range, tessellated_vertex_base_screen_ranges, triangle_position_sources_equal,
+    is_nonzero_subnormal, range_abs, range_dot, range_negate, range_vector_add, range_vector_scale,
+    rounded_f32_add_range, rounded_f32_product_range, screen_ranges_to_clip,
+    shader_clip_interval_is_safe, shader_direction_dot_range, shader_interval_sum_range,
+    shader_relative_component_bounds, shader_world_dot_range, stroke_safe_unit_range,
+    tessellated_vertex_base_screen_ranges, triangle_position_sources_equal,
+};
+
+mod primitive_targets;
+mod screen_primitives;
+pub use screen_primitives::{
+    ScreenPrimitive2d, ScreenPrimitiveBatch2d, ScreenPrimitiveBudget, ScreenPrimitiveError,
+    ScreenPrimitiveUploadReport,
 };
 
 mod outcomes;
 pub use outcomes::{
     PreparedSceneError, PreparedSceneRenderError, RenderReport, RenderStatus,
     RendererConfigurationError, RendererCoordinateError, RendererFrameError, RendererFrameMetrics,
-    RendererInitError, RendererSurfaceStatus,
+    RendererInitError, RendererPreparationMetrics, RendererSurfaceStatus,
 };
 
 /// Immutable scene geometry tessellated and uploaded once for repeated drawing.
@@ -689,6 +696,8 @@ pub struct WgpuRenderer {
     scale_factor: f64,
     pipeline: wgpu::RenderPipeline,
     target_pipeline: wgpu::RenderPipeline,
+    screen_primitive_pipeline: wgpu::RenderPipeline,
+    target_screen_primitive_pipeline: wgpu::RenderPipeline,
     dynamic_pipeline: wgpu::RenderPipeline,
     particle_pipeline: wgpu::RenderPipeline,
     target_particle_pipeline: wgpu::RenderPipeline,
@@ -1462,6 +1471,7 @@ fn render_report(
             geometry_reused,
             geometry_streamed,
             tessellation_stats,
+            preparation: None,
         },
     }
 }
@@ -1904,11 +1914,13 @@ fn create_particle_instance_buffer(device: &wgpu::Device, capacity: usize) -> wg
 }
 
 mod config;
+mod diagnostics;
 mod dynamic_mesh;
 mod exact_markers;
 mod frame;
 mod geometry;
 mod glyph;
+mod glyph_batch;
 mod gpu_timing;
 mod image;
 mod initialization;
@@ -1931,6 +1943,7 @@ use config::{
     physical_to_logical_screen, validate_scale_factor, validate_surface_dimensions,
 };
 pub use config::{RendererPresentMode, RendererSurfacePresentMode, WgpuRendererOptions};
+pub use diagnostics::RendererDiagnostics;
 pub use dynamic_mesh::{
     DynamicMesh2d, DynamicMeshBudget, DynamicMeshBudgetResource, DynamicMeshError,
     DynamicMeshRenderError, DynamicMeshUpdateReport, DynamicVertex2d,
@@ -1944,6 +1957,9 @@ pub use glyph::{
     GlyphAtlas2d, GlyphAtlasBudget, GlyphAtlasEntry, GlyphError, GlyphId, GlyphRun2d,
     GlyphRunBounds, GlyphRunBudget, GlyphRunStatistics, GlyphRunUploadReport, GlyphUploadReport,
     PositionedGlyph2d,
+};
+pub use glyph_batch::{
+    GlyphBatch2d, GlyphBatchBudget, GlyphBatchUploadReport, GlyphRunPlacement2d,
 };
 pub use gpu_timing::{
     GpuTimingBatch, GpuTimingId, GpuTimingSample, GpuTimingSource, GpuTimingStatistics,

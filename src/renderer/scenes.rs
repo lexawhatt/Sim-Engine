@@ -14,6 +14,35 @@ use super::{
 };
 
 impl WgpuRenderer {
+    /// Draws a retained analytic screen batch into a single-sample color target.
+    ///
+    /// `pixel_scale` is the target's physical texels per logical pixel, independent
+    /// of window DPI. Primitive positions and captured clips are local to the
+    /// optional viewport. The target is explicitly loaded or cleared, including
+    /// outside the viewport. Colors use the target's existing premultiplied-alpha
+    /// storage contract. This submits offscreen work, never a surface present.
+    ///
+    /// Restored resources must belong to the active renderer. All synchronous
+    /// source/viewport/clear-color validation happens before a queue write.
+    pub fn render_screen_primitive_batch_to_target(
+        &mut self,
+        target: &RenderTarget2d,
+        batch: &super::ScreenPrimitiveBatch2d,
+        pixel_scale: PhysicalPerLogical,
+        viewport: Option<LogicalViewportRegion>,
+        load: RenderTargetLoad,
+    ) -> Result<RenderReport, RenderTargetError> {
+        super::primitive_targets::PrimitiveTargetRenderer {
+            renderer_identity: &self.renderer_identity,
+            device: &self.device,
+            queue: &self.queue,
+            pipeline: &self.target_screen_primitive_pipeline,
+            camera_uniform_buffer: &self.camera_uniform_buffer,
+            camera_bind_group: &self.camera_bind_group,
+        }
+        .draw(target, batch, pixel_scale, viewport, load)
+    }
+
     /// Draws a scene using the supplied camera.
     ///
     /// Scene positions and sizes are in world units unless a style explicitly

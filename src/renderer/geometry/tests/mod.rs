@@ -2,6 +2,9 @@ use super::*;
 use crate::renderer::*;
 use std::hint::black_box;
 
+mod dense_primitives;
+mod reference;
+
 fn tessellate(scene: &Scene) -> Vec<Vertex> {
     let mut vertices = Vec::new();
     tessellate_scene(scene, &mut vertices, &mut Vec::new()).unwrap();
@@ -45,6 +48,7 @@ fn compare(vertices: &[Vertex], uniform: CameraUniform) -> bool {
     let source = GeometryValidationSource::Tessellated(vertices);
     let old = legacy_is_safe_for(extents, source, uniform);
     assert_eq!(geometry_is_safe_for(extents, source, uniform), old);
+    assert_eq!(reference::is_safe_for(extents, source, uniform), old);
     old
 }
 

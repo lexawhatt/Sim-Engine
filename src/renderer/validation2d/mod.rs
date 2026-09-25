@@ -4,6 +4,7 @@ use super::{
 };
 
 mod interval;
+mod stroke;
 #[cfg(test)]
 pub(in crate::renderer) use interval::shader_interval_sum_is_safe;
 use interval::{
@@ -16,6 +17,7 @@ pub(in crate::renderer) use interval::{
     range_vector_add, range_vector_scale, rounded_f32_add_range, rounded_f32_product_range,
     shader_interval_sum_range,
 };
+pub(in crate::renderer) use stroke::StrokeProofs;
 
 pub(in crate::renderer) fn center_axis(
     center: ((f64, f64), (f64, f64)),
@@ -480,9 +482,6 @@ pub(in crate::renderer) fn geometry_is_safe_for(
         && match source {
             GeometryValidationSource::Tessellated(vertices) => {
                 geometry::tessellated_topology_is_portable(vertices, uniform)
-                    && vertices
-                        .iter()
-                        .all(|vertex| logical_stroke_branches_are_stable(*vertex, uniform))
             }
             GeometryValidationSource::Dynamic(vertices) => {
                 // The triangle proof projects every vertex itself, so do not
@@ -764,6 +763,8 @@ pub(in crate::renderer) fn triangle_position_sources_equal(triangle: &[Vertex]) 
     })
 }
 
+// Frozen pre-0.4.2 reference: do not route through the production stroke memo.
+#[cfg(test)]
 pub(in crate::renderer) fn logical_stroke_vertex_screen_ranges(
     vertex: Vertex,
     uniform: CameraUniform,

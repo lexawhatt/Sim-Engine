@@ -115,6 +115,18 @@ impl WgpuRenderer {
         let particle_unit_buffer = create_submitted_particle_unit_buffer(&device, &queue);
         let multisample_target = create_multisample_target(&device, &config, sample_count);
         let image_renderer = ImageRenderer::new(&device, config.format, sample_count);
+        let screen_primitive_pipeline = super::screen_primitives::create_pipeline(
+            &device,
+            &camera_bind_group_layout,
+            config.format,
+            sample_count,
+        );
+        let target_screen_primitive_pipeline = super::screen_primitives::create_pipeline(
+            &device,
+            &camera_bind_group_layout,
+            config.format,
+            1,
+        );
         let mesh3d_renderer = Mesh3dRenderer::new(&device, config.format);
         let gpu_timing = gpu_timing::GpuTimingCollector::new(&device, &queue, options.gpu_timing());
 
@@ -141,6 +153,8 @@ impl WgpuRenderer {
             composition_pipelines,
             target_composition_pipelines,
             image_renderer,
+            screen_primitive_pipeline,
+            target_screen_primitive_pipeline,
             mesh3d_renderer,
             gpu_timing,
             gpu_timing_requested: options.gpu_timing(),

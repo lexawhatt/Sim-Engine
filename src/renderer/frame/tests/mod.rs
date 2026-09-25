@@ -272,6 +272,7 @@ fn late_streaming_transform_rejection_rolls_back_appended_vertices() {
             &mut statistics,
             &mut aggregate,
             &mut Vec::new(),
+            &mut RendererPreparationMetrics::default(),
         ),
         Err(FrameComposerError::Frame(
             RendererFrameError::InvalidGeometryTransform
@@ -323,6 +324,7 @@ fn streaming_screen_scene_rejects_generated_subnormal_geometry() {
             &mut statistics,
             &mut aggregate,
             &mut Vec::new(),
+            &mut RendererPreparationMetrics::default(),
         ),
         Err(FrameComposerError::Frame(
             RendererFrameError::InvalidGeometryTransform
