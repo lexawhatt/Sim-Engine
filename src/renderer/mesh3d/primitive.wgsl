@@ -11,20 +11,20 @@
     return surface_retained(input, vec2<f32>(0.0), vertex_color, normal);
 }
 @vertex fn mesh3d_clipped_surface_vs_main(@location(0) clip: vec4<f32>, @location(4) color: vec4<f32>, @location(7) surface: vec4<f32>) -> SurfaceOut {
-    return SurfaceOut(clip, color * vec4<f32>(1.0), vec2<f32>(0.0), surface, vec4<f32>(0.0));
+    return make_surface_output(clip, color * vec4<f32>(1.0), vec2<f32>(0.0), surface, vec4<f32>(0.0));
 }
 @vertex fn mesh3d_clipped_surface_enhanced_vs_main(@location(0) clip: vec4<f32>, @location(4) color: vec4<f32>, @location(7) surface: vec4<f32>, @location(8) auxiliary: vec4<f32>) -> SurfaceOut {
-    return SurfaceOut(clip, color * vec4<f32>(1.0), vec2<f32>(0.0), surface, auxiliary);
+    return make_surface_output(clip, color * vec4<f32>(1.0), vec2<f32>(0.0), surface, auxiliary);
 }
 @vertex fn mesh3d_colored_clipped_vs_main(@location(0) clip: vec4<f32>, @location(4) color: vec4<f32>, @location(7) surface: vec4<f32>, @location(6) vertex_color: vec4<f32>) -> SurfaceOut {
-    return SurfaceOut(clip, color * vertex_color, vec2<f32>(0.0), surface, vec4<f32>(0.0));
+    return make_surface_output(clip, color * vertex_color, vec2<f32>(0.0), surface, vec4<f32>(0.0));
 }
 @vertex fn mesh3d_colored_clipped_enhanced_vs_main(@location(0) clip: vec4<f32>, @location(4) color: vec4<f32>, @location(7) surface: vec4<f32>, @location(6) vertex_color: vec4<f32>, @location(8) auxiliary: vec4<f32>) -> SurfaceOut {
-    return SurfaceOut(clip, color * vertex_color, vec2<f32>(0.0), surface, auxiliary);
+    return make_surface_output(clip, color * vertex_color, vec2<f32>(0.0), surface, auxiliary);
 }
 @fragment fn mesh3d_fs_main(input: SurfaceOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {
     let color = input.color;
-    return surface_fragment(color, input.surface, input.normal_depth, front);
+    return surface_fragment(color, input.surface, input.normal_depth, front, input.position.xy);
 }
 
 struct Mesh3dEdgeIn {

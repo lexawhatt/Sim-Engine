@@ -10,8 +10,10 @@ clipping, interpolation, GPU resources, composition, recovery, and rendering
 diagnostics. Physics, simulation stepping, domain entities, UI navigation, and
 plugins remain in the host application.
 
-This is **Sim;Engine 0.4.2**, focused on dense 2D mathematical visualization.
-See the [0.4.2 changelog](CHANGELOG.md#042---2026-09-25).
+This is **Sim;Engine 0.5.0**. It adds independent 3D layer resolutions, surface
+effects, bounded GPU capture, texture-region reuse and exact shaped-cluster
+editor geometry. Start with the [0.5 integration guide](DOCUMENTATION.md#05-integration-guide)
+and [0.5 changelog](CHANGELOG.md#050---2026-11-25).
 The crate remains pre-1.0, and its
 supported release target is Linux with Vulkan. A concrete adapter/driver is
 supported when the mandatory semantic fixture passes on it;
@@ -78,6 +80,10 @@ No universal frame rate or replacement for consumer testing is promised.
 - budgeted instanced particle rendering;
 - scalar-field textures, color maps, partial updates, and heatmaps;
 - offscreen targets, composition, and bounded trails;
+- explicit target storage/overlap budgets and transactional resize/recovery;
+- independent base/detail color resolutions with native-depth composition;
+- per-pass linear quantization, dither, scanlines, vertex snap and affine UVs;
+- bounded capture of complete offscreen GPU composition and glyph-atlas 3D snapshots;
 - device recovery with explicit retained-resource restoration;
 - typed logical-pixel, 2D/3D world-length, and target-scale boundaries;
 - retained 3D meshes, independent transforms, hardware depth, and visible or
@@ -129,25 +135,38 @@ NVIDIA or software-Vulkan runs. See [known boundaries](DOCUMENTATION.md#28-known
 
 ## Installation
 
-The default feature set includes the `wgpu` renderer:
+The following commands select version 0.5.0. The default feature set includes
+the `wgpu` renderer:
 
 ```bash
-cargo add sim-engine@0.4.2
+cargo add sim-engine@0.5.0
 ```
 
 or add it directly to `Cargo.toml`:
 
 ```toml
 [dependencies]
-sim-engine = "0.4.2"
+sim-engine = "0.5.0"
 ```
 
 Use core visual-state APIs without GPU dependencies:
 
 ```toml
 [dependencies]
-sim-engine = { version = "0.4.2", default-features = false }
+sim-engine = { version = "0.5.0", default-features = false }
 ```
+
+For local development, use a checkout instead of the registry version. Adjust
+the path relative to the consuming crate's `Cargo.toml`:
+
+```toml
+[dependencies]
+sim-engine = { path = "../Sim-Engine", features = ["text"] }
+```
+
+`text` enables GPU text and CPU font shaping. For only editor geometry, use
+`default-features = false, features = ["fonts"]` on that same path dependency.
+The local dependency does not establish that a registry release is available.
 
 Run the examples from a repository checkout matching the library version:
 
@@ -187,7 +206,7 @@ GPU copy work are reported separately from host-upload bytes.
 Enable the optional `text` feature:
 
 ```toml
-sim-engine = { version = "0.4.2", features = ["text"] }
+sim-engine = { version = "0.5.0", features = ["text"] }
 ```
 
 ```rust,no_run
@@ -215,6 +234,9 @@ wrapping, color emoji, and font-file I/O are not built into the engine.
 For CPU-only font work, use `default-features = false, features = ["fonts"]`.
 `TextShapingSession` reuses shaping state; `TextAtlas2d::prepare_from_shaped`
 and `update_from_shaped` consume its results without shaping again.
+`ShapedLine::clusters`, `caret_at` and `selection` expose exact pen-based UTF-8
+cluster geometry with an explicit boundaries-only ligature policy; they do not
+implement paragraph bidi, grapheme editing or native IME.
 
 ## Quick Start
 
@@ -287,6 +309,9 @@ let report = frame.present()?;
 | Changing 3D geometry with immutable aliases | `update_scene3d_mesh` with `DynamicMesh3dBudget` |
 | Material or background changes without geometry upload | `Scene3d::set_texture_material` / `set_background` |
 | Partial 3D texture edits | `update_scene3d_texture_region` |
+| Coarse base shading with crisp 3D detail (0.5) | `LayeredTarget3d` plus `render_layered_scene3d` |
+| Exact cluster-aligned caret/selection geometry (0.5, `fonts`) | `ShapedLine::clusters`, `caret_at`, `selection` |
+| Complete GPU composition capture (0.5) | `FrameComposer::render_to_target` plus `capture_render_target` |
 
 ## Examples
 
@@ -302,6 +327,7 @@ cargo run --release --example stereometry_3d -- --uncapped
 cargo run --release --example cylinder_derivation_3d -- --uncapped --benchmark
 cargo run --release --example materials_3d
 cargo run --release --example lighting_3d
+cargo run --release --features text --example layered_3d -- --acceptance
 cargo run --release --example texture_lifecycle_3d
 cargo run --release --example texture_lifecycle_3d -- --acceptance
 cargo run --release --all-features --example mesh3d_scene_benchmark -- --case repeated

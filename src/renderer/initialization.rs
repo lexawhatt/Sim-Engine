@@ -131,6 +131,7 @@ impl WgpuRenderer {
         let gpu_timing = gpu_timing::GpuTimingCollector::new(&device, &queue, options.gpu_timing());
 
         Ok(Self {
+            capture_state: super::capture::CaptureState::default(),
             renderer_identity: Arc::new(()),
             _instance: instance,
             surface,

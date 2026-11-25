@@ -172,11 +172,22 @@ fn frame_report_exposes_single_present_contract_and_skipped_zeroes() {
         statistics: FrameStatistics::default(),
         metrics: RendererFrameMetrics::default(),
         gpu_timing_id: None,
+        surface_presented: true,
     };
     assert_eq!(drawn.command_encoder_count(), 1);
     assert_eq!(drawn.render_pass_count(), 1);
     assert_eq!(drawn.queue_submission_count(), 1);
     assert_eq!(drawn.surface_present_count(), 1);
+
+    let offscreen = FrameReport {
+        surface_presented: false,
+        ..drawn
+    };
+    assert_eq!(offscreen.status(), RenderStatus::Drawn);
+    assert_eq!(offscreen.command_encoder_count(), 1);
+    assert_eq!(offscreen.render_pass_count(), 1);
+    assert_eq!(offscreen.queue_submission_count(), 1);
+    assert_eq!(offscreen.surface_present_count(), 0);
 
     let skipped = FrameReport {
         status: RenderStatus::Skipped(RendererSurfaceStatus::Occluded),

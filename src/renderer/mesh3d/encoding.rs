@@ -23,6 +23,7 @@ pub(super) fn encode_scene_pass(
         instances,
         &[],
         None,
+        false,
     );
 }
 
@@ -36,6 +37,7 @@ pub(super) fn encode_ordered_scene_pass(
     instances: &[Mesh3dInstance],
     order: &[material::SurfaceDraw],
     timestamp_writes: Option<wgpu::RenderPassTimestampWrites<'_>>,
+    load_existing: bool,
 ) -> usize {
     let mut draw_call_count = 0;
     let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -45,14 +47,22 @@ pub(super) fn encode_ordered_scene_pass(
             depth_slice: None,
             resolve_target: None,
             ops: wgpu::Operations {
-                load: wgpu::LoadOp::Clear(premultiplied_wgpu_color(background)),
+                load: if load_existing {
+                    wgpu::LoadOp::Load
+                } else {
+                    wgpu::LoadOp::Clear(premultiplied_wgpu_color(background))
+                },
                 store: wgpu::StoreOp::Store,
             },
         })],
         depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
             view: depth_view,
             depth_ops: Some(wgpu::Operations {
-                load: wgpu::LoadOp::Clear(1.0),
+                load: if load_existing {
+                    wgpu::LoadOp::Load
+                } else {
+                    wgpu::LoadOp::Clear(1.0)
+                },
                 store: wgpu::StoreOp::Store,
             }),
             stencil_ops: None,

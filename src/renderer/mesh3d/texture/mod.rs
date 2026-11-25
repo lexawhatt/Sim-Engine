@@ -82,6 +82,8 @@ impl fmt::Display for Texture3dError {
 impl Error for Texture3dError {}
 
 struct TextureStorage {
+    content_identity: Arc<()>,
+    content_revision: u64,
     renderer_identity: Arc<()>,
     chain: CpuMipChain,
     texture: wgpu::Texture,
@@ -104,7 +106,36 @@ pub struct Texture3d {
     storage: Arc<TextureStorage>,
 }
 
+/// Engine-owned identity of a committed texture revision. Retaining this token
+/// does not keep pixel/GPU storage aliased and does not prevent in-place updates.
+#[derive(Debug, Clone)]
+pub struct Texture3dContentId {
+    identity: Arc<()>,
+    revision: u64,
+}
+impl Texture3dContentId {
+    /// Accepted update sequence, inherited on detachment; new creation/restoration starts at zero.
+    pub const fn revision(&self) -> u64 {
+        self.revision
+    }
+}
+impl PartialEq for Texture3dContentId {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.identity, &other.identity) && self.revision == other.revision
+    }
+}
+impl Eq for Texture3dContentId {}
+
 impl Texture3d {
+    /// Identifies committed CPU/GPU content. Failed updates preserve it;
+    /// detachment/restoration creates a distinct storage identity.
+    pub fn content_id(&self) -> Texture3dContentId {
+        Texture3dContentId {
+            identity: Arc::clone(&self.storage.content_identity),
+            revision: self.storage.content_revision,
+        }
+    }
+
     /// Returns physical source texel dimensions.
     pub fn size(&self) -> (u32, u32) {
         self.storage.chain.size()
@@ -620,6 +651,8 @@ pub(super) fn upload_chain(
         .position(|pixel| pixel[3] != 255);
     Texture3d {
         storage: Arc::new(TextureStorage {
+            content_identity: Arc::new(()),
+            content_revision: 0,
             renderer_identity: Arc::clone(identity),
             chain,
             texture,

@@ -27,6 +27,7 @@ pub(in crate::renderer::mesh3d) fn target(
     RenderTarget3d {
         renderer_identity: Arc::clone(identity),
         color: RenderTarget2d {
+            content_revision: std::sync::atomic::AtomicU64::new(0),
             renderer_identity: Arc::clone(identity),
             resource_identity: Arc::new(()),
             _texture: texture,

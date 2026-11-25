@@ -1,6 +1,7 @@
 //! Single-font horizontal shaping and bounded grayscale outline rasterization.
 
 mod config;
+mod geometry;
 mod raster;
 mod session;
 #[cfg(test)]
@@ -9,6 +10,10 @@ pub use config::{
     FontBudget, FontBudgetResource, FontError, TextDirection, TextLayoutBudget, TextStyle,
 };
 use config::{check, reserve};
+pub use geometry::{
+    LigatureCaretPolicy, ShapedCaret, ShapedCluster, ShapedClusters, ShapedGeometryError,
+    ShapedSelection, TextPenPosition,
+};
 pub use raster::RasterizedGlyph;
 pub use session::{ShapedLineError, TextShapingSession};
 
@@ -111,6 +116,8 @@ pub struct ShapedGlyph {
     logical_x: f32,
     logical_y: f32,
     cluster: usize,
+    pen_start: TextPenPosition,
+    pen_end: TextPenPosition,
 }
 
 impl ShapedGlyph {
@@ -118,17 +125,27 @@ impl ShapedGlyph {
     pub const fn glyph_id(self) -> u16 {
         self.glyph_id
     }
-    /// Baseline-relative horizontal origin, in logical pixels.
+    /// Baseline-relative horizontal glyph origin, including the font's offset,
+    /// in logical pixels. This is not an insertion caret; use line cluster geometry.
     pub const fn logical_x(self) -> f32 {
         self.logical_x
     }
-    /// Baseline-relative vertical origin, in logical pixels, positive downward.
+    /// Baseline-relative vertical glyph origin, including the font's offset,
+    /// in logical pixels, positive downward. This is not the pen position.
     pub const fn logical_y(self) -> f32 {
         self.logical_y
     }
     /// Original UTF-8 byte offset associated with this shaped cluster.
     pub const fn cluster(self) -> usize {
         self.cluster
+    }
+    /// Pen before this glyph in output order, excluding font placement offsets.
+    pub const fn pen_start(self) -> TextPenPosition {
+        self.pen_start
+    }
+    /// Pen after this glyph's shaped advance, including kerning but no offset.
+    pub const fn pen_end(self) -> TextPenPosition {
+        self.pen_end
     }
 }
 
@@ -139,6 +156,7 @@ pub struct ShapedLine {
     style: TextStyle,
     text: String,
     glyphs: Vec<ShapedGlyph>,
+    resolved_direction: TextDirection,
     advance: f32,
     ascent: f32,
     descent: f32,

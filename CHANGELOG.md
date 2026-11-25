@@ -5,7 +5,63 @@ uses a Keep a Changelog-style structure and Semantic Versioning. While the
 public API is pre-1.0, minor releases may contain documented source-breaking
 changes.
 
-## Unreleased
+## 0.5.0 - 2026-11-25
+
+### Added
+
+- CPU shaped-cluster editor geometry: pre-offset pen positions, UTF-8 cluster
+  and glyph ranges, visual order, resolved direction and allocation-free caret/
+  selection queries. Explicit ClusterBoundaries policy rejects interior-ligature
+  and combining-cluster positions; font/style provenance remains tied to the line.
+- Native-depth composition of independently sized base/detail surface layers,
+  with explicit intermediate attachment budgets and transactional replacement.
+- Per-pass linear quantization, Bayer dither, scanlines, bounded vertex snapping
+  and opt-in Native affine UV interpolation; legacy effects remain disabled.
+- Existing-color/depth load for later 3D passes, complete offscreen FrameComposer
+  rendering and bounded GPU capture with host correlation labels and Engine-owned
+  target content IDs. Pending timed-out capture storage remains bounded across
+  device replacement; accepted texture edits also expose content IDs.
+- Glyph-atlas snapshots for texturing arbitrary consumer-generated 3D surfaces.
+- CPU-copy diagnostics and patch-only CPU copying for unique single-level
+  texture edits. Mipmapped/aliased edits retain complete candidate preparation.
+- A `layered_3d` visual/acceptance example, with optional curved font text.
+- Explicit per-operation offscreen color/depth storage budgets and transactional
+  replacement APIs for resize and device recovery. Reports include old, new and
+  overlap bytes; returned errors retain the previous target. Successful
+  replacement requires a redraw. Existing target constructors remain available.
+
+### Migration
+
+New FrameComposer and Mesh3d render errors require exhaustive matches to account
+for invalid offscreen destinations and unsupported effect/policy combinations.
+Existing constructors and default render settings preserve their behavior.
+ShapedGlyph now retains additional pen metadata; glyph-count budgets are unchanged
+and line/session allocation diagnostics include the larger entry size. Exact
+editor geometry is cluster-aligned; no GDEF ligature carets or native IME are added.
+These APIs were introduced after 0.4.2; consumers must select 0.5.0 to use them.
+
+### Fixed during qualification
+
+- The interactive layered example no longer applies the acceptance-only frame
+  attempt ceiling during normal interactive use.
+
+- Offscreen composed frames report zero surface presents while retaining their
+  submitted draw/pass counts; only actual surface presentation counts as one.
+- Nonempty text removed entirely by shaping remains accepted with zero advance.
+  Editor geometry represents it as one zero-width source cluster, preserving
+  source endpoint carets without inventing drawable glyphs.
+
+### Supported boundaries
+
+- Independent-resolution layers accept Opaque/Mask surfaces. Blended surfaces
+  and mathematical edges use the appropriate subsequent native rendering path.
+  The native base pass still includes shading; lower color resolution alone is
+  not a measured GPU speedup.
+- Vertex snapping and affine UVs require Native rasterization. Other effects are
+  per pass; fog participation remains per material.
+- Capture returns GPU target contents, not compositor scanout. Editor geometry
+  supplies shaping-cluster boundaries, not interior ligature or paragraph bidi
+  layout. Existing host input, UI and IME ownership is unchanged.
 
 ## 0.4.2 - 2026-09-25
 

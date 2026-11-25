@@ -1,3 +1,5 @@
+mod layers;
+pub use layers::{LayeredRenderError3d, LayeredRenderReport3d, LayeredTarget3d};
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
@@ -92,7 +94,7 @@ use surface_pipeline::{SurfaceLayout, SurfacePipelines, create_surface_pipelines
 mod material;
 
 pub use texture::{
-    Texture3d, Texture3dError, Texture3dOptions, Texture3dUpdateBudget,
+    Texture3d, Texture3dContentId, Texture3dError, Texture3dOptions, Texture3dUpdateBudget,
     Texture3dUpdateBudgetResource, Texture3dUpdateError, Texture3dUpdateReport, TextureMaterial3d,
     TextureMipmaps3d,
 };

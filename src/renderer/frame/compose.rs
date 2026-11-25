@@ -871,7 +871,22 @@ impl<'frame> FrameComposer<'frame> {
 
     /// Validates, orders, encodes, submits, and presents the complete frame.
     pub fn present(self) -> Result<FrameReport, FrameComposerError> {
-        super::present::present_frame(self)
+        super::present::present_frame(self, None)
+    }
+
+    /// Renders the complete ordered composition offscreen using the production
+    /// pipelines and MSAA resolve. The target must belong to this renderer and
+    /// match its physical size; logical coordinates use the renderer's scale.
+    /// No surface is acquired or presented, so there are no surface skips.
+    /// Source/destination aliasing is rejected before uploads; synchronous
+    /// preparation errors preserve target pixels. Target storage counts toward
+    /// the frame texture budget. The target stores premultiplied linear color
+    /// encoded by its format, and can be captured or presented afterwards.
+    pub fn render_to_target(
+        self,
+        target: &RenderTarget2d,
+    ) -> Result<FrameReport, FrameComposerError> {
+        super::present::present_frame(self, Some(target))
     }
 
     fn push_item(

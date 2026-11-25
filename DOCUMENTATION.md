@@ -1,12 +1,14 @@
 # Sim;Engine Documentation
 
-This is the integration and engineering guide for **Sim;Engine 0.4.2**.
-For dense mathematical scenes, start with the [dense 2D guide](#042-dense-2d-rendering).
-Start with the [0.4 integration guide](#04-integration-guide) for new rendering,
+This is the integration and engineering guide for **Sim;Engine 0.5.0**.
+Installation snippets target 0.5.0; use a path dependency when testing local changes.
+Start with the [0.5 integration guide](#05-integration-guide) for the new APIs.
+For dense mathematical scenes, use the [dense 2D guide](#042-dense-2d-rendering).
+Use the [0.4 integration guide](#04-integration-guide) for established rendering,
 text and resource workflows, or the handbook below for the complete library.
 For older integrations, use the
 [archived 0.3 guide](https://github.com/lexawhatt/Sim-Engine/blob/v0.3.0/DOCUMENTATION.md).
-The [0.4.2 changelog](CHANGELOG.md#042---2026-09-25) describes the current additions;
+The [0.4.2 changelog](CHANGELOG.md#042---2026-09-25) describes the published baseline;
 the [0.4.1 changelog](CHANGELOG.md#041---2026-09-17) covers earlier optimizations,
 and the [0.4.0 changelog](CHANGELOG.md#040---2026-09-12) retains migration
 notes from 0.3.
@@ -28,6 +30,34 @@ cargo doc --all-features --no-deps --open
 Sim;Engine remains pre-1.0. Linux with
 Vulkan is its supported release target, and Rust 1.90 is the minimum supported
 Rust version.
+
+## 0.5 integration guide
+
+Use the [installation instructions](README.md#installation) to select 0.5.0
+or a local checkout.
+All existing feature boundaries remain: CPU geometry in `fonts`, renderer APIs
+in `wgpu`, and font-backed GPU text in `text`. MSRV remains Rust 1.90.
+
+| Need | Public entry point | Contract |
+| --- | --- | --- |
+| Different 3D shading resolutions with shared visibility | `create_layered_target3d`, `render_layered_scene3d` | [Layered passes and effects](#independent-resolution-3d-passes-05) |
+| Observable allocation, resize and device replacement | `RenderTargetBudget`, target replacement methods | [Target lifecycle](#13-targets-composition-and-trails) |
+| Final composition capture and content correlation | `FrameComposer::render_to_target`, `capture_render_target` | [Composition and capture](#complete-composition-and-bounded-capture) |
+| Bounded texture edits without a full CPU image copy when unique/single-mip | `update_texture3d_region`, `update_scene3d_texture_region` | [Region updates and diagnostics](#partial-3d-texture-updates) |
+| Text mapped onto host-generated 3D surfaces | `create_texture3d_from_glyph_atlas` | [Atlas snapshots](#glyph-atlases-on-arbitrary-3d-surfaces-05) |
+| Exact cluster-aligned insertion/selection positions | `ShapedLine::clusters`, `caret_at`, `selection` | [Editor geometry](#exact-shaped-cluster-editor-geometry-05) |
+
+For a windowed application, integrate these calls into its existing renderer
+owner and frame loop. That owner retains targets, handles resize/device recovery,
+orders 3D and UI passes, and records draw/presentation outcomes. Engine does not
+require a second window host, input loop or application-specific scene model.
+
+The important limits are explicit: independent 3D layers accept Opaque/Mask;
+Blend/edges require the appropriate subsequent native path. Snap and affine UVs
+require Native rasterization. Capture verifies target pixels rather than desktop
+scanout. Exact text insertion uses complete shaping-cluster boundaries rather
+than inferred interior-ligature positions. Detailed rejection and recovery rules
+are in the linked contracts.
 
 ## 0.4.2 dense 2D rendering
 
@@ -253,8 +283,10 @@ the host explicitly enables it; measure its cost on representative scenes.
 
 - Texture region edits regenerate and upload only affected lower-mip rectangles.
   Their bytes match complete regeneration, including odd dimensions and alpha.
-  Reports and upload/staging budgets charge these rectangles. CPU preparation
-  still clones the complete recovery chain and scans base alpha; shared textures
+  Reports and upload/staging budgets charge these rectangles. Unique single-level updates
+  patch retained CPU pixels after admission without cloning the complete image;
+  mipmapped or aliased updates still clone the recovery chain. Alpha-bearing
+  history may still require a full base-alpha scan; shared textures
   still copy their entire GPU chain. This is not an O(patch-area) whole-update
   promise. Full-image patches retain full-chain filtering and upload work.
 - `Native` surface validation first attempts a sufficient whole-mesh numerical
@@ -476,6 +508,86 @@ independently loaded identical font bytes do not. Changed-run failures preserve
 the old drawable, with the existing bounded atlas-cache-warming exception.
 Compatible unchanged GPU updates report zero work and do not consume the work
 budget; provenance checks still run first.
+
+#### Exact shaped-cluster editor geometry (0.5)
+
+`ShapedGlyph::logical_x/y` are drawing origins including the font's positioning
+offsets. They are not insertion positions. `pen_start()` and `pen_end()` expose
+the pre-offset pen in baseline-relative logical pixels, including shaped
+advances/kerning. `ShapedLine::clusters()` borrows the same shaped result without
+reshaping, rasterization, GPU work or additional allocation.
+
+Each `ShapedCluster` provides its half-open logical UTF-8 `byte_range`, output
+`glyph_range`, zero-based `visual_index`, pen endpoints, signed advance and
+logical `start_caret`/`end_caret`. Its `line()` preserves source text, exact font
+identity and `TextStyle`; `ShapedLine::resolved_direction()` is always Ltr or Rtl,
+while the style keeps the original requested direction, including Auto.
+For RTL, source start maps to pen end and source end to pen start. Iteration is
+in visual shaper output order, not increasing UTF-8 order. Offsets always refer
+to the full original string. Whitespace retains its advance even without ink.
+
+The explicit `LigatureCaretPolicy::ClusterBoundaries` treats complete shaped
+clusters as indivisible. `caret_at(byte_offset)` accepts only cluster boundaries;
+an interior character boundary returns `ShapedGeometryError::InsideCluster`
+with the enclosing range. Bytes inside a code point or beyond text length return
+`InvalidByteOffset`. Engine does not silently snap, subdivide a ligature evenly,
+or claim GDEF caret positions. The host chooses a returned cluster endpoint or
+keeps its separate approximate policy when editing inside a ligature is needed.
+Monotone-graphemes shaping clusters preserve the existing shaper default; they
+are not a complete Unicode grapheme-editing API.
+
+`selection(start..end)` validates both endpoints and returns whole-cluster spans
+in visual order, retaining logical ranges. Reversed logical ranges are errors;
+a valid empty range yields no spans. Empty text has no clusters and one caret at
+UTF-8 offset zero / pen `(0, 0)`. Nonempty input removed entirely by shaping
+(for example default ignorables in a sparse font without a space glyph) is kept
+as one zero-width source cluster with glyph range `0..0`. Both endpoint carets
+are at the origin; interior offsets still follow the cluster-boundary policy.
+For a horizontal highlight, use the min/max of
+the two caret x coordinates and host-selected ascent/descent/line-height metrics.
+This describes advances, not ink extents. The host still owns selection anchors,
+scrolling, hit-testing policy, paragraph bidi segmentation and native IME.
+
+Views borrow the originating immutable line and must be released before updating
+it. No additional geometry cache can become stale. Queries and complete traversal
+are O(glyph count), allocation-free; bulk editors should traverse once rather
+than call `caret_at` for every byte. Position endpoints are validated finite f32
+logical pixels. Cluster `advance()` subtracts endpoints in f64, avoiding overflow
+and further f32 subtraction rounding; accuracy is the shaped layout's numeric
+precision, not a promise of subpixel ink or interior-ligature geometry.
+
+The same immutable line can feed text rendering and editor overlays:
+
+```rust,no_run
+# #[cfg(feature = "fonts")]
+# fn editor_geometry(line: &sim_engine::ShapedLine, cursor_byte: usize,
+#     selection: std::ops::Range<usize>) -> Result<(), sim_engine::ShapedGeometryError> {
+let caret = line.caret_at(cursor_byte)?;
+let caret_position = caret.position();
+for cluster in line.selection(selection)? {
+    let start = cluster.start_caret().position();
+    let end = cluster.end_caret().position();
+    let left = start.logical_x().min(end.logical_x());
+    let right = start.logical_x().max(end.logical_x());
+    // Add the host's baseline/scroll transform and choose vertical font metrics.
+    println!("{:?}: {left}..{right}", cluster.byte_range());
+}
+# let _ = caret_position;
+# Ok(())
+# }
+# fn main() {}
+```
+
+For the bundled DejaVu Sans font, `office` contains an `ffi` cluster spanning
+UTF-8 bytes `1..4`: carets at 1 and 4 are available; 2 and 3 return `InsideCluster`.
+The byte at 1 in `q` followed by combining acute is also inside one cluster.
+This policy does not promise a caret at every Rust `char` boundary.
+
+Pen metadata increases `ShapedGlyph` storage. Existing glyph-count budgets still
+bound it and line/session `allocation_bytes()` counts the actual metadata
+capacity. Reusable session updates swap this geometry and resolved direction
+transactionally with the text; failures retain all prior geometry/provenance.
+No new dependency, feature, MSRV or raster behavior is introduced.
 
 Measure the named CPU workloads independently of a window/GPU:
 
@@ -902,11 +1014,28 @@ equivalent to full filtering. This includes odd and one-texel-wide dimensions.
 `Texture3dUpdateBudget` separately limits upload, staging, peak recovery, peak GPU
 and GPU-copy bytes. Reports separate base/mip uploads, calls, GPU copies,
 submissions, allocations, regenerated texels and CPU preparation/encoding costs.
-Even in 0.4.1, CPU preparation clones the complete recovery chain and scans base
-alpha; an aliased update also copies all GPU levels. These costs and retained
-memory do not shrink to the patch size. Queue uploads borrow candidate mip rows
-without allocating separately packed mip rectangles. Staging bytes count packed
-base capacity plus nominal uploaded texels, not backend padding or driver RSS.
+In 0.4.1/0.4.2, CPU preparation cloned the complete recovery chain and scanned
+base alpha. In 0.5, a unique single-level texture reuses that recovery allocation:
+CPU copying is the packed input plus the patch written into retained pixels.
+Mipmapped and aliased edits keep complete transactional candidate preparation;
+an aliased update also copies all GPU levels. Alpha validation may still scan the
+base image when its previous contents were not fully opaque. Patch-sized copying
+does not imply patch-sized total CPU work.
+
+`Texture3dUpdateReport::cpu_copy_bytes` counts packed input, recovery patch and any
+complete candidate-chain clone. For a unique single-level 2x2 RGBA edit it is
+32 CPU bytes, with 16 uploaded bytes, independent of full image dimensions.
+It excludes filtering arithmetic, backend staging and caller rasterization.
+Queue uploads borrow candidate mip rows without separately packed mip rectangles.
+Staging bytes count packed base capacity plus nominal uploaded texels, not backend
+padding or driver RSS. Peak recovery counts the reused chain once; a separate
+candidate counts alongside the old chain.
+
+`Texture3d::content_id()` identifies storage lineage and accepted content revision
+without retaining a storage alias. Failed edits preserve it. Copy-on-write
+detachment uses a fresh lineage with the next revision; creation/restoration
+starts a fresh lineage at revision zero. Surface loss does not itself invalidate
+retained textures; logical-device replacement restores their complete CPU chain.
 
 Inspect the six-panel lifecycle gallery independently of benchmarks:
 
@@ -929,6 +1058,26 @@ alpha-capable material whose current texture is opaque. It checks retained
 attributes/reserves, every CPU mip, alpha-image rebinding, background mutation
 and material removal without topology replacement. The mandatory GPU oracle
 separately reads the restored mip textures and rendered pixels on a new device.
+
+### Glyph atlases on arbitrary 3D surfaces (0.5)
+
+Prepare a `TextRun2d` with `TextAtlas2d` (optional `text`) or supply a host-shaped
+`GlyphAtlas2d`/`GlyphRun2d`. `create_texture3d_from_glyph_atlas` creates a bounded,
+alpha-capable, single-mip snapshot with exact CPU recovery pixels. Later atlas
+edits do not mutate existing snapshots. Use `atlas.source_for(glyph.glyph())` and
+`texture.region_coordinates(region)` to obtain inset UV corners, then build an
+arbitrary `Mesh3d::textured` from each glyph's destination or a consumer-generated
+page surface. The helper owns no page, book, layout or simulation semantics.
+
+Use `TextureMaterial3d::with_alpha` with explicit `ImageSampling::Nearest` for
+pixel text or Linear for filtered glyph coverage. Surface Mask gives depth-writing
+cutouts; Blend retains fractional coverage with the usual no-depth-write and
+object-sorting limitations. Default interpolation is perspective-correct. Packed
+atlas mipmaps are deliberately absent; isolate tiles before requesting mipmaps.
+Keep transparent padding around atlas glyphs to avoid adjacent glyph filtering.
+The source atlas and snapshot have independent memory budgets and recovery.
+Scene restoration restores the committed snapshot without the original font/atlas.
+`cargo run --features text --example layered_3d` demonstrates host-owned curved glyph topology.
 
 ### GPU diagnostics and the full changing-scene matrix
 
@@ -1022,14 +1171,14 @@ The default feature set includes the `wgpu` backend:
 
 ```toml
 [dependencies]
-sim-engine = "0.4.2"
+sim-engine = "0.5.0"
 ```
 
 Use the CPU-side visual-state APIs without GPU dependencies:
 
 ```toml
 [dependencies]
-sim-engine = { version = "0.4.2", default-features = false }
+sim-engine = { version = "0.5.0", default-features = false }
 ```
 
 | Configuration | Provides |
@@ -1042,7 +1191,7 @@ sim-engine = { version = "0.4.2", default-features = false }
 For CPU fonts without GPU dependencies:
 
 ```toml
-sim-engine = { version = "0.4.2", default-features = false, features = ["fonts"] }
+sim-engine = { version = "0.5.0", default-features = false, features = ["fonts"] }
 ```
 
 Window creation is deliberately outside the crate. The host may use `winit`,
@@ -1439,8 +1588,9 @@ atomic, and actual post-tessellation work is checked again before GPU upload or
 surface acquisition. `FrameStatistics` separates streaming vertices/uploads
 from retained vertices reused without a per-frame geometry upload.
 `FrameReport` also exposes actual command-encoder, render-pass, queue-submission,
-and surface-present counts: each is one for `Drawn` and zero for a skipped
-surface frame.
+and surface-present counts. A surface-presented `Drawn` frame reports one of
+each; a skipped surface frame reports zero. An offscreen `Drawn` frame reports
+one encoder/pass/submission and zero surface presents.
 
 Images and glyph runs use the same ordering rule and clip/viewport
 intersection as geometry. Referencing the same atlas several times counts its
@@ -1864,7 +2014,7 @@ No system font is implicitly selected, and no font is included in the library
 binary. The demonstration font and its license live under `examples/assets/fonts`.
 
 ```toml
-sim-engine = { version = "0.4.2", features = ["text"] }
+sim-engine = { version = "0.5.0", features = ["text"] }
 ```
 
 The default `wgpu` feature alone still accepts host-shaped glyph atlases and
@@ -2195,6 +2345,218 @@ surface using `BlendMode::Alpha`, `Additive`, or `Replace`.
 Public colors are straight linear RGBA. Offscreen target storage is
 premultiplied, and the composition shaders and blend states preserve that
 contract. Do not manually premultiply a public `Color`.
+
+For explicit attachment admission, use `create_render_target_with_budget` or
+`create_render_target3d_with_budget` with `RenderTargetBudget`. Dimensions are
+physical texels; 3D additionally requires the matching logical viewport aspect.
+The final-target limit counts nominal color storage plus Depth32Float for 3D.
+The peak limit counts old plus new attachments during replacement, including
+replacement across logical-device generations. These are per-operation limits:
+the host must separately account for other live targets. Driver alignment,
+metadata and in-flight resource retirement are not observable through wgpu.
+GPU allocation failure still follows wgpu's device-error model.
+
+`replace_render_target_with_budget` and `replace_render_target3d_with_budget`
+commit the new handle only after validation and allocation. A returned error
+preserves the previous handle and pixels if its device remains usable. Success
+invalidates all previous color/depth content, even at identical dimensions;
+redraw before composition. The report separates previous, final and peak bytes.
+Recovery may pass a stale-device target to these replacement methods, but does
+not recover its old GPU pixels. Existing constructors remain unchanged.
+
+```rust,no_run
+# #[cfg(feature = "wgpu")]
+# fn replace(renderer: &sim_engine::WgpuRenderer, target: &mut sim_engine::RenderTarget3d)
+# -> Result<(), Box<dyn std::error::Error>> {
+use sim_engine::{LogicalViewport, RenderTargetBudget};
+let limits = RenderTargetBudget::new(16 * 1024 * 1024, 32 * 1024 * 1024);
+let report = renderer.replace_render_target3d_with_budget(
+    target, 1152, 720, LogicalViewport::new(1152.0, 720.0)?, limits,
+)?;
+assert_eq!(report.target_bytes, target.allocation_bytes());
+// Render the complete scene into the replacement before composing it.
+# Ok(())
+# }
+```
+
+#### Independent-resolution 3D passes (0.5)
+
+`create_layered_target3d((384, 240), (1152, 720), viewport, limits)` allocates
+four explicit color/depth targets: low-resolution base, native base visibility,
+native detail and final native output. All targets have the same logical aspect.
+`allocation_bytes()` counts every attachment (20,643,840 bytes for these sizes
+with RGBA8 color and Depth32Float). Creation checks the complete budget first;
+`replace_layered_target3d` also checks old/new overlap before committing resize
+or device restoration. After replacement redraw both layers. Restore their
+`Scene3d` resources separately after logical-device replacement.
+
+Keep the target between frames; recreate it only for an explicit size/viewport
+change or device restoration. The following helper shows initial allocation and
+one render. Its fixed dimensions assume a 1152x720 logical/physical output;
+a resizable host must supply sizes with matching aspect instead.
+
+```rust,no_run
+# #[cfg(feature = "wgpu")]
+# fn layered(renderer: &mut sim_engine::WgpuRenderer, base: &sim_engine::Scene3d,
+#     detail: &sim_engine::Scene3d, camera: sim_engine::Camera3d)
+#     -> Result<sim_engine::LayeredTarget3d, Box<dyn std::error::Error>> {
+use sim_engine::{LogicalViewport, Mesh3dRenderBudget, RenderTargetBudget, SurfaceEffects3d};
+let limits = RenderTargetBudget::new(24 * 1024 * 1024, 48 * 1024 * 1024);
+let target = renderer.create_layered_target3d(
+    (384, 240), (1152, 720), LogicalViewport::new(1152.0, 720.0)?, limits,
+)?;
+let base_effects = SurfaceEffects3d::new().with_quantization(8)?.with_dither(96);
+let base_budget = Mesh3dRenderBudget::default().with_surface_effects(base_effects);
+let detail_budget = Mesh3dRenderBudget::default();
+let work = renderer.render_layered_scene3d(
+    &target, base, detail, camera, [base_budget, detail_budget],
+)?;
+// Retain `target`; compose target.output().color_target() with UI afterward.
+# let _ = work;
+# Ok(target)
+# }
+# fn main() {}
+```
+
+`render_layered_scene3d(&target, &base, &detail, camera, [base_budget, detail_budget])`
+uses one camera and renders base shading at low resolution plus a native base
+visibility pass. Detail uses native resolution. Composition compares native
+depths, chooses detail only when strictly closer, and writes final shared depth.
+Base wins ties, as with Less and base-first insertion. Native uncovered pixels
+use the native background. Coarse base color may cross boundaries between
+different base surfaces; depth and coverage still use the native winners.
+Nearest low-resolution color sampling preserves its coarse shading; when a covered native silhouette
+has no covered low texel, native base color preserves that geometry. This avoids
+stretching low-resolution depth across a smoothly tilting surface. It performs
+three scene draws plus one composition draw; it is not a vertex-work saving.
+Each scene report exposes the actual work; budget limits apply to each base draw
+and the detail draw separately. Intermediate color/depth allocation is reported
+separately from scene geometry/upload budgets.
+
+Independent layers accept Opaque/Mask surfaces. Blend and mathematical edges
+are explicitly rejected because independently compositing their resolved colors
+cannot reproduce general transparency/hidden-line ordering. For a subsequent
+native overlay, draw into `target.output()` using
+`Mesh3dRenderBudget::with_existing_depth(true)`: this loads both color and shared
+depth. Use the identical camera/projection and dimensions. Put related Blend
+objects in one overlay scene to retain the ordinary object-ordering contract.
+The layered renderer always clears its intermediate targets, irrespective of
+that flag. All scene validation happens before output mutation; a synchronous
+failure retains the previous complete output. Asynchronous device loss still
+invalidates GPU content and requires restoration/redraw.
+
+Keep these budgets distinct when composing a complete application frame:
+
+| Limit/report | Includes | Account separately |
+| --- | --- | --- |
+| Layered `RenderTargetBudget` / `allocation_bytes()` | All four color/depth targets; replacement also admits old plus new | Other live targets, renderer MSAA attachments and driver-retired resources |
+| Two `Mesh3dRenderBudget` values | Each base draw and the detail draw, independently | The extra composition draw and intermediate target storage |
+| Final `FrameBudget` | Admitted composition sources and destination texels | Earlier 3D preparation, captures and caller-owned CPU data |
+| Capture byte limit | Padded readback, CPU output capacity and pending retired-device capture staging | Previously returned captures retained by the caller and driver metadata |
+
+Zero-sized/minimized windows should follow the host's normal suspended-rendering
+path. The target API rejects zero dimensions; it does not encode a minimized
+window as a valid zero-size attachment. A failed resize keeps the previous
+handle; successful replacement requires a complete redraw before presentation.
+
+`SurfaceEffects3d` selects surface-pass effects through
+`Mesh3dRenderBudget::with_surface_effects`. Defaults preserve legacy output.
+Different base/detail budgets keep coarse effects off crisp geometry.
+
+- Texture sampling and vertex/material tint operate in linear RGB, followed by
+  optional lighting and per-material fog, then scanline attenuation, then ordered
+  dither and quantization. Alpha and depth are unaffected by these color effects.
+- Quantization uses 2-256 uniformly spaced linear RGB levels; zero disables it.
+  Dither uses a centered 4x4 Bayer threshold, scaled in 1/255 units of a level.
+  Scanlines attenuate odd physical target rows in 1/255 units. Pixel coordinates
+  belong to each shading target, not the final presentation surface.
+- `with_vertex_snap([columns, rows])` selects a viewport-wide grid, each dimension
+  1-32768; `[0,0]` disables snapping. Projected XY rounds to nearest grid points;
+  depth is not quantized. This may intentionally collapse sub-cell triangles.
+  The normalized grid is consistent across different target resolutions.
+  It requires Native surface policy and no mathematical edges. Conservative
+  preflight requires positive clip W in 1e-10..=1e10 and projected XY within
+  +/-1024; geometry outside that opt-in domain is rejected, never silently omitted.
+- `with_affine_uv(true)` selects screen-linear UV interpolation through the
+  Native hardware clipper; default UVs remain perspective-correct. StrictPortable
+  rejects affine UVs and snapping before submission. Color and lighting varyings
+  retain their original interpolation rules.
+
+The ordinary surface material's `with_fog` controls fog participation independently.
+No whole-frame palette conversion is implicitly applied to detail, UI or text.
+The `layered_3d` example renders a fogged/dithered moving surface intersecting a
+crisp wedge; with `--features text` it adds shaped glyphs on curved geometry.
+`--acceptance` requires actual presents, tests native occlusion, resize/recovery
+and rejected-operation preservation. `SIM_ENGINE_LAYERED_CAPTURE=/new/file.ppm`
+saves its final GPU composition without overwriting an existing file.
+
+#### Complete composition and bounded capture
+
+`FrameComposer::render_to_target(&target)` runs the same ordered composition,
+clipping and MSAA pipelines as `present`, with the current renderer physical size
+and logical scale. The destination must match that size and renderer generation;
+sampling the destination in the same frame is rejected. Destination texel storage
+counts toward the frame texture budget. The result is a normal `FrameReport`.
+`surface_present_count()` is zero even when offscreen status is Drawn.
+There is no surface acquisition, hence no surface skip; acquisition/presentation
+status belongs to the separate presentation call. Returned preparation errors
+preserve existing target pixels. Target clear and contents use premultiplied color.
+
+`capture_render_target` waits for a GPU texture-to-buffer copy with an explicit
+timeout. Its byte limit covers the 256-byte-row-aligned readback buffer plus actual
+CPU vector capacity before submission. Timed-out copies remain owned; retries
+return Busy until completion. Pending buffers from quarantined old devices also
+count against the next capture limit. `capture_retained_staging_bytes()` exposes
+this storage and retires completed readbacks. Returned bytes are tightly packed RGBA8
+or BGRA8 in the reported format, retaining sRGB/linear encoding and premultiplied
+alpha. No hidden channel conversion, unpremultiplication or file I/O occurs.
+`CaptureCorrelation` carries host frame/content-revision IDs unchanged. In addition,
+`RenderTargetCapture::content_id()` identifies the actual Engine-committed target
+contents. Record `target.content_id()` after a successful draw and compare it to
+the capture ID: a rejected/skipped draw cannot relabel old pixels as new. Target
+replacement/restoration creates a fresh identity. `Texture3d::content_id()`
+likewise identifies accepted texture edits without forcing storage aliasing.
+Capture only after the intended render returns Drawn and retain that report plus any subsequent presentation
+report for rejected/skipped diagnostics. The capture proves GPU composition;
+it does not prove window-system/compositor scanout. Present the same target with
+Replace to avoid independently rebuilding a potentially different frame.
+
+A diagnostic capture can use the same final target that is presented. The source
+and destination below must be distinct and belong to this renderer generation.
+The destination must use its current physical output size. Create/retain it with the
+budgeted target API before beginning the frame. Add normal UI passes to the first
+composer before `render_to_target` when they belong in the captured frame.
+
+```rust,no_run
+# #[cfg(feature = "wgpu")]
+# fn capture_frame(renderer: &mut sim_engine::WgpuRenderer,
+#     source: &sim_engine::RenderTarget2d, destination: &sim_engine::RenderTarget2d,
+#     frame_id: u64, texture_revision: u64)
+#     -> Result<(sim_engine::RenderTargetCapture, sim_engine::FrameReport,
+#         sim_engine::FrameReport), Box<dyn std::error::Error>> {
+use sim_engine::{BlendMode, CaptureCorrelation, Color, FrameBudget, FramePassOptions};
+let mut composition = renderer.begin_frame(Color::BLACK, FrameBudget::default())?;
+composition.draw_render_target(source, BlendMode::Replace, 1.0, FramePassOptions::new(0))?;
+let composed = composition.render_to_target(destination)?;
+let captured = renderer.capture_render_target(
+    destination, CaptureCorrelation { frame_id, texture_revision },
+    16 * 1024 * 1024, std::time::Duration::from_secs(2),
+)?;
+assert_eq!(destination.content_id().as_ref(), Some(captured.content_id()));
+let mut presentation = renderer.begin_frame(Color::BLACK, FrameBudget::default())?;
+presentation.draw_render_target(destination, BlendMode::Replace, 1.0, FramePassOptions::new(0))?;
+let presented = presentation.present()?;
+// Preserve both reports: a valid offscreen capture does not guarantee a Drawn present.
+# Ok((captured, composed, presented))
+# }
+# fn main() {}
+```
+
+Capture waits synchronously and is intended for diagnostics, not every animation
+frame. An in-flight timeout retains staging until completion; Busy means defer
+the next request rather than allocate another target to evade the limit. Content
+IDs are opaque in-process equality tokens; host frame/revision labels provide
+application correlation. Neither label proves physical display scanout.
 
 `TrailBuffer2d` owns two ping-pong targets. Accumulation reads history from one
 target, writes retained history and a fresh source into the other, then swaps
@@ -2790,16 +3152,20 @@ composed, drawn, measured, and recovered.
 | `mesh3d/mod.rs`, `mesh3d/style.rs` | retained topology and edge/style contracts |
 | `mesh3d/attributes.rs`, `mesh3d/uv.rs` | optional vertex attributes and bounded material UV mapping |
 | `text/font/session.rs` | CPU-only reusable shaping sessions |
+| `text/font/geometry.rs` | borrowed pen/cluster geometry, UTF-8 carets and selection spans |
+| `mesh3d/effects.rs` | validated CPU configuration of per-pass surface effects |
 | `renderer/config.rs` | surface mode, DPI, renderer options, recovery setup |
 | `renderer/mod.rs`, `renderer/outcomes.rs` | renderer facade, shared resources, reports and errors |
 | `renderer/initialization.rs`, `renderer/pipelines.rs` | device/surface setup and 2D pipeline construction |
 | `renderer/scenes.rs`, `renderer/dynamic_mesh.rs` | streaming/prepared scenes and bounded triangle updates |
-| `renderer/particles.rs`, `renderer/scalar_fields.rs`, `renderer/targets.rs` | particle/field resources, offscreen composition and trails |
+| `renderer/particles.rs`, `renderer/scalar_fields.rs`, `renderer/targets.rs`, `renderer/target_lifecycle.rs` | particle/field resources, offscreen composition, trails and target admission/replacement |
 | `renderer/validation2d/` | camera-relative arithmetic, bounded validation cache and interval proofs |
 | `renderer/tessellation.rs` | 2D scene command to triangle conversion |
 | `renderer/visualization.rs` | fused scientific visualization path |
 | `renderer/mesh3d/mod.rs`, `renderer/mesh3d/api.rs` | retained resource facade and public entry points |
 | `renderer/mesh3d/frame.rs`, `renderer/mesh3d/encoding.rs` | transactional frame staging and ordered depth/edge passes |
+| `renderer/mesh3d/layers/` | independently sized shading layers with native visibility composition |
+| `renderer/capture.rs` | bounded synchronous GPU readback and retained timeout staging |
 | `renderer/mesh3d/objects/mod.rs` | indexed object IDs, lifetime and shared-resource accounting |
 | `renderer/mesh3d/upload.rs`, `renderer/mesh3d/allocation.rs` | bounded immutable mesh upload/replacement |
 | `renderer/mesh3d/surface/mod.rs` | interval-proven bounded surface clipping and preflight |
@@ -3120,6 +3486,8 @@ gate is:
 ./scripts/linux_release_gate.sh
 ```
 
+It also runs `layered_3d` with text and bounded acceptance for native occlusion,
+masked silhouettes, content correlation, resize and recovery.
 It checks formatting, Rust 1.90 compatibility, all targets with and without
 default features and with CPU fonts, strict clippy, doctests, warning-free
 rustdoc, a mandatory
@@ -3169,7 +3537,7 @@ and measurement method.
 
 ### 30. Official release procedure
 
-The commands below target the 0.4.2 release. For a later release, substitute its
+The commands below target the 0.5.0 release. For a later release, substitute its
 version and finish its dated changelog and migration notes first. Do not run
 publication or create a tag while review or the exact-commit release gate is
 pending. Run from the Sim-Engine repository, not a consumer checkout, and stop
@@ -3209,13 +3577,13 @@ case "$(git remote get-url origin)" in
   *) echo 'Wrong Git repository'; false ;;
 esac
 case "$(cargo pkgid --locked)" in
-  *'#sim-engine@0.4.2') ;;
+  *'#sim-engine@0.5.0') ;;
   *) echo 'Wrong repository or package version'; false ;;
 esac
 test -z "$(git status --porcelain --untracked-files=all)"
 test "$(git rev-parse HEAD)" = "$(git rev-parse origin/master)"
-test -z "$(git tag -l v0.4.2)"
-test -z "$(git ls-remote --tags origin refs/tags/v0.4.2)"
+test -z "$(git tag -l v0.5.0)"
+test -z "$(git ls-remote --tags origin refs/tags/v0.5.0)"
 ./scripts/linux_release_gate.sh
 ```
 
@@ -3229,12 +3597,12 @@ grep -Fxq "vcs_sha=$release_sha" \
 grep -Fxq 'status=passed' target/linux-release-evidence/completion.txt
 cargo package --list
 cargo package --locked
-crate=target/package/sim-engine-0.4.2.crate
-tar -xOf "$crate" sim-engine-0.4.2/.cargo_vcs_info.json \
+crate=target/package/sim-engine-0.5.0.crate
+tar -xOf "$crate" sim-engine-0.5.0/.cargo_vcs_info.json \
   | grep -Fq "\"sha1\": \"$release_sha\""
-! tar -xOf "$crate" sim-engine-0.4.2/.cargo_vcs_info.json \
+! tar -xOf "$crate" sim-engine-0.5.0/.cargo_vcs_info.json \
   | grep -Fq '"dirty": true'
-cargo publish -p sim-engine@0.4.2 --registry crates-io --dry-run --locked
+cargo publish -p sim-engine@0.5.0 --registry crates-io --dry-run --locked
 ```
 
 `cargo package` explicitly refreshes the local archive; do not assume a publish
@@ -3252,12 +3620,12 @@ test "$(git rev-parse HEAD)" = "$release_sha" &&
 test -z "$(git status --porcelain --untracked-files=all)" &&
 grep -Fxq "vcs_sha=$release_sha" target/linux-release-evidence/completion.txt &&
 grep -Fxq 'status=passed' target/linux-release-evidence/completion.txt &&
-cargo publish -p sim-engine@0.4.2 --registry crates-io --locked
+cargo publish -p sim-engine@0.5.0 --registry crates-io --locked
 ```
 
 Cargo may time out while waiting for the new version to appear in the registry
 index even after a successful upload. Before retrying, check the crates.io
-package page or run `cargo info sim-engine@0.4.2`; retrying an accepted version
+package page or run `cargo info sim-engine@0.5.0`; retrying an accepted version
 cannot overwrite it.
 
 #### 3. Tag the published commit
@@ -3269,40 +3637,40 @@ release tag for an upload that never succeeded, while the packaged
 ```bash
 test -n "${release_sha:?Use the SHA recorded in the published crate}" &&
 test "$(git rev-parse HEAD)" = "$release_sha" &&
-git tag -a v0.4.2 "$release_sha" -m "Sim;Engine v0.4.2" &&
-test "$(git rev-list -n 1 v0.4.2)" = "$release_sha" &&
-git push origin v0.4.2
+git tag -a v0.5.0 "$release_sha" -m "Sim;Engine v0.5.0" &&
+test "$(git rev-list -n 1 v0.5.0)" = "$release_sha" &&
+git push origin v0.5.0
 ```
 
 Tags for published versions are immutable release history. Never move or
-force-push one. If `v0.4.2` already exists, stop and verify its target instead
+force-push one. If `v0.5.0` already exists, stop and verify its target instead
 of replacing it.
 
 #### 4. Create the GitHub Release and verify public artifacts
 
-Prepare release notes from the `0.4.2` changelog section, then either use the
+Prepare release notes from the `0.5.0` changelog section, then either use the
 GitHub web interface or the GitHub CLI:
 
 ```bash
-gh release create v0.4.2 \
+gh release create v0.5.0 \
   --repo lexawhatt/Sim-Engine \
   --verify-tag \
-  --title "Sim;Engine v0.4.2" \
-  --notes-file /tmp/sim-engine-v0.4.2-notes.md
+  --title "Sim;Engine v0.5.0" \
+  --notes-file /tmp/sim-engine-v0.5.0-notes.md
 ```
 
 Finally verify all four public identities:
 
-- `https://crates.io/crates/sim-engine/0.4.2` shows version 0.4.2;
-- `https://docs.rs/sim-engine/0.4.2` completes successfully;
-- Git tag `v0.4.2` points to `$release_sha`;
+- `https://crates.io/crates/sim-engine/0.5.0` shows version 0.5.0;
+- `https://docs.rs/sim-engine/0.5.0` completes successfully;
+- Git tag `v0.5.0` points to `$release_sha`;
 - the GitHub Release names the same tag and is not marked as a prerelease.
 
 If a serious defect is discovered after publishing, do not attempt to delete
-or overwrite 0.4.2. Yank it and prepare a corrected patch release:
+or overwrite 0.5.0. Yank it and prepare a corrected patch release:
 
 ```bash
-cargo yank --version 0.4.2 sim-engine
+cargo yank --version 0.5.0 sim-engine
 ```
 
 The authoritative external references are Cargo's

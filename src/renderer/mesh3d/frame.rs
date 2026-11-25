@@ -113,6 +113,58 @@ impl Mesh3dRenderer {
                 return Err(Mesh3dRenderError::InstanceCapacityTooLarge);
             }
             camera_uniform.environment = SurfaceEnvironmentGpu::new(scene, camera);
+            let effects = budget.surface_effects();
+            if (effects.affine_uv() || effects.vertex_snap_grid()[0] != 0)
+                && budget.surface_policy() != super::SurfaceRasterization3d::Native
+            {
+                return Err(Mesh3dRenderError::UnsupportedSurfaceEffects);
+            }
+            camera_uniform.environment.effects = [
+                f32::from(effects.quantization_levels()),
+                f32::from(effects.dither_strength()) / 255.0,
+                f32::from(effects.scanline_strength()) / 255.0,
+                if effects.affine_uv() { 1.0 } else { 0.0 },
+            ];
+            let grid = effects.vertex_snap_grid();
+            camera_uniform.environment.snap = [f32::from(grid[0]), f32::from(grid[1]), 0.0, 0.0];
+            if grid[0] != 0 {
+                for instance in scene
+                    .instances()
+                    .iter()
+                    .filter(|instance| instance.is_visible())
+                {
+                    if instance.wireframe().is_some() {
+                        return Err(Mesh3dRenderError::UnsupportedSurfaceEffects);
+                    }
+                    let model = instance
+                        .transform()
+                        .model_rows()
+                        .map_err(|_| Mesh3dRenderError::InvalidGeometryTransform)?;
+                    for &vertex in instance.mesh().source().vertices() {
+                        let clip =
+                            super::shader_clip_point_ranges(vertex, model, camera_uniform.rows())?;
+                        let w = clip[3];
+                        if w.minimum < 1.0e-10 || w.maximum > 1.0e10 {
+                            return Err(Mesh3dRenderError::InvalidGeometryTransform
+                                .for_object(instance.id()));
+                        }
+                        for coordinate in &clip[..2] {
+                            let quotient = super::wgsl_division_range(
+                                (coordinate.minimum, coordinate.maximum),
+                                (w.minimum, w.maximum),
+                            )
+                            .ok_or(
+                                Mesh3dRenderError::InvalidGeometryTransform
+                                    .for_object(instance.id()),
+                            )?;
+                            if quotient.0 < -1024.0 || quotient.1 > 1024.0 {
+                                return Err(Mesh3dRenderError::InvalidGeometryTransform
+                                    .for_object(instance.id()));
+                            }
+                        }
+                    }
+                }
+            }
             material::prepare_order_into(scene, camera, budget, &mut frame.order)?;
             surface::preflight_into(
                 renderer_identity,
@@ -479,11 +531,13 @@ impl Mesh3dRenderer {
             scene.instances(),
             &surface_frame.order,
             timing.as_ref().map(|timing| timing.timestamp_writes()),
+            budget.loads_existing_depth(),
         );
         if let Some(timing) = &timing {
             timing.resolve(&mut encoder);
         }
         queue.submit([encoder.finish()]);
+        target.color.mark_written();
         let gpu_timing_id = match (gpu_timing, timing) {
             (Some(collector), Some(timing)) => Some(collector.submitted(timing)),
             _ => None,

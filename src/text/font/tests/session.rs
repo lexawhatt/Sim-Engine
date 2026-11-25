@@ -18,6 +18,7 @@ fn style(direction: TextDirection) -> TextStyle {
 fn assert_same(left: &ShapedLine, right: &ShapedLine) {
     assert_eq!(left.text(), right.text());
     assert_eq!(left.style(), right.style());
+    assert_eq!(left.resolved_direction(), right.resolved_direction());
     assert_eq!(left.glyphs(), right.glyphs());
     assert_eq!(left.advance(), right.advance());
     assert_eq!(left.ascent(), right.ascent());

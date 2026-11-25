@@ -83,6 +83,8 @@ impl Error for Mesh3dResourceError {}
 /// Failure while encoding a depth-tested 3D scene.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mesh3dRenderError {
+    /// Requested raster effects are incompatible with the strict clipping policy.
+    UnsupportedSurfaceEffects,
     /// Transient Blend ordering capacity exceeded its explicit byte ceiling.
     SortingBudgetExceeded {
         /// Configured sorting-array byte limit.
@@ -211,6 +213,12 @@ impl Mesh3dRenderError {
 impl fmt::Display for Mesh3dRenderError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::UnsupportedSurfaceEffects => {
+                write!(
+                    formatter,
+                    "surface effects require a compatible raster policy and surface-only geometry"
+                )
+            }
             Self::SortingBudgetExceeded { limit, actual } => write!(
                 formatter,
                 "3D sorting storage {actual} exceeds {limit} bytes"

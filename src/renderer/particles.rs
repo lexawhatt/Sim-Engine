@@ -920,6 +920,7 @@ impl WgpuRenderer {
             }
         }
         self.queue.submit([encoder.finish()]);
+        target.mark_written();
         field.statistics = ParticleStatistics {
             rendered: preparation.visible_count,
             ..preparation.statistics

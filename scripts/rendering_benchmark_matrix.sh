@@ -99,6 +99,7 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 assert_provenance
+expected_adapter_pci_bus_id=${SIM_ENGINE_REQUIRED_ADAPTER_PCI_BUS_ID:-}
 SIM_ENGINE_SURFACE_EVIDENCE_PATH="$surface_evidence" \
 SIM_ENGINE_RELEASE_SHA="$release_sha" \
 SIM_ENGINE_REQUIRE_ADAPTER_IDENTITY=0 \
@@ -106,6 +107,12 @@ cargo run --release --example rendering_benchmark_suite -- --fixture adapter_pro
 assert_provenance
 grep -Fxq "vcs_sha=$release_sha" "$surface_evidence"
 grep -Fxq 'backend=vulkan' "$surface_evidence"
+if [ -n "$expected_adapter_pci_bus_id" ]; then
+    grep -Fxq "pci_bus_id=$expected_adapter_pci_bus_id" "$surface_evidence" || {
+        echo "rendering matrix selected a different physical adapter" >&2
+        exit 1
+    }
+fi
 
 SIM_ENGINE_REQUIRED_ADAPTER_BACKEND=$(sed -n 's/^backend=//p' "$surface_evidence")
 SIM_ENGINE_REQUIRED_ADAPTER_NAME=$(sed -n 's/^name=//p' "$surface_evidence")

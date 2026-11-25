@@ -510,6 +510,7 @@ impl WgpuRenderer {
             draw_call_count += 1;
         }
         self.queue.submit([encoder.finish()]);
+        target.mark_written();
         self.notify_before_present();
         self.queue.present(surface_texture);
         particles.statistics = ParticleStatistics {

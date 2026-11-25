@@ -661,6 +661,7 @@ impl WgpuRenderer {
             pass.draw(0..6, 0..1);
         }
         self.queue.submit([encoder.finish()]);
+        target.mark_written();
         render_report(
             RenderStatus::Drawn,
             Duration::ZERO,

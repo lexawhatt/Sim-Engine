@@ -4,7 +4,7 @@ use super::{Scene3dError, Texture3dError};
 
 /// Explicit operation-local limits for atomic texture edits and alias detachment.
 ///
-/// Peak recovery includes old plus candidate CPU chains. Staging limits cover
+/// Peak recovery counts a reused single-level CPU chain once, otherwise old plus candidate chains. Staging limits cover
 /// owned packed-patch capacity plus nominal queued upload bytes, not unobservable
 /// driver allocations. GPU copy is separate from host upload. Caller input,
 /// unrelated snapshots and previously submitted driver work are excluded.
@@ -42,7 +42,7 @@ impl Texture3dUpdateBudget {
     pub const fn max_staging_bytes(self) -> usize {
         self.staging
     }
-    /// Maximum old plus candidate CPU chain capacity.
+    /// Maximum CPU chain capacity at peak, deduplicating in-place single-level reuse.
     pub const fn max_peak_recovery_bytes(self) -> usize {
         self.recovery
     }
@@ -75,7 +75,7 @@ pub enum Texture3dUpdateBudgetResource {
     UploadBytes,
     /// Packed patch capacity plus nominal queued-upload bytes.
     StagingBytes,
-    /// Old and candidate retained CPU chain capacity.
+    /// Peak retained CPU chain capacity, counting in-place reuse once.
     PeakRecoveryBytes,
     /// Old and replacement GPU chain storage, or only old storage when reused.
     PeakGpuBytes,
@@ -95,6 +95,10 @@ pub enum Texture3dUpdateError {
     InvalidSourceLayout,
     /// The selected object has no texture material.
     MissingTexture,
+    /// Resource ownership changed before the transaction could commit.
+    OwnershipChanged,
+    /// Content revision reached its non-repeating limit; create a fresh texture.
+    RevisionExhausted,
     /// Checked size arithmetic cannot represent the requested edit.
     CapacityTooLarge,
     /// A caller limit rejected planned or actual operation-local work.
@@ -124,6 +128,10 @@ impl fmt::Display for Texture3dUpdateError {
             Self::Scene(error) => write!(formatter, "3D texture scene update: {error}"),
             Self::InvalidSourceLayout => formatter
                 .write_str("3D texture update requires an exact strided RGBA source layout"),
+            Self::RevisionExhausted => formatter.write_str("texture content revision exhausted"),
+            Self::OwnershipChanged => {
+                formatter.write_str("texture ownership changed before commit")
+            }
             Self::MissingTexture => formatter.write_str("3D object has no texture material"),
             Self::CapacityTooLarge => {
                 formatter.write_str("3D texture update capacity arithmetic overflowed")
@@ -145,13 +153,15 @@ impl Error for Texture3dUpdateError {}
 ///
 /// Every successful edit uploads its patch, including identical input. Generated
 /// chains regenerate/upload only affected lower-mip rectangles, using the same
-/// filter as full regeneration. Preparation still clones the complete CPU chain
-/// and scans its base-level alpha; it is not proportional only to patch area.
+/// filter as full regeneration. Unique single-level edits reuse CPU storage after admission. Other edits clone
+/// the complete CPU chain. Existing nonopaque content may require a complete
+/// base-alpha scan; not all update work is proportional only to patch area.
 /// Aliased edits copy the old GPU chain before patch uploads. Queue submissions
 /// and CPU durations describe this edit, not physical GPU completion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Texture3dUpdateReport {
     pub(super) base: usize,
+    pub(super) cpu_copy_bytes: usize,
     pub(super) mips: usize,
     pub(super) uploads: usize,
     pub(super) copy: usize,
@@ -167,6 +177,14 @@ pub struct Texture3dUpdateReport {
     pub(super) encode_submit: Duration,
 }
 impl Texture3dUpdateReport {
+    /// Bytes copied by Engine on the CPU: packed input, recovery patch and any
+    /// complete recovery-chain clone. Excludes filtering arithmetic, backend
+    /// staging copies and caller-owned input generation. Unique single-level
+    /// textures copy only twice the patch bytes, regardless of image extent.
+    pub const fn cpu_copy_bytes(self) -> usize {
+        self.cpu_copy_bytes
+    }
+
     /// Bytes uploaded for the requested base-level rectangle, excluding source padding.
     pub const fn base_upload_bytes(self) -> usize {
         self.base
@@ -219,7 +237,8 @@ impl Texture3dUpdateReport {
     pub const fn staging_bytes(self) -> usize {
         self.staging
     }
-    /// Old plus candidate CPU chain capacity at preparation peak.
+    /// Peak CPU chain capacity: one allocation for unique single-level edits,
+    /// old plus candidate for mipmapped or aliased edits.
     pub const fn peak_recovery_bytes(self) -> usize {
         self.peak_recovery
     }
@@ -235,7 +254,8 @@ impl Texture3dUpdateReport {
     pub const fn preparation_cpu(self) -> Duration {
         self.preparation
     }
-    /// CPU resource creation, copy encoding and queue submission duration.
+    /// CPU commit (including in-place patch/alpha scan), resource creation,
+    /// copy encoding and queue submission duration.
     pub const fn encode_submit_cpu(self) -> Duration {
         self.encode_submit
     }

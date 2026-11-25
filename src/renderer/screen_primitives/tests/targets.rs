@@ -40,6 +40,7 @@ pub(super) fn verify(device: &wgpu::Device, queue: &wgpu::Queue, format: wgpu::T
         view_formats: &[],
     });
     let mut target = RenderTarget2d {
+        content_revision: std::sync::atomic::AtomicU64::new(0),
         renderer_identity: Arc::clone(&identity),
         resource_identity: Arc::new(()),
         view: texture.create_view(&Default::default()),
@@ -91,6 +92,37 @@ pub(super) fn verify(device: &wgpu::Device, queue: &wgpu::Queue, format: wgpu::T
         assert_eq!(report.status(), RenderStatus::Drawn);
         assert_eq!(report.metrics().tessellation_stats().command_count(), 1);
         let first = read(device, queue, &target);
+        let capture_state = crate::renderer::capture::CaptureState::default();
+        let correlation = crate::CaptureCorrelation {
+            frame_id: 7,
+            texture_revision: 11,
+        };
+        crate::renderer::capture::verify_backpressure(device, queue, &target);
+        let captured = crate::renderer::capture::capture(
+            &capture_state,
+            device,
+            queue,
+            &target,
+            correlation,
+            64 * 64 * 8,
+            Duration::from_secs(15),
+        )
+        .unwrap();
+        assert_eq!(captured.pixels(), first);
+        assert_eq!(captured.correlation(), correlation);
+        assert_eq!(Some(captured.content_id()), target.content_id().as_ref());
+        assert!(matches!(
+            crate::renderer::capture::capture(
+                &capture_state,
+                device,
+                queue,
+                &target,
+                correlation,
+                64 * 64 * 8 - 1,
+                Duration::from_secs(15)
+            ),
+            Err(crate::CaptureError::BudgetExceeded)
+        ));
         assert_pixel(
             &first,
             format,

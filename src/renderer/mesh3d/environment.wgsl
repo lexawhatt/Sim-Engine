@@ -1,7 +1,7 @@
 // Shared retained/clipped, textured/plain surface RGB contract.
 struct SurfaceEnvironmentGpu {
     depth_row: vec4<f32>, ambient: vec4<f32>, sunlight: vec4<f32>,
-    direction: vec4<f32>, fog_color_start: vec4<f32>, fog_density: vec4<f32>,
+    direction: vec4<f32>, fog_color_start: vec4<f32>, fog_density: vec4<f32>, effects: vec4<f32>, snap: vec4<f32>,
 };
 struct Camera3dUniform {
     clip_row_0: vec4<f32>, clip_row_1: vec4<f32>, clip_row_2: vec4<f32>, clip_row_3: vec4<f32>,
@@ -18,6 +18,7 @@ struct SurfaceVertexIn {
 struct SurfaceOut {
     @builtin(position) position: vec4<f32>, @location(0) color: vec4<f32>, @location(1) uv: vec2<f32>,
     @location(2) @interpolate(flat) surface: vec4<f32>, @location(3) normal_depth: vec4<f32>,
+    @location(4) @interpolate(linear) affine_uv: vec2<f32>,
 };
 fn surface_retained(input: SurfaceVertexIn, uv: vec2<f32>, vertex_color: vec4<f32>, normal: vec3<f32>) -> SurfaceOut {
     let model = vec4<f32>(input.position, 1.0);
@@ -32,9 +33,19 @@ fn surface_retained(input: SurfaceVertexIn, uv: vec2<f32>, vertex_color: vec4<f3
     if input.surface.w == 1.0 && camera3d.environment.fog_density.x > 0.0 {
         auxiliary.w = dot(camera3d.environment.depth_row, world);
     }
-    return SurfaceOut(clip, input.color * vertex_color, uv * input.uv_transform.xy + input.uv_transform.zw, input.surface, auxiliary);
+    return make_surface_output(clip, input.color * vertex_color, uv * input.uv_transform.xy + input.uv_transform.zw, input.surface, auxiliary);
 }
-fn surface_fragment(color: vec4<f32>, surface: vec4<f32>, auxiliary: vec4<f32>, front: bool) -> vec4<f32> {
+fn make_surface_output(clip: vec4<f32>, color: vec4<f32>, uv: vec2<f32>, surface: vec4<f32>, auxiliary: vec4<f32>) -> SurfaceOut {
+    var position=clip;
+    let grid=camera3d.environment.snap.xy;
+    if grid.x>0.0 {
+        let pixel=(clip.xy/clip.w*0.5+vec2<f32>(0.5))*grid;
+        let snapped=floor(pixel+vec2<f32>(0.5));
+        position=vec4<f32>((snapped/grid*2.0-vec2<f32>(1.0))*clip.w,clip.zw);
+    }
+    return SurfaceOut(position,color,uv,surface,auxiliary,uv);
+}
+fn surface_fragment(color: vec4<f32>, surface: vec4<f32>, auxiliary: vec4<f32>, front: bool, pixel: vec2<f32>) -> vec4<f32> {
     if surface.x == 1.0 && color.a < surface.y { discard; }
     var rgb = color.rgb;
     if surface.z == 1.0 {
@@ -63,6 +74,14 @@ fn surface_fragment(color: vec4<f32>, surface: vec4<f32>, auxiliary: vec4<f32>, 
             amount = 1.0 - exp(-(density * distance));
         }
         rgb = mix(rgb, camera3d.environment.fog_color_start.rgb, amount);
+    }
+    let effects = camera3d.environment.effects;
+    if u32(pixel.y) % 2u == 1u { rgb *= 1.0-effects.z; }
+    if effects.x > 1.0 {
+        let bayer = array<f32,16>(0.0,8.0,2.0,10.0,12.0,4.0,14.0,6.0,3.0,11.0,1.0,9.0,15.0,7.0,13.0,5.0);
+        let index = (u32(pixel.y)%4u)*4u + u32(pixel.x)%4u;
+        let offset = ((bayer[index]+0.5)/16.0-0.5)*effects.y;
+        rgb = clamp(floor(rgb*(effects.x-1.0)+vec3<f32>(0.5+offset))/(effects.x-1.0),vec3<f32>(0.0),vec3<f32>(1.0));
     }
     if surface.x == 2.0 { return vec4<f32>(rgb, color.a); }
     return vec4<f32>(rgb, 1.0);

@@ -18,6 +18,8 @@ pub(super) struct SurfaceEnvironmentGpu {
     pub(super) direction: [f32; 4],
     pub(super) fog_color_start: [f32; 4],
     pub(super) fog_density: [f32; 4],
+    pub(super) effects: [f32; 4],
+    pub(super) snap: [f32; 4],
 }
 
 impl SurfaceEnvironmentGpu {

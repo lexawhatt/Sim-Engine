@@ -317,6 +317,10 @@ impl FrameSourceStatistics {
 /// Failure while constructing or presenting a heterogeneous frame.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum FrameComposerError {
+    /// Offscreen destination dimensions differ from the renderer's physical size.
+    TargetSizeMismatch,
+    /// A composition source is also the offscreen destination.
+    DestinationAliasesSource,
     /// The one frame clear color was not normalized linear RGBA.
     InvalidBackground,
     /// A target-composition opacity was non-finite or outside `0.0..=1.0`.
@@ -360,6 +364,13 @@ pub enum FrameComposerError {
 impl fmt::Display for FrameComposerError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::TargetSizeMismatch => write!(
+                formatter,
+                "frame target must match renderer physical dimensions"
+            ),
+            Self::DestinationAliasesSource => {
+                write!(formatter, "frame destination aliases a sampled target")
+            }
             Self::InvalidBackground => write!(formatter, "frame background must be normalized"),
             Self::InvalidOpacity => write!(formatter, "frame opacity must be finite and in 0..=1"),
             Self::InvalidTint => write!(formatter, "frame image tint must be normalized"),
@@ -530,6 +541,7 @@ pub struct FrameReport {
     statistics: FrameStatistics,
     metrics: RendererFrameMetrics,
     gpu_timing_id: Option<GpuTimingId>,
+    surface_presented: bool,
 }
 
 impl FrameReport {
@@ -579,11 +591,12 @@ impl FrameReport {
         }
     }
 
-    /// Returns surface presents performed by this composed frame.
+    /// Returns actual surface presents performed by this composed frame.
+    /// Offscreen Drawn frames and skipped frames report zero.
     pub const fn surface_present_count(self) -> usize {
-        match self.status {
-            RenderStatus::Drawn => 1,
-            RenderStatus::Skipped(_) => 0,
+        match (self.status, self.surface_presented) {
+            (RenderStatus::Drawn, true) => 1,
+            _ => 0,
         }
     }
 }
@@ -593,7 +606,7 @@ impl FrameReport {
 /// Calling [`FrameComposer::present`] performs all fallible geometry and
 /// ownership validation before acquiring the surface. A successful frame uses
 /// one clear, one command encoder, one queue submission, and one present.
-#[must_use = "a frame composer does no rendering until present is called"]
+#[must_use = "a frame composer does no rendering until present or render_to_target is called"]
 pub struct FrameComposer<'frame> {
     renderer: &'frame mut WgpuRenderer,
     background: Color,
@@ -1894,5 +1907,6 @@ fn frame_report(
         statistics,
         metrics: report.metrics,
         gpu_timing_id: None,
+        surface_presented: false,
     }
 }

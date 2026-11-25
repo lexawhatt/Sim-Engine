@@ -378,6 +378,7 @@ impl WgpuRenderer {
 
         self.renderer_identity = Arc::new(());
         let retired_device = RetiredDevice {
+            _capture: std::mem::take(&mut self.capture_state),
             _adapter: std::mem::replace(&mut self._adapter, adapter),
             _device: std::mem::replace(&mut self.device, device),
             _queue: std::mem::replace(&mut self.queue, queue),

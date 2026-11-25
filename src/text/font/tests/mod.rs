@@ -1,6 +1,7 @@
 use super::*;
 use ab_glyph::Font;
 
+mod geometry;
 mod session;
 use crate::{LogicalPixels, PhysicalPerLogical};
 

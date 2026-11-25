@@ -13,6 +13,7 @@ use super::{
 /// recreation. Use the renderer's physical [`WgpuRenderer::size`] when a
 /// target should match the presentation surface exactly.
 pub struct RenderTarget2d {
+    pub(super) content_revision: std::sync::atomic::AtomicU64,
     pub(super) renderer_identity: Arc<()>,
     pub(super) resource_identity: Arc<()>,
     pub(super) _texture: wgpu::Texture,
@@ -58,7 +59,48 @@ impl TrailBuffer2d {
     }
 }
 
+/// Engine-owned identity of committed target contents within this process.
+/// Cloning retains the target identity so allocation-address reuse cannot collide.
+/// A replacement/restored target has a new identity even if its size matches.
+#[derive(Debug, Clone)]
+pub struct RenderTargetContentId {
+    identity: Arc<()>,
+    revision: u64,
+}
+impl RenderTargetContentId {
+    /// Successful GPU-write submissions on this target; zero precedes any draw.
+    pub const fn revision(&self) -> u64 {
+        self.revision
+    }
+}
+impl PartialEq for RenderTargetContentId {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.identity, &other.identity) && self.revision == other.revision
+    }
+}
+impl Eq for RenderTargetContentId {}
+
 impl RenderTarget2d {
+    /// Returns Engine-owned committed content identity. Rejected/skipped renders
+    /// do not advance it. None means the revision counter is exhausted; capture
+    /// then fails explicitly. Device-loss validity still follows renderer identity.
+    pub fn content_id(&self) -> Option<RenderTargetContentId> {
+        let revision = self
+            .content_revision
+            .load(std::sync::atomic::Ordering::Acquire);
+        (revision != u64::MAX).then(|| RenderTargetContentId {
+            identity: Arc::clone(&self.resource_identity),
+            revision,
+        })
+    }
+    pub(super) fn mark_written(&self) {
+        let _ = self.content_revision.fetch_update(
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+            |value| value.checked_add(1),
+        );
+    }
+
     /// Returns target width in physical texture pixels.
     pub fn width(&self) -> u32 {
         self.width
@@ -166,6 +208,7 @@ impl WgpuRenderer {
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         Ok(RenderTarget2d {
+            content_revision: std::sync::atomic::AtomicU64::new(0),
             renderer_identity: Arc::clone(&self.renderer_identity),
             resource_identity: Arc::new(()),
             _texture: texture,
@@ -538,6 +581,7 @@ impl WgpuRenderer {
             pass.draw(0..6, 0..1);
         }
         self.queue.submit([encoder.finish()]);
+        trails.back.mark_written();
         std::mem::swap(&mut trails.front, &mut trails.back);
         render_report(
             RenderStatus::Drawn,
@@ -584,6 +628,8 @@ impl WgpuRenderer {
             });
         }
         self.queue.submit([encoder.finish()]);
+        trails.front.mark_written();
+        trails.back.mark_written();
         render_report(
             RenderStatus::Drawn,
             Duration::ZERO,

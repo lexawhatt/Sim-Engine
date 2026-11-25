@@ -320,7 +320,16 @@ fn assert_report(
     assert_eq!(report.peak_gpu_bytes(), gpu * (1 + usize::from(aliased)));
     assert_eq!(
         report.peak_recovery_bytes(),
-        old_cpu + report.recovery_bytes()
+        old_cpu
+            + if !aliased && levels == 1 {
+                0
+            } else {
+                report.recovery_bytes()
+            }
+    );
+    assert_eq!(
+        report.cpu_copy_bytes(),
+        2 * base + if !aliased && levels == 1 { 0 } else { gpu }
     );
     assert!(report.staging_bytes() >= base + report.uploaded_bytes());
 }
@@ -378,6 +387,45 @@ fn unique_and_aliased_updates(fixture: &Fixture<'_>) {
             }
         }
     }
+}
+
+fn unique_single_level_bounded_patch(fixture: &Fixture<'_>) {
+    let mut model = Model::new(1152, 720, false, false);
+    let mut texture = fixture.texture(&model, true);
+    let region = ImageTexelRect::new(100, 200, 2, 2).unwrap();
+    let pixels = [12, 34, 56, 255].repeat(4);
+    let retained = texture.recovery_memory_bytes();
+    let budget = Texture3dUpdateBudget::new(16, 32, retained, model.gpu_bytes(), 0);
+    let content_before = texture.content_id();
+    let submitted = crate::renderer::standalone_upload_submissions();
+    let report = fixture
+        .update(&mut texture, region, &pixels, 8, budget)
+        .unwrap();
+    assert_eq!(
+        crate::renderer::standalone_upload_submissions(),
+        submitted + 1
+    );
+    assert_ne!(texture.content_id(), content_before);
+    assert_eq!(
+        texture.content_id().revision(),
+        content_before.revision() + 1
+    );
+    assert!(report.reused_allocation());
+    assert_eq!(report.cpu_copy_bytes(), 32);
+    assert_eq!(report.peak_recovery_bytes(), retained);
+    assert_eq!(report.gpu_copy_bytes(), 0);
+    model.patch(region, &pixels, 8);
+    fixture.assert_chain(&texture, &model);
+    let snapshot = texture.clone();
+    let committed = texture.content_id();
+    assert!(
+        fixture
+            .update(&mut texture, region, &pixels, 8, budget)
+            .is_err()
+    );
+    assert_eq!(texture.content_id(), committed);
+    fixture.assert_chain(&snapshot, &model);
+    fixture.assert_chain(&texture, &model);
 }
 
 fn operation_budget_boundaries(fixture: &Fixture<'_>) {
@@ -724,6 +772,7 @@ pub(in crate::renderer::mesh3d) fn assert_gpu_partial_mip_updates(
 ) {
     let fixture = Fixture::new(device, queue, format);
     unique_and_aliased_updates(&fixture);
+    unique_single_level_bounded_patch(&fixture);
     operation_budget_boundaries(&fixture);
     scene_budget_boundaries(&fixture);
     tile_and_material_rebinding(&fixture);

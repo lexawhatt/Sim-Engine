@@ -4,6 +4,7 @@ use super::*;
 use crate::renderer::*;
 
 mod edges;
+mod effects;
 mod resources;
 mod transforms;
 

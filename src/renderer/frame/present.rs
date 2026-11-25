@@ -19,7 +19,38 @@ use crate::renderer::{
 
 pub(super) fn present_frame(
     mut composer: FrameComposer<'_>,
+    destination: Option<&crate::renderer::RenderTarget2d>,
 ) -> Result<FrameReport, FrameComposerError> {
+    if let Some(target) = destination {
+        if !std::sync::Arc::ptr_eq(
+            &target.renderer_identity,
+            &composer.renderer.renderer_identity,
+        ) {
+            return Err(FrameComposerError::RendererMismatch {
+                source: super::FrameSourceKind::RenderTarget,
+            });
+        }
+        if target.size() != composer.renderer.size() {
+            return Err(FrameComposerError::TargetSizeMismatch);
+        }
+        for item in &composer.items {
+            if let FrameItem::Target { target: source, .. } = item
+                && std::sync::Arc::ptr_eq(&source.resource_identity, &target.resource_identity)
+            {
+                return Err(FrameComposerError::DestinationAliasesSource);
+            }
+        }
+        composer.planned.texture_bytes = composer
+            .planned
+            .texture_bytes
+            .checked_add(target.allocation_bytes())
+            .ok_or(FrameComposerError::BudgetExceeded {
+                resource: super::FrameBudgetResource::TextureBytes,
+                limit: composer.budget.max_texture_bytes(),
+                actual: usize::MAX,
+            })?;
+        validate_frame_budget(composer.budget, composer.planned)?;
+    }
     let renderer = &mut *composer.renderer;
     // Always return the transient allocation, including structured error
     // paths before surface acquisition.
@@ -39,6 +70,7 @@ pub(super) fn present_frame(
         &mut bindings,
         &mut composer.cache,
         &mut preparation,
+        destination,
     )
     .map(|mut report| {
         report.metrics.preparation = Some(preparation);
@@ -63,6 +95,7 @@ fn present_frame_with_vertices<'frame>(
     bindings: &mut Vec<FrameBinding>,
     cache: &mut FrameCache,
     preparation: &mut RendererPreparationMetrics,
+    destination: Option<&crate::renderer::RenderTarget2d>,
 ) -> Result<FrameReport, FrameComposerError> {
     let frame_started_at = Instant::now();
     items.sort_unstable_by_key(FrameItem::sort_key);
@@ -605,66 +638,74 @@ fn present_frame_with_vertices<'frame>(
     // before bind-group creation or queue writes. Repeated skipped frames must
     // not accumulate wgpu's deferred upload staging allocations.
     let acquire_started_at = Instant::now();
-    let surface_texture = match renderer.surface.get_current_texture() {
-        wgpu::CurrentSurfaceTexture::Success(texture)
-        | wgpu::CurrentSurfaceTexture::Suboptimal(texture) => texture,
-        wgpu::CurrentSurfaceTexture::Timeout => {
-            set_particle_rendered(ready, false);
-            return Ok(frame_report(
-                RenderStatus::Skipped(RendererSurfaceStatus::Timeout),
-                statistics.without_uploads(),
-                tessellation,
-                Duration::ZERO,
-                Duration::ZERO,
-                acquire_started_at.elapsed(),
-                Duration::ZERO,
-                frame_started_at.elapsed(),
-                geometry_reused,
-                geometry_streamed,
-                tessellation_stats,
-            ));
-        }
-        wgpu::CurrentSurfaceTexture::Occluded => {
-            set_particle_rendered(ready, false);
-            return Ok(frame_report(
-                RenderStatus::Skipped(RendererSurfaceStatus::Occluded),
-                statistics.without_uploads(),
-                tessellation,
-                Duration::ZERO,
-                Duration::ZERO,
-                acquire_started_at.elapsed(),
-                Duration::ZERO,
-                frame_started_at.elapsed(),
-                geometry_reused,
-                geometry_streamed,
-                tessellation_stats,
-            ));
-        }
-        wgpu::CurrentSurfaceTexture::Outdated => {
-            let _ = renderer.resize(renderer.config.width, renderer.config.height);
-            set_particle_rendered(ready, false);
-            return Ok(frame_report(
-                RenderStatus::Skipped(RendererSurfaceStatus::Outdated),
-                statistics.without_uploads(),
-                tessellation,
-                Duration::ZERO,
-                Duration::ZERO,
-                acquire_started_at.elapsed(),
-                Duration::ZERO,
-                frame_started_at.elapsed(),
-                geometry_reused,
-                geometry_streamed,
-                tessellation_stats,
-            ));
-        }
-        wgpu::CurrentSurfaceTexture::Lost => {
-            return Err(RendererFrameError::Surface(RendererSurfaceStatus::Lost).into());
-        }
-        wgpu::CurrentSurfaceTexture::Validation => {
-            return Err(RendererFrameError::Surface(RendererSurfaceStatus::Validation).into());
-        }
+    let surface_texture = if destination.is_some() {
+        None
+    } else {
+        Some(match renderer.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(texture)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(texture) => texture,
+            wgpu::CurrentSurfaceTexture::Timeout => {
+                set_particle_rendered(ready, false);
+                return Ok(frame_report(
+                    RenderStatus::Skipped(RendererSurfaceStatus::Timeout),
+                    statistics.without_uploads(),
+                    tessellation,
+                    Duration::ZERO,
+                    Duration::ZERO,
+                    acquire_started_at.elapsed(),
+                    Duration::ZERO,
+                    frame_started_at.elapsed(),
+                    geometry_reused,
+                    geometry_streamed,
+                    tessellation_stats,
+                ));
+            }
+            wgpu::CurrentSurfaceTexture::Occluded => {
+                set_particle_rendered(ready, false);
+                return Ok(frame_report(
+                    RenderStatus::Skipped(RendererSurfaceStatus::Occluded),
+                    statistics.without_uploads(),
+                    tessellation,
+                    Duration::ZERO,
+                    Duration::ZERO,
+                    acquire_started_at.elapsed(),
+                    Duration::ZERO,
+                    frame_started_at.elapsed(),
+                    geometry_reused,
+                    geometry_streamed,
+                    tessellation_stats,
+                ));
+            }
+            wgpu::CurrentSurfaceTexture::Outdated => {
+                let _ = renderer.resize(renderer.config.width, renderer.config.height);
+                set_particle_rendered(ready, false);
+                return Ok(frame_report(
+                    RenderStatus::Skipped(RendererSurfaceStatus::Outdated),
+                    statistics.without_uploads(),
+                    tessellation,
+                    Duration::ZERO,
+                    Duration::ZERO,
+                    acquire_started_at.elapsed(),
+                    Duration::ZERO,
+                    frame_started_at.elapsed(),
+                    geometry_reused,
+                    geometry_streamed,
+                    tessellation_stats,
+                ));
+            }
+            wgpu::CurrentSurfaceTexture::Lost => {
+                return Err(RendererFrameError::Surface(RendererSurfaceStatus::Lost).into());
+            }
+            wgpu::CurrentSurfaceTexture::Validation => {
+                return Err(RendererFrameError::Surface(RendererSurfaceStatus::Validation).into());
+            }
+        })
     };
-    let surface_acquire = acquire_started_at.elapsed();
+    let surface_acquire = if destination.is_some() {
+        Duration::ZERO
+    } else {
+        acquire_started_at.elapsed()
+    };
 
     let mut binding_upload = Duration::ZERO;
     let mut camera_uniform_upload = Duration::ZERO;
@@ -723,9 +764,13 @@ fn present_frame_with_vertices<'frame>(
     }
     let mut upload = upload_started_at.elapsed() + binding_upload;
     let encode_started_at = Instant::now();
-    let surface_view = surface_texture
-        .texture
-        .create_view(&wgpu::TextureViewDescriptor::default());
+    let surface_view = match (&surface_texture, destination) {
+        (Some(surface), _) => surface
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default()),
+        (_, Some(target)) => target.view.clone(),
+        _ => return Err(FrameComposerError::TargetSizeMismatch),
+    };
     let (view, resolve_target) = match &renderer.multisample_target {
         Some(target) => (&target.view, Some(&surface_view)),
         None => (&surface_view, None),
@@ -748,7 +793,11 @@ fn present_frame_with_vertices<'frame>(
                 depth_slice: None,
                 resolve_target,
                 ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(background.to_wgpu()),
+                    load: wgpu::LoadOp::Clear(if destination.is_some() {
+                        crate::renderer::premultiplied_wgpu_color(background)
+                    } else {
+                        background.to_wgpu()
+                    }),
                     store: wgpu::StoreOp::Store,
                 },
             })],
@@ -763,9 +812,17 @@ fn present_frame_with_vertices<'frame>(
         timing.resolve(&mut encoder);
     }
     renderer.queue.submit([encoder.finish()]);
+    if let Some(target) = destination {
+        target.mark_written();
+    }
     let gpu_timing_id = timing.map(|timing| renderer.gpu_timing.submitted(timing));
-    renderer.notify_before_present();
-    renderer.queue.present(surface_texture);
+    let surface_presented = if let Some(surface) = surface_texture {
+        renderer.notify_before_present();
+        renderer.queue.present(surface);
+        true
+    } else {
+        false
+    };
     set_particle_rendered(ready, true);
     let encode_submit_present = encode_started_at
         .elapsed()
@@ -784,5 +841,6 @@ fn present_frame_with_vertices<'frame>(
         tessellation_stats,
     );
     report.gpu_timing_id = gpu_timing_id;
+    report.surface_presented = surface_presented;
     Ok(report)
 }

@@ -6,6 +6,45 @@ use super::{
 };
 
 impl WgpuRenderer {
+    /// Snapshots a host-shaped or font-generated glyph atlas into an alpha-capable
+    /// 3D texture. Existing glyph IDs/source rectangles map directly through
+    /// `Texture3d::region_coordinates`; the host supplies arbitrary curved meshes.
+    /// The snapshot has one mip level and retains exact straight sRGB RGBA pixels.
+    /// Later atlas edits do not mutate it. Choose material Nearest/Linear explicitly
+    /// and Mask/Blend coverage on the surface. Packed glyph mipmaps are not implied.
+    /// CPU recovery pixels remain usable as a source after device replacement.
+    /// The budget covers the new texture; the source atlas remains separately owned.
+    pub fn create_texture3d_from_glyph_atlas(
+        &self,
+        atlas: &crate::renderer::GlyphAtlas2d,
+        budget: ImageBudget,
+    ) -> Result<Texture3d, Texture3dError> {
+        let (width, height) = atlas.size();
+        let source = atlas.image.pixels();
+        image::validate_image_shape(
+            width,
+            height,
+            source.len(),
+            budget,
+            self.device.limits().max_texture_dimension_2d,
+        )
+        .map_err(Texture3dError::Image)?;
+        let mut pixels = Vec::new();
+        pixels.try_reserve_exact(source.len()).map_err(|_| {
+            Texture3dError::Image(ImageError::AllocationFailed {
+                requested_bytes: source.len(),
+            })
+        })?;
+        pixels.extend_from_slice(source);
+        self.create_texture3d_rgba8_with_options(
+            width,
+            height,
+            pixels,
+            budget,
+            Texture3dOptions::new().with_alpha_preservation(true),
+        )
+    }
+
     /// Creates an independently filtered image with explicit alpha/mipmap policy.
     /// ImageBudget covers the complete committed CPU/GPU chain, not only mip zero.
     pub fn create_texture3d_rgba8_with_options(

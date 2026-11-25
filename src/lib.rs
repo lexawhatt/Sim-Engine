@@ -22,8 +22,10 @@ pub use renderer::{
 };
 #[cfg(feature = "fonts")]
 pub use text::{
-    FontBudget, FontBudgetResource, FontError, FontFace, RasterizedGlyph, ShapedGlyph, ShapedLine,
-    ShapedLineError, TextDirection, TextLayoutBudget, TextShapingSession, TextStyle,
+    FontBudget, FontBudgetResource, FontError, FontFace, LigatureCaretPolicy, RasterizedGlyph,
+    ShapedCaret, ShapedCluster, ShapedClusters, ShapedGeometryError, ShapedGlyph, ShapedLine,
+    ShapedLineError, ShapedSelection, TextDirection, TextLayoutBudget, TextPenPosition,
+    TextShapingSession, TextStyle,
 };
 
 #[cfg(test)]
@@ -64,34 +66,45 @@ pub use units::{LogicalPixels, PhysicalPerLogical, UnitError, WorldLength};
 
 #[cfg(feature = "wgpu")]
 pub use renderer::{
-    BlendMode, DynamicMesh2d, DynamicMesh3dBudget, DynamicMesh3dBudgetResource, DynamicMesh3dError,
-    DynamicMesh3dUpdateReport, DynamicMeshBudget, DynamicMeshBudgetResource, DynamicMeshError,
-    DynamicMeshRenderError, DynamicMeshUpdateReport, DynamicVertex2d, FrameBudget,
-    FrameBudgetResource, FrameCacheBudget, FrameCacheStatistics, FrameComposer, FrameComposerError,
-    FramePassOptions, FrameReport, FrameSourceKind, FrameSourceStatistics, FrameStatistics,
-    GlyphAtlas2d, GlyphAtlasBudget, GlyphAtlasEntry, GlyphBatch2d, GlyphBatchBudget,
-    GlyphBatchUploadReport, GlyphError, GlyphId, GlyphRun2d, GlyphRunBounds, GlyphRunBudget,
-    GlyphRunPlacement2d, GlyphRunStatistics, GlyphRunUploadReport, GlyphUploadReport,
-    GpuTimingBatch, GpuTimingId, GpuTimingSample, GpuTimingSource, GpuTimingStatistics,
-    GpuTimingStatus, Image2d, ImageBatch2d, ImageBatchBudget, ImageBatchPlacement,
-    ImageBatchUploadReport, ImageBudget, ImageError, ImageSampling, ImageSprite2d, ImageTexelRect,
-    ImageUploadReport, LayeredVisualizationError, LayeredVisualizationOptions,
-    LayeredVisualizationReport, Mesh3dInstance, Mesh3dObjectError, Mesh3dPreflightReport,
-    Mesh3dRenderBudget, Mesh3dRenderError, Mesh3dRenderReport, Mesh3dResourceError,
-    Mesh3dSurfaceError, Mesh3dUploadBudget, Mesh3dUploadBudgetResource, Mesh3dUploadReport,
-    Object3dId, ParticleBudgetError, ParticleField2d, ParticleFieldError, ParticleFieldRenderError,
-    ParticleFieldUpdateReport, ParticleRenderBudget, ParticleStatistics, PositionedGlyph2d,
-    PreparedScene, PreparedSceneError, PreparedSceneRenderError, PreparedScreenScene, RenderReport,
-    RenderStatus, RenderTarget2d, RenderTarget3d, RenderTargetError, RenderTargetLoad,
-    RendererConfigurationError, RendererCoordinateError, RendererDiagnostics, RendererFrameError,
-    RendererFrameMetrics, RendererInitError, RendererPreparationMetrics, RendererPresentMode,
-    RendererSurfacePresentMode, RendererSurfaceStatus, RetainedMesh3d, ScalarFieldRenderError,
-    ScalarFieldSampling, ScalarFieldTexture, ScalarFieldTextureError, ScalarFieldUploadReport,
-    Scene3d, Scene3dBudget, Scene3dBudgetResource, Scene3dError, Scene3dMeshUpdateReport,
-    Scene3dRestoreReport, Scene3dStatistics, ScreenPrimitive2d, ScreenPrimitiveBatch2d,
-    ScreenPrimitiveBudget, ScreenPrimitiveError, ScreenPrimitiveUploadReport,
-    SurfaceRasterization3d, TessellationStats, Texture3d, Texture3dError, Texture3dOptions,
-    Texture3dUpdateBudget, Texture3dUpdateBudgetResource, Texture3dUpdateError,
-    Texture3dUpdateReport, TextureMaterial3d, TextureMipmaps3d, TrailBuffer2d, WgpuRenderer,
-    WgpuRendererOptions,
+    BlendMode, CaptureCorrelation, CaptureError, DynamicMesh2d, DynamicMesh3dBudget,
+    DynamicMesh3dBudgetResource, DynamicMesh3dError, DynamicMesh3dUpdateReport, DynamicMeshBudget,
+    DynamicMeshBudgetResource, DynamicMeshError, DynamicMeshRenderError, DynamicMeshUpdateReport,
+    DynamicVertex2d, FrameBudget, FrameBudgetResource, FrameCacheBudget, FrameCacheStatistics,
+    FrameComposer, FrameComposerError, FramePassOptions, FrameReport, FrameSourceKind,
+    FrameSourceStatistics, FrameStatistics, GlyphAtlas2d, GlyphAtlasBudget, GlyphAtlasEntry,
+    GlyphBatch2d, GlyphBatchBudget, GlyphBatchUploadReport, GlyphError, GlyphId, GlyphRun2d,
+    GlyphRunBounds, GlyphRunBudget, GlyphRunPlacement2d, GlyphRunStatistics, GlyphRunUploadReport,
+    GlyphUploadReport, GpuTimingBatch, GpuTimingId, GpuTimingSample, GpuTimingSource,
+    GpuTimingStatistics, GpuTimingStatus, Image2d, ImageBatch2d, ImageBatchBudget,
+    ImageBatchPlacement, ImageBatchUploadReport, ImageBudget, ImageError, ImageSampling,
+    ImageSprite2d, ImageTexelRect, ImageUploadReport, LayeredVisualizationError,
+    LayeredVisualizationOptions, LayeredVisualizationReport, Mesh3dInstance, Mesh3dObjectError,
+    Mesh3dPreflightReport, Mesh3dRenderBudget, Mesh3dRenderError, Mesh3dRenderReport,
+    Mesh3dResourceError, Mesh3dSurfaceError, Mesh3dUploadBudget, Mesh3dUploadBudgetResource,
+    Mesh3dUploadReport, Object3dId, ParticleBudgetError, ParticleField2d, ParticleFieldError,
+    ParticleFieldRenderError, ParticleFieldUpdateReport, ParticleRenderBudget, ParticleStatistics,
+    PositionedGlyph2d, PreparedScene, PreparedSceneError, PreparedSceneRenderError,
+    PreparedScreenScene, RenderReport, RenderStatus, RenderTarget2d, RenderTarget3d,
+    RenderTargetBudget, RenderTargetCapture, RenderTargetError, RenderTargetLifecycleError,
+    RenderTargetLoad, RenderTargetReplacementReport, RendererConfigurationError,
+    RendererCoordinateError, RendererDiagnostics, RendererFrameError, RendererFrameMetrics,
+    RendererInitError, RendererPreparationMetrics, RendererPresentMode, RendererSurfacePresentMode,
+    RendererSurfaceStatus, RetainedMesh3d, ScalarFieldRenderError, ScalarFieldSampling,
+    ScalarFieldTexture, ScalarFieldTextureError, ScalarFieldUploadReport, Scene3d, Scene3dBudget,
+    Scene3dBudgetResource, Scene3dError, Scene3dMeshUpdateReport, Scene3dRestoreReport,
+    Scene3dStatistics, ScreenPrimitive2d, ScreenPrimitiveBatch2d, ScreenPrimitiveBudget,
+    ScreenPrimitiveError, ScreenPrimitiveUploadReport, SurfaceRasterization3d, TessellationStats,
+    Texture3d, Texture3dError, Texture3dOptions, Texture3dUpdateBudget,
+    Texture3dUpdateBudgetResource, Texture3dUpdateError, Texture3dUpdateReport, TextureMaterial3d,
+    TextureMipmaps3d, TrailBuffer2d, WgpuRenderer, WgpuRendererOptions,
 };
+
+pub use mesh3d::{SurfaceEffects3d, SurfaceEffectsError3d};
+#[cfg(feature = "wgpu")]
+pub use renderer::{LayeredRenderError3d, LayeredRenderReport3d, LayeredTarget3d};
+
+#[cfg(feature = "wgpu")]
+pub use renderer::RenderTargetContentId;
+
+#[cfg(feature = "wgpu")]
+pub use renderer::Texture3dContentId;

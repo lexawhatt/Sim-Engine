@@ -4,6 +4,8 @@ use std::{error::Error, fmt, sync::Arc};
 
 use crate::{Color, Vec3};
 
+mod effects;
+pub use effects::{SurfaceEffects3d, SurfaceEffectsError3d};
 mod attributes;
 mod environment;
 mod material;

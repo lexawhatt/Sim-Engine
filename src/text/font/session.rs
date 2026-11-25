@@ -1,6 +1,6 @@
 use super::{
     FontBudgetResource, FontError, FontFace, ShapedGlyph, ShapedLine, TextDirection,
-    TextLayoutBudget, TextStyle, check, represent, reserve,
+    TextLayoutBudget, TextPenPosition, TextStyle, check, represent, reserve,
 };
 
 /// A prepared line cannot be reused with the requested font, style or limits.
@@ -143,12 +143,13 @@ impl<'font> TextShapingSession<'font> {
     /// Shapes a new owned line; later updates can reuse its allocation.
     /// Separate returned lines each own their own bounded UTF-8 and glyph vectors.
     pub fn shape_line(&mut self, text: &str) -> Result<ShapedLine, FontError> {
-        let advance = self.shape_to_scratch(text)?;
+        let (advance, resolved_direction) = self.shape_to_scratch(text)?;
         Ok(ShapedLine {
             font: self.font.clone(),
             style: self.style,
             text: std::mem::take(&mut self.text),
             glyphs: std::mem::take(&mut self.glyphs),
+            resolved_direction,
             advance,
             ascent: self.ascent,
             descent: self.descent,
@@ -183,10 +184,11 @@ impl<'font> TextShapingSession<'font> {
         if line.text == text {
             return Ok(false);
         }
-        let advance = self.shape_to_scratch(text)?;
+        let (advance, resolved_direction) = self.shape_to_scratch(text)?;
         std::mem::swap(&mut line.text, &mut self.text);
         std::mem::swap(&mut line.glyphs, &mut self.glyphs);
         line.advance = advance;
+        line.resolved_direction = resolved_direction;
         Ok(true)
     }
 
@@ -213,9 +215,11 @@ impl<'font> TextShapingSession<'font> {
         self.text = String::new();
     }
 
-    fn shape_to_scratch(&mut self, text: &str) -> Result<f32, FontError> {
+    fn shape_to_scratch(&mut self, text: &str) -> Result<(f32, TextDirection), FontError> {
         validate_text(text, self.budget)?;
         self.input.clear();
+        self.input
+            .set_cluster_level(rustybuzz::BufferClusterLevel::MonotoneGraphemes);
         self.input.push_str(text);
         match self.style.direction() {
             TextDirection::Auto => {}
@@ -223,6 +227,11 @@ impl<'font> TextShapingSession<'font> {
             TextDirection::Rtl => self.input.set_direction(rustybuzz::Direction::RightToLeft),
         }
         self.input.guess_segment_properties();
+        let resolved_direction = match self.input.direction() {
+            rustybuzz::Direction::LeftToRight => TextDirection::Ltr,
+            rustybuzz::Direction::RightToLeft => TextDirection::Rtl,
+            _ => return Err(FontError::InvalidGeometry),
+        };
         let key = PlanKey {
             script: self.input.script(),
             direction: self.input.direction(),
@@ -246,18 +255,19 @@ impl<'font> TextShapingSession<'font> {
             return Err(FontError::InvalidFont);
         };
         let output = rustybuzz::shape_with_plan(&self.face, plan, std::mem::take(&mut self.input));
-        let result = self.copy_output(text, &output);
+        let result = self.copy_output(text, &output, resolved_direction);
         // A rejected expanded output must not remain as hidden retained scratch.
         if result.is_ok() {
             self.input = output.clear();
         }
-        result
+        result.map(|advance| (advance, resolved_direction))
     }
 
     fn copy_output(
         &mut self,
         text: &str,
         output: &rustybuzz::GlyphBuffer,
+        direction: TextDirection,
     ) -> Result<f32, FontError> {
         check(
             FontBudgetResource::ShapedGlyphs,
@@ -268,7 +278,22 @@ impl<'font> TextShapingSession<'font> {
         reserve(&mut self.glyphs, output.len())?;
         let mut pen_x = 0.0f64;
         let mut pen_y = 0.0f64;
+        let mut previous_cluster = None;
+        if output.glyph_infos().len() != output.glyph_positions().len() {
+            return Err(FontError::InvalidGeometry);
+        }
         for (information, position) in output.glyph_infos().iter().zip(output.glyph_positions()) {
+            let cluster = information.cluster as usize;
+            if cluster >= text.len()
+                || !text.is_char_boundary(cluster)
+                || previous_cluster.is_some_and(|previous| match direction {
+                    TextDirection::Rtl => previous < cluster,
+                    _ => previous > cluster,
+                })
+            {
+                return Err(FontError::InvalidGeometry);
+            }
+            previous_cluster = Some(cluster);
             if information.glyph_id == 0 {
                 return Err(FontError::MissingGlyph {
                     byte_index: information.cluster as usize,
@@ -280,9 +305,23 @@ impl<'font> TextShapingSession<'font> {
                 logical_x: represent((pen_x + f64::from(position.x_offset)) * self.factor)?,
                 logical_y: represent(-(pen_y + f64::from(position.y_offset)) * self.factor)?,
                 cluster: information.cluster as usize,
+                pen_start: TextPenPosition::new(pen_x * self.factor, -pen_y * self.factor)?,
+                pen_end: TextPenPosition::new(
+                    (pen_x + f64::from(position.x_advance)) * self.factor,
+                    -(pen_y + f64::from(position.y_advance)) * self.factor,
+                )?,
             });
             pen_x += f64::from(position.x_advance);
             pen_y += f64::from(position.y_advance);
+        }
+        if self
+            .glyphs
+            .iter()
+            .map(|glyph| glyph.cluster())
+            .min()
+            .is_some_and(|first| first != 0)
+        {
+            return Err(FontError::InvalidGeometry);
         }
         let advance = represent(pen_x * self.factor)?;
         self.text.clear();

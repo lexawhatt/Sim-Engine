@@ -134,6 +134,7 @@ impl PrimitiveTargetRenderer<'_> {
             );
         }
         self.queue.submit([encoder.finish()]);
+        target.mark_written();
         Ok(render_report(
             RenderStatus::Drawn,
             preparation,

@@ -13,7 +13,7 @@ pub use types::{
 };
 
 struct PreparedUpdate {
-    chain: CpuMipChain,
+    chain: Option<CpuMipChain>,
     regions: mips::MipRegionPlan,
     packed: Vec<u8>,
     first_nonopaque: Option<usize>,
@@ -30,7 +30,8 @@ impl WgpuRenderer {
     /// Old materials remain unchanged until explicitly rebound with `with_texture`.
     /// Only affected lower-mip rectangles are regenerated and uploaded, with
     /// byte-identical filtering to full regeneration, including odd dimensions.
-    /// CPU preparation still clones the complete recovery chain; shared handles
+    /// Unique single-level edits commit patch-only CPU copies after admission; other
+    /// updates clone the complete recovery chain. Shared handles
     /// still copy the complete GPU chain before applying these smaller uploads.
     /// Synchronous errors preserve CPU/GPU drawable state; asynchronous device
     /// loss is separate and recovery restores the last committed complete chain.
@@ -139,6 +140,9 @@ fn prepare_update(
     detached: bool,
 ) -> Result<PreparedUpdate, Texture3dUpdateError> {
     let started = Instant::now();
+    if source.storage.content_revision == u64::MAX {
+        return Err(Texture3dUpdateError::RevisionExhausted);
+    }
     if !source.belongs_to(identity) {
         return Err(Texture3dError::RendererMismatch.into());
     }
@@ -184,7 +188,11 @@ fn prepare_update(
     let uploaded = sum(base, mips)?;
     let copy = if detached { gpu } else { 0 };
     let peak_gpu = sum(gpu, copy)?;
-    let peak_recovery = sum(source.recovery_memory_bytes(), gpu)?;
+    let in_place = !detached && source.storage.chain.levels().len() == 1;
+    let peak_recovery = sum(
+        source.recovery_memory_bytes(),
+        if in_place { 0 } else { gpu },
+    )?;
     let staging = sum(base, uploaded)?;
     for (resource, actual, maximum) in [
         (
@@ -227,28 +235,45 @@ fn prepare_update(
         staging,
         budget.staging,
     )?;
-    let mut chain = source
-        .storage
-        .chain
-        .try_clone()
-        .map_err(Texture3dError::Image)?;
-    let recovery = chain.recovery_memory_bytes();
-    let peak_recovery = sum(source.recovery_memory_bytes(), recovery)?;
+    let mut chain = if in_place {
+        None
+    } else {
+        Some(
+            source
+                .storage
+                .chain
+                .try_clone()
+                .map_err(Texture3dError::Image)?,
+        )
+    };
+    let recovery = chain.as_ref().map_or(
+        source.recovery_memory_bytes(),
+        CpuMipChain::recovery_memory_bytes,
+    );
+    let peak_recovery = sum(
+        source.recovery_memory_bytes(),
+        if in_place { 0 } else { recovery },
+    )?;
     limit(
         Texture3dUpdateBudgetResource::PeakRecoveryBytes,
         peak_recovery,
         budget.recovery,
     )?;
+    let cpu_copy_bytes = sum(sum(base, base)?, if in_place { 0 } else { gpu })?;
     for y in 0..region.height() as usize {
         packed.extend_from_slice(&pixels[y * stride..y * stride + row_bytes]);
     }
-    chain.patch_base(region, &packed);
-    chain.regenerate_regions(&regions);
-    let first_nonopaque = chain
-        .pixels()
-        .chunks_exact(4)
-        .position(|pixel| pixel[3] != 255);
-    let level_count = chain.levels().len();
+    let first_nonopaque = if let Some(chain) = &mut chain {
+        chain.patch_base(region, &packed);
+        chain.regenerate_regions(&regions);
+        chain
+            .pixels()
+            .chunks_exact(4)
+            .position(|pixel| pixel[3] != 255)
+    } else {
+        None
+    };
+    let level_count = source.storage.chain.levels().len();
     Ok(PreparedUpdate {
         chain,
         regions,
@@ -256,6 +281,7 @@ fn prepare_update(
         first_nonopaque,
         report: Texture3dUpdateReport {
             base,
+            cpu_copy_bytes,
             mips,
             uploads: level_count,
             copy,
@@ -289,9 +315,7 @@ pub(in crate::renderer::mesh3d) fn update_texture_region(
     let prepared = prepare_update(
         device, identity, texture, region, pixels, stride, budget, false, detached,
     )?;
-    Ok(apply_update(
-        device, queue, layout, texture, region, prepared,
-    ))
+    apply_update(device, queue, layout, texture, region, prepared)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -344,7 +368,7 @@ pub(in crate::renderer::mesh3d) fn update_scene_texture_region(
         &mut material.texture,
         region,
         prepared,
-    );
+    )?;
     scene.commit_dynamic_texture_change(change);
     Ok(report)
 }
@@ -378,8 +402,11 @@ fn upload_patch(
             depth_or_array_layers: 1,
         },
     );
-    for (index, (level, patch)) in prepared
-        .chain
+    let Some(chain) = &prepared.chain else {
+        submit_pending_uploads(queue);
+        return;
+    };
+    for (index, (level, patch)) in chain
         .levels()
         .iter()
         .zip(prepared.regions.regions())
@@ -402,7 +429,7 @@ fn upload_patch(
                 },
                 aspect: wgpu::TextureAspect::All,
             },
-            &prepared.chain.level_pixels(*level)[start..end],
+            &chain.level_pixels(*level)[start..end],
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
                 bytes_per_row: Some(level.width * 4),
@@ -425,19 +452,53 @@ fn apply_update(
     target: &mut Texture3d,
     region: ImageTexelRect,
     mut prepared: PreparedUpdate,
-) -> Texture3dUpdateReport {
+) -> Result<Texture3dUpdateReport, Texture3dUpdateError> {
     let started = Instant::now();
+    let next_revision = target
+        .storage
+        .content_revision
+        .checked_add(1)
+        .ok_or(Texture3dUpdateError::RevisionExhausted)?;
     if let Some(storage) = Arc::get_mut(&mut target.storage) {
         upload_patch(queue, &storage.texture, region, &prepared);
-        storage.chain = prepared.chain;
-        storage.first_nonopaque_texel = prepared.first_nonopaque;
+        storage.content_revision = next_revision;
+        if let Some(chain) = prepared.chain.take() {
+            storage.chain = chain;
+            storage.first_nonopaque_texel = prepared.first_nonopaque;
+        } else {
+            // All fallible preparation and scene admission completed before this
+            // allocation-free commit. No alias observes partial CPU changes.
+            storage.chain.patch_base(region, &prepared.packed);
+            storage.first_nonopaque_texel = if storage.first_nonopaque_texel.is_none() {
+                prepared
+                    .packed
+                    .chunks_exact(4)
+                    .position(|pixel| pixel[3] != 255)
+                    .map(|index| {
+                        (region.y() as usize + index / region.width() as usize)
+                            * storage.chain.levels()[0].width as usize
+                            + region.x() as usize
+                            + index % region.width() as usize
+                    })
+            } else {
+                storage
+                    .chain
+                    .pixels()
+                    .chunks_exact(4)
+                    .position(|pixel| pixel[3] != 255)
+            };
+        }
     } else {
-        let texture = prepared.chain.allocate_gpu(device);
-        let bindings = create_bindings(device, layout, &texture, prepared.chain.levels().len());
+        let chain = prepared
+            .chain
+            .as_ref()
+            .ok_or(Texture3dUpdateError::OwnershipChanged)?;
+        let texture = chain.allocate_gpu(device);
+        let bindings = create_bindings(device, layout, &texture, chain.levels().len());
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("sim-engine 3D texture alias detachment"),
         });
-        for (index, level) in prepared.chain.levels().iter().enumerate() {
+        for (index, level) in chain.levels().iter().enumerate() {
             encoder.copy_texture_to_texture(
                 wgpu::TexelCopyTextureInfo {
                     texture: &target.storage.texture,
@@ -463,16 +524,21 @@ fn apply_update(
         queue.submit([encoder.finish()]);
         upload_patch(queue, &texture, region, &prepared);
         target.storage = Arc::new(TextureStorage {
+            content_identity: Arc::new(()),
+            content_revision: next_revision,
             renderer_identity: Arc::clone(&target.storage.renderer_identity),
             preserve_alpha: target.storage.preserve_alpha,
             first_nonopaque_texel: prepared.first_nonopaque,
-            chain: prepared.chain,
+            chain: prepared
+                .chain
+                .take()
+                .ok_or(Texture3dUpdateError::OwnershipChanged)?,
             texture,
             bindings,
         });
     }
     prepared.report.encode_submit = started.elapsed();
-    prepared.report
+    Ok(prepared.report)
 }
 
 #[cfg(test)]

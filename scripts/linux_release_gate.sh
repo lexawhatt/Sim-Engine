@@ -105,8 +105,14 @@ cargo run --release --features text --example text_ui_updates -- --acceptance
 WGPU_BACKEND=vulkan \
 cargo run --release --example texture_lifecycle_3d -- --acceptance
 WGPU_BACKEND=vulkan \
+SIM_ENGINE_REQUIRED_ADAPTER_PCI_BUS_ID="$required_adapter_pci_bus_id" \
+cargo run --release --features text --example layered_3d -- --acceptance
+WGPU_BACKEND=vulkan \
 SIM_ENGINE_REQUIRE_VULKAN=1 \
+SIM_ENGINE_REQUIRED_ADAPTER_PCI_BUS_ID="$required_adapter_pci_bus_id" \
 ./scripts/rendering_benchmark_matrix.sh
+grep -Fxq "pci_bus_id=$required_adapter_pci_bus_id" "$output_dir/linux-vulkan-surface.txt"
+grep -Fxq "pci_bus_id=$required_adapter_pci_bus_id" "$output_dir/linux-vulkan-adapter.txt"
 WGPU_BACKEND=vulkan \
 SIM_ENGINE_REQUIRED_ADAPTER_PCI_BUS_ID="$required_adapter_pci_bus_id" \
 ./scripts/dense_scene_benchmark_matrix.sh --acceptance
@@ -125,6 +131,23 @@ fi
 
 echo "[11/11] package verification"
 cargo package --offline
+assert_provenance
+
+# The snapshot wrapper removes its temporary build tree. Keep the artifacts
+# that establish this exact-source qualification before that cleanup occurs.
+artifact_root="$output_dir/artifacts"
+mkdir -p "$artifact_root/package" "$artifact_root/binaries"
+package_id=$(cargo pkgid --offline)
+package_version=${package_id##*@}
+cp "${CARGO_TARGET_DIR:?}/package/sim-engine-$package_version.crate" "$artifact_root/package/"
+git archive --format=tar.gz --output="$artifact_root/source.tar.gz" "$start_sha"
+for example in rendering_benchmark_suite text_ui_updates texture_lifecycle_3d layered_3d dense_scene_benchmark; do
+    cp "$CARGO_TARGET_DIR/release/examples/$example" "$artifact_root/binaries/"
+done
+(
+    cd "$artifact_root"
+    sha256sum source.tar.gz package/*.crate binaries/* > SHA256SUMS
+)
 assert_provenance
 
 echo "Linux release gate passed"

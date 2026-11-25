@@ -8,6 +8,7 @@ pub(in crate::renderer) fn assert_gpu_depth_contract(
     queue: &wgpu::Queue,
     format: wgpu::TextureFormat,
 ) {
+    effects::verify(device, queue, format);
     accounting_benchmark::run(device, queue);
     texture::benchmark_texture_updates(device, queue, format);
     instancing::assert_gpu_batch_contract(device, queue, format);

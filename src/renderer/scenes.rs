@@ -273,6 +273,7 @@ impl WgpuRenderer {
             }
         }
         self.queue.submit([encoder.finish()]);
+        target.mark_written();
         let encode = encode_started_at.elapsed();
 
         Ok(render_report(

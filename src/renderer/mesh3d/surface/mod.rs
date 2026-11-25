@@ -37,9 +37,34 @@ pub struct Mesh3dRenderBudget {
     surface_policy: SurfaceRasterization3d,
     max_sorting_bytes: usize,
     offscreen_surface_culling: bool,
+    effects: crate::SurfaceEffects3d,
+    load_existing: bool,
 }
 
 impl Mesh3dRenderBudget {
+    /// Preserves existing target color and depth before this pass. The caller
+    /// must use the same camera/projection and target dimensions as the producer
+    /// of that depth. Useful for additional native transparent/edge overlays on
+    /// a layered output. Default false clears both attachments.
+    pub const fn with_existing_depth(mut self, load: bool) -> Self {
+        self.load_existing = load;
+        self
+    }
+    /// Whether this pass loads existing color and depth instead of clearing.
+    pub const fn loads_existing_depth(self) -> bool {
+        self.load_existing
+    }
+
+    /// Selects explicit surface-pass color/interpolation controls. Default is identity.
+    pub const fn with_surface_effects(mut self, effects: crate::SurfaceEffects3d) -> Self {
+        self.effects = effects;
+        self
+    }
+    /// Returns surface-pass color/interpolation controls.
+    pub const fn surface_effects(self) -> crate::SurfaceEffects3d {
+        self.effects
+    }
+
     /// Sets exact generated surface vertex, triangle, and total upload-byte
     /// ceilings. Upload bytes include optional vertex colors, lighting/depth attributes and canonical
     /// display-edge endpoints. The
@@ -54,6 +79,8 @@ impl Mesh3dRenderBudget {
             surface_policy: SurfaceRasterization3d::StrictPortable,
             max_sorting_bytes: 16 * 1024 * 1024,
             offscreen_surface_culling: false,
+            effects: crate::SurfaceEffects3d::new(),
+            load_existing: false,
         }
     }
 

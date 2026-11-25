@@ -708,6 +708,7 @@ pub struct WgpuRenderer {
     image_renderer: ImageRenderer,
     mesh3d_renderer: Mesh3dRenderer,
     gpu_timing: gpu_timing::GpuTimingCollector,
+    capture_state: capture::CaptureState,
     gpu_timing_requested: bool,
     camera_uniform_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
@@ -728,6 +729,7 @@ pub struct WgpuRenderer {
 }
 
 struct RetiredDevice {
+    _capture: capture::CaptureState,
     _adapter: wgpu::Adapter,
     _device: wgpu::Device,
     _queue: wgpu::Queue,
@@ -1727,6 +1729,14 @@ fn upload_scalar_field_texture_region(
 /// render paths instead combine their writes with the draw submission.
 pub(super) fn submit_pending_uploads(queue: &wgpu::Queue) {
     let _ = queue.submit([]);
+    #[cfg(test)]
+    STANDALONE_UPLOAD_SUBMISSIONS.with(|count| count.set(count.get() + 1));
+}
+#[cfg(test)]
+thread_local! {static STANDALONE_UPLOAD_SUBMISSIONS: std::cell::Cell<usize> = const {std::cell::Cell::new(0)};}
+#[cfg(test)]
+pub(super) fn standalone_upload_submissions() -> usize {
+    STANDALONE_UPLOAD_SUBMISSIONS.with(std::cell::Cell::get)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1913,6 +1923,7 @@ fn create_particle_instance_buffer(device: &wgpu::Device, capacity: usize) -> wg
     })
 }
 
+mod capture;
 mod config;
 mod diagnostics;
 mod dynamic_mesh;
@@ -1929,7 +1940,12 @@ mod particles;
 mod pipelines;
 mod scalar_fields;
 mod scenes;
+pub use capture::{CaptureCorrelation, CaptureError, RenderTargetCapture};
+mod target_lifecycle;
 mod targets;
+pub use target_lifecycle::{
+    RenderTargetBudget, RenderTargetLifecycleError, RenderTargetReplacementReport,
+};
 mod tessellation;
 #[cfg(feature = "text")]
 mod text;
@@ -1973,12 +1989,13 @@ use image::{ImageRenderer, ImageUniform};
 use mesh3d::Mesh3dRenderer;
 pub use mesh3d::{
     DynamicMesh3dBudget, DynamicMesh3dBudgetResource, DynamicMesh3dError,
-    DynamicMesh3dUpdateReport, Mesh3dInstance, Mesh3dObjectError, Mesh3dPreflightReport,
-    Mesh3dRenderBudget, Mesh3dRenderError, Mesh3dRenderReport, Mesh3dResourceError,
-    Mesh3dSurfaceError, Mesh3dUploadBudget, Mesh3dUploadBudgetResource, Mesh3dUploadReport,
-    Object3dId, RenderTarget3d, RetainedMesh3d, Scene3d, Scene3dBudget, Scene3dBudgetResource,
-    Scene3dError, Scene3dMeshUpdateReport, Scene3dRestoreReport, Scene3dStatistics,
-    SurfaceRasterization3d, Texture3d, Texture3dError, Texture3dOptions, Texture3dUpdateBudget,
+    DynamicMesh3dUpdateReport, LayeredRenderError3d, LayeredRenderReport3d, LayeredTarget3d,
+    Mesh3dInstance, Mesh3dObjectError, Mesh3dPreflightReport, Mesh3dRenderBudget,
+    Mesh3dRenderError, Mesh3dRenderReport, Mesh3dResourceError, Mesh3dSurfaceError,
+    Mesh3dUploadBudget, Mesh3dUploadBudgetResource, Mesh3dUploadReport, Object3dId, RenderTarget3d,
+    RetainedMesh3d, Scene3d, Scene3dBudget, Scene3dBudgetResource, Scene3dError,
+    Scene3dMeshUpdateReport, Scene3dRestoreReport, Scene3dStatistics, SurfaceRasterization3d,
+    Texture3d, Texture3dContentId, Texture3dError, Texture3dOptions, Texture3dUpdateBudget,
     Texture3dUpdateBudgetResource, Texture3dUpdateError, Texture3dUpdateReport, TextureMaterial3d,
     TextureMipmaps3d,
 };
@@ -1990,7 +2007,7 @@ use pipelines::{PipelineResources, create_pipeline};
 pub use scalar_fields::{
     ScalarFieldRenderError, ScalarFieldTexture, ScalarFieldTextureError, ScalarFieldUploadReport,
 };
-pub use targets::{RenderTarget2d, RenderTargetError, TrailBuffer2d};
+pub use targets::{RenderTarget2d, RenderTargetContentId, RenderTargetError, TrailBuffer2d};
 use tessellation::{
     logical_viewport_scissor, offset_scissor, screen_clip_to_scissor, tessellate_scene,
 };
